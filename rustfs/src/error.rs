@@ -20,6 +20,7 @@ use s3s::{S3Error, S3ErrorCode};
 
 const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";
 const MAX_VERSIONS_EXCEEDED_MESSAGE: &str = "You've exceeded the limit on the number of versions you can create on this object";
+const XMINIO_STORAGE_FULL_CODE: &str = "XMinioStorageFull";
 
 /// S3 error code for a request that names a KMS key the KMS does not hold.
 pub const KMS_KEY_NOT_FOUND_ERROR_CODE: &str = "KMS.NotFoundException";
@@ -104,6 +105,9 @@ fn custom_error_status(code: &S3ErrorCode) -> Option<StatusCode> {
     match code {
         S3ErrorCode::Custom(custom) if &**custom == KMS_KEY_NOT_FOUND_ERROR_CODE || &**custom == MAX_VERSIONS_EXCEEDED_CODE => {
             Some(StatusCode::BAD_REQUEST)
+        }
+        S3ErrorCode::Custom(custom) if &**custom == XMINIO_STORAGE_FULL_CODE => {
+            Some(StatusCode::INSUFFICIENT_STORAGE)
         }
         _ => None,
     }
@@ -423,6 +427,9 @@ impl ApiError {
             S3ErrorCode::Custom(code) if &**code == MAX_VERSIONS_EXCEEDED_CODE => {
                 MAX_VERSIONS_EXCEEDED_MESSAGE.to_string()
             }
+            S3ErrorCode::Custom(code) if &**code == XMINIO_STORAGE_FULL_CODE => {
+                "Storage backend has reached its minimum free drive threshold. Please delete a few objects to proceed.".to_string()
+            }
             _ => code.as_str().to_string(),
         }
     }
@@ -624,12 +631,11 @@ impl From<StorageError> for ApiError {
             StorageError::BucketNameInvalid(_) => S3ErrorCode::InvalidBucketName,
             StorageError::ObjectNameInvalid(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
-            StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
+            StorageError::StorageFull | StorageError::DiskFull => S3ErrorCode::Custom(XMINIO_STORAGE_FULL_CODE.into()),
             StorageError::SlowDown => S3ErrorCode::SlowDown,
             StorageError::FaultyDisk
             | StorageError::FaultyRemoteDisk
             | StorageError::DiskNotFound
-            | StorageError::DiskFull
             | StorageError::TooManyOpenFiles => S3ErrorCode::ServiceUnavailable,
             StorageError::ErasureReadQuorum
             | StorageError::InsufficientReadQuorum(_, _)
