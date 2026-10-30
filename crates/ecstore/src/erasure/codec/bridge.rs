@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::erasure::codec::workspace::RustfsCodecDecodeWorkspace;
-use crate::erasure::coding::Erasure;
+use crate::erasure::coding::{Erasure, cached_modern_reed_solomon};
 use rustfs_erasure_codec::galois_8::ReedSolomon;
 use smallvec::SmallVec;
 use std::io;
@@ -190,10 +190,8 @@ impl RustfsCodecDecodeEngine {
             return Ok(Some(Arc::clone(codec)));
         }
 
-        let codec = Arc::new(
-            ReedSolomon::new(self.data_shards, self.parity_shards)
-                .map_err(|err| io::Error::other(format!("Failed to create RustFS codec decode engine: {err:?}")))?,
-        );
+        let codec = cached_modern_reed_solomon(self.data_shards, self.parity_shards)
+            .map_err(|err| io::Error::other(format!("Failed to create RustFS codec decode engine: {err:?}")))?;
         if self.codec.set(Arc::clone(&codec)).is_err() {
             return Ok(self.codec.get().map(Arc::clone).or(Some(codec)));
         }
@@ -815,5 +813,22 @@ mod tests {
             .expect("enum engine should dispatch reconstruction");
 
         assert!(shards.iter().take(engine.data_shards()).all(Option::is_some));
+    }
+
+    #[test]
+    fn rustfs_codec_decode_engine_shares_cached_modern_reed_solomon_instance() {
+        let erasure = Erasure::new(4, 2, 16);
+        let engine_a = RustfsCodecDecodeEngine::new(&erasure).expect("first engine should be created");
+        let engine_b = RustfsCodecDecodeEngine::new(&erasure).expect("second engine should be created");
+
+        assert!(!engine_a.codec_is_initialized());
+        assert!(!engine_b.codec_is_initialized());
+
+        let codec_a = engine_a.codec().expect("codec a should init").expect("parity > 0");
+        let codec_b = engine_b.codec().expect("codec b should init").expect("parity > 0");
+        assert!(
+            Arc::ptr_eq(&codec_a, &codec_b),
+            "decode engines with identical dimensions should share the cached ReedSolomon instance and its inversion tree"
+        );
     }
 }
