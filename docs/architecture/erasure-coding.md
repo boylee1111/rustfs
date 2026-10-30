@@ -5,7 +5,7 @@
 
 Status: normative. This document is the source of truth for how RustFS erasure-codes, stores, reads, reconstructs, and heals user data, and for the on-disk / on-wire compatibility contract that every future change must preserve. It governs the highest-risk code in the system: a regression here can silently corrupt or lose all user data, or make existing (and MinIO-migrated) objects permanently unreadable.
 
-Erasure coding, quorum/heal, and metadata/on-disk formats are **High-risk** per [AGENTS.md](../../AGENTS.md) ("Broad or High-Risk Changes"). Any behavior-affecting change to code this document governs requires adversarial review with the `adversarial-validation` skill and, for anything touching decode or the on-disk format, a regression test against real on-disk and MinIO-migrated samples before merge.
+Erasure coding, quorum/heal, and metadata/on-disk formats are **High-risk** per [AGENTS.md](../../AGENTS.md). Any behavior-affecting change to code this document governs requires adversarial review and, for anything touching decode or the on-disk format, a regression test against real on-disk and MinIO-migrated samples before merge.
 
 This document describes the algorithm as implemented on `main`. The *invariant* stated is always the rule the code must satisfy; where the code enforces it, the enforcing symbol is cited.
 
@@ -17,6 +17,7 @@ This document describes the algorithm as implemented on `main`. The *invariant* 
   - [placement-repair-invariants.md](placement-repair-invariants.md) — owns object-to-**set** placement (which erasure set a key lands in), per-set readiness/lock quorum, scanner/heal admission, and the behavior-change gates.
   - [ecstore-layout-boundary.md](ecstore-layout-boundary.md) — owns the ecstore module ownership map, `FormatV3` set-ordering and disk-UUID-position invariants, and where the erasure engine physically lives.
   - [decommission-compatibility.md](decommission-compatibility.md) — owns moving encoded objects between pools (decommission/rebalance) and its persisted `PoolMeta` contract.
+  - [../operations/cluster-lifecycle-operations.md](../operations/cluster-lifecycle-operations.md) — owns the operator runbook (planning, `EC:0` consequences, expansion, rebalance, decommission, heal, drive replacement, restart recovery); this spec stays normative for the rules it cites.
   - [../operations/tier-ilm-debugging.md](../operations/tier-ilm-debugging.md) — owns the ILM/tier runtime runbook, the dual internal-metadata-key table, the defensive binary-UUID read pattern, and the `xl.meta` inspection tooling (`dump_fileinfo` / `dump_versions`).
   - [AGENTS.md](../../AGENTS.md) "Cross-Cutting Domain Invariants" — dual internal metadata keys, defensive UUID reads, unversioned tier buckets.
   - [../../ARCHITECTURE.md](../../ARCHITECTURE.md) — crate roles (`ecstore`, `filemeta`, the `rustfs-erasure-codec` codec fork, `heal`, `scanner`).
@@ -156,6 +157,76 @@ Each shard file is self-verifying against silent disk corruption.
 
 ---
 
+### 5.1 Independent shard commitments
+
+New PUTs and newly initiated multipart uploads retain `CSumAlgo = 1` and the
+existing `[HighwayHash256][shard]` frames. Independent commitments are disabled
+for new writes by default; both `RUSTFS_SHARD_INTEGRITY_WRITE` and
+`RUSTFS_SHARD_INTEGRITY_FLEET_CONFIRMED` must be enabled to start protecting new
+writes. Existing protected objects and uploads retain their mode. An independent SHA-256
+commitment protects against replacing a complete frame with a same-length donor
+frame whose self-contained checksum is valid (backlog#2497).
+
+The commitment describes an immutable part generation, with a random UUID,
+part number, exact encoded length, erasure geometry, codec mode, stripe count,
+and Merkle root. Each leaf commits to the ordered SHA-256 digests of **all**
+encoded shards in one stripe. Payload digests include generation, part, stripe,
+coding index, length, and geometry. The root also commits to the final part size.
+A valid metadata quorum selects the expected root; neither RS consistency nor
+an intact adjacent HighwayHash checksum establishes the root.
+
+The dual-prefix internal `shard-integrity-v1` metadata value encodes a canonical
+Base64 table: a 32-byte header and 64 bytes per part, up to 10,000 sorted unique
+parts. The same table is stored under both internal prefixes. Readers reject a
+malformed, conflicting, or incomplete descriptor instead of treating it as
+legacy metadata. Each external part has an immutable
+`part.N.integrity.<generation UUID>` sidecar, replicated on every participating
+disk. Its 64-byte header is followed by stripe records containing all shard
+digests and a Merkle path. An inline object stores the small proof under the
+dual-prefix `shard-integrity-inline-v1` key.
+
+GET authenticates a stripe record against the selected root, then verifies each
+source shard before decoding or emitting bytes. Reconstructed data is also
+checked against its expected digest. Range reads fetch only the proof records
+for touched stripes; deferred parity readers retain their exact stripe position.
+A missing or corrupt index replica can use another authenticated replica. Deep
+Heal verifies at the coordinator, including data returned by older disk servers,
+and restores missing indexes only from proofs matching the existing root. It
+never mints a new commitment from suspect stored bytes. Index-only repair leaves
+payload and `xl.meta` bytes unchanged and requires acknowledged durable publish.
+
+Writes publish the payload and proof on the same write quorum. UploadPart uses
+a fresh generation for each replacement, includes that generation and root in
+part-metadata quorum selection, and publishes its index before the existing
+part transaction switches data and metadata. Settlement removes only the
+obsolete generation; rollback retains the old index. Interrupted preparation
+can leave unreferenced files until the upload directory is reclaimed. Ordinary
+metadata COPY preserves commitments. Physical rewrites inherit their source
+mode: protected sources create new commitments after reading through their
+verifier; legacy sources remain legacy. Rewriting existing bytes is not a
+trusted migration of their historical identity. An upload's persisted marker,
+not the current node's write switch, determines its UploadPart/Complete mode.
+
+Digest/index builders spill above a 1 MiB buffer limit, and request readers keep
+a bounded stripe cache. For EC 12+4, a 5 GiB part with 1 MiB stripes has a
+4,751,424-byte index on each disk (about 1.42% of logical data across 16 disks).
+The maximum descriptor is 853,376 Base64 bytes per prefix, about 1.63 MiB for
+both copies. These are format bounds, not measured throughput guarantees.
+
+Legacy objects retain their existing GET and traditional Heal behavior and
+therefore their residual complete-donor substitution risk. Ordinary shard repair
+and the existing explicit-version metadata recovery path remain available, but
+do not create commitments or certify object identity. Actual drive repairs are
+reported separately from strong integrity receipts. Normal presence scans do
+not issue strong integrity receipts even for protected objects; an all-healthy
+protected version or delete marker may instead carry `MetadataHealthy`, which
+proves metadata quorum only. Legacy objects receive no positive receipt. Only a
+completed exclusive Deep scan/repair with authenticated sources
+can produce `VerifiedHealthy` or a payload-backed repair receipt. See the
+[upgrade contract](minio-file-format-compat.md#independent-integrity-upgrade-contract)
+for mixed-version and migration constraints and the
+[rollout runbook](../operations/shard-integrity-rollout.md) for activation and rollback.
+
 ## 6. On-disk format (`xl.meta`)
 
 This section is the load-bearing compatibility contract for stored metadata. It is byte-compatible with MinIO's `xl.meta`; interop proof, the fixture corpus, and the out-of-scope list are owned by [minio-file-format-compat.md](minio-file-format-compat.md) — cite it, do not re-derive interop claims.
@@ -221,7 +292,7 @@ Fields: `version_id`, `mod_time`, `signature: [u8;4]`, `version_type`, `flags: u
 
 ### 6.6 Inline data
 
-Small objects store their payload inline after the container CRC ([filemeta_inline.rs](../../crates/filemeta/src/filemeta_inline.rs)): 1 version byte (`INLINE_DATA_VER = 1`) then a msgpack map of `version-key → bin`. **INVARIANT — the map key** is the version-id string, `"null"` (`NULL_VERSION_ID`, [fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)) for the null/None version, else the lowercase hyphenated UUID. Presence is determined **on read** solely by the `meta_sys[inline-data]` body marker (`FileInfo::inline_data`); the read path gates inline extraction on that marker alone. The header `InlineData` flag is **written** (mirrored from the body on marshal) but is **not** consulted on read, and a disagreement is tolerated — MinIO may leave the header flag unset while inline data is present, so a reader must **not** require the flag and the marker to agree. The inline threshold is `should_inline` ([storageclass.rs](../../crates/ecstore/src/config/storageclass.rs)): inline if `shard_size ≤ inline_block/8` for versioned buckets, else `≤ inline_block`; `DEFAULT_INLINE_BLOCK = 128 KiB`. A compressed or encrypted single PUT has no known stored size up front, so its shard size is derived from the plaintext `actual_size` (`inline_admission_shard_size`, MinIO `putObject` parity); such objects are inlined through the streaming encoder with in-memory bitrot writers rather than the single-block fast path.
+Small objects store their payload inline after the container CRC ([filemeta_inline.rs](../../crates/filemeta/src/filemeta_inline.rs)): 1 version byte (`INLINE_DATA_VER = 1`) then a msgpack map of `version-key → bin`. **INVARIANT — the map key** is the version-id string, `"null"` (`NULL_VERSION_ID`, [fileinfo.rs](../../crates/filemeta/src/fileinfo.rs)) for the null/None version, else the lowercase hyphenated UUID. Presence is determined **on read** solely by the `meta_sys[inline-data]` body marker (`FileInfo::inline_data`); the read path gates inline extraction on that marker alone. The header `InlineData` flag is **written** (mirrored from the body on marshal) but is **not** consulted on read, and a disagreement is tolerated — MinIO may leave the header flag unset while inline data is present, so a reader must **not** require the flag and the marker to agree. The inline threshold is `should_inline` ([storageclass.rs](../../crates/ecstore/src/config/storageclass.rs)): inline if `shard_size ≤ inline_block/8` for versioned buckets, else `≤ inline_block`; `DEFAULT_INLINE_BLOCK = 128 KiB`. A compressed or encrypted single PUT has no known stored size up front, so its shard size is derived from the plaintext `actual_size` (`inline_admission_shard_size`, MinIO `putObject` parity); such objects are inlined through the streaming encoder with in-memory bitrot writers rather than the single-block fast path. When shard-integrity protected writes are enabled, inline placement additionally requires a known stored length no greater than one erasure block; unknown transformed streams retain external shards and proof indexes.
 
 ---
 
@@ -231,6 +302,9 @@ Small objects store their payload inline after the container CRC ([filemeta_inli
 
 - Encode-time gates: writable disks `< write_quorum` ⇒ `ErasureWriteQuorum`; committed shards `< write_quorum` after encode ⇒ error ([set_disk/ops/object.rs](../../crates/ecstore/src/set_disk/ops/object.rs)).
 - **INVARIANT — atomic commit with best-effort rollback.** Commit is `rename_data` (per-disk temp → final) fanned across all disks ([core/io_primitives.rs](../../crates/ecstore/src/set_disk/core/io_primitives.rs)). If write quorum is not met (`reduce_write_quorum_errs`), every successful disk is undone (`delete_version{undo_write:true}`) and the original quorum error is returned. **Baseline:** the rollback is **best-effort** — undo failures are counted and `warn!`-logged, never propagated or retried — so a write that both misses quorum *and* whose rollback partially fails can leave shards on some disks; that partial residue is reconciled later by heal/scanner, not by the commit path. The guarantee the commit path enforces is "never *reports* success below quorum", not "never leaves any bytes behind".
+- **INVARIANT — separate active uploads from recovery authority.** For legacy multipart publication, `LocalDisk::rename_data_inner` moves the original upload `xl.meta` into `.abort-authority/xl.meta`, then publishes object metadata through `xl.meta.complete`. The recovery move holds the source metadata mutation lease and is synced under the existing system-metadata durability policy before payload publication. Multipart publication requires an existing upload root and cannot recreate it after retirement, including inline empty objects and delayed native requests. Late upload metadata writes refuse while recovery authority exists. Decoded upload identifiers must remain a single safe path component, so recovery children cannot be addressed as active uploads. Original metadata bytes and payload shards are not copied; shards still move by rename. Successful per-disk publication no longer leaves active upload metadata, so a completed upload cannot accept more parts when set-level cleanup fails. `SetDisks::complete_multipart_upload` owns root cleanup after success; ordinary Abort combines primary and recovery metadata with at most one vote per disk, then retains its full deletion quorum and existing incarnation, access and lifecycle fences. Stale/internal cleanup can read recovery authority; orphan cleanup must prove both authority locations and any prepared metadata absent. Empty upload metadata retains its existing half-set identity quorum, independently of the payload's data-shard count. Older peers and historical residue without enough authority remain a refusal, not an inferred cleanup success.
+- **INVARIANT — native Abort closes every publisher before cleanup.** New uploads carry a dual-family source-only native protocol marker; an unmarked legacy upload must be upgraded under its upload guard and exact source-identity comparison before native publication. Unknown or conflicting markers and native private controls never fall back to legacy deletion. A missing state file with surviving native owned records remains uncertain. First state creation checks a bounded root inventory for reserved controls; existing state avoids this scan. Native Abort uses an irreversible `Aborting` phase: each original physical participant drains its source-owned callbacks and durably closes publication, then every source root retains the same certificate of all participants before deletion starts. Generic object-deletion recovery refuses multipart storage scopes and aliases. Strict `DeleteAborted` validates that certificate and its durable local binding inside the physical callback; ordinary recursive deletion cannot remove an Aborting source or bypass it through a wider multipart prefix. Payload shards and completed targets are not copied or changed. A surviving root retains enough certified original authority for cold retry after partial deletion, without inventing a read or publication quorum. The first closure certificate requires every original participant; unavailable or never-initialized participants keep cleanup retryable. Pause multipart mutations and quiesce old unmarked in-flight writers during mixed-version upgrades; settle Aborting roots before downgrade.
+- **INVARIANT — completion replay needs write authority.** `SetDisks::replay_completed_multipart_upload` requires a matching upload ID and part list, then `confirm_completed_multipart_write_quorum` corroborates the same version, data directory, modification time and payload layout at its full write quorum. A readable minority from an uncertain publication is insufficient, including empty objects. Recovery metadata alone never proves completion and cannot reopen an active upload. When no committed object can be proved but primary or recovery authority remains, recovery callers refuse rather than inventing NoSuchUpload. A partial legacy Abort can leave primary metadata below identity quorum; restored peers do not recreate the missing authority, and the surviving records remain untouched. Healthy first completions add no destination metadata probe. Native replay obtains fresh independent confirmations of the exact target, including from a surviving committed-Aborting producer; its immutable source scope, own target anchor and complete version/data-directory identity must match. A cleanup certificate alone never proves publication. Legacy unversioned/current-version replay uses two ReadVersion fan-outs; historical-version lookup can additionally scan version metadata. A previously committed object below write quorum can remain readable while completion replay refuses until write quorum returns.
 - On success the newly committed dir is `fi.data_dir`. Separately, `reduce_common_data_dir` votes over each disk's **`old_data_dir`** (the *superseded* dir being dereferenced) and returns it when it reaches write_quorum, so the old dir can be reclaimed (`commit_rename_data_dir`) — it is a GC input, **not** the new `data_dir`. `classify_rename_convergence` classifies the commit (`PartialCommit` / `SignatureDivergent`), but **only the multipart-complete path consumes it** (`convergence.needs_heal()` → `send_heal_request`); the regular `put_object` path discards the convergence result and relies on the old-data-dir cleanup / `add_partial` heal enqueue instead.
 - The write layout (per-pool parity, storage class, `max_parity`) is resolved once by `resolve_write_layout` into a `WriteLayout` ([set_disk/mod.rs](../../crates/ecstore/src/set_disk/mod.rs)) and consumed by the object and multipart write paths ([set_disk/ops/object.rs](../../crates/ecstore/src/set_disk/ops/object.rs), [set_disk/ops/multipart.rs](../../crates/ecstore/src/set_disk/ops/multipart.rs)); resolution is per pool (§2.2).
 
@@ -239,7 +313,7 @@ Small objects store their payload inline after the container CRC ([filemeta_inli
 ## 8. Read path and read quorum
 
 - **INVARIANT — read quorum = `data_blocks`.** `object_quorum_from_meta` returns `(read_quorum = data_blocks, write_quorum)` ([set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs)); `parity_blocks = common_parity(...)` is the parity value held by the most disks that still reaches its own read quorum. When `default_parity_count == 0`, read = write = all shards.
-- Authoritative FileInfo selection — `find_file_info_in_quorum` ([set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs)) groups valid metas by a content-identity SHA-256 (`file_info_quorum_hash`) that hashes size/flags/mod_time/transition/version_id/data_dir/parts and, for real objects, data/parity/distribution — **excluding replication-status keys** so replication noise never splits quorum. A meta counts only if its mod_time equals the common mod_time (or etag matches when mod_time is absent). The winning hash must reach quorum, else `ErasureReadQuorum`. Latest-version reads may escalate to write_quorum to avoid resurrecting a partially-overwritten version.
+- Authoritative FileInfo selection — `find_file_info_in_quorum` ([set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs)) groups valid metas by a content-identity SHA-256 (`file_info_quorum_hash`) that hashes size/flags/mod_time/transition/version_id/data_dir/parts and, for real objects, data/parity/distribution — **excluding replication-status keys** so replication noise never splits quorum. A meta counts only if its mod_time equals the common mod_time (or etag matches when mod_time is absent). The winning hash must reach quorum, else `ErasureReadQuorum`. S3 reads select at read quorum through `select_valid_fileinfo`, the same rule heal uses and MinIO's `getObjectFileInfo`: the most common mod_time wins and a tie goes to the newer one, so a write that failed after reaching exactly `data_blocks` copies is served as listing shows it, instead of `ErasureReadQuorum` until heal runs. Two identities tied at the selected mod_time (a data = parity set split in half, such as a metadata update that failed after reaching half the drives) resolve to the one on the lowest-index disk, in reads and heal alike, so a retried metadata write can repair the split. A selected version with local shards also needs as many copies as its own `data_blocks`, since delete markers and empty versions can lower the common parity's read quorum. A metadata update whose target disks cannot reach write quorum is refused before any write. A version replaced by a committed write keeps fewer than `data_blocks` copies and can never be selected again; the newer side of a failed write can be served and then lose to the older side if one of its disks fails before heal converges the set. Reads in the system bucket (`is_meta_bucketname`) keep the commit-proof rule in `select_committed_fileinfo`: when enough copies answer to prove write quorum, the latest version must hold it, and a degraded read never serves a newer version below write quorum. Pool metadata's PREPARE/COMMIT recovery and identity epochs rely on an ordinary read implying a committed record, so a split stays unreadable until native recovery resolves it. When every drive answered and an S3 latest read still cannot select a version, `read_latest_past_dangling_versions` walks the version stack newest first through exact-version reads, as MinIO's `pickLatestQuorumFilesInfo` resolves stacks: it serves the readable version with the newest selected mod_time, skips versions whose exact read proves them dangling (the NoSuchVersion an explicit GET reports) and queues heal for them, and keeps the read-quorum error on any other outcome. A failed versioned PUT that left the new version on fewer drives than its data blocks therefore no longer hides the committed version below it; ListObjectVersions can still show the dangling version as latest until heal removes it. Metadata updates of the latest version (object tagging, `put_object_metadata`) and the CopyObject source read resolve a failed selection through the same walk; when the walk finds no readable version, tagging keeps the read-quorum error while `put_object_metadata` and CopyObject keep their existing `delete_if_dangling` cleanup. Replication status write-back never walks. The update targets only the served version's disks and is refused before writing when they cannot reach its write quorum, including a version-only copy.
 - **INVARIANT — decode needs ≥ `data_blocks` shards.** The stripe reader requires `available_shards ≥ data_shards`; below that the read fails closed with a read-quorum error (never silent truncation) ([set_disk/read.rs](../../crates/ecstore/src/set_disk/read.rs), [set_disk/shard_source.rs](../../crates/ecstore/src/set_disk/shard_source.rs)). Codec geometry is validated at construction: `Erasure::try_new` / `try_new_with_options` ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)) return `ErasureConstructionError` for `data_shards == 0`, `block_size == 0`, shard-count overflow, or an unsupported shard configuration, so a read never reaches a `block_size` / `data_shards` division with invalid geometry (§13).
 - If `available ≥ data_blocks` but some shards are missing, the read is served **and** a background read-repair heal is enqueued.
 - **INVARIANT — cross-stripe read verification.** When a data shard is missing and `available > data_blocks`, reconstruction regenerates parity and compares it to the surviving parity; a mismatch is `InvalidData "inconsistent read source shards"` (backlog#832), catching corruption that passed per-shard bitrot but disagrees across the stripe ([erasure.rs](../../crates/ecstore/src/erasure/coding/erasure.rs)).
@@ -252,7 +326,7 @@ Version-aware heal ([set_disk/ops/heal.rs](../../crates/ecstore/src/set_disk/ops
 
 - **INVARIANT — reconstructability.** Heal refuses when `meta_to_heal_count > parity_blocks` (relaxed only if a quorum etag exists) or when any part loses more than `parity_blocks` shards.
 - **INVARIANT — geometry match.** `latest_meta.erasure.distribution.len()` must equal the online-disk, outdated-disk, and parts-metadata counts, else heal refuses ("backend disks manually modified"). A real object missing `data_dir` is `FileCorrupt`.
-- **Data-safety guard (backlog#920).** If data shards survive on ≥ `data_blocks` disks, regenerate the missing `xl.meta` from a valid FileInfo and re-drive heal rather than dangling-delete; torn writes (< `data_blocks`) fall through to dangling-delete handling.
+- **Data-safety guard (backlog#920).** Legacy explicit-version metadata recovery retains its validated geometry, consistent candidate identity, online-disk and available-data bounds. It does not establish independent payload identity. Protected recovery additionally requires a matching metadata quorum and authenticated data on ≥ `data_blocks` disks. Conflicting metadata and uncertain deletion conditions retain their existing refusal/grace behavior.
 - Healed shards are written to the outdated disks, each recording `erasure.index = slot + 1`, then `rename_data` to final. Heal admission / scanner budget is owned by [placement-repair-invariants.md](placement-repair-invariants.md).
 
 ---
@@ -326,7 +400,7 @@ Decode tolerance
 
 ## 13. Change procedure and guardrails
 
-- **Risk tier.** All of the above is High-risk ([AGENTS.md](../../AGENTS.md) "Broad or High-Risk Changes"). Any behavior-affecting change requires adversarial review with the `adversarial-validation` skill.
+- **Risk tier.** All of the above is High-risk ([AGENTS.md](../../AGENTS.md)). Any behavior-affecting change requires adversarial review.
 - **Keep this document in sync.** A change to any governed behavior, formula, format field, or invariant must update this spec in the same PR; renaming a cited symbol must update its reference here. The spec is normative and is the checklist the next change is reviewed against, so drift is a correctness defect. References are symbol-based (not line numbers) specifically so ordinary refactors do not invalidate them — but semantic changes still must.
 - **Adding an on-disk field** must be additive: new msgpack key or a `minor`/`meta_ver` bump with a read path for the old value; keep decoders skipping unknown keys; write both internal-key prefixes; never repurpose or reorder existing keys or header array positions.
 - **Never make a decode boundary stricter** than what §11 allows without (a) proving no legitimate older-RustFS or MinIO-migrated shape is rejected, and (b) a regression test against real on-disk and MinIO fixtures. New validation belongs at the trust boundary and must fail *open to a tolerant default*, not closed to `FileCorrupt`, for anything recoverable. (Concretely: rejecting a negative `actual_size`, or hard-failing a non-16-byte `transitioned-versionID`, breaks existing data — see §11.)

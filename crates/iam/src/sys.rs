@@ -41,6 +41,7 @@ use rustfs_policy::policy::Args;
 use rustfs_policy::policy::opa;
 use rustfs_policy::policy::{Policy, PolicyDoc, iam_policy_claim_name_sa, policy_needs_existing_object_tag_for_args};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -74,6 +75,7 @@ pub const STATUS_ENABLED: &str = "enabled";
 pub const STATUS_DISABLED: &str = "disabled";
 
 pub const POLICYNAME: &str = "policy";
+pub const PLUGIN_ATTEMPT_CREDENTIAL_CLAIM: &str = "rustfs:plugin-attempt-v1";
 pub const SESSION_POLICY_NAME: &str = "sessionPolicy";
 pub const SESSION_POLICY_NAME_EXTRACTED: &str = "sessionPolicy-extracted";
 const VERIFIED_FEDERATED_POLICY_CLAIM: &str = "x-rustfs-internal-federated-policy";
@@ -167,6 +169,12 @@ enum PreparedServicePolicyMode {
 
 #[derive(Clone)]
 enum PreparedIamMode {
+    TerminalDeny,
+    PluginAttemptSts {
+        is_owner: bool,
+        combined_policy: Policy,
+        session_policy: PreparedSessionPolicy,
+    },
     Opa,
     Owner,
     Deny,
@@ -201,11 +209,16 @@ impl PreparedIamAuth {
     pub async fn needs_existing_object_tag_for_args(&self, args: &Args<'_>) -> bool {
         match &self.mode {
             PreparedIamMode::Opa => true,
-            PreparedIamMode::Owner | PreparedIamMode::Deny => false,
+            PreparedIamMode::Owner | PreparedIamMode::Deny | PreparedIamMode::TerminalDeny => false,
             PreparedIamMode::Regular { combined_policy } => {
                 policy_needs_existing_object_tag_for_args(combined_policy, args).await
             }
             PreparedIamMode::Sts {
+                combined_policy,
+                session_policy,
+                ..
+            }
+            | PreparedIamMode::PluginAttemptSts {
                 combined_policy,
                 session_policy,
                 ..
@@ -238,14 +251,56 @@ impl PreparedIamAuth {
     pub fn combined_policy_for_view(&self) -> Option<&Policy> {
         match &self.mode {
             PreparedIamMode::Regular { combined_policy } => Some(combined_policy),
-            PreparedIamMode::Sts { combined_policy, .. } => Some(combined_policy),
+            PreparedIamMode::Sts { combined_policy, .. } | PreparedIamMode::PluginAttemptSts { combined_policy, .. } => {
+                Some(combined_policy)
+            }
             PreparedIamMode::ServiceAccount { combined_policy, .. } => Some(combined_policy),
-            PreparedIamMode::Opa | PreparedIamMode::Owner | PreparedIamMode::Deny => None,
+            PreparedIamMode::Opa | PreparedIamMode::Owner | PreparedIamMode::Deny | PreparedIamMode::TerminalDeny => None,
         }
     }
 }
 
 impl<T: Store> IamSys<T> {
+    /// For the authenticated, explicitly configured broker handler only.
+    pub async fn read_active_plugin_delegation_for_broker(
+        &self,
+        id: &str,
+        now: u64,
+    ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
+        crate::delegation::read_active_for_broker(&self.store.api, id, now).await
+    }
+    pub async fn create_plugin_delegation(
+        &self,
+        owner: &str,
+        restrictions: crate::delegation::Restrictions,
+        now: u64,
+    ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
+        crate::delegation::create(&self.store.api, owner, restrictions, now).await
+    }
+    pub async fn revoke_plugin_delegation(
+        &self,
+        owner: &str,
+        id: &str,
+    ) -> std::result::Result<(), crate::delegation::DelegationError> {
+        crate::delegation::revoke(&self.store.api, owner, id).await
+    }
+    pub async fn read_active_plugin_delegation(
+        &self,
+        owner: &str,
+        id: &str,
+        now: u64,
+    ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
+        crate::delegation::read_active(&self.store.api, owner, id, now).await
+    }
+    /// Reads an owned delegation record for historical lookups, including expired or revoked records.
+    pub async fn read_owned_plugin_delegation(
+        &self,
+        owner: &str,
+        id: &str,
+    ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
+        crate::delegation::read_owned(&self.store.api, owner, id).await
+    }
+
     /// Create a new IamSys instance with the given IamCache store
     ///
     /// # Arguments
@@ -278,6 +333,16 @@ impl<T: Store> IamSys<T> {
         let policy_plugin_state = get_policy_plugin_state();
         let mut guard = policy_plugin_state.write().await;
         *guard = PolicyPluginState::Ready(client);
+    }
+
+    /// Restricted credentials require the built-in parent/session intersection.
+    /// External authorization bypasses that path, so only Disabled is supported.
+    pub async fn ensure_restricted_credential_vending() -> Result<()> {
+        if matches!(Self::policy_plugin_state().await, PolicyPluginState::Disabled) {
+            Ok(())
+        } else {
+            Err(Error::IAMActionNotAllowed)
+        }
     }
 
     pub async fn get_policy_plugin_client() -> Option<rustfs_policy::policy::opa::AuthZPlugin> {
@@ -1156,6 +1221,11 @@ impl<T: Store> IamSys<T> {
         self.store.get_policy_doc(name).await
     }
 
+    /// Whether `name` is a stored policy; see `IamCache::policy_exists`.
+    pub async fn policy_exists(&self, name: &str) -> Result<bool> {
+        self.store.policy_exists(name).await
+    }
+
     /// The stored mapping record for one user or group (see
     /// `IamCache::get_mapped_policy_record`).
     pub async fn get_mapped_policy_record(&self, name: &str, user_type: UserType, is_group: bool) -> Option<MappedPolicy> {
@@ -1377,17 +1447,50 @@ impl<T: Store> IamSys<T> {
     /// 1) know whether policy evaluation may need `s3:ExistingObjectTag`, and
     /// 2) evaluate with final conditions without re-merging identity policies.
     pub async fn prepare_auth(&self, args: &Args<'_>) -> PreparedIamAuth {
-        if args.is_owner {
+        let marked = args.claims.contains_key(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM);
+        if args.is_owner && !marked {
             return PreparedIamAuth {
                 needs_existing_object_tag: false,
                 mode: PreparedIamMode::Owner,
             };
         }
-
-        if let Some(prepared) = Self::policy_plugin_state().await.prepared_iam_auth() {
+        // One observed state decides this request's path. Marked credentials
+        // never enter OPA, including after a restart or on another node.
+        let state = Self::policy_plugin_state().await;
+        if marked {
+            if args.is_owner
+                || args.claims.get(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM) != Some(&Value::Bool(true))
+                || !matches!(state, PolicyPluginState::Disabled)
+            {
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::TerminalDeny,
+                };
+            }
+            let prepared = self.prepare_builtin_auth(args).await;
+            let mode = match prepared.mode {
+                PreparedIamMode::Sts {
+                    is_owner,
+                    combined_policy,
+                    session_policy,
+                } => PreparedIamMode::PluginAttemptSts {
+                    is_owner,
+                    combined_policy,
+                    session_policy,
+                },
+                _ => PreparedIamMode::TerminalDeny,
+            };
+            return PreparedIamAuth {
+                needs_existing_object_tag: prepared.needs_existing_object_tag,
+                mode,
+            };
+        }
+        if let Some(prepared) = state.prepared_iam_auth() {
             return prepared;
         }
-
+        self.prepare_builtin_auth(args).await
+    }
+    async fn prepare_builtin_auth(&self, args: &Args<'_>) -> PreparedIamAuth {
         let Ok((is_svc, parent_user)) = self.is_service_account(args.account).await else {
             return PreparedIamAuth {
                 needs_existing_object_tag: false,
@@ -1412,13 +1515,44 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn eval_prepared(&self, prepared: &PreparedIamAuth, args: &Args<'_>) -> bool {
-        match &prepared.mode {
+        self.try_eval_prepared(prepared, args).await.unwrap_or(false)
+    }
+
+    /// Preserve resource lookup errors for callers that otherwise fall back to
+    /// bucket policies on an IAM denial. An error must not become an implicit deny.
+    pub async fn try_eval_prepared(&self, prepared: &PreparedIamAuth, args: &Args<'_>) -> Result<bool> {
+        Ok(match &prepared.mode {
+            PreparedIamMode::TerminalDeny => return Err(Error::IAMActionNotAllowed),
+            PreparedIamMode::PluginAttemptSts {
+                is_owner,
+                combined_policy,
+                session_policy,
+            } => {
+                // A false IAM result permits bucket-policy fallback. Restricted
+                // plugin credentials must instead terminate authorization.
+                let session_allowed = evaluate_prepared_session_policy(session_policy, args).await == Some(true);
+                if !session_allowed || !(*is_owner || combined_policy.is_allowed(args).await) {
+                    return Err(Error::IAMActionNotAllowed);
+                }
+                true
+            }
             PreparedIamMode::Opa => {
                 let Some(opa_enable) = Self::get_policy_plugin_client().await else {
                     tracing::warn!("eval_prepared: OPA mode requested but plugin is unavailable");
-                    return false;
+                    return Ok(false);
                 };
-                opa_enable.is_allowed(args).await
+                let tags = if args.bucket.is_empty() {
+                    HashMap::new()
+                } else {
+                    self.store.api.load_bucket_tags(args.bucket).await?
+                };
+                let conditions = opa_bucket_tag_conditions(args.conditions, tags);
+                opa_enable
+                    .is_allowed(&Args {
+                        conditions: conditions.as_ref(),
+                        ..args.clone()
+                    })
+                    .await
             }
             PreparedIamMode::Owner => true,
             PreparedIamMode::Deny => false,
@@ -1430,7 +1564,7 @@ impl<T: Store> IamSys<T> {
             } => {
                 let session_ok = evaluate_prepared_session_policy(session_policy, args).await;
                 if let Some(ok) = session_ok {
-                    return ok && (*is_owner || combined_policy.is_allowed(args).await);
+                    return Ok(ok && (*is_owner || combined_policy.is_allowed(args).await));
                 }
                 *is_owner || combined_policy.is_allowed(args).await
             }
@@ -1460,13 +1594,13 @@ impl<T: Store> IamSys<T> {
                     PreparedServicePolicyMode::SessionBound => {
                         let session_ok = evaluate_prepared_session_policy(session_policy, args).await;
                         if let Some(ok) = session_ok {
-                            return ok && parent_allowed;
+                            return Ok(ok && parent_allowed);
                         }
                         parent_allowed
                     }
                 }
             }
-        }
+        })
     }
 
     async fn prepare_regular_auth(&self, args: &Args<'_>) -> PreparedIamAuth {
@@ -1796,6 +1930,29 @@ impl<T: Store> IamSys<T> {
     }
 }
 
+fn opa_bucket_tag_conditions(
+    conditions: &HashMap<String, Vec<String>>,
+    tags: HashMap<String, String>,
+) -> Cow<'_, HashMap<String, Vec<String>>> {
+    // Conditions may originate in headers, claims or another resource's
+    // authorization. Only the addressed bucket supplies this namespace.
+    let is_bucket_tag = |key: &str| {
+        let namespace = key.split('/').next().unwrap_or_default();
+        namespace.eq_ignore_ascii_case("ExistingBucketTag") || namespace.eq_ignore_ascii_case("s3:ExistingBucketTag")
+    };
+    if tags.is_empty() && !conditions.keys().any(|key| is_bucket_tag(key)) {
+        return Cow::Borrowed(conditions);
+    }
+
+    let mut conditions = conditions.clone();
+    conditions.retain(|key, _| !is_bucket_tag(key));
+    conditions.reserve(tags.len());
+    for (key, value) in tags {
+        conditions.insert(format!("ExistingBucketTag/{key}"), vec![value]);
+    }
+    Cow::Owned(conditions)
+}
+
 async fn prepared_session_policy_needs_existing_object_tag_for_args(policy: &PreparedSessionPolicy, args: &Args<'_>) -> bool {
     match policy {
         PreparedSessionPolicy::Policy(p) => policy_needs_existing_object_tag_for_args(p, args).await,
@@ -2083,6 +2240,145 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn marked_signed_sts_denial_is_terminal_before_public_bucket_fallback() {
+        let iam = IamSys::new(IamCache::new(StsTestMockStore::new(false)).await.unwrap());
+        let previous = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+        let signing_key = "c07-test-token-signing-key";
+        let mut metadata=HashMap::from([
+            ("parent".into(),Value::String("sts-fallback-test-parent".into())),
+            ("exp".into(),serde_json::json!((OffsetDateTime::now_utc()+time::Duration::hours(1)).unix_timestamp())),
+            (SESSION_POLICY_NAME.into(),Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::mybucket/inside"]}]}"#))),
+        ]);
+        metadata.insert(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM.into(), Value::Bool(true));
+        let mut marked = get_new_credentials_with_metadata(&metadata, signing_key).unwrap();
+        marked.parent_user = "sts-fallback-test-parent".into();
+        let marked_claims: HashMap<String, Value> = rustfs_policy::utils::extract_claims(&marked.session_token, signing_key)
+            .expect("signed test credentials must decode")
+            .claims;
+        let marked_user = UserIdentity::from(marked.clone());
+        iam.store
+            .cache
+            .add_or_update_sts_account(&marked.access_key, &marked_user, OffsetDateTime::now_utc());
+        metadata.remove(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM);
+        let mut ordinary = get_new_credentials_with_metadata(&metadata, signing_key).unwrap();
+        ordinary.parent_user = marked.parent_user.clone();
+        let ordinary_claims: HashMap<String, Value> = rustfs_policy::utils::extract_claims(&ordinary.session_token, signing_key)
+            .expect("signed test credentials must decode")
+            .claims;
+        iam.store.cache.add_or_update_sts_account(
+            &ordinary.access_key,
+            &UserIdentity::from(ordinary.clone()),
+            OffsetDateTime::now_utc(),
+        );
+        let groups = None;
+        let conditions = HashMap::new();
+        let args = Args {
+            account: &marked.access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "mybucket",
+            object: "outside",
+            conditions: &conditions,
+            is_owner: false,
+            claims: &marked_claims,
+            deny_only: false,
+        };
+        *get_policy_plugin_state().write().await = PolicyPluginState::Disabled;
+        let denied = iam.prepare_auth(&args).await;
+        let disabled_terminal = matches!(iam.try_eval_prepared(&denied, &args).await, Err(Error::IAMActionNotAllowed));
+        let inside = Args {
+            object: "inside",
+            ..args.clone()
+        };
+        let allowed = iam.prepare_auth(&inside).await;
+        let inside_allowed = matches!(iam.try_eval_prepared(&allowed, &inside).await, Ok(true));
+        let unmarked_args = Args {
+            account: &ordinary.access_key,
+            claims: &ordinary_claims,
+            ..args.clone()
+        };
+        let unmarked = iam.prepare_auth(&unmarked_args).await;
+        let ordinary_false = matches!(iam.try_eval_prepared(&unmarked, &unmarked_args).await, Ok(false));
+        let public:rustfs_policy::policy::BucketPolicy=serde_json::from_value(serde_json::json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::mybucket/*"]}]})).unwrap();
+        let public_allows = public
+            .is_allowed(&rustfs_policy::policy::BucketPolicyArgs {
+                account: &marked.access_key,
+                groups: &groups,
+                action: args.action,
+                bucket: args.bucket,
+                object: args.object,
+                conditions: &conditions,
+                is_owner: false,
+            })
+            .await;
+        IamSys::<StsTestMockStore>::set_policy_plugin_client(opa::AuthZPlugin::new(opa::Args {
+            url: "http://127.0.0.1:8181/allow".into(),
+            auth_token: String::new(),
+        }))
+        .await;
+        let opa_marked = iam.prepare_auth(&args).await;
+        let ready_terminal = matches!(iam.try_eval_prepared(&opa_marked, &args).await, Err(Error::IAMActionNotAllowed));
+        let opa_ordinary = iam.prepare_auth(&unmarked_args).await;
+        let ordinary_keeps_opa = matches!(opa_ordinary.mode, PreparedIamMode::Opa);
+        // The captured Disabled preparation stays on built-in intersection even
+        // if an external policy client becomes ready before evaluation.
+        let captured_still_terminal = matches!(iam.try_eval_prepared(&denied, &args).await, Err(Error::IAMActionNotAllowed));
+        *get_policy_plugin_state().write().await = PolicyPluginState::Initializing;
+        let pending = iam.prepare_auth(&args).await;
+        let initializing_terminal = matches!(iam.try_eval_prepared(&pending, &args).await, Err(Error::IAMActionNotAllowed));
+        *get_policy_plugin_state().write().await = PolicyPluginState::Failed;
+        let failed = iam.prepare_auth(&args).await;
+        let failed_terminal = matches!(iam.try_eval_prepared(&failed, &args).await, Err(Error::IAMActionNotAllowed));
+        *get_policy_plugin_state().write().await = previous;
+        assert!(public_allows, "C07_PUBLIC_BUCKET_CONTROL: real public policy permits outside object");
+        assert!(
+            disabled_terminal && captured_still_terminal,
+            "C07_SCOPE_TERMINAL_BOUND: bucket policy must not rescue restricted scope denial"
+        );
+        assert!(
+            ready_terminal && initializing_terminal && failed_terminal,
+            "C07_EXTERNAL_POLICY_BOUND: marked persisted STS cannot enter OPA"
+        );
+        assert!(
+            inside_allowed && ordinary_false && ordinary_keeps_opa,
+            "C07_UNMARKED_COMPAT: preserve ordinary STS and valid marked scope"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn restricted_vending_rejects_actual_external_policy_plugin_state() {
+        let previous = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+        IamSys::<StsTestMockStore>::set_policy_plugin_client(opa::AuthZPlugin::new(opa::Args {
+            url: "http://127.0.0.1:8181/v1/data/rustfs/authz/allow".into(),
+            auth_token: String::new(),
+        }))
+        .await;
+        let active_rejected = IamSys::<StsTestMockStore>::ensure_restricted_credential_vending()
+            .await
+            .is_err();
+        *get_policy_plugin_state().write().await = PolicyPluginState::Initializing;
+        let initializing_rejected = IamSys::<StsTestMockStore>::ensure_restricted_credential_vending()
+            .await
+            .is_err();
+        *get_policy_plugin_state().write().await = PolicyPluginState::Failed;
+        let failed_rejected = IamSys::<StsTestMockStore>::ensure_restricted_credential_vending()
+            .await
+            .is_err();
+        *get_policy_plugin_state().write().await = PolicyPluginState::Disabled;
+        let disabled_allowed = IamSys::<StsTestMockStore>::ensure_restricted_credential_vending()
+            .await
+            .is_ok();
+        *get_policy_plugin_state().write().await = previous;
+        assert!(
+            active_rejected && initializing_rejected && failed_rejected,
+            "C07_EXTERNAL_POLICY_BOUND: external authorization cannot bypass minted session scope"
+        );
+        assert!(disabled_allowed);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_prepare_auth_requests_existing_object_tags_in_opa_mode() {
         let store = StsTestMockStore::new(false);
         let iam_sys = IamSys::new(IamCache::new(store).await.expect("initialize IAM cache"));
@@ -2185,6 +2481,183 @@ mod tests {
         assert!(matches!(state, PolicyPluginState::Failed));
     }
 
+    #[test]
+    fn opa_bucket_tag_conditions_reuse_clean_input() {
+        let empty = HashMap::new();
+        let clean = HashMap::from([
+            ("userid".to_string(), vec!["tag-user".to_string()]),
+            ("ExistingBucketTagger/role".to_string(), vec!["unrelated".to_string()]),
+        ]);
+        for conditions in [&empty, &clean] {
+            let result = opa_bucket_tag_conditions(conditions, HashMap::new());
+            assert_eq!(result.as_ref(), conditions);
+            assert!(
+                matches!(result, Cow::Borrowed(borrowed) if std::ptr::eq(borrowed, conditions)),
+                "clean, untagged authorization must reuse the existing conditions"
+            );
+        }
+        let result = opa_bucket_tag_conditions(&clean, HashMap::from([("department".to_string(), "finance".to_string())]));
+        assert_eq!(result.get("ExistingBucketTag/department"), Some(&vec!["finance".to_string()]));
+        assert_eq!(result.get("userid"), clean.get("userid"));
+        assert!(!clean.contains_key("ExistingBucketTag/department"));
+    }
+
+    #[test]
+    fn opa_bucket_tag_conditions_sanitize_before_enrichment() {
+        let mut untrusted = HashMap::from([("userid".to_string(), vec!["tag-user".to_string()])]);
+        for key in [
+            "ExistingBucketTag",
+            "s3:ExistingBucketTag",
+            "ExistingBucketTag/Department",
+            "existingbuckettag/department",
+            "S3:EXISTINGBUCKETTAG/role",
+        ] {
+            untrusted.insert(key.to_string(), vec!["forged".to_string()]);
+        }
+        let original = untrusted.clone();
+        for tags in [
+            HashMap::new(),
+            HashMap::from([
+                ("Department".to_string(), "Finance".to_string()),
+                ("note".to_string(), String::new()),
+                ("team/name".to_string(), "reporting".to_string()),
+            ]),
+        ] {
+            let mut expected = HashMap::from([("userid".to_string(), vec!["tag-user".to_string()])]);
+            for (key, value) in &tags {
+                expected.insert(format!("ExistingBucketTag/{key}"), vec![value.clone()]);
+            }
+            let result = opa_bucket_tag_conditions(&untrusted, tags);
+            assert_eq!(result.as_ref(), &expected);
+            assert_eq!(untrusted, original, "enrichment must not alter reusable request conditions");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn opa_bucket_tags_replace_untrusted_conditions_and_lookup_errors_deny() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind OPA input receiver");
+        let url = format!("http://{}/decision", listener.local_addr().expect("receiver address"));
+        let receiver = tokio::spawn(async move {
+            let mut payloads = Vec::new();
+            for _ in 0..5 {
+                let (stream, _) = listener.accept().await.expect("accept OPA request");
+                let mut stream = BufReader::new(stream);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(stream.read_line(&mut line).await.expect("read HTTP header") > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = Some(value.trim().parse::<usize>().expect("HTTP body length"));
+                    }
+                }
+                let mut body = vec![0; length.expect("OPA JSON has a content length")];
+                stream.read_exact(&mut body).await.expect("read complete OPA body");
+                payloads.push(serde_json::from_slice::<serde_json::Value>(&body).expect("OPA JSON"));
+                stream
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"result\":true}")
+                    .await
+                    .expect("send decision");
+            }
+            payloads
+        });
+        let (outcomes, error, denied) = temp_env::async_with_vars(
+            [
+                ("NO_PROXY", Some("127.0.0.1,localhost")),
+                ("no_proxy", Some("127.0.0.1,localhost")),
+            ],
+            async {
+                let store = StsTestMockStore::new(true);
+                let iam = IamSys::new(IamCache::new(store.clone()).await.expect("initialize IAM cache"));
+                let previous = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+                IamSys::<StsTestMockStore>::set_policy_plugin_client(opa::AuthZPlugin::new(opa::Args {
+                    url,
+                    auth_token: String::new(),
+                }))
+                .await;
+                let groups = None;
+                let claims = HashMap::new();
+                let conditions = HashMap::from([
+                    ("userid".to_string(), vec!["tag-user".to_string()]),
+                    ("ExistingBucketTag/Department".to_string(), vec!["forged".to_string()]),
+                    ("existingbuckettag/department".to_string(), vec!["forged".to_string()]),
+                    ("S3:EXISTINGBUCKETTAG/role".to_string(), vec!["forged".to_string()]),
+                ]);
+                let mut args = Args {
+                    account: "tag-user",
+                    groups: &groups,
+                    claims: &claims,
+                    conditions: &conditions,
+                    action: Action::S3Action(S3Action::GetBucketLocationAction),
+                    bucket: "finance",
+                    object: "",
+                    is_owner: false,
+                    deny_only: false,
+                };
+                let mut outcomes = Vec::new();
+                for (bucket, tags) in [
+                    (
+                        "finance",
+                        Ok(HashMap::from([
+                            ("Department".to_string(), "Finance".to_string()),
+                            ("note".to_string(), String::new()),
+                        ])),
+                    ),
+                    ("untagged", Ok(HashMap::new())),
+                    ("", Err(Error::other("bucketless decisions must not read metadata"))),
+                ] {
+                    args.bucket = bucket;
+                    *store.bucket_tags.lock().expect("tag state") = tags;
+                    outcomes.push(iam.is_allowed(&args).await);
+                }
+                let clean_conditions = HashMap::from([("userid".to_string(), vec!["tag-user".to_string()])]);
+                args.conditions = &clean_conditions;
+                for (bucket, tags) in [
+                    ("untagged", Ok(HashMap::new())),
+                    ("", Err(Error::other("bucketless decisions must not read metadata"))),
+                ] {
+                    args.bucket = bucket;
+                    *store.bucket_tags.lock().expect("tag state") = tags;
+                    outcomes.push(iam.is_allowed(&args).await);
+                }
+                args.bucket = "unavailable";
+                let prepared = iam.prepare_auth(&args).await;
+                let error = iam.try_eval_prepared(&prepared, &args).await;
+                let denied = !iam.eval_prepared(&prepared, &args).await;
+                *get_policy_plugin_state().write().await = previous;
+                (outcomes, error, denied)
+            },
+        )
+        .await;
+        assert_eq!(outcomes, [true; 5]);
+        assert!(
+            matches!(error, Err(Error::Io(_))),
+            "lookup failure must remain an error, not an implicit denial"
+        );
+        assert!(denied, "boolean IAM callers must fail closed on lookup errors");
+        let payloads = tokio::time::timeout(std::time::Duration::from_secs(10), receiver)
+            .await
+            .expect("OPA input deadline")
+            .expect("input receiver");
+        assert_eq!(
+            payloads[0]["input"]["context"]["conditions"],
+            serde_json::json!({
+                "userid": ["tag-user"], "ExistingBucketTag/Department": ["Finance"], "ExistingBucketTag/note": [""]
+            })
+        );
+        for payload in &payloads[1..] {
+            assert_eq!(payload["input"]["context"]["conditions"], serde_json::json!({"userid": ["tag-user"]}));
+        }
+    }
+
     const CUSTOM_STS_CLAIM_POLICY: &str = "custom-sts-claim-getobject";
     const CUSTOM_STS_CLAIM_BUCKET: &str = "claim-bucket";
     const CUSTOM_STS_CLAIM_POLICY_JSON: &str = r#"{
@@ -2203,6 +2676,7 @@ mod tests {
     struct StsTestMockStore {
         /// When true, parent user has no groups and no mapped policies (empty `policy_db_get`).
         empty_policies: bool,
+        bucket_tags: Arc<Mutex<Result<HashMap<String, String>>>>,
         saved_sts_users: Arc<Mutex<HashMap<String, UserIdentity>>>,
         saved_service_account_count: Arc<Mutex<usize>>,
         fail_delete: Arc<std::sync::atomic::AtomicBool>,
@@ -2219,6 +2693,7 @@ mod tests {
         fn new(empty_policies: bool) -> Self {
             Self {
                 empty_policies,
+                bucket_tags: Arc::new(Mutex::new(Err(Error::other("bucket metadata unavailable")))),
                 saved_sts_users: Arc::new(Mutex::new(HashMap::new())),
                 saved_service_account_count: Arc::new(Mutex::new(0)),
                 fail_delete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2242,6 +2717,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Store for StsTestMockStore {
+        async fn load_bucket_tags(&self, _bucket: &str) -> Result<HashMap<String, String>> {
+            self.bucket_tags.lock().expect("tag state").clone()
+        }
+
         fn has_watcher(&self) -> bool {
             false
         }
@@ -2656,6 +3135,59 @@ mod tests {
             access_key: access_key.to_string(),
             secret_key: secret_key.to_string(),
             ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn service_account_preserves_long_secret_keys_after_rotation_and_reload() {
+        ensure_test_global_credentials();
+        let iam_sys = test_iam_sys().await;
+
+        for length in [41, 90, 128, 256, 257, 4096] {
+            let access_key = format!("long-secret-{length}");
+            let secret_key = format!("{}a", "s".repeat(length - 1));
+            let (created, _) = iam_sys
+                .new_service_account("parent-user", None, service_account_opts(&access_key, &secret_key))
+                .await
+                .expect("create service account with a long secret");
+            assert_eq!(created.secret_key, secret_key);
+            get_claims_from_token_with_secret_allow_missing_exp(&created.session_token, &secret_key)
+                .expect("the complete secret verifies the created session token");
+
+            let rotated_secret = format!("{}b", "s".repeat(length - 1));
+            iam_sys
+                .update_service_account(
+                    &access_key,
+                    UpdateServiceAccountOpts {
+                        secret_key: Some(rotated_secret.clone()),
+                        session_policy: None,
+                        status: None,
+                        name: None,
+                        description: None,
+                        expiration: None,
+                        parent_user: None,
+                        allow_site_replicator_account: false,
+                    },
+                )
+                .await
+                .expect("rotate the complete long secret");
+
+            let persisted = iam_sys
+                .store
+                .api
+                .load_user_identity(&access_key, UserType::Svc)
+                .await
+                .expect("load the persisted service account identity");
+            assert_eq!(persisted.credentials.secret_key, rotated_secret);
+            get_claims_from_token_with_secret_allow_missing_exp(&persisted.credentials.session_token, &rotated_secret)
+                .expect("the rotated secret verifies the persisted session token");
+            assert!(
+                get_claims_from_token_with_secret_allow_missing_exp(&persisted.credentials.session_token, &secret_key).is_err()
+            );
+            assert!(
+                get_claims_from_token_with_secret_allow_missing_exp(&persisted.credentials.session_token, &rotated_secret[..40])
+                    .is_err()
+            );
         }
     }
 
@@ -5009,6 +5541,45 @@ mod tests {
             prepared.needs_existing_object_tag,
             "base64 sessionPolicy with ExistingObjectTag must request object tag loading"
         );
+    }
+
+    /// A session policy that requires conditional writes must decode and gate
+    /// PutObject on the `If-None-Match` header; an unknown condition key would fail
+    /// to parse and deny the session everything.
+    #[tokio::test]
+    async fn session_policy_enforces_if_none_match_condition_key() {
+        let session_policy_json = r#"{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::bucket/*"],"Condition":{"Null":{"s3:if-none-match":"false"}}}]
+}"#;
+        let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(session_policy_json.as_bytes());
+        decode_session_policy(&encoded).expect("session policy with s3:if-none-match must decode");
+
+        let mut claims = HashMap::new();
+        claims.insert(SESSION_POLICY_NAME.to_string(), Value::String(encoded));
+        let groups: Option<Vec<String>> = None;
+        let with_header = HashMap::from([("if-none-match".to_string(), vec!["*".to_string()])]);
+        let without_header = HashMap::new();
+
+        let mut outcomes = Vec::new();
+        for conditions in [&with_header, &without_header] {
+            let args = Args {
+                account: "sts-conditional-write-user",
+                groups: &groups,
+                action: Action::S3Action(S3Action::PutObjectAction),
+                bucket: "bucket",
+                conditions,
+                is_owner: false,
+                object: "obj",
+                claims: &claims,
+                deny_only: false,
+            };
+            let prepared = prepare_session_policy(&args, false);
+            assert!(matches!(prepared, PreparedSessionPolicy::Policy(_)));
+            outcomes.push(evaluate_prepared_session_policy(&prepared, &args).await);
+        }
+
+        assert_eq!(outcomes, [Some(true), Some(false)]);
     }
 
     #[tokio::test]

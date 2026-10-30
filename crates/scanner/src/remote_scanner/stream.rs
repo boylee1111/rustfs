@@ -16,11 +16,12 @@
 use crate::RUSTFS_META_BUCKET;
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
-    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk,
-    acquire_scanner_cache_locks, cache_root_entry_info, current_cache_root_or_prepare_with_generation,
-    scanner_set_disk_inventory,
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerBucketPlanDigests, ScannerCheckpointPersistContext,
+    ScannerCheckpointPersistResult, ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks,
+    cache_root_entry_info, current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache,
+    persist_scanner_checkpoint, scanner_set_disk_inventory,
 };
-use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
+use crate::storage_api::owner::{EcstoreBackgroundEncodeBuffer, EcstoreBackgroundMemoryBudget, NS_SCANNER_PROTOCOL_VERSION};
 use crate::{
     DATA_USAGE_CACHE_NAME, DataUsageCache, DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntryInfo,
     DataUsageScanPlanDigest, Disk, ScannerError, StorageError, resolve_scanner_object_store_handle,
@@ -29,7 +30,7 @@ use crate::{
 use hmac::{Hmac, KeyInit, Mac};
 use rustfs_credentials::try_get_rpc_token;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
-use rustfs_scanner_metrics::metrics::{Metric, Metrics};
+use rustfs_scanner_metrics::metrics::{CloseDiskGuard, Metric, Metrics, current_path_updater};
 use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -43,7 +44,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, OwnedSemaphorePermit};
+use tokio::sync::{Notify, OwnedSemaphorePermit, mpsc};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -95,6 +96,8 @@ pub(super) struct RemoteScannerRequestWire {
     pub(super) next_cycle: u64,
     pub(super) leader_epoch: u64,
     scan_plan_digest: DataUsageScanPlanDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_plan_digest: Option<DataUsageScanPlanDigest>,
     skip_healing: bool,
     scan_mode: HealScanMode,
     budget: RemoteScannerBudget,
@@ -213,7 +216,7 @@ pub(crate) struct RemoteScannerScanSpec<'a> {
     pub(crate) server_epoch: Uuid,
     pub(crate) session_id: Uuid,
     pub(crate) session_sequence: u64,
-    pub(crate) scan_plan_digest: DataUsageScanPlanDigest,
+    pub(crate) plans: ScannerBucketPlanDigests,
     pub(crate) tier_registry_generation: u64,
     pub(crate) skip_healing: bool,
     pub(crate) scan_mode: HealScanMode,
@@ -530,8 +533,21 @@ fn update_frame_mac(mac: &mut HmacSha256, request_id: Uuid, sequence: u64, paylo
 pub async fn serve_remote_scanner_request<W>(
     disk: Arc<Disk>,
     request: RemoteScannerRequest,
+    writer: W,
+    disconnect: CancellationToken,
+) -> Result<(), ScannerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    serve_remote_scanner_request_with_memory(disk, request, writer, disconnect, None).await
+}
+
+pub async fn serve_remote_scanner_request_with_memory<W>(
+    disk: Arc<Disk>,
+    request: RemoteScannerRequest,
     mut writer: W,
     disconnect: CancellationToken,
+    memory: Option<Arc<EcstoreBackgroundMemoryBudget>>,
 ) -> Result<(), ScannerError>
 where
     W: AsyncWrite + Unpin + Send,
@@ -574,7 +590,7 @@ where
                     Ok(result) => result,
                     Err(err) => RemoteScannerFrameResult::Error(err.into_frame()),
                 };
-                write_frame_bounded(
+                write_frame_bounded_with_memory(
                     &mut writer,
                     &authenticator,
                     &mut sequence,
@@ -585,6 +601,7 @@ where
                     ),
                     &disconnect,
                     NS_SCANNER_WRITE_TIMEOUT,
+                    memory.as_ref(),
                 )
                 .await?;
                 shutdown_writer_bounded(&mut writer, &disconnect, NS_SCANNER_WRITE_TIMEOUT).await?;
@@ -602,7 +619,7 @@ where
             }
             _ = phase_changed.notified(), if !persistence_announced => {
                 persistence_announced = true;
-                if let Err(err) = write_frame_bounded(
+                if let Err(err) = write_frame_bounded_with_memory(
                     &mut writer,
                     &authenticator,
                     &mut sequence,
@@ -613,6 +630,7 @@ where
                     ),
                     &disconnect,
                     NS_SCANNER_WRITE_TIMEOUT,
+                    memory.as_ref(),
                 )
                 .await
                 {
@@ -627,7 +645,7 @@ where
                 }
             }
             _ = heartbeat.tick() => {
-                if let Err(err) = write_frame_bounded(
+                if let Err(err) = write_frame_bounded_with_memory(
                     &mut writer,
                     &authenticator,
                     &mut sequence,
@@ -638,6 +656,7 @@ where
                     ),
                     &disconnect,
                     NS_SCANNER_WRITE_TIMEOUT,
+                    memory.as_ref(),
                 )
                 .await
                 {
@@ -668,6 +687,7 @@ async fn scan_and_persist_local_bucket(
         next_cycle,
         leader_epoch,
         scan_plan_digest,
+        checkpoint_plan_digest,
         skip_healing,
         scan_mode,
         ..
@@ -681,7 +701,9 @@ async fn scan_and_persist_local_bucket(
         .ok_or_else(|| RemoteScannerServerError::worker("remote namespace scanner object layer is unavailable"))?;
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store.clone())
         .await
-        .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner leader fence is stale: {err}")))?;
+        .map_err(|err| {
+            RemoteScannerServerError::worker(format!("remote namespace scanner leader fence verification failed: {err}"))
+        })?;
     let source = cache_source_for_disk(disk.as_ref())
         .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner source is unavailable: {err}")))?;
     let set = store
@@ -699,7 +721,7 @@ async fn scan_and_persist_local_bucket(
         RemoteScannerServerError::worker("remote namespace scanner cache publication is blocked by data movement")
     })?;
     let cache_name = path_join_buf(&[&bucket, DATA_USAGE_CACHE_NAME]);
-    let guard = acquire_scanner_cache_locks(set.as_ref(), &cache_name, source)
+    let mut guard = acquire_scanner_cache_locks(set.as_ref(), &cache_name, source)
         .await
         .map_err(|err| {
             if err.is_contention() {
@@ -709,7 +731,7 @@ async fn scan_and_persist_local_bucket(
             }
         })?;
     let mut cache = DataUsageCache::default();
-    let revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
+    let mut revisions = cache.load_with_revisions(set.clone(), &cache_name).await.map_err(|err| {
         RemoteScannerServerError::worker(format!("remote namespace scanner cache load or revision lookup failed: {err}"))
     })?;
     // Remote workers use the same cycle-frozen registry as `scan_data_folder`.
@@ -737,7 +759,12 @@ async fn scan_and_persist_local_bucket(
                 scan_mode,
             )
             .await
-            .ok(),
+            .map_err(|err| {
+                RemoteScannerServerError::retry_bucket(format!(
+                    "remote namespace scanner checkpoint identity unavailable during admission: {err}"
+                ))
+            })?,
+            checkpoint_plan_digest,
         },
     );
     match scan_state {
@@ -779,26 +806,64 @@ async fn scan_and_persist_local_bucket(
     cache.info.skip_healing = skip_healing;
 
     let set_disks = scanner_set_disk_inventory(set.as_ref()).await;
+    let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
+    let (node_tx, mut node_rx) = crate::workload_admission::scanner_node_request_channel();
     let scan_ctx = ctx.child_token();
-    let scan = ScannerIODisk::nsscanner_disk(
-        disk.clone(),
-        scan_ctx.clone(),
-        budget,
-        set_disks,
-        cache,
-        None,
-        ScannerDiskScanOptions {
-            scan_mode,
-            prefix_scan_scope: None,
-        },
+    #[cfg(feature = "e2e-test-hooks")]
+    let _ = crate::e2e_barrier::checkpoint(
+        "bucket_walk",
+        serde_json::json!({
+            "epoch": leader_epoch, "cycle": next_cycle,
+            "pool": source.pool_index, "set": source.set_index,
+            "bucket": bucket, "drive": disk.path().display().to_string(),
+        }),
+    )
+    .await;
+    let scan = crate::workload_admission::with_scanner_node_requests(
+        node_tx,
+        ScannerIODisk::nsscanner_disk(
+            disk.clone(),
+            scan_ctx.clone(),
+            budget,
+            set_disks,
+            cache,
+            None,
+            ScannerDiskScanOptions {
+                scan_mode,
+                prefix_scan_scope: None,
+                checkpoint_tx: Some(checkpoint_tx),
+            },
+        ),
     );
     tokio::pin!(scan);
     let fence_watch = watch_remote_scanner_request_fence(next_cycle, leader_epoch, store.clone(), NS_SCANNER_FENCE_POLL_INTERVAL);
     tokio::pin!(fence_watch);
     let mut lock_watch = tokio::time::interval(NS_SCANNER_LOCK_POLL_INTERVAL);
     lock_watch.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut checkpoint_channel_closed = false;
     let outcome = loop {
         tokio::select! {
+            request = async {
+                match node_rx.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(request) = request else {
+                    node_rx = None;
+                    continue;
+                };
+                if let Err(error) = wait_for_remote_node_resumption(
+                    guard.resume_node_operation(set.clone(), &cache_name, source, &revisions, request),
+                    fence_watch.as_mut(),
+                ).await {
+                    scan_ctx.cancel();
+                    let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                    return Err(RemoteScannerServerError::retry_bucket(format!(
+                        "remote namespace scanner could not resume node admission: {error}",
+                    )));
+                }
+            }
             result = &mut scan => {
                 match result {
                     Ok(outcome) => break outcome,
@@ -823,6 +888,58 @@ async fn scan_and_persist_local_bucket(
                     ));
                 }
             }
+            checkpoint = checkpoint_rx.recv(), if !checkpoint_channel_closed => {
+                let Some(checkpoint) = checkpoint else {
+                    checkpoint_channel_closed = true;
+                    continue;
+                };
+                if guard.is_lock_lost() {
+                    scan_ctx.cancel();
+                    let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                    return Err(RemoteScannerServerError::worker(
+                        "remote namespace scanner cache lock was lost before checkpoint save",
+                    ));
+                }
+                match persist_scanner_checkpoint(
+                    set.clone(),
+                    store.clone(),
+                    ScannerCheckpointPersistContext {
+                        ctx: &scan_ctx,
+                        expected_publication_epoch,
+                        cycle: next_cycle,
+                        leader_epoch,
+                    },
+                    &cache_name,
+                    &checkpoint,
+                    &mut revisions,
+                )
+                .await
+                {
+                    ScannerCheckpointPersistResult::Saved | ScannerCheckpointPersistResult::Skipped => {
+                        if guard.is_lock_lost() {
+                            scan_ctx.cancel();
+                            let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                            return Err(RemoteScannerServerError::retry_bucket(
+                                "remote namespace scanner cache lock was lost after checkpoint save",
+                            ));
+                        }
+                    }
+                    ScannerCheckpointPersistResult::FenceChanged => {
+                        scan_ctx.cancel();
+                        let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                        return Err(RemoteScannerServerError::retry_bucket(
+                            "remote namespace scanner cache fence changed during checkpoint save",
+                        ));
+                    }
+                    ScannerCheckpointPersistResult::RetryBucket(error) => {
+                        scan_ctx.cancel();
+                        let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                        return Err(RemoteScannerServerError::retry_bucket(format!(
+                            "remote namespace scanner checkpoint needs reload: {error}",
+                        )));
+                    }
+                }
+            }
             result = &mut fence_watch => {
                 scan_ctx.cancel();
                 let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
@@ -831,14 +948,19 @@ async fn scan_and_persist_local_bucket(
                     Err(err) => err,
                 };
                 return Err(RemoteScannerServerError::worker(format!(
-                    "remote namespace scanner leader fence changed during bucket scan: {}",
+                    "remote namespace scanner leader fence verification failed during bucket scan: {}",
                     err
                 )));
             }
         }
     };
     let (cache, partial_result) = match outcome {
-        ScannerDiskScanOutcome::Complete(cache) => (cache, None),
+        ScannerDiskScanOutcome::Complete(mut cache) => {
+            // The folder completes under its coverage plan; finished cache
+            // reuse and the response remain bound to the requested reuse plan.
+            cache.info.scan_plan_digest = Some(scan_plan_digest);
+            (cache, None)
+        }
         ScannerDiskScanOutcome::Partial(cache) => (cache, Some(RemoteScannerFrameResult::Partial)),
         ScannerDiskScanOutcome::NamespaceNotFound(cache) => (cache, Some(RemoteScannerFrameResult::NamespaceNotFound)),
     };
@@ -851,8 +973,11 @@ async fn scan_and_persist_local_bucket(
             scan_mode,
         )
         .await
-        .ok()
-            != Some(expected)
+        .map_err(|err| {
+            RemoteScannerServerError::retry_bucket(format!(
+                "remote namespace scanner checkpoint identity unavailable after scanning: {err}"
+            ))
+        })? != Some(expected)
     {
         return Err(RemoteScannerServerError::retry_bucket(
             "remote scanner checkpoint identity changed during scanning",
@@ -868,7 +993,9 @@ async fn scan_and_persist_local_bucket(
     phase_changed.notify_one();
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store.clone())
         .await
-        .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner leader fence changed: {err}")))?;
+        .map_err(|err| {
+            RemoteScannerServerError::worker(format!("remote namespace scanner leader fence verification failed: {err}"))
+        })?;
     let done_save = Metrics::time(Metric::SaveUsage);
     // Each physical main/backup PUT must still prove the epoch captured before
     // the scan. A movement transition that starts and ends during the scan
@@ -888,7 +1015,9 @@ async fn scan_and_persist_local_bucket(
     }
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store)
         .await
-        .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner leader fence changed: {err}")))?;
+        .map_err(|err| {
+            RemoteScannerServerError::worker(format!("remote namespace scanner leader fence verification failed: {err}"))
+        })?;
     if guard.is_lock_lost() {
         return Err(RemoteScannerServerError::worker(
             "remote namespace scanner cache lock was lost during persistence",
@@ -896,6 +1025,9 @@ async fn scan_and_persist_local_bucket(
     }
 
     if let Some(partial_result) = partial_result {
+        if matches!(partial_result, RemoteScannerFrameResult::Partial) {
+            log_saved_partial_bucket_cache(&cache, &cache_name);
+        }
         return Ok(partial_result);
     }
     if cache.info.source != Some(source) || !cache.info.snapshot_complete {
@@ -930,11 +1062,13 @@ pub(crate) async fn scan_remote_bucket(
         server_epoch,
         session_id,
         session_sequence,
-        scan_plan_digest,
+        plans,
         tier_registry_generation,
         skip_healing,
         scan_mode,
     } = spec;
+    let scan_plan_digest = plans.reuse;
+    let checkpoint_plan_digest = plans.coverage;
     let expected_source = cache_source_for_disk(disk).map_err(|err| {
         RemoteScannerFailure::transport(StorageError::other(format!("failed to resolve remote namespace scanner source: {err}")))
     })?;
@@ -949,6 +1083,7 @@ pub(crate) async fn scan_remote_bucket(
         next_cycle,
         leader_epoch,
         scan_plan_digest,
+        checkpoint_plan_digest: Some(checkpoint_plan_digest),
         skip_healing,
         scan_mode,
         budget: RemoteScannerBudget::from_config(budget.remaining_config()),
@@ -962,71 +1097,114 @@ pub(crate) async fn scan_remote_bucket(
         )));
     }
 
-    let rpc_deadline = Instant::now() + NS_SCANNER_MAX_RPC_LIFETIME;
-    let open_deadline = (Instant::now() + NS_SCANNER_STALL_TIMEOUT).min(rpc_deadline);
-    let open_stream = disk.open_ns_scanner_stream(crate::NsScannerOpenRequest {
-        request_id,
-        server_epoch,
-        session_id,
-        session_sequence,
-        next_cycle,
-        leader_epoch,
-        body,
-        stall_timeout: Some(NS_SCANNER_STALL_TIMEOUT),
-    });
-    tokio::pin!(open_stream);
-    let reader = tokio::select! {
-        _ = ctx.cancelled() => {
-            budget.cancel_after_unreported_remote_progress();
-            return Err(RemoteScannerFailure::transport(StorageError::other(
-                "remote namespace scanner cancelled while opening stream",
-            )));
+    let disk_name = format!("{}{}", disk.host_name(), disk.path().display());
+    let (_, close_path) = current_path_updater(&disk_name, bucket).await;
+    let mut path_guard = CloseDiskGuard::new(close_path);
+    let result = async {
+        let rpc_deadline = Instant::now() + NS_SCANNER_MAX_RPC_LIFETIME;
+        let open_deadline = (Instant::now() + NS_SCANNER_STALL_TIMEOUT).min(rpc_deadline);
+        #[cfg(feature = "e2e-test-hooks")]
+        if crate::e2e_barrier::worker_observation::enabled() {
+            let location = disk.get_disk_location();
+            // RemoteDisk::get_disk_id reads the same cached ID used by disk_ref; no RPC.
+            let disk_uuid = crate::storage_api::owner::EcstoreDiskAPI::get_disk_id(disk)
+                .await
+                .ok()
+                .flatten();
+            crate::e2e_barrier::worker_observation::opening(serde_json::json!({
+                "epoch": leader_epoch, "cycle": next_cycle, "request_id": request_id,
+                "wire_session_id": session_id, "wire_session_sequence": session_sequence,
+                "server_epoch": server_epoch, "bucket": bucket, "pool": expected_source.pool_index,
+                "set": expected_source.set_index, "disk_index": location.disk_idx, "disk_uuid": disk_uuid,
+                "worker_endpoint": crate::storage_api::owner::EcstoreDiskAPI::endpoint(disk).grid_host(),
+                "worker_path": disk.path().display().to_string(),
+                "reuse_plan_sha256": crate::e2e_barrier::hex(&scan_plan_digest.0),
+                "coverage_plan_sha256": crate::e2e_barrier::hex(&checkpoint_plan_digest.0),
+            }));
         }
-        result = tokio::time::timeout_at(open_deadline, &mut open_stream) => {
-            match result {
-                Err(_) => {
-                    budget.cancel_after_unreported_remote_progress();
-                    return Err(RemoteScannerFailure::transport(StorageError::other(
-                        "remote namespace scanner response headers timed out",
-                    )));
-                }
-                Ok(Err(err)) if err.is_internode_http_status(429) => {
-                    return Err(RemoteScannerFailure::retry_bucket(StorageError::other(format!(
-                        "remote namespace scanner worker rejected zero-progress work: {err}"
-                    ))));
-                }
-                Ok(Err(err)) => {
-                    budget.cancel_after_unreported_remote_progress();
-                    return Err(RemoteScannerFailure::transport(StorageError::other(format!(
-                        "failed to open remote namespace scanner stream: {err}"
-                    ))));
-                }
-                Ok(Ok(reader)) => reader,
-            }
-        }
-    };
-    let authenticator = FrameAuthenticator::from_rpc_secret(request_id).map_err(|err| {
-        RemoteScannerFailure::transport(StorageError::other(format!(
-            "failed to authenticate remote namespace scanner stream: {err}"
-        )))
-    })?;
-
-    let stream_result = consume_remote_scanner_stream_until(
-        reader,
-        ctx,
-        budget.clone(),
-        RemoteScannerResponseExpectation {
-            bucket,
-            source: expected_source,
+        let open_stream = disk.open_ns_scanner_stream(crate::NsScannerOpenRequest {
+            request_id,
+            server_epoch,
+            session_id,
+            session_sequence,
             next_cycle,
-            scan_plan_digest,
-            tier_registry_generation,
-        },
-        authenticator,
-        rpc_deadline,
-    )
+            leader_epoch,
+            body,
+            stall_timeout: Some(NS_SCANNER_STALL_TIMEOUT),
+        });
+        tokio::pin!(open_stream);
+        let reader = tokio::select! {
+            _ = ctx.cancelled() => {
+                budget.cancel_after_unreported_remote_progress();
+                return Err(RemoteScannerFailure::transport(StorageError::other(
+                    "remote namespace scanner cancelled while opening stream",
+                )));
+            }
+            result = tokio::time::timeout_at(open_deadline, &mut open_stream) => {
+                match result {
+                    Err(_) => {
+                        budget.cancel_after_unreported_remote_progress();
+                        return Err(RemoteScannerFailure::transport(StorageError::other(
+                            "remote namespace scanner response headers timed out",
+                        )));
+                    }
+                    Ok(Err(err)) if err.is_internode_http_status(429) => {
+                        return Err(RemoteScannerFailure::retry_bucket(StorageError::other(format!(
+                            "remote namespace scanner worker rejected zero-progress work: {err}"
+                        ))));
+                    }
+                    Ok(Err(err)) => {
+                        budget.cancel_after_unreported_remote_progress();
+                        return Err(RemoteScannerFailure::transport(StorageError::other(format!(
+                            "failed to open remote namespace scanner stream: {err}"
+                        ))));
+                    }
+                    Ok(Ok(reader)) => reader,
+                }
+            }
+        };
+        let authenticator = FrameAuthenticator::from_rpc_secret(request_id).map_err(|err| {
+            RemoteScannerFailure::transport(StorageError::other(format!(
+                "failed to authenticate remote namespace scanner stream: {err}"
+            )))
+        })?;
+
+        let stream_result = consume_remote_scanner_stream_until(
+            reader,
+            ctx,
+            budget.clone(),
+            RemoteScannerResponseExpectation {
+                bucket,
+                source: expected_source,
+                next_cycle,
+                scan_plan_digest,
+                tier_registry_generation,
+            },
+            authenticator,
+            rpc_deadline,
+        )
+        .await;
+        finish_remote_scanner_stream(stream_result, budget.as_ref())
+    }
     .await;
-    finish_remote_scanner_stream(stream_result, budget.as_ref())
+    path_guard.close().await;
+    result
+}
+
+/// Resource waits must keep checking the persisted leader fence.
+async fn wait_for_remote_node_resumption<F, G>(resume: F, fence_watch: Pin<&mut G>) -> Result<(), StorageError>
+where
+    F: Future<Output = Result<(), StorageError>>,
+    G: Future<Output = Result<(), ScannerError>>,
+{
+    tokio::select! {
+        biased;
+        result = fence_watch => Err(match result {
+            Ok(()) => StorageError::other("remote namespace scanner fence watcher stopped unexpectedly"),
+            Err(error) => StorageError::other(error),
+        }),
+        result = resume => result,
+    }
 }
 
 fn finish_remote_scanner_stream(
@@ -1075,7 +1253,7 @@ pub(crate) async fn checkpoint_fixture_partial_return(progress: (u64, u64), entr
     )
     .await
     .expect("checkpoint partial frame must encode");
-    let frame = read_frame(&mut std::io::Cursor::new(bytes.as_slice()), &reader_auth, &mut 0)
+    let frame = read_frame(&mut std::io::Cursor::new(bytes.as_slice()), &reader_auth, &mut 0, None)
         .await
         .expect("checkpoint progress frame must authenticate");
     assert_eq!(frame.progress.entries_visited, entries_visited);
@@ -1137,6 +1315,9 @@ async fn consume_remote_scanner_stream_until<R>(
 where
     R: AsyncRead + Unpin,
 {
+    // Namespace consumption is background work even in a plain spawned worker.
+    // Capture only its installed local memory policy, never scheduler receipts.
+    let memory = EcstoreBackgroundMemoryBudget::current();
     let mut expected_sequence = 0_u64;
     let mut last_progress = RemoteScannerProgress::default();
     let mut last_phase = RemoteScannerPhase::Scanning;
@@ -1162,7 +1343,7 @@ where
             }
             result = tokio::time::timeout_at(
                 read_deadline,
-                read_frame(&mut reader, &authenticator, &mut expected_sequence),
+                read_frame(&mut reader, &authenticator, &mut expected_sequence, memory.as_ref()),
             ) => match result {
                 Ok(Ok(frame)) => frame,
                 Ok(Err(err)) => {
@@ -1196,11 +1377,12 @@ where
                 bounded_remote_scanner_deadline(Instant::now(), NS_SCANNER_SEMANTIC_STALL_TIMEOUT, rpc_deadline);
         }
 
-        match frame.result {
+        let terminal = match frame.result {
             RemoteScannerFrameResult::Progress => {
                 if budget.budget_elapsed() && frame.phase == RemoteScannerPhase::Scanning {
                     return Ok(RemoteScannerOutcome::Partial);
                 }
+                None
             }
             RemoteScannerFrameResult::Complete(complete) => {
                 if complete.usage.name != expected.bucket || complete.usage.parent != crate::DATA_USAGE_ROOT {
@@ -1229,22 +1411,23 @@ where
                     )));
                 }
                 if budget.budget_elapsed() {
-                    return Ok(RemoteScannerOutcome::Partial);
+                    Some(Ok(RemoteScannerOutcome::Partial))
+                } else {
+                    Some(Ok(RemoteScannerOutcome::Complete {
+                        usage: Box::new(complete.usage),
+                        pending_maintenance_work: complete.pending_maintenance_work,
+                    }))
                 }
-                return Ok(RemoteScannerOutcome::Complete {
-                    usage: Box::new(complete.usage),
-                    pending_maintenance_work: complete.pending_maintenance_work,
-                });
             }
-            RemoteScannerFrameResult::Partial => return Ok(RemoteScannerOutcome::Partial),
-            RemoteScannerFrameResult::NamespaceNotFound => return Ok(RemoteScannerOutcome::NamespaceNotFound),
+            RemoteScannerFrameResult::Partial => Some(Ok(RemoteScannerOutcome::Partial)),
+            RemoteScannerFrameResult::NamespaceNotFound => Some(Ok(RemoteScannerOutcome::NamespaceNotFound)),
             RemoteScannerFrameResult::CycleAhead { required_cycle } => {
                 if required_cycle <= expected.next_cycle || required_cycle == u64::MAX {
                     return Err(RemoteScannerStreamError::reconciled(StorageError::other(
                         "remote namespace scanner returned an invalid required cycle",
                     )));
                 }
-                return Ok(RemoteScannerOutcome::CycleAhead(required_cycle));
+                Some(Ok(RemoteScannerOutcome::CycleAhead(required_cycle)))
             }
             RemoteScannerFrameResult::Error(error_frame) => {
                 let retry_bucket = error_frame.message.starts_with(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX);
@@ -1255,12 +1438,56 @@ where
                     .unwrap_or(error_frame.message.as_str());
                 let error =
                     StorageError::other(format!("remote namespace scanner failed: {}", limit_error_message(message.to_string())));
-                return Err(match error_frame.scope {
+                Some(Err(match error_frame.scope {
                     RemoteScannerErrorScope::Bucket if retry_bucket => RemoteScannerStreamError::retry_bucket(error),
                     RemoteScannerErrorScope::Bucket => RemoteScannerStreamError::bucket(error),
                     RemoteScannerErrorScope::Worker => RemoteScannerStreamError::reconciled(error),
-                });
+                }))
             }
+        };
+
+        if let Some(result) = terminal {
+            let mut trailing = [0_u8; 1];
+            let read_deadline = rpc_deadline.min(semantic_progress_deadline);
+            let lifetime_limited = rpc_deadline <= semantic_progress_deadline;
+            let eof = tokio::select! {
+                biased;
+                _ = ctx.cancelled(), if budget.reason().is_none() => {
+                    return Err(RemoteScannerStreamError::for_phase(
+                        StorageError::other("remote namespace scanner cancelled"), last_phase,
+                    ));
+                }
+                read = tokio::time::timeout_at(read_deadline, reader.read(&mut trailing)) => match read {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(err)) => return Err(RemoteScannerStreamError::for_phase(StorageError::other(err), last_phase)),
+                    Err(_) => {
+                        let message = if lifetime_limited {
+                            "remote namespace scanner RPC lifetime exceeded"
+                        } else {
+                            "remote namespace scanner made no semantic progress"
+                        };
+                        return Err(RemoteScannerStreamError::for_phase(StorageError::other(message), last_phase));
+                    }
+                }
+            };
+            if eof != 0 {
+                return Err(RemoteScannerStreamError::for_phase(
+                    StorageError::other("remote namespace scanner returned trailing bytes after terminal frame"),
+                    last_phase,
+                ));
+            }
+            #[cfg(feature = "e2e-test-hooks")]
+            if matches!(&result, Ok(RemoteScannerOutcome::Complete { .. })) && crate::e2e_barrier::worker_observation::enabled() {
+                crate::e2e_barrier::worker_observation::complete(
+                    authenticator.request_id,
+                    [
+                        last_progress.objects_scanned,
+                        last_progress.directories_started,
+                        last_progress.entries_visited,
+                    ],
+                );
+            }
+            return result;
         }
     }
 }
@@ -1325,6 +1552,7 @@ fn writer_timeout_error(operation: &str, timeout_duration: Duration) -> ScannerE
     ))
 }
 
+#[cfg(test)]
 async fn write_frame_bounded<W>(
     writer: &mut W,
     authenticator: &FrameAuthenticator,
@@ -1336,10 +1564,30 @@ async fn write_frame_bounded<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    write_frame_bounded_with_memory(writer, authenticator, sequence, frame, disconnect, timeout_duration, None).await
+}
+
+async fn write_frame_bounded_with_memory<W>(
+    writer: &mut W,
+    authenticator: &FrameAuthenticator,
+    sequence: &mut u64,
+    frame: &RemoteScannerFrame,
+    disconnect: &CancellationToken,
+    timeout_duration: Duration,
+    memory: Option<&Arc<EcstoreBackgroundMemoryBudget>>,
+) -> Result<(), ScannerError>
+where
+    W: AsyncWrite + Unpin,
+{
     tokio::select! {
         biased;
         _ = disconnect.cancelled() => Err(disconnected_writer_error()),
-        result = tokio::time::timeout(timeout_duration, write_frame(writer, authenticator, sequence, frame)) => {
+        result = tokio::time::timeout(timeout_duration, async {
+            match memory {
+                Some(memory) => write_background_frame(writer, authenticator, sequence, frame, memory).await,
+                None => write_frame(writer, authenticator, sequence, frame).await,
+            }
+        }) => {
             result.map_err(|_| writer_timeout_error("write", timeout_duration))?
         }
     }
@@ -1419,10 +1667,215 @@ where
     Ok(())
 }
 
+#[derive(Serialize)]
+struct BorrowedRemoteScannerFrameEnvelope<'a> {
+    version: u16,
+    sequence: u64,
+    payload: &'a [u8],
+    mac: &'a [u8],
+}
+
+fn encode_background<T: Serialize>(value: &T, memory: &Arc<EcstoreBackgroundMemoryBudget>) -> Result<bytes::Bytes, ScannerError> {
+    let mut buffer = EcstoreBackgroundEncodeBuffer::new(memory.clone(), NS_SCANNER_MAX_FRAME_SIZE);
+    // Preserve the serializer's original I/O error and its memory-denial cause.
+    rmp_serde::encode::write_named(&mut buffer, value).map_err(|error| match error {
+        rmp_serde::encode::Error::InvalidValueWrite(error) => ScannerError::Io(error.into()),
+        error => ScannerError::Io(IoError::other(error)),
+    })?;
+    Ok(buffer.into_bytes())
+}
+
+async fn write_background_frame<W>(
+    writer: &mut W,
+    authenticator: &FrameAuthenticator,
+    sequence: &mut u64,
+    frame: &RemoteScannerFrame,
+    memory: &Arc<EcstoreBackgroundMemoryBudget>,
+) -> Result<(), ScannerError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = encode_background(frame, memory)?;
+    let mut mac = HmacSha256::new_from_slice(authenticator.secret.as_bytes())
+        .map_err(|_| ScannerError::Other("invalid remote namespace scanner authentication key".to_string()))?;
+    update_frame_mac(&mut mac, authenticator.request_id, *sequence, &payload);
+    let signature = mac.finalize().into_bytes();
+    let envelope = BorrowedRemoteScannerFrameEnvelope {
+        version: NS_SCANNER_PROTOCOL_VERSION,
+        sequence: *sequence,
+        payload: &payload,
+        mac: &signature,
+    };
+    let encoded = encode_background(&envelope, memory)?;
+    if encoded.is_empty() {
+        return Err(ScannerError::Other("remote namespace scanner encoded frame is empty".to_string()));
+    }
+    let len = u32::try_from(encoded.len())
+        .map_err(|_| ScannerError::Other("remote namespace scanner frame is too large".to_string()))?;
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(&encoded).await?;
+    drop(encoded);
+    drop(payload);
+    *sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| ScannerError::Other("remote namespace scanner frame sequence overflow".to_string()))?;
+    Ok(())
+}
+
+// These owners account only envelope payload and MAC storage, not the decoded model.
+struct BackgroundRemoteScannerEnvelope {
+    version: u16,
+    sequence: u64,
+    payload: bytes::Bytes,
+    mac: bytes::Bytes,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "lowercase")]
+enum RemoteScannerEnvelopeField {
+    Version,
+    Sequence,
+    Payload,
+    Mac,
+}
+
+struct BackgroundEnvelopeSeed<'a> {
+    memory: &'a Arc<EcstoreBackgroundMemoryBudget>,
+    maximum: usize,
+    failure: &'a mut Option<IoError>,
+}
+
+impl BackgroundEnvelopeSeed<'_> {
+    fn bytes(&mut self) -> BackgroundEnvelopeBytesSeed<'_> {
+        BackgroundEnvelopeBytesSeed {
+            buffer: EcstoreBackgroundEncodeBuffer::new(self.memory.clone(), self.maximum),
+            failure: self.failure,
+        }
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BackgroundEnvelopeSeed<'_> {
+    type Value = BackgroundRemoteScannerEnvelope;
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_struct("RemoteScannerFrameEnvelope", &["version", "sequence", "payload", "mac"], self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for BackgroundEnvelopeSeed<'_> {
+    type Value = BackgroundRemoteScannerEnvelope;
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("remote namespace scanner frame envelope")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(mut self, mut seq: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let version = seq.next_element()?.ok_or_else(|| A::Error::invalid_length(0, &self))?;
+        let sequence = seq.next_element()?.ok_or_else(|| A::Error::invalid_length(1, &self))?;
+        let payload = seq
+            .next_element_seed(self.bytes())?
+            .ok_or_else(|| A::Error::invalid_length(2, &self))?;
+        let mac = seq
+            .next_element_seed(self.bytes())?
+            .ok_or_else(|| A::Error::invalid_length(3, &self))?;
+        Ok(BackgroundRemoteScannerEnvelope {
+            version,
+            sequence,
+            payload,
+            mac,
+        })
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(mut self, mut map: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let (mut version, mut sequence, mut payload, mut mac) = (None, None, None, None);
+        while let Some(field) = map.next_key()? {
+            match field {
+                RemoteScannerEnvelopeField::Version => {
+                    if version.is_some() {
+                        return Err(A::Error::duplicate_field("version"));
+                    }
+                    version = Some(map.next_value()?);
+                }
+                RemoteScannerEnvelopeField::Sequence => {
+                    if sequence.is_some() {
+                        return Err(A::Error::duplicate_field("sequence"));
+                    }
+                    sequence = Some(map.next_value()?);
+                }
+                RemoteScannerEnvelopeField::Payload => {
+                    if payload.is_some() {
+                        return Err(A::Error::duplicate_field("payload"));
+                    }
+                    payload = Some(map.next_value_seed(self.bytes())?);
+                }
+                RemoteScannerEnvelopeField::Mac => {
+                    if mac.is_some() {
+                        return Err(A::Error::duplicate_field("mac"));
+                    }
+                    mac = Some(map.next_value_seed(self.bytes())?);
+                }
+            }
+        }
+        Ok(BackgroundRemoteScannerEnvelope {
+            version: version.ok_or_else(|| A::Error::missing_field("version"))?,
+            sequence: sequence.ok_or_else(|| A::Error::missing_field("sequence"))?,
+            payload: payload.ok_or_else(|| A::Error::missing_field("payload"))?,
+            mac: mac.ok_or_else(|| A::Error::missing_field("mac"))?,
+        })
+    }
+}
+
+struct BackgroundEnvelopeBytesSeed<'a> {
+    buffer: EcstoreBackgroundEncodeBuffer,
+    failure: &'a mut Option<IoError>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BackgroundEnvelopeBytesSeed<'_> {
+    type Value = bytes::Bytes;
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        // deserialize_seq matches Vec<u8>, including MessagePack bin input.
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for BackgroundEnvelopeBytesSeed<'_> {
+    type Value = bytes::Bytes;
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a sequence of bytes")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(mut self, mut seq: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        // Never allocate from an untrusted sequence size_hint.
+        while let Some(byte) = seq.next_element::<u8>()? {
+            if let Err(error) = std::io::Write::write_all(&mut self.buffer, &[byte]) {
+                *self.failure = Some(error);
+                return Err(A::Error::custom("background envelope byte storage unavailable"));
+            }
+        }
+        Ok(self.buffer.into_bytes())
+    }
+}
+
+fn decode_background_envelope(
+    encoded: &[u8],
+    memory: &Arc<EcstoreBackgroundMemoryBudget>,
+) -> std::io::Result<BackgroundRemoteScannerEnvelope> {
+    use serde::de::DeserializeSeed;
+    let mut failure = None;
+    let seed = BackgroundEnvelopeSeed {
+        memory,
+        maximum: encoded.len(),
+        failure: &mut failure,
+    };
+    seed.deserialize(&mut rmp_serde::Deserializer::from_read_ref(encoded))
+        .map_err(|_| {
+            failure.unwrap_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid remote namespace scanner frame envelope"))
+        })
+}
+
 async fn read_frame<R>(
     reader: &mut R,
     authenticator: &FrameAuthenticator,
     expected_sequence: &mut u64,
+    memory: Option<&Arc<EcstoreBackgroundMemoryBudget>>,
 ) -> std::io::Result<RemoteScannerFrame>
 where
     R: AsyncRead + Unpin,
@@ -1444,21 +1897,50 @@ where
         ));
     }
 
-    let mut encoded = vec![0_u8; len];
-    reader.read_exact(&mut encoded).await?;
-    let envelope: RemoteScannerFrameEnvelope = rmp_serde::from_slice(&encoded)
-        .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid remote namespace scanner frame envelope"))?;
-    if envelope.version != NS_SCANNER_PROTOCOL_VERSION {
+    let mut background = memory.map(|memory| EcstoreBackgroundEncodeBuffer::new(memory.clone(), len));
+    let mut foreground;
+    let encoded = match background.as_mut() {
+        Some(buffer) => buffer.prepare_read(len)?,
+        None => {
+            foreground = vec![0_u8; len];
+            foreground.as_mut_slice()
+        }
+    };
+    reader.read_exact(encoded).await?;
+    let background_envelope;
+    let foreground_envelope;
+    let (version, sequence, payload, mac) = match memory {
+        Some(memory) => {
+            background_envelope = decode_background_envelope(encoded, memory)?;
+            (
+                background_envelope.version,
+                background_envelope.sequence,
+                background_envelope.payload.as_ref(),
+                background_envelope.mac.as_ref(),
+            )
+        }
+        None => {
+            foreground_envelope = rmp_serde::from_slice::<RemoteScannerFrameEnvelope>(encoded)
+                .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid remote namespace scanner frame envelope"))?;
+            (
+                foreground_envelope.version,
+                foreground_envelope.sequence,
+                foreground_envelope.payload.as_slice(),
+                foreground_envelope.mac.as_slice(),
+            )
+        }
+    };
+    if version != NS_SCANNER_PROTOCOL_VERSION {
         return Err(IoError::new(
             ErrorKind::InvalidData,
-            format!("unsupported remote namespace scanner frame version: {}", envelope.version),
+            format!("unsupported remote namespace scanner frame version: {}", version),
         ));
     }
-    if envelope.sequence != *expected_sequence {
+    if sequence != *expected_sequence {
         return Err(IoError::new(ErrorKind::InvalidData, "remote namespace scanner frame sequence is invalid"));
     }
-    authenticator.verify(envelope.sequence, &envelope.payload, &envelope.mac)?;
-    let frame: RemoteScannerFrame = rmp_serde::from_slice(&envelope.payload)
+    authenticator.verify(sequence, payload, mac)?;
+    let frame: RemoteScannerFrame = rmp_serde::from_slice(payload)
         .map_err(|_| IoError::new(ErrorKind::InvalidData, "invalid remote namespace scanner frame payload"))?;
     *expected_sequence = expected_sequence
         .checked_add(1)

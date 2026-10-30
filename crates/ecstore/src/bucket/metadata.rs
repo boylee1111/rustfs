@@ -18,9 +18,10 @@ use super::versioning::VersioningApi;
 use super::{quota::BucketQuota, target::BucketTargets};
 use crate::bucket::replication::invalid_replication_config_status_field;
 use crate::bucket::utils::deserialize;
-use crate::config::com::{read_config, read_config_preserve_empty, save_config};
+use crate::config::com::{read_config, read_config_preserve_empty, save_config, save_config_with_opts};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result};
+use crate::object_api::WriteCompletion;
 use crate::runtime::sources as runtime_sources;
 use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
@@ -437,6 +438,7 @@ pub struct BucketMetadata {
     pub lock_enabled: bool, // While marked as unused, it may need to be retained
     pub bucket_incarnation_id: Uuid,
     pub(crate) bucket_incarnation_sidecar: bool,
+    pub(crate) bucket_creation_committed: bool,
     pub policy_config_json: Vec<u8>,
     pub notification_config_xml: Vec<u8>,
     pub lifecycle_config_xml: Vec<u8>,
@@ -511,6 +513,7 @@ impl Default for BucketMetadata {
             lock_enabled: Default::default(),
             bucket_incarnation_id: Uuid::nil(),
             bucket_incarnation_sidecar: false,
+            bucket_creation_committed: false,
             policy_config_json: Default::default(),
             notification_config_xml: Default::default(),
             lifecycle_config_xml: Default::default(),
@@ -590,8 +593,24 @@ impl BucketMetadata {
     /// durability posture.
     pub fn new_with_default_durability(name: &str) -> Self {
         let mut metadata = Self::new(name);
-        metadata.durability_config_json = super::durability::new_bucket_durability_config_json();
+        metadata.durability_config_json = super::durability::new_bucket_durability_config_json(name);
         metadata
+    }
+
+    /// Whether this generation still needs its creation-commit proof.
+    ///
+    /// The proof is only ever written while the caller holds the bucket
+    /// metadata transaction fence; see
+    /// `BucketMetadataSys::migrate_bucket_creation_commit`.
+    ///
+    /// Metadata without an authoritative incarnation sidecar is owned by the
+    /// legacy migration path, which mints the sidecar first; it must not be
+    /// rewritten by this migration.
+    pub(crate) fn needs_bucket_creation_commit(&self) -> bool {
+        self.lock_enabled
+            && !self.bucket_creation_committed
+            && self.bucket_incarnation_sidecar
+            && !self.bucket_incarnation_id.is_nil()
     }
 
     pub fn save_file_path(&self) -> String {
@@ -733,6 +752,7 @@ impl BucketMetadata {
                 "TableBucketConfigUpdatedAt" => self.table_bucket_config_updated_at = read_msgp_time_value(rd)?,
                 "DurabilityConfigUpdatedAt" => self.durability_config_updated_at = read_msgp_time_value(rd)?,
                 "OnDemandMigrationConfigUpdatedAt" => self.on_demand_migration_config_updated_at = read_msgp_time_value(rd)?,
+                "BucketCreationCommitted" => self.bucket_creation_committed = read_msgp_bool(rd)?,
                 other => {
                     tracing::debug!(field = %other, "BucketMetadata decode_from: skipping unknown field");
                     skip_msgp_value(rd)?;
@@ -745,8 +765,8 @@ impl BucketMetadata {
 
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
-        // Map size: MinIO fields (25) + RustFS extensions (21)
-        let map_len: u32 = 46;
+        // Map size: MinIO fields (25) + RustFS extensions (22)
+        let map_len: u32 = 47;
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -827,6 +847,8 @@ impl BucketMetadata {
         write_msgp_time(wr, self.durability_config_updated_at)?;
         rmp::encode::write_str(wr, "OnDemandMigrationConfigUpdatedAt")?;
         write_msgp_time(wr, self.on_demand_migration_config_updated_at)?;
+        rmp::encode::write_str(wr, "BucketCreationCommitted")?;
+        rmp::encode::write_bool(wr, self.bucket_creation_committed)?;
 
         Ok(())
     }
@@ -982,6 +1004,11 @@ impl BucketMetadata {
                 self.object_lock_config = None;
                 if !data.is_empty() {
                     self.lock_enabled = true;
+                    // Enabling Object Lock is only reachable for a bucket that
+                    // already exists: the caller validated physical presence and
+                    // holds the incarnation fence, so this generation is committed
+                    // and must never be mistaken for a pre-physical creation intent.
+                    self.bucket_creation_committed = true;
                 }
                 self.object_lock_config_xml = data;
                 self.object_lock_config_updated_at = updated;
@@ -1086,6 +1113,21 @@ impl BucketMetadata {
     /// server's bucket metadata lands in that server's `.rustfs.sys`, not the
     /// ambient (first) one. [`BucketMetadata::save`] keeps the ambient default.
     pub async fn save_with_store(&mut self, store: std::sync::Arc<crate::store::ECStore>) -> Result<()> {
+        self.save_with_store_completion(store, WriteCompletion::Quorum).await
+    }
+
+    /// Persist a committed creation record and drain the rename fan-out before
+    /// returning. A quorum ACK is insufficient here: later degraded reads may
+    /// have to reconstruct this record from any read quorum of surviving shards.
+    pub(crate) async fn save_with_store_committed(&mut self, store: std::sync::Arc<crate::store::ECStore>) -> Result<()> {
+        self.save_with_store_completion(store, WriteCompletion::TailDrained).await
+    }
+
+    async fn save_with_store_completion(
+        &mut self,
+        store: std::sync::Arc<crate::store::ECStore>,
+        write_completion: WriteCompletion,
+    ) -> Result<()> {
         self.parse_all_configs()?;
         let mut buf: Vec<u8> = vec![0; 4];
 
@@ -1099,7 +1141,17 @@ impl BucketMetadata {
 
         buf.extend_from_slice(&data);
 
-        save_config(store, self.save_file_path().as_str(), buf).await?;
+        save_config_with_opts(
+            store,
+            self.save_file_path().as_str(),
+            buf,
+            &crate::object_api::ObjectOptions {
+                max_parity: true,
+                write_completion,
+                ..Default::default()
+            },
+        )
+        .await?;
 
         Ok(())
     }
@@ -1158,6 +1210,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.notification_config = None;
         if !self.notification_config_xml.is_empty()
             && let Err(e) = deserialize::<NotificationConfiguration>(&self.notification_config_xml)
                 .map(|c| self.notification_config = Some(c))
@@ -1172,6 +1225,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.lifecycle_config = None;
         if !self.lifecycle_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<BucketLifecycleConfiguration>(&self.lifecycle_config_xml).map(|c| self.lifecycle_config = Some(c))
@@ -1186,6 +1240,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.object_lock_config = None;
         if !self.object_lock_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<ObjectLockConfiguration>(&self.object_lock_config_xml).map(|c| self.object_lock_config = Some(c))
@@ -1215,6 +1270,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.sse_config = None;
         if !self.encryption_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<ServerSideEncryptionConfiguration>(&self.encryption_config_xml).map(|c| self.sse_config = Some(c))
@@ -1229,6 +1285,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.tagging_config = None;
         if !self.tagging_config_xml.is_empty()
             && let Err(e) = deserialize::<Tagging>(&self.tagging_config_xml).map(|c| self.tagging_config = Some(c))
         {
@@ -1294,6 +1351,7 @@ impl BucketMetadata {
         } else {
             self.bucket_target_config = Some(BucketTargets::default());
         }
+        self.cors_config = None;
         if !self.cors_config_xml.is_empty()
             && let Err(e) = deserialize::<CORSConfiguration>(&self.cors_config_xml).map(|c| self.cors_config = Some(c))
         {
@@ -1307,6 +1365,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.logging_config = None;
         if !self.logging_config_xml.is_empty()
             && let Err(e) = deserialize::<BucketLoggingStatus>(&self.logging_config_xml).map(|c| self.logging_config = Some(c))
         {
@@ -1320,6 +1379,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.website_config = None;
         if !self.website_config_xml.is_empty()
             && let Err(e) = deserialize::<WebsiteConfiguration>(&self.website_config_xml).map(|c| self.website_config = Some(c))
         {
@@ -1333,6 +1393,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.accelerate_config = None;
         if !self.accelerate_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<AccelerateConfiguration>(&self.accelerate_config_xml).map(|c| self.accelerate_config = Some(c))
@@ -1347,6 +1408,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.request_payment_config = None;
         if !self.request_payment_config_xml.is_empty()
             && let Err(e) = deserialize::<RequestPaymentConfiguration>(&self.request_payment_config_xml)
                 .map(|c| self.request_payment_config = Some(c))
@@ -1361,6 +1423,7 @@ impl BucketMetadata {
                 "Failed to parse bucket metadata config"
             );
         }
+        self.public_access_block_config = None;
         if !self.public_access_block_config_xml.is_empty()
             && let Err(e) = deserialize::<PublicAccessBlockConfiguration>(&self.public_access_block_config_xml)
                 .map(|c| self.public_access_block_config = Some(c))
@@ -1440,7 +1503,11 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
     bucket: &str,
     parse: bool,
 ) -> Result<(BucketMetadata, bool)> {
-    let (mut bm, persisted) = match read_bucket_metadata(api.clone(), bucket).await {
+    let (metadata_res, incarnation_res) = tokio::join!(
+        Box::pin(read_bucket_metadata(api.clone(), bucket)),
+        Box::pin(load_bucket_incarnation(api.clone(), bucket)),
+    );
+    let (mut bm, persisted) = match metadata_res {
         Ok(res) => (res, true),
         Err(err) => {
             if err != Error::ConfigNotFound {
@@ -1451,8 +1518,13 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
         }
     };
 
-    let incarnation = load_bucket_incarnation(api, bucket).await?;
+    let incarnation = incarnation_res?;
     if persisted {
+        if bm.name.is_empty() {
+            bm.name = bucket.to_string();
+        } else if bm.name != bucket {
+            return Err(Error::FileCorrupt);
+        }
         if let Some(incarnation) = incarnation {
             if !bm.bucket_incarnation_id.is_nil() && bm.bucket_incarnation_id != incarnation {
                 return Err(Error::other("bucket incarnation sidecar does not match bucket metadata"));
@@ -1464,9 +1536,13 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
                 "bucket incarnation sidecar is missing for new-format metadata: {bucket}"
             )));
         }
-    } else if incarnation.is_some() {
-        return Err(Error::other("bucket incarnation sidecar exists without bucket metadata"));
     }
+    // A sidecar without `.metadata.bin` is the window between the two legacy
+    // migration writes (rustfs/rustfs#8003): the sidecar lands first, and a
+    // crash or lost namespace lease before the metadata write leaves the
+    // bucket in this state on every node. Report it as not persisted so the
+    // migration runs again; the writers adopt the stored incarnation instead
+    // of minting a new one, so the sidecar keeps its authority.
 
     bm.default_timestamps();
 
@@ -1618,6 +1694,7 @@ mod test {
         BucketMetadata::check_header(&body).expect("recovered body is a valid .metadata.bin");
         let mut bm = BucketMetadata::unmarshal(&body[4..]).expect("unmarshal recovered blob");
         assert_eq!(bm.name, "interop");
+        assert!(!bm.bucket_creation_committed, "legacy metadata must default to uncommitted");
         bm.parse_all_configs().expect("parse recovered configs");
         assert!(bm.lifecycle_config.is_some());
     }
@@ -1626,13 +1703,15 @@ mod test {
     async fn marshal_msg() {
         // write_time(OffsetDateTime::UNIX_EPOCH).unwrap();
 
-        let bm = BucketMetadata::new("dada");
+        let mut bm = BucketMetadata::new("dada");
+        bm.bucket_creation_committed = true;
 
         let buf = bm.marshal_msg().unwrap();
 
         let new = BucketMetadata::unmarshal(&buf).unwrap();
 
         assert_eq!(bm.name, new.name);
+        assert!(new.bucket_creation_committed);
         assert!(!bm.bucket_incarnation_id.is_nil());
         assert_eq!(bm.bucket_incarnation_id, new.bucket_incarnation_id);
     }
@@ -1668,21 +1747,15 @@ mod test {
     }
 
     #[test]
-    fn new_bucket_metadata_constructor_seeds_default_durability() {
+    fn new_bucket_metadata_constructor_inherits_default_durability() {
         temp_env::with_var_unset(crate::bucket::durability::ENV_NEW_BUCKET_DURABILITY_MODE, || {
             let metadata = BucketMetadata::new_with_default_durability("new-user-bucket");
-            assert_eq!(
-                metadata.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
-                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
-            );
+            assert!(metadata.durability_config().is_none());
 
             let encoded = metadata.marshal_msg().expect("marshal metadata");
             let decoded = BucketMetadata::unmarshal(&encoded).expect("unmarshal metadata");
             assert_eq!(decoded.durability_config_json, metadata.durability_config_json);
-            assert_eq!(
-                decoded.durability_config().and_then(|cfg| cfg.normalized_mode()).as_deref(),
-                Some(crate::bucket::durability::BUCKET_DURABILITY_MODE_RELAXED)
-            );
+            assert!(decoded.durability_config().is_none());
         });
     }
 
@@ -1913,6 +1986,156 @@ mod test {
 
         assert_eq!(bm.bucket_targets_config_json, malformed_json, "raw bytes are retained");
         assert_eq!(bm.lifecycle_config_xml, malformed_xml, "raw bytes are retained");
+    }
+
+    const REPARSE_XML_FIXTURES: [(&str, &[u8]); 13] = [
+        (BUCKET_NOTIFICATION_CONFIG, br#"<NotificationConfiguration/>"#),
+        (
+            BUCKET_LIFECYCLE_CONFIG,
+            br#"<LifecycleConfiguration><Rule><ID>keep</ID><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>"#,
+        ),
+        (
+            OBJECT_LOCK_CONFIG,
+            br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule></ObjectLockConfiguration>"#,
+        ),
+        (BUCKET_VERSIONING_CONFIG, br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#),
+        (
+            BUCKET_SSECONFIG,
+            br#"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#,
+        ),
+        (BUCKET_TAGGING_CONFIG, br#"<Tagging><TagSet><Tag><Key>team</Key><Value>blue</Value></Tag></TagSet></Tagging>"#),
+        (
+            BUCKET_REPLICATION_CONFIG,
+            br#"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication-role</Role><Rule><ID>copy</ID><Status>Enabled</Status><Prefix>documents/</Prefix><Destination><Bucket>arn:aws:s3:::destination-bucket</Bucket></Destination></Rule></ReplicationConfiguration>"#,
+        ),
+        (
+            BUCKET_CORS_CONFIG,
+            br#"<CORSConfiguration><CORSRule><AllowedOrigin>https://example.test</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>"#,
+        ),
+        (BUCKET_LOGGING_CONFIG, br#"<BucketLoggingStatus/>"#),
+        (BUCKET_WEBSITE_CONFIG, br#"<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>"#),
+        (BUCKET_ACCELERATE_CONFIG, br#"<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>"#),
+        (BUCKET_REQUEST_PAYMENT_CONFIG, br#"<RequestPaymentConfiguration><Payer>BucketOwner</Payer></RequestPaymentConfiguration>"#),
+        (
+            BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG,
+            br#"<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>"#,
+        ),
+    ];
+
+    fn reparse_xml_state(bm: &BucketMetadata, config: &str) -> &'static str {
+        fn state<T>(raw: &[u8], parsed: &Option<T>) -> &'static str {
+            match ConfigState::of(raw, parsed) {
+                ConfigState::Absent => "absent",
+                ConfigState::Valid(_) => "valid",
+                ConfigState::Unreadable { .. } => "unreadable",
+            }
+        }
+        match config {
+            BUCKET_NOTIFICATION_CONFIG => state(&bm.notification_config_xml, &bm.notification_config),
+            BUCKET_LIFECYCLE_CONFIG => state(&bm.lifecycle_config_xml, &bm.lifecycle_config),
+            OBJECT_LOCK_CONFIG => state(&bm.object_lock_config_xml, &bm.object_lock_config),
+            BUCKET_VERSIONING_CONFIG => state(&bm.versioning_config_xml, &bm.versioning_config),
+            BUCKET_SSECONFIG => state(&bm.encryption_config_xml, &bm.sse_config),
+            BUCKET_TAGGING_CONFIG => state(&bm.tagging_config_xml, &bm.tagging_config),
+            BUCKET_REPLICATION_CONFIG => state(&bm.replication_config_xml, &bm.replication_config),
+            BUCKET_CORS_CONFIG => state(&bm.cors_config_xml, &bm.cors_config),
+            BUCKET_LOGGING_CONFIG => state(&bm.logging_config_xml, &bm.logging_config),
+            BUCKET_WEBSITE_CONFIG => state(&bm.website_config_xml, &bm.website_config),
+            BUCKET_ACCELERATE_CONFIG => state(&bm.accelerate_config_xml, &bm.accelerate_config),
+            BUCKET_REQUEST_PAYMENT_CONFIG => state(&bm.request_payment_config_xml, &bm.request_payment_config),
+            BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG => state(&bm.public_access_block_config_xml, &bm.public_access_block_config),
+            _ => panic!("unknown XML config: {config}"),
+        }
+    }
+
+    // A persisted payload can change without going through the request decoder.
+    fn replace_xml_raw(bm: &mut BucketMetadata, config: &str, raw: Vec<u8>) {
+        match config {
+            BUCKET_NOTIFICATION_CONFIG => bm.notification_config_xml = raw,
+            BUCKET_LIFECYCLE_CONFIG => bm.lifecycle_config_xml = raw,
+            OBJECT_LOCK_CONFIG => bm.object_lock_config_xml = raw,
+            BUCKET_VERSIONING_CONFIG => bm.versioning_config_xml = raw,
+            BUCKET_SSECONFIG => bm.encryption_config_xml = raw,
+            BUCKET_TAGGING_CONFIG => bm.tagging_config_xml = raw,
+            BUCKET_REPLICATION_CONFIG => bm.replication_config_xml = raw,
+            BUCKET_CORS_CONFIG => bm.cors_config_xml = raw,
+            BUCKET_LOGGING_CONFIG => bm.logging_config_xml = raw,
+            BUCKET_WEBSITE_CONFIG => bm.website_config_xml = raw,
+            BUCKET_ACCELERATE_CONFIG => bm.accelerate_config_xml = raw,
+            BUCKET_REQUEST_PAYMENT_CONFIG => bm.request_payment_config_xml = raw,
+            BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG => bm.public_access_block_config_xml = raw,
+            _ => panic!("unknown XML config: {config}"),
+        }
+    }
+
+    #[test]
+    fn reparse_xml_rejects_stale_views_after_corruption() {
+        let corrupt = b"<not-a-valid-document";
+        for (config, valid) in REPARSE_XML_FIXTURES {
+            let mut bm = BucketMetadata::new("reparse-corrupt");
+            bm.update_config(config, valid.to_vec()).expect("store valid XML");
+            bm.parse_all_configs().expect("parse valid XML");
+            assert_eq!(reparse_xml_state(&bm, config), "valid", "{config}: valid setup");
+
+            replace_xml_raw(&mut bm, config, corrupt.to_vec());
+            let before = bm.marshal_msg().expect("marshal corrupt raw metadata");
+            bm.parse_all_configs()
+                .expect("one corrupt config must not fail the metadata load");
+
+            assert_eq!(reparse_xml_state(&bm, config), "unreadable", "{config}: stale view accepted");
+            assert_eq!(bm.xml_config_unreadable_len(config), Some(corrupt.len()), "{config}: missing refusal");
+            assert_eq!(
+                bm.marshal_msg().expect("marshal reparsed metadata"),
+                before,
+                "{config}: persisted bytes changed"
+            );
+        }
+    }
+
+    #[test]
+    fn reparse_xml_clears_stale_views_after_raw_is_removed() {
+        for (config, valid) in REPARSE_XML_FIXTURES {
+            let mut bm = BucketMetadata::new("reparse-removed");
+            bm.update_config(config, valid.to_vec()).expect("store valid XML");
+            bm.parse_all_configs().expect("parse valid XML");
+            assert_eq!(reparse_xml_state(&bm, config), "valid", "{config}: valid setup");
+
+            replace_xml_raw(&mut bm, config, Vec::new());
+            let before = bm.marshal_msg().expect("marshal absent raw metadata");
+            bm.parse_all_configs().expect("parse removed XML");
+
+            assert_eq!(reparse_xml_state(&bm, config), "absent", "{config}: stale view survived removal");
+            assert!(!bm.xml_config_unreadable(config), "{config}: absence is not corruption");
+            assert_eq!(
+                bm.marshal_msg().expect("marshal reparsed metadata"),
+                before,
+                "{config}: persisted bytes changed"
+            );
+        }
+    }
+
+    #[test]
+    fn reparse_xml_recovers_after_corrupt_raw_is_repaired() {
+        for (config, valid) in REPARSE_XML_FIXTURES {
+            let mut bm = BucketMetadata::new("reparse-repaired");
+            bm.update_config(config, valid.to_vec()).expect("store valid XML");
+            bm.parse_all_configs().expect("parse valid XML");
+            replace_xml_raw(&mut bm, config, b"<not-a-valid-document".to_vec());
+            bm.parse_all_configs().expect("parse corrupt XML");
+            assert_eq!(reparse_xml_state(&bm, config), "unreadable", "{config}: corrupt setup");
+
+            replace_xml_raw(&mut bm, config, valid.to_vec());
+            let before = bm.marshal_msg().expect("marshal repaired raw metadata");
+            bm.parse_all_configs().expect("parse repaired XML");
+
+            assert_eq!(reparse_xml_state(&bm, config), "valid", "{config}: repaired config must become readable");
+            assert!(!bm.xml_config_unreadable(config), "{config}: repaired config is not corrupt");
+            assert_eq!(
+                bm.marshal_msg().expect("marshal reparsed metadata"),
+                before,
+                "{config}: persisted bytes changed"
+            );
+        }
     }
 
     #[test]

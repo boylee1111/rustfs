@@ -21,6 +21,12 @@ use rustfs_lock::NamespaceLockWrapper;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+pub(crate) use rustfs_ecstore::spawn_blocking_with_resource_ownership as ecstore_spawn_blocking_with_resource_ownership;
+pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
+pub(crate) use rustfs_ecstore::with_background_resource_set as ecstore_with_background_resource_set;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::with_background_resource_unit as ecstore_with_background_resource_unit;
+
 pub(crate) use s3s::dto::{
     BucketLifecycleConfiguration as EcstoreBucketLifecycleConfiguration, LifecycleRuleFilter as EcstoreLifecycleRuleFilter,
     ObjectLockConfiguration as EcstoreObjectLockConfiguration, VersioningConfiguration as EcstoreVersioningConfiguration,
@@ -29,14 +35,16 @@ pub(crate) use s3s::dto::{
 pub(crate) use s3s::dto::{ExpirationStatus as EcstoreExpirationStatus, LifecycleRule as EcstoreLifecycleRule};
 
 pub(crate) use rustfs_ecstore::api::data_usage::{
-    MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementPlan, ScannerPauseBacklogRetirementReplica,
-    register_scanner_pause_backlog_retirement_planner,
+    MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
+    ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::data_usage::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};
 
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys as EcstoreBucketTargetSys;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc as EcstoreLcEventSrc;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::ExpiryState as EcstoreExpiryState;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
     apply_expiry_rule as ecstore_apply_expiry_rule, apply_transition_rule as ecstore_apply_transition_rule,
     lifecycle_version_delete_target as ecstore_lifecycle_version_delete_target,
@@ -59,6 +67,11 @@ pub(crate) use rustfs_ecstore::api::bucket::replication::{ReplicationStatusType,
 pub(crate) use rustfs_ecstore::api::bucket::target::BucketTargets as EcstoreBucketTargets;
 pub(crate) use rustfs_ecstore::api::bucket::versioning::VersioningApi as EcstoreVersioningApi;
 pub(crate) use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys as EcstoreBucketVersioningSys;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::bucket::{
+    metadata_sys::BucketMetadataSys as EcstoreQuotaMetadataSys,
+    quota::{QuotaError as EcstoreQuotaError, checker::QuotaChecker as EcstoreQuotaChecker},
+};
 pub(crate) use rustfs_ecstore::api::cache::{
     ListPathRawOptions as EcstoreListPathRawOptions, list_path_raw as ecstore_list_path_raw,
 };
@@ -92,6 +105,10 @@ pub(crate) use rustfs_ecstore::api::disk::{
 pub(crate) use rustfs_ecstore::api::disk::{
     DiskOption as EcstoreDiskOption, DiskStore as EcstoreDiskStore, new_disk as ecstore_new_disk,
 };
+#[cfg(all(test, unix))]
+pub(crate) use rustfs_ecstore::api::disk::{
+    LocalPublicationPause as EcstoreLocalPublicationPause, LocalPublicationStage as EcstoreLocalPublicationStage,
+};
 pub(crate) use rustfs_ecstore::api::error::{
     Error as EcstoreErrorType, Result as EcstoreResultType, StorageError as EcstoreStorageError,
 };
@@ -99,9 +116,12 @@ pub(crate) use rustfs_ecstore::api::event::{EventArgs as EcstoreEventArgs, send_
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::layout::{
     EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
+    SetupType as EcstoreSetupType,
 };
-pub(crate) use rustfs_ecstore::api::notification::NotificationSys as EcstoreNotificationSys;
 pub(crate) use rustfs_ecstore::api::notification::scanner_peer_transport_error_message_is_retryable;
+pub(crate) use rustfs_ecstore::api::notification::{
+    NotificationSys as EcstoreNotificationSys, ScannerPublicationLeaseGrant as EcstoreScannerPublicationLeaseGrant,
+};
 pub(crate) use rustfs_ecstore::api::object::{
     SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitState,
 };
@@ -110,8 +130,6 @@ pub(crate) use rustfs_ecstore::api::rebalance::{
     RebalStatus as EcstoreRebalStatus, RebalanceInfo as EcstoreRebalanceInfo, RebalanceMeta as EcstoreRebalanceMeta,
     RebalanceStats as EcstoreRebalanceStats,
 };
-#[cfg(test)]
-pub(crate) use rustfs_ecstore::api::rpc::ScannerPeerDirtyUsageBucket as EcstoreScannerPeerDirtyUsageBucket;
 pub(crate) use rustfs_ecstore::api::rpc::{
     ScannerBucketListing as EcstoreScannerBucketListing,
     ScannerDirtyUsageAcknowledgement as EcstoreScannerDirtyUsageAcknowledgement,
@@ -119,7 +137,13 @@ pub(crate) use rustfs_ecstore::api::rpc::{
     ScannerScopedDirtyUsageAckEntry as EcstoreScannerScopedDirtyUsageAckEntry,
 };
 #[cfg(test)]
+pub(crate) use rustfs_ecstore::api::rpc::{
+    ScannerPeerDirtyUsageBucket as EcstoreScannerPeerDirtyUsageBucket, ScannerPublicationLease as EcstoreScannerPublicationLease,
+};
+#[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::runtime::set_object_store_resolver as ecstore_set_object_store_resolver;
 pub(crate) use rustfs_ecstore::api::runtime::{
     expiry_state_handle as ecstore_expiry_state_handle, global_tier_config_mgr as ecstore_get_global_tier_config_mgr,
     object_store_handle as ecstore_resolve_object_store_handle, setup_is_erasure as ecstore_is_erasure,
@@ -138,19 +162,53 @@ pub(crate) use rustfs_lifecycle::{
 };
 use rustfs_storage_api as storage_contracts;
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub(crate) mod ecstore_diagnostic {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::diagnostic::current_read_version_entry_source;
+    pub(crate) use rustfs_ecstore::api::diagnostic::{
+        ReadVersionContextBoundary, ReadVersionEntrySource, observe_read_version_context_boundary, with_read_version_entry,
+    };
+}
+
 #[cfg(test)]
 pub(crate) type EcstoreHealResultItem = <EcstoreStore as storage_contracts::HealOperations>::HealResultItem;
 
 pub(crate) mod owner {
+    #[cfg(test)]
+    pub(crate) use super::EcstoreExpiryState;
+    #[cfg(test)]
+    pub(crate) use super::ecstore_set_object_store_resolver;
+    #[cfg(test)]
+    pub(crate) use super::ecstore_spawn_blocking_with_resource_ownership;
+    pub(crate) use super::ecstore_with_background_resource_set;
+    #[cfg(test)]
+    pub(crate) use super::storage_contracts::DiskSetSelector;
+    #[cfg(all(test, unix))]
     pub(crate) use super::{
-        MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementPlan, ScannerPauseBacklogRetirementReplica,
-        register_scanner_pause_backlog_retirement_planner,
+        EcstoreLocalPublicationPause, EcstoreLocalPublicationStage, ecstore_with_background_disk_io,
+        ecstore_with_background_resource_unit,
+    };
+    pub(crate) use super::{
+        MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
+        ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,
     };
     #[cfg(test)]
     pub(crate) use super::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};
+    pub(crate) use rustfs_ecstore::api::disk::{
+        BackgroundEncodeBuffer as EcstoreBackgroundEncodeBuffer, BackgroundMemoryBudget as EcstoreBackgroundMemoryBudget,
+        PhysicalDiskBinding, PhysicalDiskPlan,
+    };
 
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::set_disk::test_util::hold_namespace_commit as ecstore_hold_namespace_commit;
+    pub(crate) use rustfs_ecstore::api::object::{WriteCommitGuard, WriteCompletion};
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::set_disk::get_lock_acquire_timeout as ecstore_get_lock_acquire_timeout;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::set_disk::test_util::{
+        PutObjectCommitBarrier, PutObjectCommitPause, hold_namespace_commit as ecstore_hold_namespace_commit,
+        namespace_commits_pending as ecstore_namespace_commits_pending,
+    };
 
     pub(crate) use super::storage_contracts::{
         HTTPPreconditions, HTTPRangeSpec, NS_SCANNER_PROTOCOL_VERSION, ObjectIO, ObjectOperations, ObjectToDelete,
@@ -324,7 +382,6 @@ impl From<EcstoreReplicationHealQueueResult> for ScannerReplicationHealResult {
 }
 
 pub(crate) mod scan {
-    #[cfg(test)]
     pub(crate) use super::storage_contracts::BucketOperations;
     pub(crate) use super::storage_contracts::{
         BucketOptions, NamespaceLocking, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
@@ -336,12 +393,30 @@ pub(crate) mod scan {
         SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
         SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
     };
+    #[cfg(test)]
+    pub(crate) use super::{
+        EcstoreScannerPeerDirtyUsageBucket, EcstoreScannerPeerDirtyUsageSnapshot, EcstoreScannerPublicationLease,
+        EcstoreScannerPublicationLeaseGrant,
+    };
 }
 
 pub(crate) mod scanner_io {
     pub(crate) use super::storage_contracts::{BucketInfo, BucketOptions};
     #[cfg(test)]
     pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO};
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::{
+        bucket::{
+            lifecycle::bucket_lifecycle_ops::init_background_expiry,
+            metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG},
+            metadata_sys::update as update_bucket_metadata,
+        },
+        data_usage::{
+            apply_bucket_usage_memory_overlay, get_bucket_usage_memory, load_admin_data_usage_from_backend_cached,
+            load_data_usage_from_backend, record_bucket_object_delete_memory, record_bucket_object_write_memory,
+            replace_bucket_usage_memory_from_info, store_data_usage_in_backend as seed_persisted_usage,
+        },
+    };
 }
 
 pub(crate) type ScannerBucketListing = EcstoreScannerBucketListing;
@@ -359,6 +434,7 @@ pub(crate) trait ScannerStorage:
     fn scanner_namespace_mutation_generation(&self) -> u64;
     async fn scanner_data_movement_activity(&self) -> (bool, bool, u64);
     async fn scanner_data_usage_publication_blocked(&self) -> bool;
+    async fn scanner_data_movement_publication_blocked(&self) -> bool;
     async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus;
     fn scanner_data_movement_generation(&self) -> u64;
     fn scanner_data_movement_changed(&self) -> Arc<Notify>;
@@ -369,12 +445,13 @@ pub(crate) trait ScannerStorage:
     async fn list_bucket_for_scanner(&self, opts: &storage_contracts::BucketOptions) -> EcstoreResultType<ScannerBucketListing>;
     fn all_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>>;
     async fn scanner_pause_backlog_writable_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>>;
-    async fn save_scanner_pause_backlog_replica(
+    async fn save_scanner_pause_backlog_replica_for_membership(
         self: Arc<Self>,
         pool_index: usize,
         set_index: usize,
         data: Vec<u8>,
         preconditions: storage_contracts::HTTPPreconditions,
+        writable_pool_indices: Arc<[usize]>,
     ) -> EcstoreResultType<()>;
     #[cfg(test)]
     fn scanner_observed_probe_store_key(&self) -> usize;
@@ -396,6 +473,10 @@ impl ScannerStorage for EcstoreStore {
 
     async fn scanner_data_usage_publication_blocked(&self) -> bool {
         EcstoreStore::scanner_data_usage_publication_blocked(self).await
+    }
+
+    async fn scanner_data_movement_publication_blocked(&self) -> bool {
+        EcstoreStore::scanner_data_movement_activity(self).await.1
     }
 
     async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus {
@@ -438,16 +519,24 @@ impl ScannerStorage for EcstoreStore {
         EcstoreStore::scanner_pause_backlog_writable_set_disks(self).await
     }
 
-    async fn save_scanner_pause_backlog_replica(
+    async fn save_scanner_pause_backlog_replica_for_membership(
         self: Arc<Self>,
         pool_index: usize,
         set_index: usize,
         data: Vec<u8>,
         preconditions: storage_contracts::HTTPPreconditions,
+        writable_pool_indices: Arc<[usize]>,
     ) -> EcstoreResultType<()> {
-        EcstoreStore::save_scanner_pause_backlog_replica(&self, pool_index, set_index, data, preconditions)
-            .await
-            .map(|_| ())
+        EcstoreStore::save_scanner_pause_backlog_replica_for_membership(
+            &self,
+            pool_index,
+            set_index,
+            data,
+            preconditions,
+            writable_pool_indices,
+        )
+        .await
+        .map(|_| ())
     }
 
     #[cfg(test)]
@@ -567,6 +656,10 @@ mod tests {
             false
         }
 
+        async fn scanner_data_movement_publication_blocked(&self) -> bool {
+            false
+        }
+
         async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus {
             ScannerDataMovementPauseStatus::default()
         }
@@ -610,12 +703,13 @@ mod tests {
             Vec::new()
         }
 
-        async fn save_scanner_pause_backlog_replica(
+        async fn save_scanner_pause_backlog_replica_for_membership(
             self: Arc<Self>,
             _pool_index: usize,
             _set_index: usize,
             _data: Vec<u8>,
             _preconditions: storage_contracts::HTTPPreconditions,
+            _writable_pool_indices: Arc<[usize]>,
         ) -> EcstoreResultType<()> {
             Err(EcstoreErrorType::InvalidArgument(
                 "scanner-backlog".into(),

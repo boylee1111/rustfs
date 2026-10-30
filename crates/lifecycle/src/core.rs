@@ -241,7 +241,9 @@ impl RuleValidate for LifecycleRule {
             return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_DEL_MARKER_EXPIRATION_DAYS));
         }
         // Rule must have at least one action
-        let has_expiration = self.expiration.is_some();
+        let has_expiration = self.expiration.as_ref().is_some_and(|expiration| {
+            expiration.days.is_some() || expiration.date.is_some() || expiration.expired_object_delete_marker.is_some()
+        });
         let has_transition = self.transitions.as_ref().is_some_and(|t| !t.is_empty());
         // `NewerNoncurrentVersions` on its own is a MinIO extension, not an AWS
         // form: it keeps the newest N noncurrent versions and expires the rest
@@ -646,7 +648,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
     async fn eval(&self, obj: &ObjectOpts) -> Event {
         // A single-object lookup cannot prove how many newer historical versions
         // survive. Count-dependent actions wait for the complete-group evaluator.
-        self.eval_inner(obj, OffsetDateTime::now_utc(), 0).await
+        let mut event = self.eval_inner(obj, OffsetDateTime::now_utc(), 0).await;
+        if event.requires_expiry_policy() {
+            event.expiry_policy = Some(Arc::new(self.clone()).into());
+        }
+        event
     }
 
     async fn predict_expiration(&self, obj: &ObjectOpts) -> Event {
@@ -685,6 +691,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 noncurrent_days: 0,
                 newer_noncurrent_versions: 0,
                 storage_class: "".into(),
+                expiry_policy: None,
             };
             let predicted_due = predicted.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp();
             let should_replace = event
@@ -747,6 +754,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 noncurrent_days: 0,
                                 newer_noncurrent_versions: 0,
                                 storage_class: "".into(),
+                                expiry_policy: None,
                             });
                             // Stop after scheduling an expired delete-marker event.
                             break;
@@ -762,6 +770,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 noncurrent_days: 0,
                                 newer_noncurrent_versions: 0,
                                 storage_class: "".into(),
+                                expiry_policy: None,
                             });
                         }
                     }
@@ -781,6 +790,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             noncurrent_days: 0,
                             newer_noncurrent_versions: 0,
                             storage_class: "".into(),
+                            expiry_policy: None,
                         });
                     }
                     continue;
@@ -810,6 +820,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 noncurrent_days: 0,
                                 newer_noncurrent_versions: 0,
                                 storage_class: "".into(),
+                                expiry_policy: None,
                             });
                         }
                     } else {
@@ -875,6 +886,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                     noncurrent_days: 0,
                                     newer_noncurrent_versions: 0,
                                     storage_class: "".into(),
+                                    expiry_policy: None,
                                 });
                             }
                         } else if let Some(days) = expiration.days {
@@ -896,6 +908,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                     noncurrent_days: 0,
                                     newer_noncurrent_versions: 0,
                                     storage_class: "".into(),
+                                    expiry_policy: None,
                                 };
                                 // MinIO extension: ExpiredObjectAllVersions deletes all versions
                                 if rule
@@ -933,6 +946,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 rule_id: rule.id.clone().unwrap_or_default(),
                                 due,
                                 storage_class: storage_class.as_str().to_string(),
+                                expiry_policy: None,
                                 noncurrent_days: 0,
                                 newer_noncurrent_versions: 0,
                             });
@@ -981,6 +995,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             newer_noncurrent_versions: retained,
                             due: Some(OffsetDateTime::UNIX_EPOCH),
                             storage_class: "".into(),
+                            expiry_policy: Some(Arc::clone(&self).into()),
                         }
                     } else {
                         Event {
@@ -991,6 +1006,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             newer_noncurrent_versions: 0,
                             due: Some(OffsetDateTime::UNIX_EPOCH),
                             storage_class: "".into(),
+                            expiry_policy: Some(Arc::clone(&self).into()),
                         }
                     };
                 }
@@ -1282,7 +1298,27 @@ fn ilm_action_priority_rank(action: &IlmAction) -> u8 {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Immutable policy identity carried from lifecycle evaluation to deletion.
+/// Consumers can compare authoritative metadata without exposing the policy's
+/// wire representation in storage operation options. Clones share the policy.
+#[derive(Clone)]
+pub struct ExpiryPolicySnapshot {
+    configuration: Arc<BucketLifecycleConfiguration>,
+}
+
+impl From<Arc<BucketLifecycleConfiguration>> for ExpiryPolicySnapshot {
+    fn from(configuration: Arc<BucketLifecycleConfiguration>) -> Self {
+        Self { configuration }
+    }
+}
+
+impl ExpiryPolicySnapshot {
+    pub fn matches_configuration(&self, current: Option<&BucketLifecycleConfiguration>) -> bool {
+        current == Some(self.configuration.as_ref())
+    }
+}
+
+#[derive(Clone)]
 pub struct Event {
     pub action: IlmAction,
     pub rule_id: String,
@@ -1290,6 +1326,35 @@ pub struct Event {
     pub noncurrent_days: u32,
     pub newer_noncurrent_versions: usize,
     pub storage_class: String,
+    /// In-memory policy that authorized logical expiration. Execution must
+    /// compare it with authoritative bucket metadata under the transaction lock.
+    pub expiry_policy: Option<ExpiryPolicySnapshot>,
+}
+
+impl Event {
+    pub fn requires_expiry_policy(&self) -> bool {
+        matches!(
+            self.action,
+            IlmAction::DeleteAction
+                | IlmAction::DeleteVersionAction
+                | IlmAction::DeleteAllVersionsAction
+                | IlmAction::DelMarkerDeleteAllVersionsAction
+        )
+    }
+}
+
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Event")
+            .field("action", &self.action)
+            .field("rule_id", &self.rule_id)
+            .field("due", &self.due)
+            .field("noncurrent_days", &self.noncurrent_days)
+            .field("newer_noncurrent_versions", &self.newer_noncurrent_versions)
+            .field("storage_class", &self.storage_class)
+            .field("has_expiry_policy", &self.expiry_policy.is_some())
+            .finish()
+    }
 }
 
 impl Default for Event {
@@ -1301,6 +1366,7 @@ impl Default for Event {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: "".into(),
+            expiry_policy: None,
         }
     }
 }
@@ -4453,6 +4519,19 @@ mod tests {
             .validate(&ObjectLockConfiguration::default())
             .await
             .expect_err("a negative retention count on a transition must be rejected");
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_empty_expiration_action() {
+        let mut rule = rule_with_filter(LifecycleRuleFilter::default());
+        rule.expiration = Some(LifecycleExpiration::default());
+
+        let err = config_with_rules(vec![rule])
+            .validate(&ObjectLockConfiguration::default())
+            .await
+            .expect_err("an empty Expiration object must not count as an action");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_RULE_MUST_HAVE_ACTION);
     }
 
     #[tokio::test]

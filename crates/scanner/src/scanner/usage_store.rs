@@ -15,6 +15,9 @@
 use super::*;
 use crate::data_usage_define::usage_floor_primary_read_error_allows_backup;
 use crate::storage_api::owner::ScannerPublicationCommitState;
+use rustfs_scanner_metrics::metrics::{
+    ScannerUsagePublicationClass, ScannerUsagePublicationOutcome, ScannerUsagePublicationStatus,
+};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
@@ -53,11 +56,16 @@ impl RootPublicationProof {
 pub(super) struct DataUsagePublicationResult {
     outcome: DataUsagePersistOutcome,
     proof: Option<RootPublicationProof>,
+    observation: Option<ScannerUsagePublicationStatus>,
 }
 
 impl From<DataUsagePersistOutcome> for DataUsagePublicationResult {
     fn from(outcome: DataUsagePersistOutcome) -> Self {
-        Self { outcome, proof: None }
+        Self {
+            outcome,
+            proof: None,
+            observation: None,
+        }
     }
 }
 
@@ -68,12 +76,237 @@ impl DataUsagePublicationResult {
     pub(super) fn restrict_outcome(&mut self, outcome: DataUsagePersistOutcome) {
         if outcome != self.outcome {
             self.proof = None;
+            self.observation = None;
         }
         self.outcome = outcome;
     }
     pub(super) fn into_parts(self) -> (DataUsagePersistOutcome, Option<RootPublicationProof>) {
         (self.outcome, self.proof)
     }
+
+    #[cfg(feature = "e2e-test-hooks")]
+    pub(super) fn e2e_durable_observation(
+        &self,
+        epoch: u64,
+        cycle: u64,
+        expected: &crate::scanner_io::ScannerPublicationExpectation,
+    ) -> Option<serde_json::Value> {
+        let outcome = match self.outcome {
+            DataUsagePersistOutcome::Saved => "saved",
+            DataUsagePersistOutcome::AlreadyDurable => "already_durable",
+            _ => return None,
+        };
+        let (root_version, root_digest) = self.proof.as_ref()?.verified_version_for(expected)?;
+        let (candidate_digest, coverage_digest) = expected.e2e_digests();
+        Some(serde_json::json!({
+            "epoch": epoch, "cycle": cycle, "outcome": outcome,
+            "candidate_sha256": candidate_digest, "coverage_sha256": coverage_digest,
+            "root_version": root_version, "root_sha256": crate::e2e_barrier::hex(root_digest),
+        }))
+    }
+
+    pub(super) fn observation_for_attempt(
+        &self,
+        scanner_epoch: u64,
+        cycle: u64,
+        progress_only: bool,
+        final_outcome: DataUsagePersistOutcome,
+    ) -> ScannerUsagePublicationStatus {
+        let outcome = match final_outcome {
+            DataUsagePersistOutcome::NoUpdate => ScannerUsagePublicationOutcome::NoUpdate,
+            DataUsagePersistOutcome::Current => ScannerUsagePublicationOutcome::Current,
+            DataUsagePersistOutcome::AlreadyDurable => ScannerUsagePublicationOutcome::AlreadyDurable,
+            DataUsagePersistOutcome::PriorCycleDurable => ScannerUsagePublicationOutcome::PriorCycleDurable,
+            DataUsagePersistOutcome::Saved => ScannerUsagePublicationOutcome::Saved,
+            DataUsagePersistOutcome::Deferred(_) => ScannerUsagePublicationOutcome::Deferred,
+            DataUsagePersistOutcome::Failed => ScannerUsagePublicationOutcome::Failed,
+        };
+        let mut status = ScannerUsagePublicationStatus {
+            scanner_epoch: Some(scanner_epoch),
+            cycle: Some(cycle),
+            outcome,
+            ..Default::default()
+        };
+        if final_outcome != self.outcome {
+            return status;
+        }
+        match final_outcome {
+            DataUsagePersistOutcome::NoUpdate if progress_only => status.class = ScannerUsagePublicationClass::ProgressOnly,
+            DataUsagePersistOutcome::Saved
+            | DataUsagePersistOutcome::AlreadyDurable
+            | DataUsagePersistOutcome::PriorCycleDurable => {
+                if let Some(observation) = &self.observation
+                    && observation.scanner_epoch == status.scanner_epoch
+                    && observation.cycle == status.cycle
+                {
+                    status = observation.clone();
+                    status.outcome = outcome;
+                }
+            }
+            _ => {}
+        }
+        status
+    }
+}
+
+/// Project only the bytes confirmed by this writer/read, without granting ACK or repair proof.
+fn usage_snapshot_observation(info: &DataUsageInfo) -> ScannerUsagePublicationStatus {
+    let mut status = ScannerUsagePublicationStatus {
+        scanner_epoch: info.scanner_epoch,
+        cycle: info.scanner_cycle,
+        snapshot_updated_at_unix_secs: info
+            .last_update
+            .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs()),
+        ..Default::default()
+    };
+    if status.scanner_epoch.is_none() || status.cycle.is_none() || status.snapshot_updated_at_unix_secs.is_none() {
+        return status;
+    }
+    let pending = info.usage_snapshot_pending_bucket_count;
+    if info.usage_snapshot_observational {
+        if info.usage_snapshot_converged == Some(false)
+            && pending == 0
+            && info.usage_snapshot_pending_buckets.is_empty()
+            && ((info.is_complete_bucket_usage_snapshot() && !info.usage_snapshot_partial)
+                || (info.is_valid_partial_snapshot() && !info.usage_snapshot_complete))
+        {
+            status.class = ScannerUsagePublicationClass::Observational;
+        }
+        return status;
+    }
+    if !info.is_complete_bucket_usage_snapshot()
+        || info.usage_snapshot_partial
+        || u64::try_from(info.usage_snapshot_pending_buckets.len()).ok() != Some(pending)
+        || !info.usage_snapshot_pending_buckets.windows(2).all(|pair| pair[0] < pair[1])
+    {
+        return status;
+    }
+    status.class = match (info.usage_snapshot_converged, pending) {
+        (Some(true), 0) => ScannerUsagePublicationClass::CompleteConverged,
+        (Some(false), 1..) => ScannerUsagePublicationClass::CompletePending,
+        _ => return status,
+    };
+    status.pending_bucket_count = Some(pending);
+    status
+}
+
+#[cfg(test)]
+mod publication_observation_tests {
+    use super::*;
+
+    fn converged_snapshot() -> DataUsageInfo {
+        DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            scanner_epoch: Some(8),
+            scanner_cycle: Some(12),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(true),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn publication_observation_distinguishes_snapshot_classes_and_unknown_counts() {
+        let mut info = converged_snapshot();
+        let converged = usage_snapshot_observation(&info);
+        assert_eq!(converged.class, ScannerUsagePublicationClass::CompleteConverged);
+        assert_eq!(converged.pending_bucket_count, Some(0));
+        assert_eq!(converged.snapshot_updated_at_unix_secs, Some(20));
+
+        info.usage_snapshot_converged = Some(false);
+        info.usage_snapshot_pending_buckets = vec!["new-a".into(), "new-b".into()];
+        info.usage_snapshot_pending_bucket_count = 2;
+        let pending = usage_snapshot_observation(&info);
+        assert_eq!(pending.class, ScannerUsagePublicationClass::CompletePending);
+        assert_eq!(pending.pending_bucket_count, Some(2));
+
+        info.usage_snapshot_pending_bucket_count = 0;
+        assert_eq!(
+            usage_snapshot_observation(&info).pending_bucket_count,
+            None,
+            "inconsistent count is unknown"
+        );
+        info.usage_snapshot_pending_buckets.clear();
+        assert_eq!(usage_snapshot_observation(&info).class, ScannerUsagePublicationClass::Unknown);
+        info.usage_snapshot_observational = true;
+        let observed = usage_snapshot_observation(&info);
+        assert_eq!(observed.class, ScannerUsagePublicationClass::Observational);
+        assert_eq!(observed.pending_bucket_count, None, "observational zero is not a backlog measurement");
+        info.usage_snapshot_partial = true;
+        assert_eq!(usage_snapshot_observation(&info).class, ScannerUsagePublicationClass::Unknown);
+        info.usage_snapshot_partial = false;
+
+        info.usage_snapshot_observational = false;
+        info.usage_snapshot_converged = None;
+        assert_eq!(usage_snapshot_observation(&info).class, ScannerUsagePublicationClass::Unknown);
+        assert_eq!(usage_snapshot_observation(&info).pending_bucket_count, None);
+        assert_eq!(usage_snapshot_observation(&DataUsageInfo::default()).pending_bucket_count, None);
+
+        let progress = DataUsagePublicationResult::from(DataUsagePersistOutcome::NoUpdate).observation_for_attempt(
+            8,
+            12,
+            true,
+            DataUsagePersistOutcome::NoUpdate,
+        );
+        assert_eq!(progress.class, ScannerUsagePublicationClass::ProgressOnly);
+        assert_eq!(progress.pending_bucket_count, None);
+    }
+
+    #[test]
+    fn publication_observation_is_revoked_by_final_fence_or_failed_attempt() {
+        let mut publication = DataUsagePublicationResult {
+            outcome: DataUsagePersistOutcome::Saved,
+            proof: None,
+            observation: Some(usage_snapshot_observation(&converged_snapshot())),
+        };
+        let saved = publication.observation_for_attempt(8, 12, false, DataUsagePersistOutcome::Saved);
+        assert_eq!(saved.pending_bucket_count, Some(0));
+        let another_cycle = publication.observation_for_attempt(8, 13, false, DataUsagePersistOutcome::Saved);
+        assert_eq!(another_cycle.class, ScannerUsagePublicationClass::Unknown);
+        assert_eq!(another_cycle.pending_bucket_count, None);
+        let deferred = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseReleaseFailed);
+        let fenced = publication.observation_for_attempt(8, 12, false, deferred);
+        assert_eq!(fenced.outcome, ScannerUsagePublicationOutcome::Deferred);
+        assert_eq!(fenced.class, ScannerUsagePublicationClass::Unknown);
+        assert_eq!(fenced.pending_bucket_count, None);
+        publication.restrict_outcome(deferred);
+        assert!(publication.observation.is_none());
+        assert_eq!(
+            publication
+                .observation_for_attempt(8, 12, false, deferred)
+                .pending_bucket_count,
+            None
+        );
+
+        for outcome in [
+            DataUsagePersistOutcome::Failed,
+            DataUsagePersistOutcome::Current,
+            DataUsagePersistOutcome::NoUpdate,
+        ] {
+            let status = DataUsagePublicationResult::from(outcome).observation_for_attempt(8, 12, false, outcome);
+            assert_eq!(status.class, ScannerUsagePublicationClass::Unknown);
+            assert_eq!(status.pending_bucket_count, None);
+        }
+    }
+}
+
+fn root_write_publication_proof(
+    outcome: DataUsagePersistOutcome,
+    write_confirmed: bool,
+    written_etag: Option<&str>,
+    expected: &crate::scanner_io::ScannerPublicationExpectation,
+    data_digest: &[u8; 32],
+) -> Option<RootPublicationProof> {
+    if outcome != DataUsagePersistOutcome::Saved || !write_confirmed || !expected.matches_encoded_candidate(data_digest) {
+        return None;
+    }
+
+    let etag = written_etag.filter(|etag| !etag.is_empty())?;
+    Some(RootPublicationProof {
+        candidate: expected.clone(),
+        root_version: (etag.to_string(), *data_digest),
+    })
 }
 
 fn root_ack_write_is_confirmed<T, E>(
@@ -123,6 +356,52 @@ mod root_publication_confirmation_tests {
             .map(|(result, state, etag)| root_ack_write_is_confirmed(result, *state, *etag))
             .collect::<Vec<_>>();
         assert_eq!(confirmations, [false, false, false, true]);
+    }
+}
+
+#[cfg(test)]
+mod root_write_publication_proof_tests {
+    use super::*;
+
+    fn expectation_for(info: &DataUsageInfo) -> crate::scanner_io::ScannerPublicationExpectation {
+        let data = serde_json::to_vec(info).expect("usage info should encode");
+        crate::scanner_io::ScannerPublicationExpectation::for_tests(
+            Sha256::digest(data).into(),
+            crate::data_usage_define::DataUsageScanPlanDigest([7; 32]),
+        )
+    }
+
+    #[test]
+    fn root_write_publication_proof_requires_committed_root_write_identity() {
+        let info = DataUsageInfo {
+            scanner_cycle: Some(11),
+            scanner_epoch: Some(7),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        let expected = expectation_for(&info);
+        let data = serde_json::to_vec(&info).expect("usage info should encode");
+        let digest: [u8; 32] = Sha256::digest(&data).into();
+        let stale_digest = Sha256::digest(b"stale").into();
+
+        assert!(
+            root_write_publication_proof(DataUsagePersistOutcome::AlreadyDurable, true, Some("etag"), &expected, &digest)
+                .is_none()
+        );
+        assert!(root_write_publication_proof(DataUsagePersistOutcome::Saved, false, Some("etag"), &expected, &digest).is_none());
+        assert!(root_write_publication_proof(DataUsagePersistOutcome::Saved, true, None, &expected, &digest).is_none());
+        assert!(root_write_publication_proof(DataUsagePersistOutcome::Saved, true, Some(""), &expected, &digest).is_none());
+        assert!(
+            root_write_publication_proof(DataUsagePersistOutcome::Saved, true, Some("etag"), &expected, &stale_digest).is_none()
+        );
+
+        let proof = root_write_publication_proof(DataUsagePersistOutcome::Saved, true, Some("etag"), &expected, &digest)
+            .expect("a confirmed root CAS write should prove its own candidate");
+        let (etag, raw_digest) = proof
+            .verified_version_for(&expected)
+            .expect("proof should bind the expected candidate");
+        assert_eq!(etag, "etag");
+        assert_eq!(*raw_digest, digest);
     }
 }
 
@@ -490,10 +769,12 @@ where
     let ack_deadline = scanner_publication_scope_deadline(data_usage_persist_timeout(), remote_lease_deadline);
     let mut outcome = DataUsagePersistOutcome::NoUpdate;
     let mut proof = None;
+    let mut observation = None;
     let mut next_baseline = initial_baseline;
 
     'updates: while let Some(mut data_usage_info) = receiver.recv().await {
         proof = None;
+        observation = None;
         let _activity_guard = ScannerActivityGuard::new();
         if ctx.is_cancelled() {
             break;
@@ -513,7 +794,10 @@ where
             outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
             break 'updates;
         }
-        let observational = data_usage_info.usage_snapshot_converged == Some(false);
+        // Routing keys on the explicit producer mark, not on convergence: a
+        // `Complete` cycle with pending buckets is authoritative but not
+        // converged, while a vetoed cycle is observational.
+        let observational = data_usage_info.usage_snapshot_observational;
         let target_path = if observational {
             DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()
         } else {
@@ -706,6 +990,8 @@ where
             } else {
                 None
             };
+            // An initial baseline can be a companion or an old primary; it is not a current target observation.
+            let read_target = baseline.is_none();
             ack_epoch = Some(publication_epoch_for_save);
             let (existing_data, revision) = match baseline {
                 Some(baseline) => (baseline.data, baseline.revision),
@@ -729,6 +1015,7 @@ where
             let existing = existing_data
                 .as_deref()
                 .and_then(|buf| serde_json::from_slice::<DataUsageInfo>(buf).ok());
+            let read_target = read_target && matches!(&revision, DataUsageCacheRevision::Etag(etag) if !etag.is_empty());
             if cas_retry > 0 && data_usage_reintroduces_missing_bucket(&data_usage_info, existing.as_ref()) {
                 debug!(
                     target: "rustfs::scanner",
@@ -745,6 +1032,9 @@ where
             }
             if let Some(existing) = existing.as_ref() {
                 if existing == &data_usage_info {
+                    if read_target {
+                        observation = Some(usage_snapshot_observation(existing));
+                    }
                     break DataUsagePersistOutcome::AlreadyDurable;
                 }
                 if existing.scanner_epoch.is_some()
@@ -752,6 +1042,10 @@ where
                     && existing.scanner_cycle.is_some()
                     && existing.scanner_cycle == data_usage_info.scanner_cycle
                 {
+                    // The cycle identity matches, but its pending set and payload can differ from this retry.
+                    if read_target {
+                        observation = Some(usage_snapshot_observation(existing));
+                    }
                     break DataUsagePersistOutcome::PriorCycleDurable;
                 }
                 if let Some(reason) = stale_data_usage_update_reason(&data_usage_info, existing, std::time::SystemTime::now()) {
@@ -794,6 +1088,23 @@ where
                 break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded);
             }
 
+            #[cfg(feature = "e2e-test-hooks")]
+            if !observational
+                && target_path == DATA_USAGE_OBJ_NAME_PATH.as_str()
+                && let (Some(expected), Some(epoch), Some(cycle)) =
+                    (ack_expectation.as_ref(), data_usage_info.scanner_epoch, data_usage_info.scanner_cycle)
+                && expected.matches_encoded_candidate(&data_digest)
+            {
+                let (candidate_digest, coverage_digest) = expected.e2e_digests();
+                let _ = crate::e2e_barrier::checkpoint(
+                    "root_before_publish",
+                    serde_json::json!({
+                        "epoch": epoch, "cycle": cycle,
+                        "candidate_sha256": candidate_digest, "coverage_sha256": coverage_digest,
+                    }),
+                )
+                .await;
+            }
             let done_save = Metrics::time(Metric::SaveUsage);
             let (save_result, commit_state) = {
                 let publication_scope = storeapi
@@ -857,6 +1168,9 @@ where
             match save_result {
                 Ok(object_info) => {
                     write_confirmed = attempt_confirmed;
+                    if write_confirmed {
+                        observation = Some(usage_snapshot_observation(&data_usage_info));
+                    }
                     written_etag = object_info.etag.as_ref().filter(|etag| !etag.is_empty()).cloned();
                     if !observational {
                         next_baseline = object_info
@@ -1033,6 +1347,16 @@ where
                 global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
                 global_metrics().record_scanner_usage_durable_success();
                 outcome = DataUsagePersistOutcome::Saved;
+                debug!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "saved",
+                    snapshot_kind = if observational { "observed" } else { "authoritative" },
+                    cycle = ?data_usage_info.scanner_cycle,
+                    "Scanner usage snapshot saved"
+                );
             }
         }
 
@@ -1069,7 +1393,6 @@ where
             }
         }
         if !observational
-            && data_usage_info.usage_snapshot_converged == Some(true)
             && matches!(outcome, DataUsagePersistOutcome::Saved | DataUsagePersistOutcome::AlreadyDurable)
             && (outcome == DataUsagePersistOutcome::AlreadyDurable || write_confirmed)
             && let (Some(expected), Some(epoch)) = (ack_expectation.as_ref(), ack_epoch)
@@ -1085,10 +1408,26 @@ where
                 written_etag.as_deref(),
             )
             .await;
+            if proof.is_none() {
+                proof = root_write_publication_proof(outcome, write_confirmed, written_etag.as_deref(), expected, &data_digest);
+            }
+            if outcome == DataUsagePersistOutcome::AlreadyDurable {
+                observation = proof.as_ref().map(|_| usage_snapshot_observation(&data_usage_info));
+            }
         }
     }
 
-    DataUsagePublicationResult { outcome, proof }
+    if !matches!(
+        outcome,
+        DataUsagePersistOutcome::Saved | DataUsagePersistOutcome::AlreadyDurable | DataUsagePersistOutcome::PriorCycleDurable
+    ) {
+        observation = None;
+    }
+    DataUsagePublicationResult {
+        outcome,
+        proof,
+        observation,
+    }
 }
 
 async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(

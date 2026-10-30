@@ -24,6 +24,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+/// Copy an existing cache-model value without including surrounding work.
+#[inline]
+pub fn clone_cache_value<T: ToOwned + ?Sized>(source: &T) -> T::Owned {
+    #[cfg(feature = "hotpath-alloc")]
+    let _copy_scope = hotpath::MeasurementGuardSync::new("cache_model.owned_copy", false, false);
+    source.to_owned()
+}
+
 /// Maximum amount a persisted `last_update` may lead the local wall clock before the
 /// persisted timestamp is treated as untrustworthy.
 ///
@@ -342,7 +350,7 @@ impl UnknownTierStats {
                     self.diagnostics_dropped = checked_saturating_add(1, self.diagnostics_dropped, &mut self.counter_overflowed);
                     continue;
                 }
-                self.diagnostics.push(diagnostic.clone());
+                self.diagnostics.push(clone_cache_value(diagnostic));
             }
         }
         if !self.diagnostics.is_empty() {
@@ -367,7 +375,7 @@ impl UnknownTierStats {
         if !self.fits_add(other) {
             return None;
         }
-        let mut merged = self.clone();
+        let mut merged = clone_cache_value(self);
         merged.merge(other);
         Some(merged)
     }
@@ -407,7 +415,7 @@ impl AllTierStats {
             if st.is_empty() {
                 continue;
             }
-            let entry = self.tiers.entry(tier.clone()).or_default();
+            let entry = self.tiers.entry(clone_cache_value(tier)).or_default();
             *entry = entry.add(st);
         }
     }
@@ -437,7 +445,7 @@ impl AllTierStats {
             .tiers
             .keys()
             .filter(|tier| tier.as_str() != "STANDARD" && tier.as_str() != "REDUCED_REDUNDANCY" && !known.contains(tier.as_str()))
-            .cloned()
+            .map(clone_cache_value)
             .collect();
         for tier in retired_tiers {
             if let Some(stats) = self.tiers.remove(&tier) {
@@ -466,6 +474,9 @@ pub struct BucketTargetUsageInfo {
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BucketUsageInfo {
     pub size: u64,
+    /// Bucket identity certified by every set contributing to this snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_incarnation: Option<String>,
     // Following five fields suffixed with V1 are here for backward compatibility
     // Total Size for objects that have not yet been replicated
     pub replication_pending_size_v1: u64,
@@ -569,6 +580,25 @@ pub struct DataUsageInfo {
     /// which last-known-good generation contributed to the view.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub usage_snapshot_set_states: Vec<DataUsageSnapshotSetState>,
+    /// Buckets whose dirty-usage generation moved while this complete
+    /// snapshot was being walked. Their `buckets_usage` values are the walk
+    /// result, which the cycle could not certify as current; the next cycle
+    /// rescans them. Sorted. Empty on a converged snapshot and on an
+    /// observational one. A bucket created during the walk may be listed
+    /// here without a `buckets_usage` entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_snapshot_pending_buckets: Vec<String>,
+    /// Length of `usage_snapshot_pending_buckets`, carried for readers that
+    /// only need the count. The scanner writes both from one set.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub usage_snapshot_pending_bucket_count: u64,
+    /// Set by the scanner on a snapshot whose authoritative publication was
+    /// vetoed or could not be verified. It is routed to the observed object
+    /// and never replaces the authoritative snapshot. Absent on snapshots
+    /// written before per-bucket certification, which keep
+    /// `usage_snapshot_converged == Some(false)` as their observed marker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_snapshot_observational: bool,
     /// An observational view may contain only the sets that completed this
     /// cycle (or retained a compatible last-known-good cache).
     #[serde(default)]
@@ -582,6 +612,10 @@ pub struct DataUsageInfo {
     /// Per-disk snapshot information when available
     #[serde(default)]
     pub disk_usage_status: Vec<DiskUsageStatus>,
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Stable identity fields changed by both coordinated scanner publication and
@@ -1211,10 +1245,10 @@ impl DataUsageEntry {
     }
 
     pub fn add_child(&mut self, hash: &DataUsageHash) {
-        if self.children.contains(&hash.key()) {
+        if self.children.contains(&clone_cache_value(&hash.0)) {
             return;
         }
-        self.children.insert(hash.key());
+        self.children.insert(clone_cache_value(&hash.0));
     }
 
     pub fn merge(&mut self, other: &DataUsageEntry) {
@@ -1231,7 +1265,7 @@ impl DataUsageEntry {
             s_rep.replica_size += o_rep.replica_size;
             s_rep.replica_count += o_rep.replica_count;
             for (arn, stat) in o_rep.targets.iter() {
-                let st = s_rep.targets.entry(arn.clone()).or_default();
+                let st = s_rep.targets.entry(clone_cache_value(arn)).or_default();
                 st.pending_size += stat.pending_size;
                 st.replicated_size += stat.replicated_size;
                 st.failed_size += stat.failed_size;
@@ -1425,7 +1459,7 @@ pub fn prefix_usage_in_cache(
     } else {
         format!("{bucket}/{prefix}")
     };
-    let entry = cache.get(&hash_path(&root).key())?.clone();
+    let entry = clone_cache_value(cache.get(&clone_cache_value(&hash_path(&root).0))?);
 
     let usage = PrefixUsageSummary::from_entry(&flatten_entry(cache, &entry, 0)?);
 
@@ -1568,38 +1602,38 @@ pub struct DataUsageCache {
 impl DataUsageCache {
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {
         let hash = hash_path(path);
-        self.cache.insert(hash.key(), e);
+        self.cache.insert(clone_cache_value(&hash.0), e);
         if !parent.is_empty() {
             let phash = hash_path(parent);
             let p = {
-                let p = self.cache.entry(phash.key()).or_default();
+                let p = self.cache.entry(clone_cache_value(&phash.0)).or_default();
                 p.add_child(&hash);
-                p.clone()
+                clone_cache_value(p)
             };
-            self.cache.insert(phash.key(), p);
+            self.cache.insert(clone_cache_value(&phash.0), p);
         }
     }
 
     pub fn replace_hashed(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>, e: &DataUsageEntry) {
-        self.cache.insert(hash.key(), e.clone());
+        self.cache.insert(clone_cache_value(&hash.0), clone_cache_value(e));
         if let Some(parent) = parent {
-            self.cache.entry(parent.key()).or_default().add_child(hash);
+            self.cache.entry(clone_cache_value(&parent.0)).or_default().add_child(hash);
         }
     }
 
     pub fn find(&self, path: &str) -> Option<DataUsageEntry> {
-        self.cache.get(&hash_path(path).key()).cloned()
+        self.cache.get(&clone_cache_value(&hash_path(path).0)).map(clone_cache_value)
     }
 
     pub fn find_children_copy(&mut self, h: DataUsageHash) -> DataUsageHashMap {
-        self.cache.entry(h.string()).or_default().children.clone()
+        clone_cache_value(&self.cache.entry(clone_cache_value(&h.0)).or_default().children)
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
-        let mut root = root.clone();
-        for id in root.children.clone().iter() {
+        let mut root = clone_cache_value(root);
+        for id in clone_cache_value(&root.children).iter() {
             if let Some(e) = self.cache.get(id) {
-                let mut e = e.clone();
+                let mut e = clone_cache_value(e);
                 if !e.children.is_empty() {
                     e = self.flatten(&e);
                 }
@@ -1611,16 +1645,16 @@ impl DataUsageCache {
     }
 
     pub fn copy_with_children(&mut self, src: &DataUsageCache, hash: &DataUsageHash, parent: &Option<DataUsageHash>) {
-        if let Some(e) = src.cache.get(&hash.string()) {
-            self.cache.insert(hash.key(), e.clone());
+        if let Some(e) = src.cache.get(&clone_cache_value(&hash.0)) {
+            self.cache.insert(clone_cache_value(&hash.0), clone_cache_value(e));
             for ch in e.children.iter() {
-                if *ch == hash.key() {
+                if *ch == clone_cache_value(&hash.0) {
                     return;
                 }
-                self.copy_with_children(src, &DataUsageHash(ch.to_string()), &Some(hash.clone()));
+                self.copy_with_children(src, &DataUsageHash(clone_cache_value(ch)), &Some(clone_cache_value(hash)));
             }
             if let Some(parent) = parent {
-                let p = self.cache.entry(parent.key()).or_default();
+                let p = self.cache.entry(clone_cache_value(&parent.0)).or_default();
                 p.add_child(hash);
             }
         }
@@ -1628,14 +1662,14 @@ impl DataUsageCache {
 
     pub fn delete_recursive(&mut self, hash: &DataUsageHash) {
         let mut need_remove = Vec::new();
-        if let Some(v) = self.cache.get(&hash.string()) {
+        if let Some(v) = self.cache.get(&clone_cache_value(&hash.0)) {
             for child in v.children.iter() {
-                need_remove.push(child.clone());
+                need_remove.push(clone_cache_value(child));
             }
         }
-        self.cache.remove(&hash.string());
+        self.cache.remove(&clone_cache_value(&hash.0));
         need_remove.iter().for_each(|child| {
-            self.delete_recursive(&DataUsageHash(child.to_string()));
+            self.delete_recursive(&DataUsageHash(clone_cache_value(child)));
         });
     }
 
@@ -1656,7 +1690,7 @@ impl DataUsageCache {
     }
 
     pub fn search_parent(&self, hash: &DataUsageHash) -> Option<DataUsageHash> {
-        let want = hash.key();
+        let want = clone_cache_value(&hash.0);
         if let Some(last_index) = want.rfind('/')
             && let Some(v) = self.find(&want[0..last_index])
             && v.children.contains(&want)
@@ -1667,7 +1701,7 @@ impl DataUsageCache {
 
         for (k, v) in self.cache.iter() {
             if v.children.contains(&want) {
-                let found = DataUsageHash(k.clone());
+                let found = DataUsageHash(clone_cache_value(k));
                 return Some(found);
             }
         }
@@ -1675,7 +1709,7 @@ impl DataUsageCache {
     }
 
     pub fn is_compacted(&self, hash: &DataUsageHash) -> bool {
-        match self.cache.get(&hash.key()) {
+        match self.cache.get(&clone_cache_value(&hash.0)) {
             Some(due) => due.compacted,
             None => false,
         }
@@ -1700,7 +1734,7 @@ impl DataUsageCache {
         if self.cache.len() < limit {
             return;
         }
-        let top = hash_path(&self.info.name).key();
+        let top = clone_cache_value(&hash_path(&self.info.name).0);
         let top_e = match self.find(&top) {
             Some(e) => e,
             None => return,
@@ -1727,7 +1761,7 @@ impl DataUsageCache {
     }
 
     pub fn reduce_children_of(&mut self, path: &DataUsageHash, limit: usize, compact_self: bool) {
-        let e = match self.cache.get(&path.key()) {
+        let e = match self.cache.get(&clone_cache_value(&path.0)) {
             Some(e) => e,
             None => return,
         };
@@ -1737,13 +1771,13 @@ impl DataUsageCache {
         }
 
         if e.children.len() > limit && compact_self {
-            let mut flat = self.size_recursive(&path.key()).unwrap_or_default();
+            let mut flat = self.size_recursive(&clone_cache_value(&path.0)).unwrap_or_default();
             flat.compacted = true;
             self.delete_recursive(path);
             self.replace_hashed(path, &None, &flat);
             return;
         }
-        let total = self.total_children_rec(&path.key());
+        let total = self.total_children_rec(&clone_cache_value(&path.0));
         if total < limit {
             return;
         }
@@ -1756,12 +1790,12 @@ impl DataUsageCache {
         let mut candidate_index = 0;
         while remove > 0 && candidate_index < candidates.len() {
             let e = &candidates[candidate_index];
-            let candidate = e.path.clone();
+            let candidate = clone_cache_value(&e.path);
             if candidate == *path && !compact_self {
                 break;
             }
-            let removing = self.total_children_rec(&candidate.key());
-            let mut flat = match self.size_recursive(&candidate.key()) {
+            let removing = self.total_children_rec(&clone_cache_value(&candidate.0));
+            let mut flat = match self.size_recursive(&clone_cache_value(&candidate.0)) {
                 Some(flat) => flat,
                 None => {
                     candidate_index += 1;
@@ -1798,7 +1832,7 @@ impl DataUsageCache {
             if o.root().is_none() {
                 return;
             }
-            *self = o.clone();
+            *self = clone_cache_value(o);
             return;
         };
 
@@ -1811,7 +1845,8 @@ impl DataUsageCache {
         }
 
         existing_root.merge(&other_root);
-        self.cache.insert(hash_path(&self.info.name).key(), existing_root);
+        self.cache
+            .insert(clone_cache_value(&hash_path(&self.info.name).0), existing_root);
 
         let root_hash = self.root_hash();
         for key in other_root.children.iter() {
@@ -1822,7 +1857,7 @@ impl DataUsageCache {
             if let Some(existing) = self.cache.get_mut(key) {
                 existing.merge(&flat);
             } else {
-                self.replace_hashed(&DataUsageHash(key.clone()), &Some(root_hash.clone()), &flat);
+                self.replace_hashed(&DataUsageHash(clone_cache_value(key)), &Some(clone_cache_value(&root_hash)), &flat);
             }
         }
     }
@@ -1866,7 +1901,7 @@ impl DataUsageCache {
 
                 for (arn, stat) in rs.targets.iter() {
                     bui.replication_info.insert(
-                        arn.clone(),
+                        clone_cache_value(arn),
                         BucketTargetUsageInfo {
                             replication_pending_size: stat.pending_size,
                             replicated_size: stat.replicated_size,
@@ -1879,7 +1914,7 @@ impl DataUsageCache {
                     );
                 }
             }
-            buckets_usage.insert(bucket_name.clone(), bui);
+            buckets_usage.insert(clone_cache_value(bucket_name), bui);
         }
 
         DataUsageInfo {
@@ -1911,20 +1946,20 @@ struct Inner {
 }
 
 fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut Vec<Inner>) -> usize {
-    let e = match data_usage_cache.cache.get(&path.key()) {
+    let e = match data_usage_cache.cache.get(&clone_cache_value(&path.0)) {
         Some(e) => e,
         None => return 0,
     };
     let mut objects = e.objects;
     for ch in e.children.iter() {
-        objects += add(data_usage_cache, &DataUsageHash(ch.clone()), candidates);
+        objects += add(data_usage_cache, &DataUsageHash(clone_cache_value(ch)), candidates);
     }
     // Collect internal nodes (with children) as compaction candidates.
     // Leaf nodes have no children to remove, so compacting them is a no-op.
     if !e.children.is_empty() {
         candidates.push(Inner {
             objects,
-            path: path.clone(),
+            path: clone_cache_value(path),
         });
     }
     objects
@@ -1932,7 +1967,7 @@ fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut
 
 fn mark(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String>) {
     for k in entry.children.iter() {
-        found.insert(k.to_string());
+        found.insert(clone_cache_value(k));
         if let Some(ch) = duc.cache.get(k) {
             mark(duc, ch, found);
         }
@@ -2293,6 +2328,9 @@ impl BucketUsageInfo {
     /// Add size summary to this bucket usage
     /// Merge another BucketUsageInfo into this one
     pub fn merge(&mut self, other: &BucketUsageInfo) {
+        if self.bucket_incarnation != other.bucket_incarnation {
+            self.bucket_incarnation = None;
+        }
         self.size += other.size;
         self.objects_count += other.objects_count;
         self.versions_count += other.versions_count;
@@ -2379,11 +2417,11 @@ impl SizeSummary {
         }
 
         for entry in &other.size_reconciliation {
-            self.record_size_reconciliation(entry.clone());
+            self.record_size_reconciliation(clone_cache_value(entry));
         }
         self.size_reconciliation_truncated |= other.size_reconciliation_truncated;
         for scope in &other.reconciliation_scopes {
-            self.record_reconciliation_scope(&scope.bucket, &scope.object);
+            self.record_reconciliation_scope_with(&scope.bucket, &scope.object, || clone_cache_value(scope));
         }
     }
 
@@ -2408,6 +2446,13 @@ impl SizeSummary {
     /// Mark one object scope as refreshed. Duplicate scopes are suppressed so
     /// merging summaries remains bounded and deterministic.
     pub fn record_reconciliation_scope(&mut self, bucket: &str, object: &str) {
+        self.record_reconciliation_scope_with(bucket, object, || SizeReconciliationScope {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+        });
+    }
+
+    fn record_reconciliation_scope_with(&mut self, bucket: &str, object: &str, build: impl FnOnce() -> SizeReconciliationScope) {
         if !self
             .reconciliation_scopes
             .iter()
@@ -2417,10 +2462,7 @@ impl SizeSummary {
                 self.size_reconciliation_truncated = true;
                 return;
             }
-            self.reconciliation_scopes.push(SizeReconciliationScope {
-                bucket: bucket.to_string(),
-                object: object.to_string(),
-            });
+            self.reconciliation_scopes.push(build());
         }
     }
 }
@@ -3012,6 +3054,58 @@ mod tests {
     }
 
     #[test]
+    fn pending_bucket_certification_fields_round_trip_and_stay_additive() {
+        let certified = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_pending_buckets: vec!["hot-a".to_string(), "hot-b".to_string()],
+            usage_snapshot_pending_bucket_count: 2,
+            ..Default::default()
+        };
+        let encoded = rmp_serde::to_vec_named(&certified).expect("encode certified snapshot");
+        let decoded: DataUsageInfo = rmp_serde::from_slice(&encoded).expect("decode certified snapshot");
+        assert_eq!(decoded, certified);
+        assert!(!decoded.usage_snapshot_observational);
+        let legacy: LegacyUsageReader = rmp_serde::from_slice(&encoded).expect("legacy reader should ignore pending fields");
+        assert_eq!(legacy.buckets_count, 0);
+
+        let observed = DataUsageInfo {
+            usage_snapshot_observational: true,
+            ..certified
+        };
+        let encoded = rmp_serde::to_vec_named(&observed).expect("encode observed snapshot");
+        let decoded: DataUsageInfo = rmp_serde::from_slice(&encoded).expect("decode observed snapshot");
+        assert!(decoded.usage_snapshot_observational);
+
+        // Older snapshots carry none of the fields and decode to the defaults;
+        // a converged snapshot writes none of them (named encoding carries
+        // field names, so a skipped field leaves no trace in the bytes).
+        let converged = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(true),
+            ..Default::default()
+        };
+        let encoded = rmp_serde::to_vec_named(&converged).expect("encode converged snapshot");
+        for key in [
+            "usage_snapshot_pending_buckets",
+            "usage_snapshot_pending_bucket_count",
+            "usage_snapshot_observational",
+        ] {
+            assert!(
+                !encoded.windows(key.len()).any(|window| window == key.as_bytes()),
+                "{key} must be skipped when empty"
+            );
+        }
+        let decoded: DataUsageInfo = rmp_serde::from_slice(&encoded).expect("decode converged snapshot");
+        assert!(decoded.usage_snapshot_pending_buckets.is_empty());
+        assert_eq!(decoded.usage_snapshot_pending_bucket_count, 0);
+        assert!(!decoded.usage_snapshot_observational);
+        assert!(decoded.is_complete_bucket_usage_snapshot());
+    }
+
+    #[test]
     fn convergence_marker_defaults_to_unknown_for_older_snapshots() {
         let encoded = rmp_serde::to_vec_named(&DataUsageInfo {
             last_update: Some(SystemTime::UNIX_EPOCH),
@@ -3225,6 +3319,31 @@ mod tests {
     }
 
     #[test]
+    fn bucket_usage_merge_discards_incompatible_incarnation_proofs() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut same = BucketUsageInfo {
+            bucket_incarnation: Some(id.into()),
+            ..Default::default()
+        };
+        same.merge(&BucketUsageInfo {
+            bucket_incarnation: Some(id.into()),
+            ..Default::default()
+        });
+        assert_eq!(same.bucket_incarnation.as_deref(), Some(id));
+        same.merge(&BucketUsageInfo::default());
+        assert!(same.bucket_incarnation.is_none());
+        let mut different = BucketUsageInfo {
+            bucket_incarnation: Some(id.into()),
+            ..Default::default()
+        };
+        different.merge(&BucketUsageInfo {
+            bucket_incarnation: Some("00000000-0000-4000-8000-000000000002".into()),
+            ..Default::default()
+        });
+        assert!(different.bucket_incarnation.is_none());
+    }
+
+    #[test]
     fn size_summary_add_saturates_instead_of_overflowing() {
         // The scanner folds one summary per object into a per-prefix total, so a
         // counter at its ceiling must stay there rather than panic in a debug
@@ -3296,6 +3415,42 @@ mod tests {
 
         assert_eq!(summary1.total_size, 300);
         assert_eq!(summary1.versions, 15);
+    }
+
+    #[test]
+    fn test_reconciliation_scope_builds_only_after_admission() {
+        let mut summary = SizeSummary::new();
+        let builds = std::cell::Cell::new(0);
+        let build = || {
+            builds.set(builds.get() + 1);
+            SizeReconciliationScope {
+                bucket: "bucket".to_string(),
+                object: "object".to_string(),
+            }
+        };
+
+        summary.record_reconciliation_scope_with("bucket", "object", build);
+        assert_eq!(builds.get(), 1, "an admitted scope is copied once");
+        assert_eq!(summary.reconciliation_scopes.len(), 1);
+        assert_eq!(summary.reconciliation_scopes[0].bucket, "bucket");
+        assert_eq!(summary.reconciliation_scopes[0].object, "object");
+
+        summary.record_reconciliation_scope_with("bucket", "object", build);
+        assert_eq!(builds.get(), 1, "duplicate scopes must not be copied");
+        assert_eq!(summary.reconciliation_scopes.len(), 1);
+        assert!(!summary.size_reconciliation_truncated);
+
+        for index in 1..1024 {
+            summary.record_reconciliation_scope("bucket", &index.to_string());
+        }
+        summary.record_reconciliation_scope_with("bucket", "object", build);
+        assert_eq!(builds.get(), 1, "a duplicate at capacity must not be copied");
+        assert!(!summary.size_reconciliation_truncated);
+
+        summary.record_reconciliation_scope_with("bucket", "overflow", build);
+        assert_eq!(builds.get(), 1, "a rejected scope must not be copied");
+        assert_eq!(summary.reconciliation_scopes.len(), 1024);
+        assert!(summary.size_reconciliation_truncated);
     }
 
     #[test]

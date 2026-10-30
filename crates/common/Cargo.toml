@@ -29,11 +29,13 @@ workspace = true
 
 [features]
 default = []
+test-util = []
 hotpath = ["hotpath/hotpath", "hotpath/tokio"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
+arc-swap.workspace = true
 hotpath.workspace = true
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
@@ -41,6 +43,7 @@ uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 metrics = { workspace = true }
 smallvec = { workspace = true }
 tracing = { workspace = true }
+thiserror.workspace = true
 
 [lib]
 doctest = false

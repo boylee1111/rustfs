@@ -114,7 +114,7 @@ Inventory the source first: bucket default encryption means objects can be encry
 |---|---|
 | Shipping status | Ships in no default build: absent from `default` and `full` in `rustfs/Cargo.toml`; released binaries and container images never include it. Enable with `--features rio-v2`. |
 | Pull-request coverage | `test-and-lint-rio-v2` in `.github/workflows/ci.yml`: clippy plus `cargo nextest` for `rustfs` and `rustfs-ecstore` with `--features rio-v2`. This is the cfg-seam guard; it keeps the feature compiling and its unit suite green on every pull request. |
-| Full-suite lane | `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` in `ci.yml` run only on the weekly schedule and manual dispatch (`cache-warm.yml` keeps the `ci-feat-rio` cache warm so the scheduled build fits its timeout). |
+| Full-suite lane | `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` in `ci.yml` run only on the nightly schedule and manual dispatch (`cache-warm.yml` keeps the `ci-feat-rio` cache warm so the scheduled build fits its timeout). |
 | Interop evidence | `.github/workflows/minio-interop.yml` (nightly plus manual) regenerates real MinIO backend trees via `crates/rio-v2/tests/minio_fixture_lab/` and runs the `#[ignore]` reader tests in `rustfs/src/storage/minio_generated_read_test.rs` with `--features rio-v2`. Its freshness is tracked in `.github/scheduled-validations.json`. |
 | Promote-or-delete condition | The variant stays dormant until one of two things happens. **Promote**: a release commits to shipping MinIO SSE migration as a supported capability; then `rio-v2` joins `default`/`full`, the scheduled lanes run on every pull request, and this section is rewritten. **Delete**: no release commits to it and the scheduled lanes are not kept green; then the feature flag, `crates/rio-v2`, the cfg seams in `rustfs/src/storage/sse.rs`, the three `ci.yml` jobs, the `cache-warm.yml` warm step, `minio-interop.yml`, and its `scheduled-validations.json` entry are removed in one change. Either outcome must update `ARCHITECTURE.md` and the `ci.yml` job comments that cite this section. |
 
@@ -146,3 +146,58 @@ Not fixture-proven: transitioned `xl.meta`; CORS, public-access-block, and bucke
 - Any change to `crates/filemeta` or `crates/ecstore/src/bucket` metadata encoding is a storage-format change and follows the migration and readiness contracts in [README.md](README.md) and the ecstore layout boundary rules.
 - Do not bump a Version Anchor without a read path for the prior value; see [erasure-coding.md](erasure-coding.md) for the accept-older, reject-newer rule.
 - `.github/workflows/ci.yml`, `.github/workflows/cache-warm.yml`, and `ARCHITECTURE.md` cite the [rio-v2 variant lifecycle](#rio-v2-variant-lifecycle) heading; keep it when editing this file.
+
+## Independent integrity upgrade contract
+
+The optional shard-integrity extension preserves the release checksum algorithm
+and payload framing. It does not bump XL container/header/metadata versions.
+`ObjectPartInfo` extensions use named MessagePack fields; older eight-field
+readers can ignore the new field, and new readers still decode old positional
+arrays. This is a decoder compatibility claim, not certification of arbitrary
+mixed-version write, repair, tiering, or downgrade workflows.
+
+| Workflow | Contract |
+|---|---|
+| New reader, old object | Existing reads and traditional shard/explicit-version metadata recovery remain available; independent donor-substitution protection is absent until a trusted rewrite. |
+| Old reader, new object | Existing checksum/frame and metadata decoders remain usable; old readers do not enforce the independent proof. |
+| New coordinator, old disk server | GET/Deep verification runs at the coordinator. A protected UploadPart requires a write quorum that publishes its index. An old RenameFile response cannot acknowledge durable index repair. |
+| Old write/repair coordinator | Unsupported for protected data: it may omit, discard, or preserve stale integrity metadata. New protection is disabled by default so the coordinator rollout can precede activation. |
+| Pre-upgrade in-progress multipart upload | Remains legacy when completed. Reinitiate and reupload from a trusted source to obtain protection. |
+| New multipart upload completed by an old coordinator | Unsupported; a retained upload marker without a completed descriptor fails validation. |
+| Write switch changed during an upload | The persisted upload mode wins: legacy uploads remain legacy and protected uploads must finish with all proofs. |
+| Write switch disabled after activation | Existing protected reads, repair and rewrites still require protection. This does not make an old binary safe to reintroduce. |
+| Automatic COPY, materialization or data movement | Preserve the source protection mode. Rewriting legacy bytes is not independent evidence of their original content. |
+| Full downgrade after protected writes | No blanket guarantee; preserve a snapshot and validate read, write, repair, COPY, and multipart behavior before considering a downgrade. |
+
+Upgrade all readers, writers and background coordinators before explicitly
+enabling both `RUSTFS_SHARD_INTEGRITY_WRITE` and
+`RUSTFS_SHARD_INTEGRITY_FLEET_CONFIRMED`. Both default to false. The confirmation
+is an operator attestation, not automatic capability discovery or an old-node
+fence. Validate actual mixed-version writes and restart recovery before claiming
+a rolling-upgrade or pre-activation rollback guarantee. See the
+[rollout runbook](../operations/shard-integrity-rollout.md).
+There is no automatic migration of existing payloads and no need
+to rewrite them merely to preserve reading. To protect legacy objects, compare
+against a separately trusted source or end-to-end digest and rewrite/reupload
+through upgraded coordinators. Recomputing a hash from existing suspect shards,
+or agreeing RS parity alone, does not establish their original identity.
+
+Normal scans, tier metadata scans and unproven legacy scans cannot produce `VerifiedHealthy` or
+`Repaired` integrity receipts. A protected object or delete marker may produce
+`MetadataHealthy` only when its exact version was selected from authoritative
+metadata quorum; that disposition proves metadata/presence health and never
+payload integrity. Legacy objects remain without a positive receipt. Legacy repair still runs and reports actual
+before/after drive changes; an unknown strong result does not mean the repair
+was never attempted. Authoritative historical-version absence/cleanup proofs
+remain separate from live payload verification. Retain trusted backups for
+legacy recovery. These commitments protect against misplaced or corrupted
+shards under an authoritative metadata quorum; they are not signatures against
+an attacker who can replace that quorum too.
+
+The public MinIO source inspected at
+[`7aac2a2`](https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/bitrot-streaming.go)
+uses adjacent streaming HighwayHash checksums. Its
+[XL metadata codec](https://github.com/minio/minio/blob/7aac2a2c5b7c882e68c1ce017d8256be2feea27f/cmd/xl-storage-format-v2.go)
+does not establish the independent part-generation commitment described here.
+This source comparison does not claim a live MinIO donor-shard reproduction or
+behavior of proprietary MinIO editions.

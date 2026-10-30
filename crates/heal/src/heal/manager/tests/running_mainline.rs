@@ -6,6 +6,41 @@ use crate::heal::storage::HealListItem;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 
+#[tokio::test(start_paused = true)]
+async fn automatic_replacement_uses_running_foreground_pacing() {
+    let provider = Arc::new(super::super::super::pacing::TestPressure::new(WorkloadClass::ForegroundRead, 100));
+    let provider: Option<WorkloadSnapshotProviderRef> = Some(provider);
+    let mut config = HealConfig {
+        mainline_throttle_enable: true,
+        mainline_read_utilization_high_percent: 80,
+        mainline_max_sleep: Duration::from_millis(250),
+        ..HealConfig::default()
+    };
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: Vec::new(),
+            set_disk_id: "pool_0_set_0".to_owned(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    request.source = HealRequestSource::AutoHeal;
+    request.heal_endpoints = vec!["replacement-a".to_owned()];
+
+    let pacer = super::super::scheduler::running_mainline_pacer(&request, &config, &provider)
+        .expect("automatic replacement must pace under foreground pressure");
+    let started = tokio::time::Instant::now();
+    pacer.wait(&CancellationToken::new()).await.expect("bounded progress");
+    assert_eq!(started.elapsed(), Duration::from_millis(250));
+
+    assert!(super::super::scheduler::running_mainline_pacer(&request, &config, &None).is_none());
+    config.mainline_throttle_enable = false;
+    assert!(super::super::scheduler::running_mainline_pacer(&request, &config, &provider).is_none());
+    config.mainline_throttle_enable = true;
+    request.heal_endpoints.clear();
+    assert!(super::super::scheduler::running_mainline_pacer(&request, &config, &provider).is_none());
+}
+
 #[derive(Default)]
 struct PressureProbe {
     active: AtomicUsize,
@@ -47,6 +82,27 @@ struct RunningStorage {
 
 #[async_trait::async_trait]
 impl HealStorageAPI for RunningStorage {
+    async fn admit_bucket_incarnation(&self, _: &str) -> Result<Uuid> {
+        Ok(Uuid::from_u128(42))
+    }
+
+    async fn heal_bucket_at_incarnation(&self, bucket: &str, expected: Uuid, opts: &HealOpts) -> Result<HealResultItem> {
+        self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+        self.heal_bucket(bucket, opts).await
+    }
+
+    async fn heal_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+    ) -> Result<crate::heal::storage::HealStorageObjectResult> {
+        self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+        self.heal_object_with_receipt(bucket, object, version_id, opts).await
+    }
+
     async fn get_object_meta(&self, _: &str, _: &str) -> Result<Option<HealObjectInfo>> {
         Ok(None)
     }
@@ -59,6 +115,13 @@ impl HealStorageAPI for RunningStorage {
             ..Default::default()
         }))
     }
+    async fn list_buckets_for_admin_heal(
+        &self,
+        _selector: Option<crate::heal::storage_api::storage::DiskSetSelector>,
+    ) -> Result<Vec<BucketInfo>> {
+        self.list_buckets().await
+    }
+
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
         Ok(Vec::new())
     }

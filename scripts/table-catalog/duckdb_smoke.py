@@ -41,6 +41,7 @@ class DuckDBSmokeResult:
     row_count: int
     cleanup_result: str
     checks: dict[str, str]
+    catalog_backing: str
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -287,17 +288,6 @@ def negative_sql(args: argparse.Namespace, *, kind: str, seed_table: str, write_
     bootstrap = f"bootstrap_{kind}"
     sql = profile_sql(args, catalog=bootstrap, table=seed_table)
     sql += f"DETACH {engine_compatibility.quote_double_identifier(bootstrap)};\n"
-    if kind == "stage-create":
-        catalog = "stage_default"
-        sql += attach_sql(
-            args,
-            catalog=catalog,
-            rest_path="/iceberg",
-            signing_name="s3",
-            compatibility_options=False,
-        )
-        sql += f"CREATE TABLE {table_identifier(catalog, args.namespace, table_name(args.table, 'stage'))} (id BIGINT);\n"
-        return sql
     if kind == "purge":
         catalog = "purge_requested"
         sql += attach_sql(
@@ -346,6 +336,7 @@ def pyiceberg_args(args: argparse.Namespace) -> argparse.Namespace:
         require_vended_credentials=False,
         timeout=args.timeout,
         insecure=args.insecure,
+        catalog_backing=args.catalog_backing,
     )
 
 
@@ -428,6 +419,7 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
     pyiceberg_smoke.ensure_local_proxy_bypass(endpoint)
     pyiceberg_smoke.ensure_aws_env(args.access_key, args.secret_key, args.region)
     iceberg_args = pyiceberg_args(args)
+    backing = pyiceberg_smoke.discover_catalog_backing(iceberg_args, deps)
     pyiceberg_smoke.ensure_bucket(iceberg_args, deps)
     pyiceberg_smoke.enable_table_bucket(iceberg_args, deps)
 
@@ -435,9 +427,8 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
     write_table = table_name(args.table, "write")
     purge_table = table_name(args.table, "purge")
     drop_table = table_name(args.table, "drop")
-    stage_table = table_name(args.table, "stage")
     v3_table = table_name(args.table, "v3")
-    smoke_tables = [seed_table, write_table, purge_table, drop_table, stage_table, v3_table]
+    smoke_tables = [seed_table, write_table, purge_table, drop_table, v3_table]
     catalog = pyiceberg_smoke.load_rest_catalog(iceberg_args, deps)
     namespace_preexisting = bool(catalog.namespace_exists(args.namespace))
     prepare_smoke_tables(catalog, args.namespace, smoke_tables, args.replace)
@@ -489,7 +480,6 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
         checks["s3tables_alias"] = "pass"
 
         negatives = [
-            ("stage-create", "stage-create is not supported"),
             ("purge", "purgeRequested=true is not supported"),
             ("format-v3", "unsupported Iceberg table format-version: 3"),
         ]
@@ -507,7 +497,7 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
             )
             require_duckdb_error(execution, kind, expected_error)
             checks[kind] = "failed-closed"
-        if catalog.table_exists((args.namespace, stage_table)) or catalog.table_exists((args.namespace, v3_table)):
+        if catalog.table_exists((args.namespace, v3_table)):
             raise RuntimeError("a failed DuckDB create probe left a catalog table behind")
         if not catalog.table_exists((args.namespace, purge_table)):
             raise RuntimeError("purgeRequested=true removed a table despite the expected failure")
@@ -594,7 +584,7 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
                 drop_namespace=not namespace_preexisting,
             )
 
-    return DuckDBSmokeResult(client_version, metadata_location, 2, cleanup_result, checks)
+    return DuckDBSmokeResult(client_version, metadata_location, 2, cleanup_result, checks, backing)
 
 
 def current_utc_timestamp() -> str:
@@ -611,7 +601,7 @@ def write_live_evidence(args: argparse.Namespace, result: DuckDBSmokeResult) -> 
         scenario="rest-catalog-single-table-read-write-cross-engine-negative-boundaries",
         rustfs_build=args.rustfs_build,
         git_sha=args.git_sha,
-        catalog_backing=args.catalog_backing,
+        catalog_backing=result.catalog_backing,
         endpoint=args.endpoint,
         warehouse=args.bucket,
         rest_path="/iceberg",

@@ -15,6 +15,9 @@
 //! CopyObject path.
 
 use super::*;
+use futures::FutureExt;
+use rustfs_utils::path::fold_object_name_path_separators;
+use tracing::Instrument;
 
 use crate::auth::{VerifiedPresignedRequest, reject_presigned_put_max_content_length_for_other_operation};
 use crate::error::ServerSideSourceReadError;
@@ -96,74 +99,56 @@ fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err
     }
 }
 
-async fn acquire_self_copy_namespace_lock<S>(store: &S, bucket: &str, object: &str) -> S3Result<NamespaceLockGuard>
+/// Object name the namespace lock of a copy endpoint is keyed by: the disk
+/// identity of the stored name. On Windows that folds spellings
+/// `path_join_buf` keeps apart (`a\b\` vs `a/b`), so a copy that is not a
+/// same-object copy can still have its source read guard and destination
+/// write lock on one lock, and must take the self-copy lock to not wait on
+/// itself.
+fn copy_namespace_lock_object(key: &str, backslash_is_separator: bool) -> String {
+    fold_object_name_path_separators(&encode_dir_object(key), backslash_is_separator).into_owned()
+}
+
+async fn acquire_self_copy_namespace_lock<S>(
+    store: &S,
+    bucket: &str,
+    object: &str,
+) -> S3Result<crate::app::storage_api::object_usecase::WriteCommitGuard>
 where
     S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
 {
     let object = encode_dir_object(object);
     let lock = store.new_ns_lock(bucket, &object).await.map_err(ApiError::from)?;
-    lock.get_write_lock(get_lock_acquire_timeout())
+    crate::app::storage_api::object_usecase::WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout())
         .await
         .map_err(|err| ApiError::from(copy_namespace_lock_error(bucket, &object, "write", err)).into())
-}
-
-pub(crate) async fn acquire_copy_bucket_lifecycle_lock<S>(store: &S, bucket: &str) -> S3Result<NamespaceLockGuard>
-where
-    S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
-{
-    let lock = store
-        .new_ns_lock(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT)
-        .await
-        .map_err(ApiError::from)?;
-    lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(|err| {
-        ApiError::from(copy_namespace_lock_error(
-            bucket,
-            BUCKET_LIFECYCLE_LOCK_OBJECT,
-            "bucket_lifecycle_read",
-            err,
-        ))
-        .into()
-    })
-}
-
-pub(crate) async fn acquire_copy_bucket_lifecycle_locks<S>(
-    store: &S,
-    source_bucket: &str,
-    destination_bucket: &str,
-) -> S3Result<(NamespaceLockGuard, Option<NamespaceLockGuard>)>
-where
-    S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
-{
-    if source_bucket == destination_bucket {
-        return Ok((acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?, None));
-    }
-
-    if source_bucket < destination_bucket {
-        let source_guard = acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?;
-        let destination_guard = acquire_copy_bucket_lifecycle_lock(store, destination_bucket).await?;
-        Ok((source_guard, Some(destination_guard)))
-    } else {
-        let destination_guard = acquire_copy_bucket_lifecycle_lock(store, destination_bucket).await?;
-        let source_guard = acquire_copy_bucket_lifecycle_lock(store, source_bucket).await?;
-        Ok((source_guard, Some(destination_guard)))
-    }
 }
 
 impl DefaultObjectUsecase {
     pub fn execute_copy_object(
         &self,
         req: S3Request<CopyObjectInput>,
-    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + '_ {
-        Box::pin(self.execute_copy_object_inner(req))
+    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + Unpin + '_ {
+        let body = self.execute_copy_object_body_boxed(req);
+        futures::future::lazy(move |_| body.instrument(tracing::debug_span!("execute_copy_object"))).flatten()
     }
 
-    #[instrument(name = "execute_copy_object", level = "debug", skip(self, req))]
-    async fn execute_copy_object_inner(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+    // Construct the large business future outside its caller's polling frame.
+    #[inline(never)]
+    fn execute_copy_object_body_boxed(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> impl std::future::Future<Output = S3Result<S3Response<CopyObjectOutput>>> + Send + Unpin + '_ {
+        Box::pin(self.execute_copy_object_body(req))
+    }
+
+    async fn execute_copy_object_body(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),
             req.extensions.get::<VerifiedPresignedRequest>().is_some(),
         )?;
+        reject_non_wildcard_write_if_none_match(req.input.if_none_match.as_ref(), &req.headers)?;
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -254,6 +239,7 @@ impl DefaultObjectUsecase {
         // Validate both source and destination keys
         validate_object_key(&src_key, "COPY (source)")?;
         validate_object_key(&key, "COPY (dest)")?;
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
         let replaces_metadata = match metadata_directive.as_ref().map(|directive| directive.as_str()) {
             None | Some(MetadataDirective::COPY) => false,
@@ -310,9 +296,13 @@ impl DefaultObjectUsecase {
 
         // warn!("copy_object {}/{}, to {}/{}", &src_bucket, &src_key, &bucket, &key);
 
+        let src_versioned_enabled = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await;
+        let src_version_suspended = BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
         let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
 
         src_opts.version_id = version_id.clone();
+        src_opts.versioned = src_versioned_enabled;
+        src_opts.version_suspended = src_version_suspended;
 
         let mut src_get_opts = ObjectOptions {
             version_id: src_opts.version_id.clone(),
@@ -335,6 +325,10 @@ impl DefaultObjectUsecase {
         apply_bucket_generation_guard(&req, &bucket, &mut dst_opts)?;
 
         let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
+        let backslash_is_separator = cfg!(target_os = "windows");
+        let dst_lock_object = copy_namespace_lock_object(&key, backslash_is_separator);
+        let self_copy_lock = cp_src_dst_same
+            || (src_bucket == bucket && copy_namespace_lock_object(&src_key, backslash_is_separator) == dst_lock_object);
         let expected_current_version_id = expected_current_version_id(&req.headers)?;
         if expected_current_version_id.is_some()
             && (!cp_src_dst_same || version_id.is_none() || dest_version_id.is_some() || !dst_opts.versioned)
@@ -348,29 +342,20 @@ impl DefaultObjectUsecase {
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-        let (source_bucket_lifecycle_guard, destination_bucket_lifecycle_guard_storage) =
-            acquire_copy_bucket_lifecycle_locks(store.as_ref(), &src_bucket, &bucket).await?;
-        let current_source_incarnation_id = store
-            .bucket_incarnation_id_from_disk(&src_bucket)
+        let (
+            source_bucket_lifecycle_guard,
+            current_source_incarnation_id,
+            destination_bucket_lifecycle_guard_storage,
+            current_destination_incarnation_id,
+        ) = store
+            .acquire_copy_bucket_incarnation_fences(
+                &src_bucket,
+                src_get_opts.expected_bucket_incarnation_id,
+                &bucket,
+                dst_opts.expected_bucket_incarnation_id,
+            )
             .await
             .map_err(ApiError::from)?;
-        if src_get_opts
-            .expected_bucket_incarnation_id
-            .is_some_and(|expected| expected != current_source_incarnation_id)
-        {
-            return Err(ApiError::from(StorageError::BucketNotFound(src_bucket.clone())).into());
-        }
-        let current_destination_incarnation_id = if src_bucket == bucket {
-            current_source_incarnation_id
-        } else {
-            store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?
-        };
-        if dst_opts
-            .expected_bucket_incarnation_id
-            .is_some_and(|expected| expected != current_destination_incarnation_id)
-        {
-            return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
-        }
         let destination_bucket_lifecycle_guard = destination_bucket_lifecycle_guard_storage
             .as_ref()
             .unwrap_or(&source_bucket_lifecycle_guard);
@@ -387,30 +372,24 @@ impl DefaultObjectUsecase {
         src_get_opts.expected_bucket_incarnation_id = Some(current_source_incarnation_id);
         dst_opts.expected_bucket_incarnation_id = Some(current_destination_incarnation_id);
         if src_bucket != bucket {
-            dst_opts.add_bucket_lifecycle_lock_guard(&source_bucket_lifecycle_guard);
+            source_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
         }
-        dst_opts.add_bucket_lifecycle_lock_guard(destination_bucket_lifecycle_guard);
+        destination_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
 
         // Bucket metadata uses the bucket name as its namespace-lock key. Load
         // every copy-time bucket snapshot before a same-object key can collide
         // with that key (for example, copying `bucket/bucket` onto itself).
         let bucket_sse_config = load_bucket_default_sse_config(&bucket).await?;
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
-        if cp_src_dst_same && key == bucket {
+        if self_copy_lock && dst_lock_object == bucket {
             dst_opts.object_lock_config_snapshot =
                 Some(store.object_lock_config_snapshot(&bucket).await.map_err(ApiError::from)?);
         }
-        let mut current_opts: ObjectOptions = internal_object_info_lookup_opts(
-            get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
-                .await
-                .map_err(ApiError::from)?,
-        );
-
         // Hold the self-copy namespace write lock before opening the source reader, including
         // expected-current historical copies. With lock optimization disabled, the source
         // stream retains its read guard until EOF; taking the write lock later in ECStore
         // would self-deadlock before the copy can consume that stream.
-        let _self_copy_lock_guard = if cp_src_dst_same {
+        let _self_copy_lock_guard = if self_copy_lock {
             let guard = acquire_self_copy_namespace_lock(store.as_ref(), &bucket, &key).await?;
             src_opts.no_lock = true;
             src_get_opts.no_lock = true;
@@ -420,32 +399,47 @@ impl DefaultObjectUsecase {
             None
         };
         if let Some(guard) = _self_copy_lock_guard.as_ref() {
-            dst_opts.add_namespace_lock_guard(guard);
+            dst_opts.add_write_commit_guard(guard);
+            dst_opts.write_completion = crate::app::storage_api::object_usecase::WriteCompletion::TailDrained;
         }
         dst_opts.expected_current_version_id = expected_current_version_id.clone();
 
-        if _self_copy_lock_guard.is_some() {
-            current_opts.no_lock = true;
-        }
-        let previous_current_sizes = match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &dst_opts)?;
-                if let Some(expected) = expected_current_version_id.as_deref()
-                    && existing_obj_info.version_id.unwrap_or_default().to_string() != expected
-                {
-                    return Err(s3_error!(PreconditionFailed));
-                }
-                Some((existing_obj_info.size.max(0) as u64, quota_object_size(&existing_obj_info)))
+        let copy_prelookup_required = self_copy_lock
+            || expected_current_version_id.is_some()
+            || dest_version_id.is_some()
+            || (!super::shared::put_like_write_creates_new_version(&dst_opts)
+                && object_lock_checks_required_for_state(&object_lock_config_state));
+        let previous_current_sizes: Option<Option<(u64, Result<u64, StorageError>)>> = if copy_prelookup_required {
+            let mut current_opts: ObjectOptions = internal_object_info_lookup_opts(
+                get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
+                    .await
+                    .map_err(ApiError::from)?,
+            );
+            if _self_copy_lock_guard.is_some() {
+                current_opts.no_lock = true;
             }
-            Err(err) => {
-                if expected_current_version_id.is_some() {
-                    return Err(s3_error!(PreconditionFailed));
+            Some(match store.get_object_info(&bucket, &key, &current_opts).await {
+                Ok(existing_obj_info) => {
+                    validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &dst_opts)?;
+                    if let Some(expected) = expected_current_version_id.as_deref()
+                        && existing_obj_info.version_id.unwrap_or_default().to_string() != expected
+                    {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
+                    Some((existing_obj_info.size.max(0) as u64, quota_object_size(&existing_obj_info)))
                 }
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
+                Err(err) => {
+                    if expected_current_version_id.is_some() {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+                    None
                 }
-                None
-            }
+            })
+        } else {
+            None
         };
 
         let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
@@ -607,9 +601,16 @@ impl DefaultObjectUsecase {
         // Handle MetadataDirective REPLACE: replace user metadata while preserving system metadata.
         // System metadata (compression, encryption) is added after this block to ensure
         // it's not cleared by the REPLACE operation.
-        if let Some(replacement_metadata) = replacement_metadata {
+        if let Some(mut replacement_metadata) = replacement_metadata {
+            // S3 defaults an object's content type to `binary/octet-stream` when none is
+            // supplied. REPLACE must apply that same default instead of leaving
+            // content-type unset.
+            if !replacement_metadata.contains_key("content-type") {
+                replacement_metadata.insert("content-type".to_string(), "binary/octet-stream".to_string());
+            }
+            let effective_content_type = replacement_metadata.get("content-type").cloned();
             user_defined = replacement_metadata;
-            src_info.content_type = content_type.clone();
+            src_info.content_type = effective_content_type;
             src_info.content_encoding = content_encoding.as_deref().and_then(normalize_content_encoding_for_storage);
             src_info.expires = expires_timestamp.map(OffsetDateTime::from);
         } else if metadata_directive.is_some() || website_redirect_location.is_some() {
@@ -760,10 +761,11 @@ impl DefaultObjectUsecase {
         if let Some(quota_check) = quota_check.as_ref() {
             apply_quota_admission(&mut dst_opts, quota_check)?;
         }
-        let previous_current_size = match previous_current_sizes {
-            Some((_, Ok(logical_size))) if quota_enabled => Some(logical_size),
-            Some((_, Err(err))) if quota_enabled => return Err(ApiError::from(err).into()),
-            Some((physical_size, _)) => Some(physical_size),
+        let prelookup_previous_current_size: Option<Option<u64>> = match previous_current_sizes {
+            Some(Some((_, Ok(logical_size)))) if quota_enabled => Some(Some(logical_size)),
+            Some(Some((_, Err(err)))) if quota_enabled => return Err(ApiError::from(err).into()),
+            Some(Some((physical_size, _))) => Some(Some(physical_size)),
+            Some(None) => Some(None),
             None => None,
         };
         if let Some(quota_check) = quota_check.as_ref() {
@@ -775,6 +777,7 @@ impl DefaultObjectUsecase {
         let has_bucket_metadata = self.bucket_metadata_sys().is_some();
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
 
         let copy_commit = spawn_traced_join({
             let store = Arc::clone(&store);
@@ -784,13 +787,15 @@ impl DefaultObjectUsecase {
             let key = key.clone();
             let src_opts = src_opts.clone();
             let dst_opts = dst_opts.clone();
+            let table_data_plane_publication_guards = table_data_plane_publication_guards;
             async move {
                 let _source_bucket_lifecycle_guard = source_bucket_lifecycle_guard;
                 let _destination_bucket_lifecycle_guard_storage = destination_bucket_lifecycle_guard_storage;
                 let _self_copy_lock_guard = _self_copy_lock_guard;
+                let _table_data_plane_publication_guards = table_data_plane_publication_guards;
 
-                let oi = store
-                    .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
+                let (oi, backfilled_old_current_size) = store
+                    .copy_object_with_old_current_size(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
                     .await
                     .map_err(ApiError::from)?;
 
@@ -804,13 +809,22 @@ impl DefaultObjectUsecase {
                 maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
                 let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
 
-                let dest_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+                let dest_versioned = dst_opts.versioned;
                 if has_bucket_metadata {
                     let committed_size = quota_accounting_object_size(&oi, quota_enabled)?;
-                    if dest_versioned {
-                        record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
-                    } else {
-                        record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                    match prelookup_previous_current_size
+                        .or_else(|| previous_current_size_from_backfill(backfilled_old_current_size))
+                    {
+                        Some(previous_current_size) => {
+                            if dest_versioned {
+                                record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
+                            } else {
+                                record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                            }
+                        }
+                        None => {
+                            record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, dest_versioned).await;
+                        }
                     }
                 }
 
@@ -826,22 +840,18 @@ impl DefaultObjectUsecase {
             S3Error::with_message(S3ErrorCode::InternalError, format!("copy object commit owner task failed: {err}"))
         })??;
 
-        let raw_dest_version = oi.version_id.map(|v| v.to_string());
+        let raw_dest_version = s3_response_version_id(oi.version_id);
         let dest_version = if dest_versioned { raw_dest_version } else { None };
 
         // Echo the source version that was copied via x-amz-copy-source-version-id (issue #4976).
         // AWS/MinIO return this whenever the source bucket carries versioning (enabled or
         // suspended); render the null version as "null" like GET/HEAD do. This is the exact source
         // version, kept distinct from the destination version_id above.
-        let src_versioned = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await
-            || BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
+        let src_versioned = src_versioned_enabled || src_version_suspended;
         let copy_source_version_id = if src_versioned {
-            src_resolved_version_id.map(|vid| {
-                if vid == Uuid::nil() {
-                    "null".to_string()
-                } else {
-                    vid.to_string()
-                }
+            Some(match src_resolved_version_id {
+                Some(vid) if vid != Uuid::nil() => vid.to_string(),
+                _ => "null".to_string(),
             })
         } else {
             None
@@ -914,6 +924,21 @@ mod tests {
     use s3s::dto::{ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule};
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn copy_namespace_lock_object_folds_backslash_spellings_only_as_separators() {
+        // `a\b\` is not a same-object copy of `a/b` by `path_join_buf` (the
+        // trailing separator survives), yet on Windows both are the xl.meta
+        // of `a/b` and share one namespace lock.
+        assert_eq!(copy_namespace_lock_object("a\\b\\", true), copy_namespace_lock_object("a/b", true));
+        assert_eq!(copy_namespace_lock_object("\\a\\b", true), "a/b");
+        assert_ne!(copy_namespace_lock_object("a\\b\\", false), copy_namespace_lock_object("a/b", false));
+        // Directory objects keep their encoded identity.
+        assert_eq!(copy_namespace_lock_object("a/b/", true), "a/b__XLDIR__");
+        assert_ne!(copy_namespace_lock_object("a/b/", true), copy_namespace_lock_object("a/b", true));
+        assert_eq!(copy_namespace_lock_object("bucket", true), "bucket");
+        assert_eq!(copy_namespace_lock_object("\\bucket", true), "bucket");
+    }
 
     #[test]
     fn local_copy_does_not_inherit_source_replication_generation() {
@@ -1025,6 +1050,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_object_rejects_reserved_catalog_destination_before_store_lookup() {
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "source-bucket".into(),
+                key: "source-key".into(),
+                version_id: None,
+            })
+            .bucket(format!("missing-{}", Uuid::new_v4()))
+            .key(".rustfs-table/metadata/current.json".to_string())
+            .build()
+            .unwrap();
+        let error = DefaultObjectUsecase::without_context()
+            .execute_copy_object(build_request(input, Method::PUT))
+            .await
+            .expect_err("reserved catalog destination must fail closed without bucket metadata");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(error.message(), Some(crate::table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE));
+    }
+
+    #[tokio::test]
     async fn execute_copy_object_rejects_invalid_storage_class() {
         let input = CopyObjectInput::builder()
             .copy_source(CopySource::Bucket {
@@ -1091,7 +1136,7 @@ mod tests {
         let payload = b"object whose key equals its bucket".to_vec();
         let mut reader = PutObjReader::from_vec(payload.clone());
         let setup_opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::app::storage_api::object_usecase::WriteCompletion::TailDrained,
             ..Default::default()
         };
         store
@@ -1325,6 +1370,78 @@ mod tests {
             )
             .await
             .expect("expected-current copy test bucket should be removed");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_copy_object_renders_null_directory_destination_version() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = current_app_context().expect("directory copy test requires an AppContext");
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("copy-null-dir-version-{}", Uuid::new_v4());
+        let source = "source.bin";
+        let destination = "directory/";
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned directory copy test bucket should be created");
+
+        let mut source_reader = PutObjReader::from_vec(b"copy source".to_vec());
+        store
+            .put_object(
+                &bucket,
+                source,
+                &mut source_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("copy source should be written");
+
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: source.to_string().into(),
+                version_id: None,
+            })
+            .bucket(bucket.clone())
+            .key(destination.to_string())
+            .build()
+            .expect("directory copy input should build");
+        let response = DefaultObjectUsecase::with_context(Some(context))
+            .execute_copy_object(build_request(input, Method::PUT))
+            .await
+            .expect("copying to a directory marker should succeed");
+
+        assert_eq!(
+            response.output.version_id.as_deref(),
+            Some(NULL_VERSION_ID),
+            "CopyObject must expose the null destination version without leaking the internal nil UUID"
+        );
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("directory copy test bucket should be removed");
     }
 
     #[tokio::test]

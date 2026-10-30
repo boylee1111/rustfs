@@ -20,6 +20,41 @@ const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([7; 32
 const TEST_COVERAGE_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([6; 32]);
 
 #[test]
+fn partial_progress_requires_complete_scope_and_no_hard_failure() {
+    for plan_complete in [false, true] {
+        for scope_matches in [false, true] {
+            for set_failed in [false, true] {
+                for missing_namespace in [false, true] {
+                    for status in [
+                        ScannerBucketScanStatus::Complete,
+                        ScannerBucketScanStatus::Partial,
+                        ScannerBucketScanStatus::Failed,
+                        ScannerBucketScanStatus::NamespaceNotFound,
+                    ] {
+                        let expected = plan_complete
+                            && scope_matches
+                            && !set_failed
+                            && !missing_namespace
+                            && status == ScannerBucketScanStatus::Partial;
+                        assert_eq!(
+                            scanner_partial_progress_is_usable(
+                                plan_complete,
+                                scope_matches,
+                                status,
+                                set_failed,
+                                missing_namespace
+                            ),
+                            expected,
+                            "plan={plan_complete}, scope={scope_matches}, status={status:?}, set_failed={set_failed}, missing_namespace={missing_namespace}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn scanner_bucket_inventory_requires_exact_unique_set_union() {
     let first = BucketInfo {
         name: "first".to_string(),
@@ -803,6 +838,7 @@ fn current_cache_root_with_new_tier_generation_resets_old_cache() {
             require_source: false,
             tier_registry_generation: Some(2),
             checkpoint_identity: None,
+            checkpoint_plan_digest: None,
         },
     );
 
@@ -899,12 +935,14 @@ fn completed_data_usage_info_publishes_confirmed_empty_namespace() {
 }
 
 #[test]
-fn complete_usage_candidate_with_changed_generation_is_superseded() {
+fn complete_usage_candidate_with_changed_generation_is_certified_per_bucket() {
     let all_buckets = vec!["bucket".to_string()];
     let completed_set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
     let completed_usage = completed_data_usage_info_for_test(&[completed_set], &all_buckets, false, false);
 
     assert!(completed_usage.is_some());
+    // A moved dirty generation shades buckets for the next cycle; only a
+    // guardrail veto supersedes a structurally complete candidate.
     assert_eq!(
         classify_nsscanner_cycle(
             completed_usage.is_some(),
@@ -913,6 +951,17 @@ fn complete_usage_candidate_with_changed_generation_is_superseded() {
             ScannerBucketScanStatus::Complete,
             DirtyUsageSnapshotStatus::Changed,
             ScannerCycleActivityStatus::Unchanged,
+        ),
+        ScannerCycleStatus::Complete
+    );
+    assert_eq!(
+        classify_nsscanner_cycle(
+            completed_usage.is_some(),
+            false,
+            false,
+            ScannerBucketScanStatus::Complete,
+            DirtyUsageSnapshotStatus::Changed,
+            ScannerCycleActivityStatus::Changed,
         ),
         ScannerCycleStatus::Superseded
     );
@@ -945,6 +994,228 @@ fn completed_data_usage_info_adds_same_bucket_across_unique_sets() {
     assert_eq!(bucket.size, 50);
     assert_eq!(bucket.versions_count, 4);
     assert_eq!(bucket.delete_markers_count, 1);
+}
+
+#[test]
+fn bucket_usage_incarnation_is_optional_and_old_readers_ignore_it() {
+    #[derive(serde::Deserialize)]
+    struct LegacyBucketUsage {
+        size: u64,
+    }
+    let legacy = BucketUsageInfo {
+        size: 42,
+        ..Default::default()
+    };
+    let without = serde_json::to_value(&legacy).expect("encode legacy usage");
+    assert!(without.get("bucket_incarnation").is_none());
+    let restored: BucketUsageInfo = serde_json::from_value(without).expect("decode old usage");
+    assert_eq!(restored.bucket_incarnation, None);
+    let certified = BucketUsageInfo {
+        size: 42,
+        bucket_incarnation: Some(uuid::Uuid::from_u128(7).to_string()),
+        ..Default::default()
+    };
+    let encoded = serde_json::to_vec(&certified).expect("encode certified usage");
+    let old: LegacyBucketUsage = serde_json::from_slice(&encoded).expect("old schema ignores additive field");
+    assert_eq!(old.size, 42);
+    let named = rmp_serde::to_vec_named(&certified).expect("encode certified named msgpack");
+    let old: LegacyBucketUsage = rmp_serde::from_slice(&named).expect("old named reader ignores additive field");
+    assert_eq!(old.size, 42);
+    let old_bytes = rmp_serde::to_vec_named(&legacy).expect("encode old shape");
+    let new: BucketUsageInfo = rmp_serde::from_slice(&old_bytes).expect("new reader accepts old shape");
+    assert_eq!(new.bucket_incarnation, None);
+}
+
+#[test]
+fn completed_usage_certifies_only_matching_non_nil_bucket_incarnations() {
+    let buckets = vec!["bucket".to_string()];
+    let id = uuid::Uuid::from_u128(7);
+    let mut a = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
+    let mut b = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(1, 0));
+    a.info.scan_bucket_incarnations.insert("bucket".to_string(), id);
+    b.info.scan_bucket_incarnations.insert("bucket".to_string(), id);
+    let published = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false, false)
+        .unwrap()
+        .0;
+    assert_eq!(
+        published.buckets_usage["bucket"].bucket_incarnation.as_deref(),
+        Some(id.to_string().as_str())
+    );
+    let encoded = serde_json::to_vec(&published).expect("serialize certified usage");
+    let decoded: DataUsageInfo = serde_json::from_slice(&encoded).expect("read certified usage");
+    assert_eq!(decoded.buckets_usage["bucket"].bucket_incarnation, Some(id.to_string()));
+    b.info
+        .scan_bucket_incarnations
+        .insert("bucket".to_string(), uuid::Uuid::from_u128(8));
+    let mismatch = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false, false)
+        .unwrap()
+        .0;
+    assert_eq!(mismatch.buckets_usage["bucket"].bucket_incarnation, None);
+    b.info.scan_bucket_incarnations.remove("bucket");
+    let missing = completed_data_usage_info_for_test(&[a.clone(), b.clone()], &buckets, false, false)
+        .unwrap()
+        .0;
+    assert_eq!(missing.buckets_usage["bucket"].bucket_incarnation, None);
+    b.info
+        .scan_bucket_incarnations
+        .insert("bucket".to_string(), uuid::Uuid::nil());
+    let nil = completed_data_usage_info_for_test(&[a, b], &buckets, false, false).unwrap().0;
+    assert_eq!(nil.buckets_usage["bucket"].bucket_incarnation, None);
+}
+
+#[test]
+fn checked_bucket_usage_info_moves_replication_keys_and_preserves_the_snapshot() {
+    let first_target = "arn:rustfs:replication:local::target-a".to_string();
+    let zero_target = "arn:rustfs:replication:local::zero-counters".to_string();
+    let mut entry = DataUsageEntry {
+        size: 32768,
+        objects: 9,
+        versions: 14,
+        delete_markers: 2,
+        replication_stats: Some(ReplicationAllStats {
+            replica_size: 777,
+            replica_count: 3,
+            targets: HashMap::from([
+                (
+                    first_target.clone(),
+                    ReplicationTargetUsage {
+                        pending_size: 101,
+                        replicated_size: 102,
+                        failed_size: 103,
+                        failed_count: 104,
+                        pending_count: 105,
+                        missed_threshold_size: 106,
+                        after_threshold_size: 107,
+                        missed_threshold_count: 108,
+                        after_threshold_count: 109,
+                        replicated_count: 110,
+                    },
+                ),
+                (zero_target.clone(), ReplicationTargetUsage::default()),
+            ]),
+        }),
+        ..Default::default()
+    };
+    entry.obj_sizes.add(2048);
+    entry.obj_sizes.add(32768);
+    entry.obj_versions.add(0);
+    entry.obj_versions.add(3);
+    let target_allocations = entry
+        .replication_stats
+        .as_ref()
+        .expect("replication fixture")
+        .targets
+        .keys()
+        .map(|target| (target.clone(), target.as_ptr()))
+        .collect::<Vec<_>>();
+
+    let usage = checked_bucket_usage_info(entry).expect("owned usage entry remains representable");
+    for (target, allocation) in target_allocations {
+        assert_eq!(
+            usage
+                .replication_info
+                .get_key_value(&target)
+                .expect("retained replication target")
+                .0
+                .as_ptr(),
+            allocation,
+            "the target key must move from the consumed entry without cloning its allocation"
+        );
+    }
+    let expected = BucketUsageInfo {
+        size: 32768,
+        bucket_incarnation: None,
+        replication_pending_size_v1: 0,
+        replication_failed_size_v1: 0,
+        replicated_size_v1: 0,
+        replication_pending_count_v1: 0,
+        replication_failed_count_v1: 0,
+        objects_count: 9,
+        object_size_histogram: HashMap::from([
+            ("LESS_THAN_1024_B".to_string(), 0),
+            ("BETWEEN_1024_B_AND_64_KB".to_string(), 2),
+            ("BETWEEN_64_KB_AND_256_KB".to_string(), 0),
+            ("BETWEEN_256_KB_AND_512_KB".to_string(), 0),
+            ("BETWEEN_512_KB_AND_1_MB".to_string(), 0),
+            ("BETWEEN_1024B_AND_1_MB".to_string(), 2),
+            ("BETWEEN_1_MB_AND_10_MB".to_string(), 0),
+            ("BETWEEN_10_MB_AND_64_MB".to_string(), 0),
+            ("BETWEEN_64_MB_AND_128_MB".to_string(), 0),
+            ("BETWEEN_128_MB_AND_512_MB".to_string(), 0),
+            ("GREATER_THAN_512_MB".to_string(), 0),
+        ]),
+        object_versions_histogram: HashMap::from([
+            ("UNVERSIONED".to_string(), 1),
+            ("SINGLE_VERSION".to_string(), 0),
+            ("BETWEEN_2_AND_10".to_string(), 1),
+            ("BETWEEN_10_AND_100".to_string(), 0),
+            ("BETWEEN_100_AND_1000".to_string(), 0),
+            ("BETWEEN_1000_AND_10000".to_string(), 0),
+            ("GREATER_THAN_10000".to_string(), 0),
+        ]),
+        versions_count: 14,
+        delete_markers_count: 2,
+        replica_size: 777,
+        replica_count: 3,
+        replication_info: HashMap::from([
+            (
+                first_target,
+                BucketTargetUsageInfo {
+                    replication_pending_size: 101,
+                    replication_failed_size: 103,
+                    replicated_size: 102,
+                    replica_size: 0,
+                    replication_pending_count: 105,
+                    replication_failed_count: 104,
+                    replicated_count: 110,
+                },
+            ),
+            (zero_target, BucketTargetUsageInfo::default()),
+        ]),
+    };
+    assert_eq!(usage, expected);
+    assert_eq!(
+        serde_json::to_value(&usage).expect("serialize owned usage"),
+        serde_json::to_value(&expected).expect("serialize expected snapshot")
+    );
+}
+
+#[test]
+fn checked_bucket_usage_info_keeps_missing_empty_and_zero_replication_values() {
+    for replication_stats in [
+        None,
+        Some(ReplicationAllStats::default()),
+        Some(ReplicationAllStats {
+            targets: HashMap::from([(String::new(), ReplicationTargetUsage::default())]),
+            ..Default::default()
+        }),
+    ] {
+        let has_empty_target = replication_stats.as_ref().is_some_and(|stats| !stats.targets.is_empty());
+        let usage = checked_bucket_usage_info(DataUsageEntry {
+            replication_stats,
+            ..Default::default()
+        })
+        .expect("zero usage remains representable");
+        assert_eq!(usage.object_size_histogram.len(), 11);
+        assert!(usage.object_size_histogram.values().all(|value| *value == 0));
+        assert_eq!(usage.object_versions_histogram.len(), 7);
+        assert!(usage.object_versions_histogram.values().all(|value| *value == 0));
+        let expected = BucketUsageInfo {
+            object_size_histogram: usage.object_size_histogram.clone(),
+            object_versions_histogram: usage.object_versions_histogram.clone(),
+            replication_info: if has_empty_target {
+                HashMap::from([(String::new(), BucketTargetUsageInfo::default())])
+            } else {
+                HashMap::new()
+            },
+            ..Default::default()
+        };
+        assert_eq!(usage, expected);
+        assert_eq!(
+            serde_json::to_value(&usage).expect("serialize zero usage"),
+            serde_json::to_value(&expected).expect("serialize expected zero snapshot")
+        );
+    }
 }
 
 #[test]
@@ -981,7 +1252,8 @@ fn completed_data_usage_info_flattens_nested_bucket_entries() {
     first_set.replace("bucket/prefix", "bucket", nested);
     let second_set = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(1, 0));
 
-    let (data_usage_info, _) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false)
+    let mut results = [first_set, second_set];
+    let (data_usage_info, _) = completed_data_usage_info_for_test(&results, &all_buckets, false, false)
         .expect("nested bucket entries should be flattened before aggregation");
     let bucket = data_usage_info.buckets_usage.get("bucket").expect("merged bucket usage");
 
@@ -995,6 +1267,30 @@ fn completed_data_usage_info_flattens_nested_bucket_entries() {
     assert_eq!(bucket.replica_count, 2);
     assert_eq!(bucket.replication_info["arn:target"].replicated_size, 2048);
     assert_eq!(bucket.replication_info["arn:target"].replicated_count, 2);
+
+    let sources = results.iter().filter_map(|result| result.info.source).collect::<HashSet<_>>();
+    let (observed, _) = observational_data_usage_info(&results, &sources, &all_buckets, &[], TEST_PLAN_DIGEST, 0, 0)
+        .expect("current snapshots retain the same bucket usage on the observational path");
+    assert_eq!(observed.buckets_usage, data_usage_info.buckets_usage);
+    assert_eq!(observed.bucket_sizes, data_usage_info.bucket_sizes);
+    assert!(!observed.usage_snapshot_complete);
+    assert_eq!(observed.usage_snapshot_converged, Some(false));
+
+    for result in &mut results {
+        result.info.snapshot_complete = false;
+        result.info.lkg_snapshot_complete = true;
+        result.info.lkg_next_cycle = Some(0);
+        result.info.lkg_leader_epoch = Some(0);
+        result.info.lkg_last_update = result.info.last_update;
+        result.info.lkg_scan_plan_digest = Some(TEST_PLAN_DIGEST);
+    }
+    let (observed_lkg, _) = observational_data_usage_info(&results, &sources, &all_buckets, &[], TEST_PLAN_DIGEST, 1, 1)
+        .expect("LKG snapshots retain the same bucket usage after leader change");
+    assert_eq!(observed_lkg.buckets_usage, data_usage_info.buckets_usage);
+    assert_eq!(observed_lkg.bucket_sizes, data_usage_info.bucket_sizes);
+    assert!(!observed_lkg.usage_snapshot_complete);
+    assert_eq!(observed_lkg.usage_snapshot_converged, Some(false));
+    assert!(observed_lkg.usage_snapshot_set_states.iter().all(|state| !state.complete));
 }
 
 #[test]
@@ -1528,3 +1824,58 @@ async fn requeued_bucket_remains_pending_for_another_worker() {
     assert!(!complete.is_cancelled());
     assert_eq!(rx.recv().await.expect("requeued bucket").name, "photos");
 }
+
+#[test]
+fn replication_execution_digest_is_canonical_and_tracks_statistics() {
+    use rustfs_data_usage::{ReplicationAllStats, ReplicationTargetUsage};
+    let execution = DataUsageScanPlanDigest([9; 32]);
+    let mut cache = DataUsageCache::default();
+    assert_eq!(super::cache::scanner_replication_execution_digest(execution, &cache), execution);
+    let first = ReplicationTargetUsage {
+        replicated_size: 7,
+        replicated_count: 1,
+        ..Default::default()
+    };
+    let second = ReplicationTargetUsage {
+        pending_size: 3,
+        pending_count: 1,
+        ..Default::default()
+    };
+    cache.cache.insert(
+        "photos".to_string(),
+        DataUsageEntry {
+            replication_stats: Some(ReplicationAllStats {
+                replica_size: 0,
+                replica_count: 0,
+                targets: HashMap::from([("arn:a".to_string(), first.clone()), ("arn:b".to_string(), second.clone())]),
+            }),
+            ..Default::default()
+        },
+    );
+    let digest = super::cache::scanner_replication_execution_digest(execution, &cache);
+    assert_ne!(digest, execution);
+    let stats = cache
+        .cache
+        .get_mut("photos")
+        .expect("cached bucket")
+        .replication_stats
+        .as_mut()
+        .expect("replication stats");
+    stats.targets = HashMap::from([("arn:b".to_string(), second), ("arn:a".to_string(), first)]);
+    assert_eq!(super::cache::scanner_replication_execution_digest(execution, &cache), digest);
+    cache
+        .cache
+        .get_mut("photos")
+        .expect("cached bucket")
+        .replication_stats
+        .as_mut()
+        .expect("replication stats")
+        .targets
+        .get_mut("arn:a")
+        .expect("target stats")
+        .failed_count = 1;
+    assert_ne!(super::cache::scanner_replication_execution_digest(execution, &cache), digest);
+}
+
+#[path = "usage_candidate_metrics_tests.rs"]
+mod usage_candidate_metrics_tests;

@@ -15,16 +15,16 @@
 # Sole writer of the Rust dependency caches that ci.yml restores.
 #
 # Why this is a separate workflow rather than steps inside ci.yml: ci.yml's
-# concurrency group cancels in-progress runs on main pushes, and merges land far
-# faster than its 70-minute pipeline. Measured over 15 consecutive main pushes:
+# concurrency group originally cancelled in-progress main runs, while merges
+# landed faster than its 70-minute pipeline. Over 15 consecutive main pushes:
 # 12 cancelled, 2 failed, 0 succeeded. A cancelled run never reaches
 # Swatinem/rust-cache's post step (cache-on-failure does not cover cancellation),
 # so the writer lanes were saving nothing and every PR paid a cold restore —
 # 11.8-20.9 minutes of "Setup Rust environment" against 0.7-3.4 warm.
 #
-# Splitting cache writing out of the test pipeline lets ci.yml keep cancelling
-# superseded runs (which is correct — nobody needs test results for a commit
-# that is already three merges behind) while the caches still get written.
+# Keep cache writing separate from validation: only these jobs publish the
+# complete feature closure for each key. Main validation now also finishes its
+# running baseline, while superseded PR attempts can still be cancelled.
 #
 # The group below deliberately does NOT cancel in progress; see the comment on
 # it for how that bounds concurrency and why it is scoped by event.
@@ -42,26 +42,23 @@
 name: Cache Warm
 
 on:
+  schedule:
+    # Every six hours; the 22:41 UTC run lands before ci.yml's nightly 00:11
+    # UTC matrix. A reader restores the newest entry under its key and
+    # rebuilds whatever its own diff changed, so a cache up to six hours old
+    # costs a PR the handful of crates merged since. Warming after every merge
+    # (fourteen completed runs a day, about two sm-standard-4 hours each)
+    # spent far more than that to avoid it.
+    - cron: "41 4,10,16,22 * * *"
   push:
     branches: [ main ]
-    # Mirrors ci.yml's push paths-ignore: if a commit cannot change what ci.yml
-    # compiles, it cannot change what ci.yml needs restored either.
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "deploy/**"
-      - "scripts/dev_*.sh"
-      - "scripts/probe.sh"
-      - "LICENSE*"
-      - ".gitignore"
-      - ".dockerignore"
-      - "README*"
-      - "**/*.png"
-      - "**/*.jpg"
-      - "**/*.svg"
-      - ".github/workflows/build.yml"
-      - ".github/workflows/docker.yml"
-      - ".github/workflows/audit.yml"
+    # A toolchain or lockfile change invalidates most of every key; those
+    # re-warm at once instead of waiting for the next slot.
+    paths:
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/actions/setup/**"
+      - ".github/workflows/cache-warm.yml"
   workflow_dispatch:
     inputs:
       emit_timings:
@@ -75,7 +72,7 @@ on:
 permissions:
   contents: read
 
-# Scoped by event. A push run and a dispatch run do not compete: GitHub keeps
+# Scoped by event. Scheduled, push and dispatch runs do not compete: GitHub keeps
 # one running plus one pending per group, so with a single shared group a
 # manually dispatched run was displaced as pending by the next merge and
 # cancelled — observed three times in a row, which made the --timings gate in
@@ -99,7 +96,7 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Readers: test-and-lint, test-ilm-integration-serial, build-rustfs-debug-binary,
+  # Readers: test-and-lint (workspace and ILM), build-rustfs-debug-binary,
   # e2e-tests, e2e-full.
   warm-ci-dev:
     name: Warm ci-dev
@@ -109,7 +106,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -141,7 +138,7 @@ jobs:
 
       - name: Upload cargo timings report
         if: inputs.emit_timings
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cargo-timings-ci-dev
           path: target/cargo-timings/
@@ -161,6 +158,17 @@ jobs:
         run: |
           cargo build --workspace --all-targets
           cargo build -p rustfs --bins --features e2e-test-hooks
+
+      # ci.yml runs Clippy on every pull request. Clippy's check-mode artifacts
+      # are separate from the build above, so warm them with the exact
+      # invocation ci.yml uses; a pull request then re-checks only what its diff
+      # touches. A lint failure on main must not stop the warm-up: the cache is
+      # still saved (cache-on-failure), and the failure belongs to ci.yml.
+      - name: Warm Clippy check artifacts
+        run: |
+          if ! cargo clippy --all-targets -- -D warnings; then
+            echo "::warning::cargo clippy reports findings on this commit; check artifacts are still cached"
+          fi
 
       # Runs before rust-cache's post step, so these are the sizes it is about
       # to archive. Reported so the cache-all-crates decision stays evidence-led:
@@ -185,9 +193,10 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Readers: test-and-lint-rio-v2 (per-PR), build-rustfs-debug-binary-rio-v2
-  # (weekly schedule / manual dispatch only — dormant rio-v2 variant, see
-  # rustfs/backlog#1835 and docs/architecture/minio-file-format-compat.md).
+  # Readers: test-and-lint-rio-v2 (nightly schedule, merge group, dispatch),
+  # build-rustfs-debug-binary-rio-v2 (nightly schedule / manual dispatch only —
+  # dormant rio-v2 variant, see rustfs/backlog#1835 and
+  # docs/architecture/minio-file-format-compat.md).
   # The second build below stays despite the reduced cadence: it warms the
   # rio-v2,e2e-test-hooks feature resolution the scheduled build restores,
   # which keeps that lane inside its 30-minute timeout.
@@ -199,7 +208,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -230,7 +239,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -260,7 +269,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 

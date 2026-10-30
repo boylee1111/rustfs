@@ -908,7 +908,7 @@ fn explicit_url_port(raw: &str) -> Result<Option<u16>> {
         return Err(invalid());
     }
 
-    let (scheme, remainder) = raw.split_once("://").ok_or_else(&invalid)?;
+    let (scheme, remainder) = raw.split_once("://").ok_or_else(invalid)?;
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return Err(invalid());
     }
@@ -916,17 +916,17 @@ fn explicit_url_port(raw: &str) -> Result<Option<u16>> {
         .split('/')
         .next()
         .filter(|authority| !authority.is_empty())
-        .ok_or_else(&invalid)?;
+        .ok_or_else(invalid)?;
     if authority.contains('@') {
         return Err(invalid());
     }
 
     let port = if let Some(bracketed) = authority.strip_prefix('[') {
-        let (_, suffix) = bracketed.split_once(']').ok_or_else(&invalid)?;
+        let (_, suffix) = bracketed.split_once(']').ok_or_else(invalid)?;
         if suffix.is_empty() {
             return Ok(None);
         }
-        suffix.strip_prefix(':').ok_or_else(&invalid)?
+        suffix.strip_prefix(':').ok_or_else(invalid)?
     } else if let Some((_, port)) = authority.rsplit_once(':') {
         port
     } else {
@@ -1001,11 +1001,7 @@ fn parse_explicit_local_endpoint_host(raw: &str) -> Result<Host<String>> {
 
     let host = Host::parse(raw).map_err(|_| invalid())?;
     let host = match host {
-        Host::Domain(domain) => Host::Domain(
-            domain_without_optional_trailing_dot(&domain)
-                .ok_or_else(&invalid)?
-                .to_string(),
-        ),
+        Host::Domain(domain) => Host::Domain(domain_without_optional_trailing_dot(&domain).ok_or_else(invalid)?.to_string()),
         host => host,
     };
     if matches!(&host, Host::Domain(domain) if domain.contains('*'))
@@ -1733,10 +1729,20 @@ fn validate_local_physical_disk_independence(pools: &[Endpoints]) -> Result<()> 
 
     Err(Error::other(format!(
         "local erasure endpoints must use distinct physical disks; detected shared devices [{details}]. \
-validation diagnostics: [{diagnostics_summary}]. \
+validation diagnostics: [{diagnostics_summary}]. {SHARED_DEVICE_PLATFORM_HINT}\
 Set {ENV_UNSAFE_BYPASS_DISK_CHECK}=true only for local testing or CI to bypass this safety check"
     )))
 }
+
+/// Windows reports the volume mount point (for example `C:\`) as the device
+/// identity, so every directory on one drive letter or mounted volume counts
+/// as the same physical disk.
+#[cfg(windows)]
+const SHARED_DEVICE_PLATFORM_HINT: &str = "On Windows the device identity is the volume mount point, so directories on the same \
+drive letter or mounted volume (for example C:\\data1 and C:\\data2) count as one disk; place each endpoint on its own \
+volume. ";
+#[cfg(not(windows))]
+const SHARED_DEVICE_PLATFORM_HINT: &str = "";
 
 fn validate_local_cross_device_mounts(local_paths: &[String]) -> Result<()> {
     rustfs_utils::os::check_cross_device_mounts(local_paths)
@@ -3583,6 +3589,38 @@ mod test {
                 panic!("Test {}: expected failure but passed instead", i + 1);
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[serial]
+    #[tokio::test]
+    async fn windows_url_endpoints_on_one_volume_resolve_and_report_shared_volume() {
+        async_with_vars([(ENV_UNSAFE_BYPASS_DISK_CHECK, None::<&str>), (ENV_MINIO_CI, None::<&str>)], async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut endpoints = Vec::new();
+            for name in ["disk1", "disk2"] {
+                let disk = dir.path().join(name);
+                std::fs::create_dir_all(&disk).unwrap();
+                let drive_path = disk.to_string_lossy().replace('\\', "/");
+                let mut endpoint = Endpoint::try_from(format!("http://127.0.0.1:9000/{drive_path}").as_str()).unwrap();
+                endpoint.is_local = true;
+                endpoints.push(endpoint);
+            }
+
+            let err = validate_local_physical_disk_independence(&[Endpoints::from(endpoints)]).unwrap_err();
+
+            // Before the drive-path fix, `/C:/...` failed canonicalization here
+            // with "failed to resolve local endpoint path".
+            let err_text = err.to_string();
+            assert!(
+                !err_text.contains("failed to resolve local endpoint path"),
+                "unexpected error: {err_text}"
+            );
+            assert!(err_text.contains("distinct physical disks"), "unexpected error: {err_text}");
+            assert!(err_text.contains("same drive letter or mounted volume"), "unexpected error: {err_text}");
+            assert!(err_text.contains(ENV_UNSAFE_BYPASS_DISK_CHECK), "unexpected error: {err_text}");
+        })
+        .await;
     }
 
     #[cfg(target_os = "linux")]

@@ -301,14 +301,16 @@ impl<K: Hash + Eq + Clone> RateLimiter<K> {
 /// Resolve the client identity for rate limiting.
 ///
 /// Only trusted sources are consulted: `ClientInfo` is inserted by the
-/// trusted-proxy layer after validating the proxy chain, and `RemoteAddr` is
-/// the raw socket peer. Spoofable headers (`X-Forwarded-For`, `X-Real-IP`)
-/// are deliberately never read here.
+/// trusted-proxy layer after validating the proxy chain, and `Option<RemoteAddr>`
+/// carries the socket peer injected by the external HTTP stack. Spoofable
+/// headers (`X-Forwarded-For`, `X-Real-IP`) are deliberately never read here.
 pub(crate) fn client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
     if let Some(info) = req.extensions().get::<ClientInfo>() {
         return Some(info.real_ip);
     }
-    req.extensions().get::<RemoteAddr>().map(|remote| remote.0.ip())
+    req.extensions()
+        .get::<Option<RemoteAddr>>()
+        .and_then(|remote| remote.map(|remote| remote.0.ip()))
 }
 
 /// Resolve the host a request addresses, for virtual-hosted-style bucket
@@ -337,7 +339,7 @@ fn bounded_bucket_name(bucket: &str) -> Option<&str> {
     (!bucket.is_empty() && bucket.len() <= MAX_BUCKET_NAME_LENGTH).then_some(bucket)
 }
 
-fn rate_limit_vh_domain_hosts(vh_domains: Vec<String>) -> Arc<[String]> {
+pub(crate) fn rate_limit_vh_domain_hosts(vh_domains: Vec<String>) -> Arc<[String]> {
     let mut domains = Vec::with_capacity(vh_domains.len());
     let mut seen = HashSet::with_capacity(vh_domains.len());
 
@@ -365,23 +367,34 @@ fn request_bucket<'a, B>(req: &'a Request<B>, vh_domain_hosts: &[String]) -> Opt
         return None;
     }
 
-    if !vh_domain_hosts.is_empty()
-        && let Some(host) = request_host(req)
-    {
-        let host = strip_valid_port_suffix(host);
-        for domain_host in vh_domain_hosts {
-            if host.eq_ignore_ascii_case(domain_host) {
-                // Path-style request on the API domain itself.
-                break;
-            }
-            if let Some(bucket) = strip_vh_prefix(host, domain_host) {
-                return bounded_bucket_name(bucket);
-            }
-        }
+    if let Some(bucket) = virtual_host_bucket(req, vh_domain_hosts) {
+        return bounded_bucket_name(bucket);
     }
 
     let bucket = path.trim_start_matches('/').split('/').next().unwrap_or("");
     bounded_bucket_name(bucket)
+}
+
+/// Extract the bucket from the host prefix of a virtual-hosted-style request.
+///
+/// Returns `None` for path-style requests: when no domains are configured,
+/// when the host is exactly a configured domain, or when it matches none.
+pub(crate) fn virtual_host_bucket<'a, B>(req: &'a Request<B>, vh_domain_hosts: &[String]) -> Option<&'a str> {
+    if vh_domain_hosts.is_empty() {
+        return None;
+    }
+
+    let host = strip_valid_port_suffix(request_host(req)?);
+    for domain_host in vh_domain_hosts {
+        if host.eq_ignore_ascii_case(domain_host) {
+            // Path-style request on the API domain itself.
+            return None;
+        }
+        if let Some(bucket) = strip_vh_prefix(host, domain_host) {
+            return Some(bucket);
+        }
+    }
+    None
 }
 
 /// Paths exempt from S3 API rate limiting.
@@ -867,6 +880,27 @@ mod tests {
     }
 
     #[test]
+    fn virtual_host_bucket_only_resolves_host_prefix() {
+        let domains = vh_domain_hosts(&["localhost:9000"]);
+
+        let vh = request_with_host("mybucket.localhost:9000", "/x.jpg");
+        assert_eq!(virtual_host_bucket(&vh, &domains), Some("mybucket"));
+
+        let vh_root = request_with_host("mybucket.localhost:9000", "/");
+        assert_eq!(virtual_host_bucket(&vh_root, &domains), Some("mybucket"));
+
+        // Path-style requests carry the bucket in the path, not the host.
+        let path_style = request_with_host("localhost:9000", "/mybucket/x.jpg");
+        assert_eq!(virtual_host_bucket(&path_style, &domains), None);
+
+        let other = request_with_host("cdn.other.net", "/mybucket/x.jpg");
+        assert_eq!(virtual_host_bucket(&other, &domains), None);
+
+        let no_domains = vh_domain_hosts(&[]);
+        assert_eq!(virtual_host_bucket(&vh, &no_domains), None);
+    }
+
+    #[test]
     fn request_bucket_matches_virtual_hosted_domains_port_agnostically() {
         let domains = vh_domain_hosts(&["s3.example.com:1234"]);
 
@@ -929,7 +963,7 @@ mod tests {
 
     fn request_from(peer: IpAddr, path: &str) -> Request<()> {
         let mut req = Request::builder().uri(path).body(()).expect("request");
-        req.extensions_mut().insert(RemoteAddr(SocketAddr::new(peer, 51000)));
+        req.extensions_mut().insert(Some(RemoteAddr(SocketAddr::new(peer, 51000))));
         req
     }
 
@@ -1047,7 +1081,11 @@ mod tests {
     async fn missing_client_identity_fails_open() {
         let mut service = service_with_quota(60, 1);
         for _ in 0..3 {
-            let req = Request::builder().uri("/bucket/object").body(()).expect("request");
+            let mut req = Request::builder().uri("/bucket/object").body(()).expect("request");
+            req.extensions_mut().insert(None::<RemoteAddr>);
+            req.headers_mut()
+                .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.1"));
+            req.headers_mut().insert("x-real-ip", HeaderValue::from_static("203.0.113.2"));
             assert_eq!(service.call(req).await.expect("ok").status(), StatusCode::OK);
         }
     }

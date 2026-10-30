@@ -357,6 +357,7 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedPayloadMeta {
+    #[serde(deserialize_with = "rustfs_s3_types::deserialize_persisted_event_name")]
     pub event_name: EventName,
     pub bucket_name: String,
     pub object_name: String,
@@ -1177,6 +1178,24 @@ mod tests {
         assert_eq!(decoded.dedup_id, "minted-id");
     }
 
+    /// Regression: the internal multipart events were dropped on replay because their
+    /// persisted name did not parse back.
+    #[test]
+    fn queued_payload_round_trips_internal_event_names() {
+        for event in [
+            EventName::ObjectCreatedCreateMultipartUpload,
+            EventName::ObjectRemovedAbortMultipartUpload,
+            EventName::ObjectRemovedDeleteObjects,
+            EventName::AuditS3Operation,
+        ] {
+            let body = br#"{"ok":true}"#.to_vec();
+            let meta = QueuedPayloadMeta::new(event, "bucket-a".to_string(), "obj".to_string(), "application/json", body.len());
+            let encoded = QueuedPayload::new(meta, body).encode().unwrap();
+            let decoded = QueuedPayload::decode(&encoded).unwrap_or_else(|err| panic!("{event:?} dropped on replay: {err}"));
+            assert_eq!(decoded.meta.event_name, event);
+        }
+    }
+
     #[test]
     fn queued_payload_round_trips_meta_and_body() {
         let body = br#"{"ok":true}"#.to_vec();
@@ -1264,7 +1283,11 @@ mod tests {
 
         match result {
             Ok(_) => panic!("expected open_target_queue_store to fail on file base path"),
-            Err(err) => assert!(err.to_string().contains("custom open context")),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(message.contains("custom open context"));
+                assert!(message.contains(base.to_string_lossy().as_ref()));
+            }
         }
         let _ = fs::remove_file(base);
     }

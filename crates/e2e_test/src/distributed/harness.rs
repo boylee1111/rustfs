@@ -34,14 +34,18 @@ use crate::common::{
 };
 use crate::replication_extension_test::LOOPBACK_REPLICATION_TARGET_ENV;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::{Credentials, retry::RetryConfig};
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::{get_object::GetObjectError, put_object::PutObjectError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use futures::future::try_join_all;
 use http::{Method, StatusCode};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout_at};
 use uuid::Uuid;
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -74,6 +78,7 @@ pub(crate) struct DistCluster {
     pub cluster: RustFSTestClusterEnvironment,
     pool_storage_roots: Option<Vec<PathBuf>>,
     owned_pool_dirs: Vec<PathBuf>,
+    capture_log_dir: Option<PathBuf>,
 }
 
 impl DistCluster {
@@ -125,11 +130,12 @@ impl DistCluster {
         for &(key, value) in extra_env {
             cluster.set_env(key, value);
         }
-        configure_node_logs(&mut cluster)?;
+        configure_node_logs(&mut cluster, None)?;
         Ok(Self {
             cluster,
             pool_storage_roots,
             owned_pool_dirs,
+            capture_log_dir: None,
         })
     }
 
@@ -167,17 +173,34 @@ impl DistCluster {
         Ok(())
     }
 
+    /// Append every node's stdout/stderr to `directory/node-<idx>.log`, including
+    /// nodes added by later pool expansion. Call before the first start so startup
+    /// events such as the resolved durability mode are captured.
+    pub fn capture_logs_under(&mut self, directory: &Path) -> TestResult {
+        self.capture_log_dir = Some(directory.to_path_buf());
+        configure_node_logs(&mut self.cluster, Some(directory))
+    }
+
     pub fn client_with_credentials(&self, node_idx: usize, access_key: &str, secret_key: &str) -> TestResult<Client> {
         if node_idx >= self.cluster.nodes.len() {
             return Err("node_idx is invalid".into());
         }
-        Ok(Client::from_conf(build_test_s3_config(
-            &self.cluster.nodes[node_idx].url,
-            access_key,
-            secret_key,
-            None,
-            "cluster-iam-test",
-        )))
+        let config = self.cluster.create_s3_client(node_idx)?.config().to_builder();
+        Ok(Client::from_conf(
+            config
+                .credentials_provider(Credentials::new(access_key, secret_key, None, None, "cluster-iam-test"))
+                .build(),
+        ))
+    }
+
+    /// Stop the fleet, drop retired pools from the command line, and restart
+    /// the remaining pools, which are renumbered from zero.
+    pub async fn remove_retired_pools_and_restart(&mut self, retired: &[usize]) -> TestResult {
+        self.stop_all_gracefully().await?;
+        self.cluster.remove_single_node_pools(retired)?;
+        self.cluster.start().await?;
+        wait_for_ready(&self.cluster).await?;
+        Ok(())
     }
 
     pub async fn append_pool_and_restart(&mut self) -> TestResult<usize> {
@@ -189,7 +212,7 @@ impl DistCluster {
             .ok_or("pool expansion requires configured isolated pool filesystems")?;
         self.owned_pool_dirs
             .push(relocate_pool_storage(&mut self.cluster, node_idx, roots)?);
-        configure_node_logs(&mut self.cluster)?;
+        configure_node_logs(&mut self.cluster, self.capture_log_dir.as_deref())?;
         self.cluster.start().await?;
         wait_for_ready(&self.cluster).await?;
         Ok(node_idx)
@@ -323,7 +346,22 @@ fn relocate_pool_storage(cluster: &mut RustFSTestClusterEnvironment, node_idx: u
     Ok(pool_run_root)
 }
 
-fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment) -> TestResult {
+pub(super) fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment, capture_dir: Option<&Path>) -> TestResult {
+    if let Ok(filter) = std::env::var("RUSTFS_E2E_LOG_FILTER") {
+        cluster.set_env("RUST_LOG", filter);
+    }
+    if let Some(directory) = capture_dir {
+        std::fs::create_dir_all(directory)?;
+        for node_idx in 0..cluster.nodes.len() {
+            // Overrides a path assigned from RUSTFS_E2E_LOG_DIR so every node of
+            // the run, including the seed node, logs into the same directory.
+            let path = directory.join(format!("node-{node_idx}.log"));
+            if cluster.node_capture_log_paths[node_idx].as_deref() != Some(path.to_string_lossy().as_ref()) {
+                cluster.set_node_capture_log_path(node_idx, path.to_string_lossy().into_owned())?;
+            }
+        }
+        return Ok(());
+    }
     let Some(log_dir) = std::env::var_os("RUSTFS_E2E_LOG_DIR") else {
         return Ok(());
     };
@@ -400,9 +438,9 @@ pub(crate) async fn put_inventory(
     Ok(inventory)
 }
 
-/// Retry only transport-level service availability failures while a data
-/// movement operation changes the pool map. Generic InternalError responses
-/// remain fatal because accepting them would hide server defects.
+/// Retry only explicit S3 availability responses while a data movement
+/// operation changes the pool map. Transport failures and InternalError
+/// responses remain fatal because callers already require a ready endpoint.
 pub(crate) async fn put_inventory_retrying(
     client: &Client,
     bucket: &str,
@@ -449,17 +487,46 @@ where
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(50);
     loop {
-        let last_error = match probe().await {
-            Ok(true) => return Ok(()),
-            Ok(false) => format!("{label} still false"),
-            Err(error) => error.to_string(),
-        };
         if Instant::now() >= deadline {
-            return Err(format!("{label} did not become true within {timeout:?}: {last_error}").into());
+            return Err(format!("{label} did not become true within {timeout:?}").into());
         }
-        sleep(delay).await;
+        // A pending request must consume the same budget as unsuccessful probes.
+        match timeout_at(deadline, probe()).await {
+            Err(_) => return Err(format!("{label} did not become true within {timeout:?}").into()),
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(true)) => return Ok(()),
+            Ok(Ok(false)) => {}
+        }
+        tokio::time::sleep_until((Instant::now() + delay).min(deadline)).await;
         delay = (delay * 2).min(Duration::from_secs(1));
     }
+}
+
+// Boxed SDK errors retain the operation's service code; Display only says
+// "service error" and cannot distinguish convergence from a server defect.
+pub(crate) fn s3_probe_error_code<'a>(error: &'a (dyn std::error::Error + Send + Sync + 'static)) -> Option<&'a str> {
+    error
+        .downcast_ref::<SdkError<GetObjectError>>()
+        .and_then(|error| error.as_service_error())
+        .and_then(ProvideErrorMetadata::code)
+        .or_else(|| {
+            error
+                .downcast_ref::<SdkError<PutObjectError>>()
+                .and_then(|error| error.as_service_error())
+                .and_then(ProvideErrorMetadata::code)
+        })
+}
+
+pub(crate) fn s3_probe_client(client: &Client) -> Client {
+    // The probe owns the retry policy. SDK retries must not hide a response
+    // that the probe would classify as fatal.
+    Client::from_conf(
+        client
+            .config()
+            .to_builder()
+            .retry_config(RetryConfig::standard().with_max_attempts(1))
+            .build(),
+    )
 }
 
 pub(crate) async fn cluster_admin(
@@ -598,15 +665,20 @@ pub(crate) async fn wait_for_replicated_bytes(
     expected: &[u8],
     timeout: Duration,
 ) -> TestResult {
+    let client = s3_probe_client(client);
     wait_until(
         timeout,
         || async {
-            match get_object_bytes(client, bucket, key).await {
+            match get_object_bytes(&client, bucket, key).await {
                 Ok(got) if got.as_slice() == expected => Ok(true),
-                Ok(_) => Ok(false),
+                Ok(got) => Err(format!(
+                    "replicated object {bucket}/{key} bytes mismatch: expected sha256={} got sha256={}",
+                    sha256_hex(expected),
+                    sha256_hex(&got)
+                )
+                .into()),
                 Err(error) => {
-                    let message = error.to_string();
-                    if message.contains("NoSuchKey") || message.contains("NotFound") {
+                    if matches!(s3_probe_error_code(error.as_ref()), Some("NoSuchKey" | "NotFound")) {
                         Ok(false)
                     } else {
                         Err(error)
@@ -619,13 +691,50 @@ pub(crate) async fn wait_for_replicated_bytes(
     .await
 }
 
+/// Quota stats for `bucket` from every node at once. Each node answers from
+/// its own cached copy of the persisted usage snapshot, and only the scanner
+/// leader's save invalidates that copy. Leadership goes to whichever node
+/// starts its scanner first, so a probe pinned to one node can wait out the
+/// whole cache TTL on a node that never saves.
+pub(crate) async fn quota_stats_on_every_node(
+    cluster: &RustFSTestClusterEnvironment,
+    bucket: &str,
+) -> TestResult<Vec<(StatusCode, String)>> {
+    let path = format!("/rustfs/admin/v3/quota-stats/{bucket}");
+    try_join_all(
+        cluster
+            .nodes
+            .iter()
+            .map(|node| admin_request(&node.url, Method::GET, &path, None, &cluster.access_key, &cluster.secret_key)),
+    )
+    .await
+}
+
+/// `current_usage` from a quota-stats body. `None` means the node has no
+/// scanner usage for the bucket yet: a quota admitted by the reservation
+/// ledger reports `null` rather than a guess.
+pub(crate) fn quota_stats_current_usage(body: &str) -> TestResult<Option<u64>> {
+    let stats: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| format!("quota stats returned invalid JSON: {error}: {body}"))?;
+    match stats.get("current_usage") {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(usage) => Ok(Some(
+            usage
+                .as_u64()
+                .ok_or_else(|| format!("quota stats current_usage is not a byte count: {stats}"))?,
+        )),
+        None => Err(format!("quota stats omitted current_usage: {stats}").into()),
+    }
+}
+
 pub(crate) async fn set_bucket_quota(cluster: &RustFSTestClusterEnvironment, bucket: &str, quota_bytes: u64) -> TestResult {
     wait_until(
         Duration::from_secs(30),
         || async {
-            let (status, _) =
-                cluster_admin(cluster, Method::GET, &format!("/rustfs/admin/v3/quota-stats/{bucket}"), None).await?;
-            Ok(status.is_success() || status == StatusCode::NOT_FOUND)
+            let stats = quota_stats_on_every_node(cluster, bucket).await?;
+            Ok(stats
+                .iter()
+                .any(|(status, _)| status.is_success() || *status == StatusCode::NOT_FOUND))
         },
         "quota stats ready",
     )
@@ -649,23 +758,44 @@ pub(crate) async fn set_bucket_quota(cluster: &RustFSTestClusterEnvironment, buc
     .await
 }
 
+/// The existing decommission cases wait up to 180 s for movement to finish; a
+/// start refused because a movement gate is busy is retried within the same budget.
+const DECOMMISSION_START_BUSY_BUDGET: Duration = Duration::from_secs(180);
+const DECOMMISSION_START_PROOF_BUDGET: Duration = Duration::from_secs(45);
+
 /// Start decommission and fail closed unless the admin API acknowledges it.
 pub(crate) async fn start_decommission(cluster: &RustFSTestClusterEnvironment, pool_id: usize) -> TestResult {
     let path = format!("/rustfs/admin/v3/pools/decommission?pool={pool_id}&by-id=true");
-    let deadline = Instant::now() + Duration::from_secs(45);
+    post_decommission_start(cluster, &path, DECOMMISSION_START_BUSY_BUDGET).await?;
+    Ok(())
+}
+
+/// POST a decommission start and return the response body. A start that meets
+/// a busy movement gate answers a retryable 503 and is retried within
+/// `busy_budget`; the init stage's missing fleet capability proof (500) is
+/// retried for 45 s. Every other status is fatal.
+pub(crate) async fn post_decommission_start(
+    cluster: &RustFSTestClusterEnvironment,
+    path: &str,
+    busy_budget: Duration,
+) -> TestResult<String> {
+    let started = Instant::now();
+    let mut delay = Duration::from_millis(250);
     loop {
-        let (status, response) = cluster_admin(cluster, Method::POST, &path, None).await?;
+        let (status, response) = cluster_admin(cluster, Method::POST, path, None).await?;
         if status.is_success() {
-            return Ok(());
+            return Ok(response);
         }
-        if status == StatusCode::INTERNAL_SERVER_ERROR
+        let elapsed = started.elapsed();
+        let busy = status == StatusCode::SERVICE_UNAVAILABLE && elapsed < busy_budget;
+        let awaiting_proof = status == StatusCode::INTERNAL_SERVER_ERROR
             && response.contains("requires a live fleet capability proof")
-            && Instant::now() < deadline
-        {
-            sleep(Duration::from_secs(1)).await;
-            continue;
+            && elapsed < DECOMMISSION_START_PROOF_BUDGET;
+        if !busy && !awaiting_proof {
+            return Err(format!("POST {path} did not start decommission: {status} {response}").into());
         }
-        return Err(format!("POST {path} did not start decommission: {status} {response}").into());
+        sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(2));
     }
 }
 
@@ -823,10 +953,12 @@ pub(crate) async fn start_rebalance(cluster: &RustFSTestClusterEnvironment) -> T
         if status.is_success() {
             break response;
         }
-        if status == StatusCode::INTERNAL_SERVER_ERROR
-            && response.contains("requires a live fleet capability proof")
-            && Instant::now() < deadline
-        {
+        // The init stage answers 503 + Retry-After while the cluster capability
+        // proof is still missing; older binaries surfaced the same condition as
+        // a 500 carrying the proof marker.
+        let waiting_for_readiness = status == StatusCode::SERVICE_UNAVAILABLE
+            || (status == StatusCode::INTERNAL_SERVER_ERROR && response.contains("requires a live fleet capability proof"));
+        if waiting_for_readiness && Instant::now() < deadline {
             sleep(Duration::from_secs(1)).await;
             continue;
         }
@@ -844,6 +976,21 @@ pub(crate) async fn start_rebalance(cluster: &RustFSTestClusterEnvironment) -> T
 pub(crate) async fn rebalance_status_json(cluster: &RustFSTestClusterEnvironment) -> TestResult<serde_json::Value> {
     let body = cluster_admin_ok(cluster, Method::GET, "/rustfs/admin/v3/rebalance/status", None).await?;
     Ok(serde_json::from_str(&body)?)
+}
+
+/// Mirrors `REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX` in `crates/ecstore/src/services/rebalance`.
+const REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX: &str = "deferred transient rebalance entry failure:";
+
+/// A transient entry failure (for example a write quorum miss on a busy
+/// target) is recorded as `lastError` and retried at the end of the run; the
+/// worker clears it when the pool completes. It is only acceptable while the
+/// pool is still started: a terminal pool keeping it is a real failure.
+fn is_retrying_deferred_rebalance_error(pool: &serde_json::Value, error: &str) -> bool {
+    error.starts_with(REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX)
+        && pool
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("started"))
 }
 
 fn validate_rebalance_status<'a>(status: &'a serde_json::Value, expected_id: &str) -> TestResult<&'a [serde_json::Value]> {
@@ -873,7 +1020,7 @@ fn validate_rebalance_status<'a>(status: &'a serde_json::Value, expected_id: &st
         if pool
             .get("lastError")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|error| !error.is_empty())
+            .is_some_and(|error| !error.is_empty() && !is_retrying_deferred_rebalance_error(pool, error))
         {
             return Err(format!("rebalance reported lastError: {status}").into());
         }
@@ -988,6 +1135,7 @@ pub(crate) async fn list_pools_json(cluster: &RustFSTestClusterEnvironment) -> T
 }
 
 pub(crate) async fn retrying_put(client: &Client, bucket: &str, key: &str, body: Vec<u8>, timeout: Duration) -> TestResult {
+    let client = s3_probe_client(client);
     wait_until(
         timeout,
         || {
@@ -999,8 +1147,7 @@ pub(crate) async fn retrying_put(client: &Client, bucket: &str, key: &str, body:
                 match put_object(&client, &bucket, &key, body).await {
                     Ok(()) => Ok(true),
                     Err(error) => {
-                        let message = error.to_string();
-                        if message.contains("SlowDown") || message.contains("ServiceUnavailable") || message.contains("503") {
+                        if matches!(s3_probe_error_code(error.as_ref()), Some("SlowDown" | "ServiceUnavailable")) {
                             Ok(false)
                         } else {
                             Err(error)
@@ -1021,29 +1168,247 @@ pub(crate) async fn retrying_get_equals(
     expected: &[u8],
     timeout: Duration,
 ) -> TestResult {
+    let client = s3_probe_client(client);
     wait_until(
         timeout,
         || async {
-            match get_object_bytes(client, bucket, key).await {
+            match get_object_bytes(&client, bucket, key).await {
                 Ok(got) if got.as_slice() == expected => Ok(true),
-                Ok(_) => Ok(false),
+                Ok(got) => Err(format!(
+                    "object {bucket}/{key} bytes mismatch: expected sha256={} got sha256={}",
+                    sha256_hex(expected),
+                    sha256_hex(&got)
+                )
+                .into()),
                 Err(error) => {
-                    let message = error.to_string();
-                    if message.contains("NoSuchKey")
-                        || message.contains("SlowDown")
-                        || message.contains("ServiceUnavailable")
-                        || message.contains("503")
-                    {
-                        Ok(false)
-                    } else {
-                        Err(error)
-                    }
+                    let retryable = match s3_probe_error_code(error.as_ref()) {
+                        Some("SlowDown" | "ServiceUnavailable") => true,
+                        // GET preserves this compatibility code for a lost data quorum.
+                        Some("SlowDownRead") => error
+                            .downcast_ref::<SdkError<GetObjectError>>()
+                            .and_then(SdkError::raw_response)
+                            .is_some_and(|response| response.status().as_u16() == 503),
+                        _ => false,
+                    };
+                    if retryable { Ok(false) } else { Err(error) }
                 }
             }
         },
         &format!("get {bucket}/{key} during data movement"),
     )
     .await
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction, Operation, SeedMetadata};
+    use std::cell::Cell;
+
+    fn client(target: &FakeS3Target) -> Client {
+        Client::from_conf(build_test_s3_config(
+            target.endpoint(),
+            FAKE_ACCESS_KEY,
+            FAKE_SECRET_KEY,
+            None,
+            "distributed-retry-test",
+        ))
+    }
+
+    #[tokio::test]
+    async fn wait_until_preserves_first_error() {
+        let attempts = Cell::new(0);
+        let error = wait_until(
+            Duration::from_secs(5),
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(if attempts.get() == 1 {
+                    Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permanent probe failure").into())
+                } else {
+                    Ok(true)
+                })
+            },
+            "permanent failure",
+        )
+        .await
+        .expect_err("a later success must not hide a permanent failure");
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("preserve the original error")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_until_retries_explicit_pending_state() -> TestResult {
+        let attempts = Cell::new(0);
+        wait_until(
+            Duration::from_secs(5),
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Ok(attempts.get() == 2))
+            },
+            "eventual readiness",
+        )
+        .await?;
+        assert_eq!(attempts.get(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_until_bounds_a_pending_probe() {
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_until(Duration::from_millis(10), std::future::pending, "hung probe"),
+        )
+        .await
+        .expect("the probe deadline must finish before the test watchdog")
+        .expect_err("a permanently pending probe must time out");
+        assert!(error.to_string().contains("hung probe did not become true"));
+    }
+
+    #[tokio::test]
+    async fn wait_until_does_not_start_a_probe_after_its_deadline() {
+        let attempts = Cell::new(0);
+        wait_until(
+            Duration::ZERO,
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Ok(true))
+            },
+            "expired budget",
+        )
+        .await
+        .expect_err("an expired budget must not admit another probe");
+        assert_eq!(attempts.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn retrying_put_does_not_hide_internal_error() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("retry-probe");
+        target.inject(Operation::PutObject, FaultAction::ResponseStatus(500), 1);
+        let error = retrying_put(&client(&target), "retry-probe", "key", b"body".to_vec(), Duration::from_secs(5))
+            .await
+            .expect_err("InternalError must remain fatal even if the next PUT would succeed");
+        assert_eq!(s3_probe_error_code(error.as_ref()), Some("InternalError"));
+        assert_eq!(target.requests().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retrying_put_allows_transient_availability_errors() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("retry-probe");
+        for status in [429, 503] {
+            target.inject(Operation::PutObject, FaultAction::ResponseStatus(status), 1);
+            retrying_put(&client(&target), "retry-probe", "key", b"body".to_vec(), Duration::from_secs(5)).await?;
+            assert_eq!(target.take_requests().len(), 2);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_polls_reject_wrong_object_bytes() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("retry-probe");
+        target.put_seed_object("retry-probe", "key", "wrong bytes", &SeedMetadata::default());
+        let error = retrying_get_equals(&client(&target), "retry-probe", "key", b"expected bytes", Duration::from_secs(5))
+            .await
+            .expect_err("a successful response with wrong bytes must fail immediately");
+        assert!(error.to_string().contains("bytes mismatch"));
+        assert_eq!(target.take_requests().len(), 1);
+        let error = wait_for_replicated_bytes(&client(&target), "retry-probe", "key", b"expected bytes", Duration::from_secs(5))
+            .await
+            .expect_err("replication may lag, but it must not return corrupt bytes");
+        assert!(error.to_string().contains("bytes mismatch"));
+        assert_eq!(target.requests().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retrying_get_allows_read_quorum_recovery() -> TestResult {
+        use aws_sdk_s3::config::Region;
+        use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+        use aws_smithy_types::body::SdkBody;
+
+        let endpoint = "http://read-quorum.example.invalid";
+        let event = |status: u16, body: &'static str| {
+            ReplayEvent::new(
+                http::Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("{endpoint}/retry-probe/key?x-id=GetObject"))
+                    .body(SdkBody::empty())
+                    .expect("build replay request"),
+                http::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/xml")
+                    .header("content-length", body.len())
+                    .body(SdkBody::from(body))
+                    .expect("build replay response"),
+            )
+        };
+        for status in [503, 403, 500] {
+            let transport = StaticReplayClient::new(vec![
+                event(status, "<Error><Code>SlowDownRead</Code></Error>"),
+                event(200, "expected bytes"),
+            ]);
+            let client = Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .behavior_version_latest()
+                    .credentials_provider(Credentials::new(FAKE_ACCESS_KEY, FAKE_SECRET_KEY, None, None, "read-quorum-test"))
+                    .region(Region::new("us-east-1"))
+                    .endpoint_url(endpoint)
+                    .force_path_style(true)
+                    .retry_config(RetryConfig::disabled())
+                    .http_client(transport.clone())
+                    .build(),
+            );
+            let result = retrying_get_equals(&client, "retry-probe", "key", b"expected bytes", Duration::from_secs(5)).await;
+            if status == 503 {
+                result?;
+                assert_eq!(
+                    transport.actual_requests().count(),
+                    2,
+                    "the probe must retry the read-quorum error exactly once"
+                );
+                transport.assert_requests_match(&[]);
+            } else {
+                let error = result.expect_err("the compatibility code must not hide a non-503 failure");
+                assert_eq!(s3_probe_error_code(error.as_ref()), Some("SlowDownRead"));
+                assert_eq!(transport.actual_requests().count(), 1, "non-availability errors must fail immediately");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_polls_distinguish_committed_and_replicated_keys() -> TestResult {
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("retry-probe");
+        target.put_seed_object("retry-probe", "key", "expected bytes", &SeedMetadata::default());
+        let client = client(&target);
+        for (status, expected_code) in [(404, "NoSuchKey"), (500, "InternalError"), (403, "AccessDenied")] {
+            target.inject(Operation::GetObject, FaultAction::ResponseStatus(status), 1);
+            let error = retrying_get_equals(&client, "retry-probe", "key", b"expected bytes", Duration::from_secs(5))
+                .await
+                .expect_err("an acknowledged object must not disappear or fail before a later successful read");
+            assert_eq!(s3_probe_error_code(error.as_ref()), Some(expected_code));
+            assert_eq!(target.take_requests().len(), 1);
+        }
+        for status in [429, 503] {
+            target.inject(Operation::GetObject, FaultAction::ResponseStatus(status), 1);
+            retrying_get_equals(&client, "retry-probe", "key", b"expected bytes", Duration::from_secs(5)).await?;
+            assert_eq!(target.take_requests().len(), 2);
+        }
+        target.inject(Operation::GetObject, FaultAction::ResponseStatus(404), 1);
+        wait_for_replicated_bytes(&client, "retry-probe", "key", b"expected bytes", Duration::from_secs(5)).await?;
+        assert_eq!(target.requests().len(), 2);
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -1061,6 +1426,29 @@ async fn append_single_node_pool_extends_ellipses_volumes() {
     let volumes = env.rustfs_volumes_arg();
     assert_eq!(volumes.split(' ').count(), 3, "expected three pool arguments, got: {volumes}");
     assert!(volumes.contains("/drive{0...1}"), "expanded layout must keep drive ellipses: {volumes}");
+}
+
+#[tokio::test]
+async fn remove_single_node_pools_drops_retired_pools_and_renumbers() {
+    let mut env =
+        RustFSTestClusterEnvironment::with_topology(ClusterTopology::per_node_pools(2, vec![vec![0], vec![1], vec![2], vec![3]]))
+            .await
+            .expect("four-pool topology");
+    let kept: Vec<String> = env.nodes[2..].iter().map(|node| node.address.clone()).collect();
+
+    env.remove_single_node_pools(&[0, 1]).expect("remove two retired pools");
+    assert_eq!(env.nodes.len(), 2);
+    assert_eq!(env.nodes.iter().map(|node| node.address.clone()).collect::<Vec<_>>(), kept);
+    assert_eq!(env.nodes.iter().map(|node| node.pool_idx).collect::<Vec<_>>(), vec![0, 1]);
+    let volumes = env.rustfs_volumes_arg();
+    assert_eq!(volumes.split(' ').count(), 2, "expected two pool arguments, got: {volumes}");
+    assert!(
+        volumes.contains(&kept[0]) && volumes.contains(&kept[1]),
+        "retired pools must leave the command line: {volumes}"
+    );
+
+    env.remove_single_node_pools(&[0, 1])
+        .expect_err("the last remaining pool cannot be removed");
 }
 
 #[tokio::test]
@@ -1215,4 +1603,24 @@ fn rebalance_complete_accepts_non_participating_pools_but_requires_progress() {
         ]
     });
     assert!(!rebalance_complete(&no_movement, "run-1").unwrap());
+}
+
+#[test]
+fn rebalance_status_tolerates_deferred_entry_error_only_while_started() {
+    let deferred = "deferred transient rebalance entry failure: Storage resources are insufficient for the write operation: b/k";
+    let mut status = serde_json::json!({
+        "id": "run-1",
+        "pools": [{ "id": 0, "status": "Started", "stopping": false, "lastError": deferred, "progress": { "objects": 1, "bytes": 1 } }]
+    });
+    assert!(rebalance_active(&status, "run-1").expect("a retried deferral keeps the run active"));
+
+    status["pools"][0]["status"] = serde_json::json!("Completed");
+    assert!(
+        rebalance_complete(&status, "run-1").is_err(),
+        "a completed pool must have cleared its deferred entry error"
+    );
+
+    status["pools"][0]["status"] = serde_json::json!("Started");
+    status["pools"][0]["lastError"] = serde_json::json!("rebalance entry failed: Storage resources are insufficient");
+    assert!(rebalance_active(&status, "run-1").is_err(), "a non-deferred lastError stays fatal");
 }

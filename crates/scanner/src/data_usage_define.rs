@@ -31,7 +31,8 @@ pub use rustfs_data_usage::{
     DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, DataUsageSegmentInvalidationProof, DataUsageSnapshotSetState,
     LEGACY_DATA_USAGE_OBJECT_NAME, PrefixUsageEntry, PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary,
     SizeReconciliationEntry, SizeReconciliationScope, SizeSummary, TierAccountingProof, TierStats, UNKNOWN_TIER,
-    UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP, UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, hash_path, prefix_usage_in_cache,
+    UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP, UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, clone_cache_value, hash_path,
+    prefix_usage_in_cache,
 };
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
@@ -43,7 +44,7 @@ use crate::storage_api::owner::HTTPPreconditions;
 use crate::{
     BUCKET_META_PREFIX, EcstoreError as Error, EcstoreResult as StorageResult, RUSTFS_META_BUCKET, ReplicationConfig,
     SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, StorageError,
-    TRANSITION_COMPLETE, save_config, save_config_with_preconditions, scanner_publication_admission_for_epoch, storageclass,
+    TRANSITION_COMPLETE, save_config, scanner_publication_admission_for_epoch, storageclass,
 };
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 
@@ -56,13 +57,15 @@ pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 pub(crate) const DATA_USAGE_CACHE_KEY_FORMAT: u16 = 1;
 
 const DATA_USAGE_CACHE_SAVE_RETRIES: u32 = 2;
-const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX: u64 = 5;
+const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_BASE: u64 = 5;
 const DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES: u32 = 0;
 const DATA_USAGE_CACHE_SAVE_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(350);
+const DATA_USAGE_CACHE_RECONCILE_BACKOFF_MAX: Duration = Duration::from_millis(150);
 const DATA_USAGE_CACHE_PERSISTENCE_MARGIN: Duration = Duration::from_secs(5);
 const METRIC_CACHE_SAVE_ATTEMPT_TOTAL: &str = "rustfs_scanner_cache_save_attempt_total";
 const METRIC_CACHE_SAVE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cache_save_timeout_total";
 const METRIC_CACHE_SAVE_RETRY_TOTAL: &str = "rustfs_scanner_cache_save_retry_total";
+const METRIC_CACHE_SAVE_PAYLOAD_BYTES_TOTAL: &str = "rustfs_scanner_cache_save_payload_bytes_total";
 const METRIC_CACHE_SAVE_DURATION_SECONDS: &str = "rustfs_scanner_cache_save_duration_seconds";
 const METRIC_CACHE_BACKUP_REVISION_FAILURE_TOTAL: &str = "rustfs_scanner_cache_backup_revision_failure_total";
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -100,19 +103,17 @@ pub(crate) async fn read_config_with_revision<S: ScannerObjectIO>(
     store: Arc<S>,
     path: &str,
 ) -> StorageResult<(Option<Vec<u8>>, DataUsageCacheRevision)> {
-    match store
-        .get_object_reader(
-            RUSTFS_META_BUCKET,
-            path,
-            None,
-            HeaderMap::new(),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-    {
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let read = store.get_object_reader(RUSTFS_META_BUCKET, path, None, HeaderMap::new(), &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
+        read,
+    );
+    match read.await {
         Ok(mut reader) => {
             let revision = reader
                 .object_info
@@ -170,19 +171,17 @@ fn error_chain_has_usage_floor_corruption_signature(error: &(dyn std::error::Err
 
 /// Read only the object revision without materializing its body.
 pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path: &str) -> StorageResult<DataUsageCacheRevision> {
-    match store
-        .get_object_reader(
-            RUSTFS_META_BUCKET,
-            path,
-            None,
-            HeaderMap::new(),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-    {
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let read = store.get_object_reader(RUSTFS_META_BUCKET, path, None, HeaderMap::new(), &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
+        read,
+    );
+    match read.await {
         Ok(reader) => reader
             .object_info
             .etag
@@ -234,7 +233,7 @@ pub static DATA_USAGE_BLOOM_RECOVERY_PATH: LazyLock<String> =
 pub static BACKGROUND_HEAL_INFO_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}.background-heal.json"));
 
-const MAX_DATA_USAGE_CACHE_DEPTH: usize = 1024;
+pub(crate) const MAX_DATA_USAGE_CACHE_DEPTH: usize = 1024;
 
 /// Scanner-side accounting on the shared [`SizeSummary`].
 ///
@@ -518,6 +517,14 @@ impl Serialize for DataUsageScanCoverageReceipt {
     }
 }
 
+/// Coverage follows depth-first directory traversal, rather than raw path order.
+/// A completed subtree includes its descendants but never an unfinished ancestor.
+pub(crate) fn scan_frontier_covers_path(path: &str, frontier: &str) -> bool {
+    let ancestor = frontier.strip_prefix(path).is_some_and(|suffix| suffix.starts_with('/'));
+    let descendant = path.strip_prefix(frontier).is_some_and(|suffix| suffix.starts_with('/'));
+    (path.split('/').cmp(frontier.split('/')).is_le() && !ancestor) || descendant
+}
+
 struct CheckpointDigestWriter(Sha256);
 
 impl std::io::Write for CheckpointDigestWriter {
@@ -787,7 +794,7 @@ impl DataUsageCache {
         let known_tiers = tier_names.iter().map(String::as_str).collect::<HashSet<_>>();
         for entry in self.cache.values_mut() {
             let Some(tiers) = entry.all_tier_stats.as_mut() else { continue };
-            let existing_unknown = tiers.tiers.get(UNKNOWN_TIER).cloned().unwrap_or_default();
+            let existing_unknown = tiers.tiers.get(UNKNOWN_TIER).map(clone_cache_value).unwrap_or_default();
             let companion_present = entry.unknown_tier_stats.as_ref().is_some_and(|stats| !stats.is_empty());
             let migrate_existing_unknown = !companion_present;
             let mut retired = TierStats::default();
@@ -895,6 +902,16 @@ impl DataUsageCache {
         }
     }
 
+    pub(crate) fn has_scan_position(&self) -> bool {
+        self.info.scan_resume_after.is_some()
+            || self.info.scan_checkpoint.is_some()
+            || self.info.scan_raw_enumeration_cursor.is_some()
+            || self.info.scan_raw_enumeration_page_index.is_some()
+            || self.info.scan_coverage_receipt.is_some()
+    }
+
+    /// Resume and reuse under one plan; fixtures that model a single digest.
+    #[cfg(test)]
     pub(crate) fn prepare_bucket_checkpoint(
         &mut self,
         name: &str,
@@ -904,17 +921,63 @@ impl DataUsageCache {
         scan_plan_digest: DataUsageScanPlanDigest,
         identity: DataUsageScanIdentity,
     ) -> DataUsageCachePrepareOutcome {
+        self.prepare_bucket_checkpoint_with_coverage(
+            name,
+            next_cycle,
+            leader_epoch,
+            source,
+            scan_plan_digest,
+            scan_plan_digest,
+            identity,
+        )
+    }
+
+    /// `scan_plan_digest` is the reuse plan a complete cache is current under;
+    /// `checkpoint_plan_digest` is the coverage plan a sweep is started and
+    /// resumed under (`scanner_activity_coverage_digest`). The two differ by
+    /// the inputs that force a new walk without changing the namespace a
+    /// walk traverses, so a coordinator restart invalidates finished results
+    /// but not a sweep in progress.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_bucket_checkpoint_with_coverage(
+        &mut self,
+        name: &str,
+        next_cycle: u64,
+        leader_epoch: u64,
+        source: DataUsageCacheSource,
+        scan_plan_digest: DataUsageScanPlanDigest,
+        checkpoint_plan_digest: DataUsageScanPlanDigest,
+        identity: DataUsageScanIdentity,
+    ) -> DataUsageCachePrepareOutcome {
         if self.info.next_cycle > next_cycle {
             return DataUsageCachePrepareOutcome::RejectedNewerCycle;
         }
         if self.info.leader_epoch > leader_epoch {
             return DataUsageCachePrepareOutcome::RejectedNewerLeader;
         }
+        let previous_cycle = self.info.next_cycle;
+        let previous_leader_epoch = self.info.leader_epoch;
+        // A checkpoint is a durable traversal frontier, not a publication
+        // result.  A newer leader may adopt it only when the frontier is
+        // independently fenced by the bucket identity and has a validated
+        // cursor/coverage receipt.  Caches without that proof still take the
+        // normal rebuild path; this keeps an old, incomplete writer from
+        // authorizing a new leader to skip namespace coverage.
+        // Cycle deadlines advance both counters, so a validated frontier from
+        // an earlier cycle must remain eligible for adoption.
+        let cross_epoch_checkpoint = self.info.leader_epoch < leader_epoch
+            && self.info.scan_identity == Some(identity)
+            && (self.validated_scan_frontier().is_some()
+                || self.validated_raw_enumeration_cursor().is_some()
+                || self.validated_raw_enumeration_page_index().is_some());
+        let handoff_frontier = cross_epoch_checkpoint
+            .then(|| self.validated_scan_frontier().map(clone_cache_value))
+            .flatten();
         let reusable = identity.is_valid()
             && name != DATA_USAGE_ROOT
             && self.info.name == name
             && self.info.source == Some(source)
-            && self.info.leader_epoch == leader_epoch
+            && (self.info.leader_epoch == leader_epoch || cross_epoch_checkpoint)
             && self.info.cache_key_format == DATA_USAGE_CACHE_KEY_FORMAT
             && self.info.scan_identity == Some(identity)
             && self.info.tier_registry_generation == Some(identity.tier_registry_generation)
@@ -922,16 +985,43 @@ impl DataUsageCache {
         if reusable
             && self.info.snapshot_complete
             && self.info.scan_progress.is_none()
-            && self.info.scan_checkpoint.is_none()
-            && self.info.scan_raw_enumeration_cursor.is_none()
-            && self.info.scan_raw_enumeration_page_index.is_none()
-            && self.info.scan_resume_after.is_none()
-            && self.info.scan_coverage_receipt.is_none()
+            && !self.has_scan_position()
             && self.info.scan_plan_digest == Some(scan_plan_digest)
         {
             return self.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, true);
         }
         if !reusable {
+            if self.has_scan_position() {
+                let reason = if name == DATA_USAGE_ROOT {
+                    "invalid_bucket_scope"
+                } else if !identity.is_valid() {
+                    "invalid_identity"
+                } else if self.info.name != name {
+                    "bucket_mismatch"
+                } else if self.info.source != Some(source) {
+                    "source_mismatch"
+                } else if self.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT {
+                    "key_format_mismatch"
+                } else if self.info.scan_identity != Some(identity)
+                    || self.info.tier_registry_generation != Some(identity.tier_registry_generation)
+                {
+                    "identity_mismatch"
+                } else if self.info.leader_epoch != leader_epoch && !cross_epoch_checkpoint {
+                    "unvalidated_handoff"
+                } else {
+                    "incomplete_cache_scope"
+                };
+                warn!(
+                    target: "rustfs::scanner::data_usage",
+                    event = EVENT_SCANNER_CACHE_LOAD_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_CACHE,
+                    state = "checkpoint_reset",
+                    bucket = %name,
+                    reason,
+                    "Scanner bucket checkpoint cannot be adopted"
+                );
+            }
             let keep_debts = self.info.name == name
                 && self
                     .info
@@ -955,11 +1045,7 @@ impl DataUsageCache {
         if self.validated_raw_enumeration_page_index().is_none() {
             self.info.scan_raw_enumeration_page_index = None;
         }
-        let cursor_is_valid = (self.info.scan_checkpoint.is_none()
-            && self.info.scan_raw_enumeration_cursor.is_none()
-            && self.info.scan_raw_enumeration_page_index.is_none()
-            && self.info.scan_resume_after.is_none()
-            && self.info.scan_coverage_receipt.is_none())
+        let cursor_is_valid = !self.has_scan_position()
             || self.validated_scan_frontier().is_some()
             || self.info.scan_raw_enumeration_cursor.is_some()
             || self.info.scan_raw_enumeration_page_index.is_some();
@@ -974,12 +1060,28 @@ impl DataUsageCache {
         self.info.tier_registry_generation = Some(identity.tier_registry_generation);
         self.info.scan_identity = Some(identity);
         self.info.snapshot_complete = false;
-        if let Some(progress) = &mut self.info.scan_progress {
-            progress.requested_plan = scan_plan_digest;
+        if let Some(frontier) = handoff_frontier
+            && let Ok(digest) = self.coverage_prefix_digest(&frontier)
+            && let Some(receipt) = self.info.scan_coverage_receipt.as_mut()
+        {
+            // Migrate a legacy epoch-bound receipt while the old epoch is
+            // still available for validation.  New receipts deliberately do
+            // not bind to the process-local leader epoch.
+            receipt.digest = digest;
+        }
+        // A sweep without a durable position restarts from the first entry,
+        // so it observes nothing under the plan that finished the previous
+        // sweep. Keeping that plan would mark every sweep of a bucket written
+        // between cycles as mixed, and the bucket could never certify.
+        let has_position = self.has_scan_position();
+        if let Some(progress) = &mut self.info.scan_progress
+            && has_position
+        {
+            progress.requested_plan = checkpoint_plan_digest;
         } else {
             self.info.scan_progress = Some(DataUsageScanProgress {
-                started_plan: scan_plan_digest,
-                requested_plan: scan_plan_digest,
+                started_plan: checkpoint_plan_digest,
+                requested_plan: checkpoint_plan_digest,
             });
             self.info.scan_resume_after = None;
             self.info.scan_checkpoint = None;
@@ -990,6 +1092,23 @@ impl DataUsageCache {
         // Old readers do not understand coverage sweeps. An absent plan makes
         // their existing prepare path rebuild instead of promoting mixed data.
         self.info.scan_plan_digest = None;
+        debug!(
+            target: "rustfs::scanner::data_usage",
+            event = EVENT_SCANNER_CACHE_LOAD_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_CACHE,
+            state = "bucket_checkpoint_prepared",
+            bucket = %name,
+            pool = source.pool_index,
+            set = source.set_index,
+            cycle = next_cycle,
+            leader_epoch,
+            previous_cycle,
+            previous_leader_epoch,
+            resume_position = self.has_scan_position(),
+            mixed_coverage = self.info.scan_progress.is_some_and(|progress| progress.started_plan != progress.requested_plan),
+            "Scanner bucket checkpoint prepared for a coverage sweep"
+        );
         if reusable {
             DataUsageCachePrepareOutcome::Reused
         } else {
@@ -998,23 +1117,69 @@ impl DataUsageCache {
     }
 
     fn coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        self.coverage_prefix_digest_with_epoch(through, None, 3)
+    }
+
+    fn v2_coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        self.coverage_prefix_digest_with_epoch(through, None, 2)
+    }
+
+    fn legacy_coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        self.coverage_prefix_digest_with_epoch(through, Some(self.info.leader_epoch), 0)
+    }
+
+    fn coverage_prefix_digest_with_epoch(
+        &self,
+        through: &str,
+        legacy_leader_epoch: Option<u64>,
+        domain_version: u8,
+    ) -> Result<[u8; 32], serde_json::Error> {
         let mut writer = CheckpointDigestWriter(Sha256::new());
-        serde_json::to_writer(
-            &mut writer,
-            &(
-                &self.info.name,
-                self.info.scan_identity,
-                self.info.source,
-                self.info.leader_epoch,
-                self.info.cache_key_format,
-                self.info.scan_progress.map(|progress| progress.started_plan),
-                through,
-            ),
-        )?;
+        if let Some(leader_epoch) = legacy_leader_epoch {
+            // Keep the old tuple available for one-way migration of caches
+            // written before leader handoff recovery was introduced.
+            serde_json::to_writer(
+                &mut writer,
+                &(
+                    &self.info.name,
+                    self.info.scan_identity,
+                    self.info.source,
+                    leader_epoch,
+                    self.info.cache_key_format,
+                    self.info.scan_progress.map(|progress| progress.started_plan),
+                    through,
+                ),
+            )?;
+        } else {
+            // The receipt must survive a scanner leader handoff.  The bucket
+            // identity and publication epoch below fence the namespace; the
+            // process-local leader epoch is intentionally excluded because it
+            // changes during a safe handoff.  The domain version also keeps
+            // old epoch-bound receipts from colliding with this digest.
+            // Domain 3 permits object-health debt behind the frontier. Older
+            // readers must reject it because they skip covered failures.
+            serde_json::to_writer(
+                &mut writer,
+                &(
+                    domain_version,
+                    &self.info.name,
+                    self.info.scan_identity,
+                    self.info.source,
+                    self.info.cache_key_format,
+                    self.info.scan_progress.map(|progress| progress.started_plan),
+                    through,
+                ),
+            )?;
+        }
         let mut prefix = self
             .cache
             .iter()
             .filter(|(key, _)| {
+                // Sign exactly the subtrees the reader can reuse, including
+                // descendants whose raw path order differs from traversal order.
+                if legacy_leader_epoch.is_none() && domain_version >= 3 {
+                    return scan_frontier_covers_path(key, through);
+                }
                 let ancestor = through
                     .strip_prefix(key.as_str())
                     .is_some_and(|suffix| suffix.starts_with('/'));
@@ -1049,7 +1214,9 @@ impl DataUsageCache {
                 .strip_prefix(&self.info.name)
                 .is_some_and(|suffix| suffix.starts_with('/'))
             && self.find(&receipt.through).is_some()
-            && self.coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest))
+            && (self.coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
+                || self.v2_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
+                || self.legacy_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)))
         .then_some(receipt.through.as_str())
     }
 
@@ -1090,18 +1257,18 @@ impl DataUsageCache {
         let frontier = frontier.filter(|path| path.len() <= 16 * 1024 && self.find(path).is_some());
         self.info.scan_coverage_receipt = match frontier {
             Some(through) => Some(DataUsageScanCoverageReceipt {
-                through: through.to_owned(),
+                through: clone_cache_value(through),
                 digest: self.coverage_prefix_digest(through)?,
             }),
             None => None,
         };
-        self.info.scan_resume_after = frontier.map(str::to_owned);
+        self.info.scan_resume_after = frontier.map(clone_cache_value);
         let reason = self
             .info
             .scan_checkpoint
             .as_ref()
             .map_or(DataUsageScanCheckpointReason::Unknown, |checkpoint| checkpoint.reason);
-        self.info.scan_checkpoint = frontier.map(|through| DataUsageScanCheckpoint::new(through.to_owned(), reason));
+        self.info.scan_checkpoint = frontier.map(|through| DataUsageScanCheckpoint::new(clone_cache_value(through), reason));
         Ok(())
     }
 
@@ -1119,6 +1286,11 @@ impl DataUsageCache {
                 METRIC_CACHE_SAVE_RETRY_TOTAL,
                 "Total scanner data usage cache save retries by cache type."
             );
+            describe_counter!(
+                METRIC_CACHE_SAVE_PAYLOAD_BYTES_TOTAL,
+                metrics::Unit::Bytes,
+                "Payload bytes submitted to scanner cache saves, including failed attempts, by cache type."
+            );
             describe_histogram!(
                 METRIC_CACHE_SAVE_DURATION_SECONDS,
                 "Duration of scanner data usage cache save attempts in seconds."
@@ -1132,26 +1304,32 @@ impl DataUsageCache {
 
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {
         let hash = hash_path(path);
-        self.cache.insert(hash.key(), e);
+        self.cache.insert(clone_cache_value(&hash.0), e);
         if !parent.is_empty() {
             let parent_hash = hash_path(parent);
-            self.cache.entry(parent_hash.key()).or_default().add_child(&hash);
+            self.cache
+                .entry(clone_cache_value(&parent_hash.0))
+                .or_default()
+                .add_child(&hash);
         }
     }
 
     pub fn replace_hashed(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>, e: &DataUsageEntry) {
-        self.cache.insert(hash.key(), e.clone());
+        self.cache.insert(clone_cache_value(&hash.0), clone_cache_value(e));
         if let Some(parent) = parent {
-            self.cache.entry(parent.key()).or_default().add_child(hash);
+            self.cache.entry(clone_cache_value(&parent.0)).or_default().add_child(hash);
         }
     }
 
     pub fn find(&self, path: &str) -> Option<&DataUsageEntry> {
-        self.cache.get(&hash_path(path).key())
+        self.cache.get(&clone_cache_value(&hash_path(path).0))
     }
 
-    pub fn find_children_copy(&mut self, h: DataUsageHash) -> DataUsageHashMap {
-        self.cache.entry(h.string()).or_default().children.clone()
+    pub fn find_children_copy(&self, h: &DataUsageHash) -> DataUsageHashMap {
+        self.cache
+            .get(&h.0)
+            .map(|entry| clone_cache_value(&entry.children))
+            .unwrap_or_default()
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
@@ -1175,7 +1353,7 @@ impl DataUsageCache {
         }
         let (entry, visited) = self.checked_flatten_inner(path)?;
         let root_parent_only = {
-            let path_key = hash_path(path).key();
+            let path_key = clone_cache_value(&hash_path(path).0);
             self.cache
                 .get(DATA_USAGE_ROOT)
                 .is_some_and(|root| root_is_parent_only(root, &path_key))
@@ -1208,7 +1386,7 @@ impl DataUsageCache {
     }
 
     fn checked_flatten_inner(&self, path: &str) -> Option<(DataUsageEntry, usize)> {
-        let root_key = hash_path(path).key();
+        let root_key = clone_cache_value(&hash_path(path).0);
         let (root_key, root) = self.cache.get_key_value(&root_key)?;
         if root.compacted && !root.children.is_empty() {
             return None;
@@ -1239,27 +1417,46 @@ impl DataUsageCache {
         Some((flattened, visited.len()))
     }
 
-    fn flatten_with_guard(&self, root: &DataUsageEntry, visited: &mut HashSet<String>, depth: usize) -> DataUsageEntry {
-        let mut root = root.clone();
+    fn flatten_with_guard<'a>(
+        &'a self,
+        root: &'a DataUsageEntry,
+        visited: &mut HashSet<&'a str>,
+        depth: usize,
+    ) -> DataUsageEntry {
+        // A summary never owns child links. Cloning and clearing the set
+        // retains its allocation in every completed subtree and update.
+        let mut flat = DataUsageEntry {
+            children: HashSet::new(),
+            size: root.size,
+            objects: root.objects,
+            versions: root.versions,
+            delete_markers: root.delete_markers,
+            obj_sizes: root.obj_sizes.clone(),
+            obj_versions: root.obj_versions.clone(),
+            replication_stats: root.replication_stats.clone(),
+            compacted: root.compacted,
+            failed_objects: root.failed_objects,
+            all_tier_stats: root.all_tier_stats.clone(),
+            unknown_tier_stats: root.unknown_tier_stats.clone(),
+            tier_accounting_proof: root.tier_accounting_proof,
+        };
         if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
-            root.children.clear();
-            return root;
+            return flat;
         }
 
-        for id in root.children.clone().iter() {
-            if !visited.insert(id.clone()) {
+        for id in &root.children {
+            if !visited.insert(id.as_str()) {
                 continue;
             }
             if let Some(e) = self.cache.get(id) {
-                let mut e = e.clone();
-                if !e.children.is_empty() {
-                    e = self.flatten_with_guard(&e, visited, depth + 1);
+                if e.children.is_empty() {
+                    flat.merge(e);
+                } else {
+                    flat.merge(&self.flatten_with_guard(e, visited, depth + 1));
                 }
-                root.merge(&e);
             }
         }
-        root.children.clear();
-        root
+        flat
     }
 
     pub fn copy_with_children(&mut self, src: &DataUsageCache, hash: &DataUsageHash, parent: &Option<DataUsageHash>) {
@@ -1275,59 +1472,58 @@ impl DataUsageCache {
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
-        if !visited.insert(hash.key()) {
+        if !visited.insert(clone_cache_value(&hash.0)) {
             return;
         }
 
-        if let Some(e) = src.cache.get(&hash.string()) {
-            self.cache.insert(hash.key(), e.clone());
+        if let Some(e) = src.cache.get(&clone_cache_value(&hash.0)) {
+            self.cache.insert(clone_cache_value(&hash.0), clone_cache_value(e));
             if depth < MAX_DATA_USAGE_CACHE_DEPTH {
                 for ch in e.children.iter() {
-                    if *ch == hash.key() {
+                    if *ch == clone_cache_value(&hash.0) {
                         continue;
                     }
-                    self.copy_with_children_guard(src, &DataUsageHash(ch.to_string()), &Some(hash.clone()), visited, depth + 1);
+                    self.copy_with_children_guard(
+                        src,
+                        &DataUsageHash(clone_cache_value(ch)),
+                        &Some(clone_cache_value(hash)),
+                        visited,
+                        depth + 1,
+                    );
                 }
             }
             if let Some(parent) = parent {
-                self.cache.entry(parent.key()).or_default().add_child(hash);
+                self.cache.entry(clone_cache_value(&parent.0)).or_default().add_child(hash);
             }
         }
     }
 
     pub fn delete_recursive(&mut self, hash: &DataUsageHash) {
-        let mut visited = HashSet::new();
-        self.delete_recursive_guard(hash, &mut visited, 0);
+        self.delete_recursive_guard(&hash.0, 0);
     }
 
-    fn delete_recursive_guard(&mut self, hash: &DataUsageHash, visited: &mut HashSet<String>, depth: usize) {
-        if !visited.insert(hash.key()) {
+    fn delete_recursive_guard(&mut self, path: &str, depth: usize) {
+        // Removal transfers child ownership and makes cyclic/shared references
+        // no-ops, without cloning paths or maintaining a second visited set.
+        let Some(children) = self.cache.remove(path).map(|entry| entry.children) else {
             return;
-        }
-
-        let mut need_remove = Vec::new();
-        if let Some(v) = self.cache.get(&hash.string()) {
-            for child in v.children.iter() {
-                need_remove.push(child.clone());
-            }
-        }
-        self.cache.remove(&hash.string());
+        };
         if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
             return;
         }
-        for child in need_remove {
-            self.delete_recursive_guard(&DataUsageHash(child), visited, depth + 1);
+        for child in children {
+            self.delete_recursive_guard(&child, depth + 1);
         }
     }
 
     pub fn size_recursive(&self, path: &str) -> Option<DataUsageEntry> {
-        match self.find(path) {
-            Some(root) => {
+        match self.cache.get_key_value(&hash_path(path).key()) {
+            Some((key, root)) => {
                 if root.children.is_empty() {
-                    return Some(root.clone());
+                    return Some(clone_cache_value(root));
                 }
                 let mut visited = HashSet::new();
-                visited.insert(hash_path(path).key());
+                visited.insert(key.as_str());
                 let mut flat = self.flatten_with_guard(root, &mut visited, 0);
                 if flat.replication_stats.as_ref().is_some_and(|stats| stats.is_empty()) {
                     flat.replication_stats = None;
@@ -1339,7 +1535,7 @@ impl DataUsageCache {
     }
 
     pub fn search_parent(&self, hash: &DataUsageHash) -> Option<DataUsageHash> {
-        let want = hash.key();
+        let want = clone_cache_value(&hash.0);
         if let Some(last_index) = want.rfind('/')
             && let Some(v) = self.find(&want[0..last_index])
             && v.children.contains(&want)
@@ -1349,22 +1545,22 @@ impl DataUsageCache {
 
         for (k, v) in self.cache.iter() {
             if v.children.contains(&want) {
-                return Some(DataUsageHash(k.clone()));
+                return Some(DataUsageHash(clone_cache_value(k)));
             }
         }
         None
     }
 
     pub fn is_compacted(&self, hash: &DataUsageHash) -> bool {
-        self.cache.get(&hash.key()).is_some_and(|due| due.compacted)
+        self.cache.get(&clone_cache_value(&hash.0)).is_some_and(|due| due.compacted)
     }
 
     pub fn force_compact(&mut self, limit: usize) {
         if self.cache.len() < limit {
             return;
         }
-        let top = hash_path(&self.info.name).key();
-        let Some(top_e) = self.find(&top).cloned() else {
+        let top = clone_cache_value(&hash_path(&self.info.name).0);
+        let Some(top_e) = self.find(&top).map(clone_cache_value) else {
             return;
         };
 
@@ -1382,7 +1578,7 @@ impl DataUsageCache {
     }
 
     pub fn reduce_children_of(&mut self, path: &DataUsageHash, limit: usize, compact_self: bool) {
-        let Some(e) = self.cache.get(&path.key()).cloned() else {
+        let Some(e) = self.cache.get(&path.0) else {
             return;
         };
 
@@ -1391,14 +1587,14 @@ impl DataUsageCache {
         }
 
         if e.children.len() > limit && compact_self {
-            let mut flat = self.size_recursive(&path.key()).unwrap_or_default();
+            let mut flat = self.size_recursive(&clone_cache_value(&path.0)).unwrap_or_default();
             flat.compacted = true;
             self.delete_recursive(path);
             self.replace_hashed(path, &None, &flat);
             return;
         }
 
-        let total = self.total_children_rec(&path.key());
+        let total = self.total_children_rec(&clone_cache_value(&path.0));
         if total < limit {
             return;
         }
@@ -1411,12 +1607,12 @@ impl DataUsageCache {
         let mut candidate_index = 0;
         while remove > 0 && candidate_index < candidates.len() {
             let e = &candidates[candidate_index];
-            let candidate = e.path.clone();
+            let candidate = clone_cache_value(&e.path);
             if candidate == *path && !compact_self {
                 break;
             }
-            let removing = self.total_children_rec(&candidate.key());
-            let mut flat = match self.size_recursive(&candidate.key()) {
+            let removing = self.total_children_rec(&clone_cache_value(&candidate.0));
+            let mut flat = match self.size_recursive(&clone_cache_value(&candidate.0)) {
                 Some(flat) => flat,
                 None => {
                     candidate_index += 1;
@@ -1434,12 +1630,13 @@ impl DataUsageCache {
     }
 
     pub fn total_children_rec(&self, path: &str) -> usize {
+        let root = hash_path(path);
         let mut visited = HashSet::new();
-        visited.insert(hash_path(path).key());
+        visited.insert(root.0.as_str());
         self.total_children_rec_guard(path, &mut visited, 0)
     }
 
-    fn total_children_rec_guard(&self, path: &str, visited: &mut HashSet<String>, depth: usize) -> usize {
+    fn total_children_rec_guard<'a>(&'a self, path: &str, visited: &mut HashSet<&'a str>, depth: usize) -> usize {
         let Some(root) = self.find(path) else {
             return 0;
         };
@@ -1449,7 +1646,7 @@ impl DataUsageCache {
 
         let mut n = 0;
         for ch in root.children.iter() {
-            if visited.insert(ch.clone()) {
+            if visited.insert(ch.as_str()) {
                 n += 1 + self.total_children_rec_guard(ch, visited, depth + 1);
             }
         }
@@ -1461,7 +1658,7 @@ impl DataUsageCache {
             if o.root().is_none() {
                 return;
             }
-            *self = o.clone();
+            *self = clone_cache_value(o);
             return;
         };
 
@@ -1474,7 +1671,8 @@ impl DataUsageCache {
         }
 
         existing_root.merge(&other_root);
-        self.cache.insert(hash_path(&self.info.name).key(), existing_root);
+        self.cache
+            .insert(clone_cache_value(&hash_path(&self.info.name).0), existing_root);
 
         let root_hash = self.root_hash();
         for key in other_root.children.iter() {
@@ -1485,7 +1683,7 @@ impl DataUsageCache {
             if let Some(existing) = self.cache.get_mut(key) {
                 existing.merge(&flat);
             } else {
-                self.replace_hashed(&DataUsageHash(key.clone()), &Some(root_hash.clone()), &flat);
+                self.replace_hashed(&DataUsageHash(clone_cache_value(key)), &Some(clone_cache_value(&root_hash)), &flat);
             }
         }
     }
@@ -1495,7 +1693,7 @@ impl DataUsageCache {
     }
 
     pub fn root(&self) -> Option<DataUsageEntry> {
-        self.find(&self.info.name).cloned()
+        self.find(&self.info.name).map(clone_cache_value)
     }
 
     /// Convert cache to DataUsageInfo for a specific path
@@ -1529,7 +1727,7 @@ impl DataUsageCache {
 
                 for (arn, stat) in rs.targets.iter() {
                     bui.replication_info.insert(
-                        arn.clone(),
+                        clone_cache_value(arn),
                         BucketTargetUsageInfo {
                             replication_pending_size: stat.pending_size,
                             replicated_size: stat.replicated_size,
@@ -1542,7 +1740,7 @@ impl DataUsageCache {
                     );
                 }
             }
-            buckets_usage.insert(bucket_name.clone(), bui);
+            buckets_usage.insert(clone_cache_value(bucket_name), bui);
         }
 
         DataUsageInfo {
@@ -1581,7 +1779,7 @@ struct Inner {
 
 fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut Vec<Inner>) -> usize {
     let mut visited = HashSet::new();
-    visited.insert(path.key());
+    visited.insert(clone_cache_value(&path.0));
     add_with_guard(data_usage_cache, path, candidates, &mut visited, 0)
 }
 
@@ -1592,15 +1790,16 @@ fn add_with_guard(
     visited: &mut HashSet<String>,
     depth: usize,
 ) -> usize {
-    let e = match data_usage_cache.cache.get(&path.key()) {
+    let e = match data_usage_cache.cache.get(&clone_cache_value(&path.0)) {
         Some(e) => e,
         None => return 0,
     };
     let mut objects = e.objects;
     if depth < MAX_DATA_USAGE_CACHE_DEPTH {
         for ch in e.children.iter() {
-            if visited.insert(ch.clone()) {
-                objects += add_with_guard(data_usage_cache, &DataUsageHash(ch.clone()), candidates, visited, depth + 1);
+            if visited.insert(clone_cache_value(ch)) {
+                objects +=
+                    add_with_guard(data_usage_cache, &DataUsageHash(clone_cache_value(ch)), candidates, visited, depth + 1);
             }
         }
     }
@@ -1610,7 +1809,7 @@ fn add_with_guard(
     if !e.children.is_empty() {
         candidates.push(Inner {
             objects,
-            path: path.clone(),
+            path: clone_cache_value(path),
         });
     }
     objects
@@ -1626,7 +1825,7 @@ fn mark_with_depth(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut Has
     }
 
     for k in entry.children.iter() {
-        if !found.insert(k.to_string()) {
+        if !found.insert(clone_cache_value(k)) {
             continue;
         }
         if let Some(ch) = duc.cache.get(k) {

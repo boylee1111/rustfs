@@ -22,7 +22,7 @@ Registered in [`src/lib.rs`](src/lib.rs). Grouped by concern:
 | **functional** | top-level `*_test.rs` | S3 data plane: `list_objects_*`, `copy_object_*`, `delete_objects_versioning`, `head_object_*`, `checksum_upload`, `compression`, `content_encoding`, `special_chars`, `leading_slash_key`, `create_bucket_region`, `quota`, `data_usage`, `snowball_auto_extract`, `mc_mirror_small_bucket`, `archive_download_integrity`, `version_id_regression`, `delete_marker_migration_semantics` |
 | **object_lock** | [`src/object_lock/`](src/object_lock) | Retention / legal-hold / WORM semantics |
 | **kms** | [`src/kms/`](src/kms) | SSE-S3 / SSE-KMS / SSE-C, local + Vault backends, multipart encryption. Own guide: [`src/kms/README.md`](src/kms/README.md) |
-| **policy** | [`src/policy/`](src/policy), `existing_object_tag_policy_test`, `bucket_policy_check_test`, `anonymous_access_test`, `security_boundary_test`, `multipart_auth_test` | IAM / bucket-policy / STS session policy, policy variables, anonymous access, DoS/SSRF boundaries. Own guide: [`src/policy/README.md`](src/policy/README.md) |
+| **policy** | [`src/policy/`](src/policy), `existing_object_tag_policy_test`, `conditional_write_policy_test`, `bucket_policy_check_test`, `anonymous_access_test`, `security_boundary_test`, `multipart_auth_test` | IAM / bucket-policy / STS session policy, policy variables, anonymous access, DoS/SSRF boundaries. Own guide: [`src/policy/README.md`](src/policy/README.md) |
 | **protocols** | [`src/protocols/`](src/protocols) | FTPS, WebDAV, SFTP compliance. Fixed ports, own guide: [`src/protocols/README.md`](src/protocols/README.md) |
 | **reliant** | [`src/reliant/`](src/reliant) | Tests that reuse an **externally started** server (SQL/select, conditional writes, lifecycle, deleted-object reads, node-interact). Run via [`scripts/run_e2e_tests.sh`](../../scripts/run_e2e_tests.sh); see [`src/reliant/README.md`](src/reliant/README.md) |
 | **cluster** | `cluster_concurrency_test`, `stale_multipart_cleanup_cluster_test`, `namespace_lock_quorum_test`, `admin_timeout_regression_test`, `object_lambda_test`, `replication_extension_test`, `tier_stats_cluster_test` | Multi-node scenarios via `RustFSTestClusterEnvironment` |
@@ -63,6 +63,25 @@ The additional `--features` arguments must match between `build` and `run`; Carg
 Each build/run holds an exclusive `rustfs.e2e.lock` marker beside the binary; concurrent wrappers fail immediately. Use a private target directory and do not run ordinary Cargo builds against it while tests are active: Cargo does not honor this marker. Interrupted runs fail and terminate their command group. After an uncatchable kill, inspect the PID recorded in a leftover marker and remove it only after confirming its owner has stopped. Embedded file symlinks are hashed through their target; embedded directory symlinks are rejected because their contents cannot be enumerated safely by this entry point.
 
 The protocols suite has its own fixed-port and single-worker contract in [`src/protocols/README.md`](src/protocols/README.md). Use its command under [Troubleshooting](#troubleshooting).
+
+### Scanner mixed-version gate
+
+The Linux N/O scanner gate needs a separately qualified `33482bb` server, which supports scoped ACKs. Set `RUSTFS_SCANNER_COMPAT_OLD_BINARY` to that executable and `RUSTFS_SCANNER_COMPAT_OLD_SHA256` to its independently verified digest. The release binary used by ordinary upgrade CI is a different baseline. Missing or mismatched inputs fail the test.
+
+Enable the harness-only `scanner-peer-mixed-version` feature explicitly; keep the server wrapper features identical between build and run:
+
+```bash
+python3 scripts/e2e_binary.py build --features e2e-test-hooks
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- \
+  cargo nextest run --profile e2e-distributed -p e2e_test \
+  --features scanner-peer-mixed-version --ignore-default-filter \
+  -E 'test(=distributed::scanner_peer_bucket_test::scanner_peer_bucket_new_coordinator_certifies_old_peers_and_scopes_next_cycle)' \
+  --test-threads 1 --retries 0 --no-tests=fail
+```
+
+The separate `scanner_peer_bucket_new_coordinator_certifies_old_worker_peers_and_scopes_next_cycle` case uses the same feature and qualified old binary inputs. Select its exact name in the command above. It keeps the original N process enabled and starts the three official O replacements with `RUSTFS_SCANNER_ENABLED=false`: their autonomous scanner loops are disabled, while real S3 dirty tracking, authenticated snapshots, publication leases, scoped ACKs, and N-dispatched RemoteScanner workers remain active. It records each node's actual scanner status and retains the same identity, durability, root, ACK, data-conservation, and physical-walk requirements. This fixed-role case does not validate autonomous O scanning or all-enabled election behavior. The original all-enabled N/O test remains separate and has not passed acceptance; a fixed-role result cannot satisfy that gate.
+
+For this fixed-role case, the `e2e-test-hooks` server also records the N client's complete bounded worker inventory. Requests are observed before opening the normal stream and paired only after authenticated source/plan validation and terminal EOF. Closed manifests and final health receipts must bind both cycles to their actual candidate/root; the next cycle needs exactly four sets of hot-only execution and at least one positive-progress worker mapped to a measured official O process. A zero-progress Current response, missing/extra request, unhealthy recorder, or missing physical coverage fails the gate. The recorder does not add O hooks or change any protocol or timeout. Final health reads check immutable closed-cycle evidence, not current N liveness.
 
 ### `#[ignore]` semantics
 
@@ -200,10 +219,11 @@ python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run
 python3 scripts/e2e_binary.py run --binary "$RUSTFS_E2E_STARTUP_CAS_BINARY" --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test
 python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-nightly -p e2e_test
 
-# Distributed 4-node 4-disk lane uses the default server.
+# Distributed 4-node 4-disk lane uses the fault-test hooks server; the
+# scanner_heal_topology_ fault cases fail closed without it.
 # Upgrade cases require RUSTFS_UPGRADE_SOURCE_BINARY and fail closed without it.
-python3 scripts/e2e_binary.py build
-python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test
+python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test
 
 # Replication nightly uses the default server; awscurl is required for STS.
 python3 scripts/e2e_binary.py build

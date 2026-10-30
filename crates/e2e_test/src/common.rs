@@ -22,6 +22,8 @@
 //! - Common test constants and utilities
 
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::list_buckets::ListBucketsError;
 use aws_sdk_s3::{Client, Config};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use http::header::{CONTENT_TYPE, HOST};
@@ -32,8 +34,8 @@ use rustfs_signer::sign_v4;
 use s3s::Body;
 use serde_json;
 use std::fs as stdfs;
-use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::io::{self, ErrorKind};
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
@@ -60,6 +62,41 @@ const TEST_PORT_RANGE_ENV: &str = "RUSTFS_E2E_TEST_PORT_RANGE";
 const TEST_PORT_COUNTER_PATH: &str = "/tmp/rustfs_e2e_next_port";
 const TEST_PORT_LOCK_DIR: &str = "/tmp/rustfs_e2e_port_allocator.lock";
 const TEST_PORT_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+
+fn list_buckets_readiness_error(err: &SdkError<ListBucketsError>) -> String {
+    // SDK Display reports only the category. Do not expose raw response bodies or headers.
+    let service_code = err.as_service_error().and_then(|error| error.code()).filter(|code| {
+        matches!(
+            *code,
+            "ServiceUnavailable"
+                | "ServerNotInitialized"
+                | "InternalError"
+                | "AccessDenied"
+                | "InvalidAccessKeyId"
+                | "SignatureDoesNotMatch"
+        )
+    });
+    let transport = match err {
+        SdkError::DispatchFailure(failure) if failure.is_timeout() => Some("timeout"),
+        SdkError::DispatchFailure(failure) if failure.is_io() => Some("io"),
+        SdkError::DispatchFailure(failure) if failure.is_user() => Some("user"),
+        SdkError::DispatchFailure(failure) if failure.is_other() => Some("other"),
+        _ => None,
+    };
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    let mut io_error = None;
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            io_error = Some((error.kind(), error.raw_os_error()));
+            break;
+        }
+        source = error.source();
+    }
+    format!(
+        "{err}; http_status={:?}; service_code={service_code:?}; transport={transport:?}; io_error={io_error:?}",
+        err.raw_response().map(|response| response.status().as_u16())
+    )
+}
 
 fn capture_log_path(log_dir: &Path, temp_dir: &str) -> Option<PathBuf> {
     let temp_name = Path::new(temp_dir).file_name()?.to_string_lossy();
@@ -1000,6 +1037,22 @@ pub async fn awscurl_post_sts_form_urlencoded(
     Ok(response)
 }
 
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].to_string())
+}
+
+/// Returns `(access_key, secret_key, session_token)` from an STS `AssumeRole` XML response.
+pub fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
+    let access_key = extract_xml_tag(xml, "AccessKeyId").ok_or("missing AccessKeyId in AssumeRole response")?;
+    let secret_key = extract_xml_tag(xml, "SecretAccessKey").ok_or("missing SecretAccessKey in AssumeRole response")?;
+    let session_token = extract_xml_tag(xml, "SessionToken").ok_or("missing SessionToken in AssumeRole response")?;
+    Ok((access_key, secret_key, session_token))
+}
+
 /// Helper function for POST requests
 pub async fn awscurl_post(
     url: &str,
@@ -1219,6 +1272,7 @@ pub struct RustFSTestClusterEnvironment {
     /// Optional socket proxies used for the corresponding node's volume
     /// endpoints. Proxies must be installed before [`Self::start`].
     volume_proxy_addresses: Vec<Option<SocketAddr>>,
+    tls_ca_pem: Option<Vec<u8>>,
 }
 
 impl RustFSTestClusterEnvironment {
@@ -1259,7 +1313,10 @@ impl RustFSTestClusterEnvironment {
     pub async fn with_topology(topology: ClusterTopology) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         topology.validate()?;
 
-        let temp_dir = format!("/tmp/rustfs_cluster_test_{}", Uuid::new_v4());
+        let temp_dir = std::env::temp_dir()
+            .join(format!("rustfs_cluster_test_{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
         fs::create_dir_all(&temp_dir).await?;
 
         // Map every node to its owning pool index.
@@ -1321,7 +1378,33 @@ impl RustFSTestClusterEnvironment {
             node_capture_log_paths: vec![None; topology.node_count],
             topology,
             volume_proxy_addresses: vec![None; node_count],
+            tls_ca_pem: None,
         })
+    }
+
+    /// Configure verified HTTPS for both volume endpoints and S3 clients.
+    /// The bundle must be generated before any node starts.
+    pub async fn enable_tls(&mut self, directory: &Path) -> std::io::Result<()> {
+        if self.nodes.iter().any(|node| node.process.is_some()) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "configure cluster TLS before starting nodes",
+            ));
+        }
+        let directory = fs::canonicalize(directory).await?;
+        let ca_pem = fs::read(directory.join("ca.crt")).await?;
+        reqwest::Certificate::from_pem(&ca_pem).map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+        self.set_env(
+            "RUSTFS_TLS_PATH",
+            directory
+                .to_str()
+                .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "TLS directory is not UTF-8"))?,
+        );
+        for node in &mut self.nodes {
+            node.url = format!("https://{}", node.address);
+        }
+        self.tls_ca_pem = Some(ca_pem);
+        Ok(())
     }
 
     /// Add an extra environment variable applied to every cluster node process.
@@ -1405,7 +1488,34 @@ impl RustFSTestClusterEnvironment {
             return Err(format!("a volume proxy is already configured for node {node_idx}").into());
         }
         let target = self.nodes[node_idx].address.parse::<SocketAddr>()?;
-        let proxy = crate::fault_proxy::FaultProxy::start(target).await?;
+        // Endpoint locality and RPC audience both use the advertised authority.
+        // Keep the node's port while the second loopback IP separates the proxy
+        // listener from the direct IPv4 server and S3 client address.
+        let listen = SocketAddr::from((Ipv6Addr::LOCALHOST, target.port()));
+        let proxy = crate::fault_proxy::FaultProxy::start_on(listen, target).await?;
+        self.volume_proxy_addresses[node_idx] = Some(proxy.local_addr());
+        Ok(proxy)
+    }
+
+    /// Route internode traffic through a method-aware HTTP proxy.
+    pub(crate) async fn start_rpc_proxy_for_node(
+        &mut self,
+        node_idx: usize,
+    ) -> io::Result<crate::rpc_fault_proxy::RpcFaultProxy> {
+        self.ensure_node_index(node_idx)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        if self.volume_proxy_addresses[node_idx].is_some() {
+            return Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!("a volume proxy is already configured for node {node_idx}"),
+            ));
+        }
+        let target = self.nodes[node_idx]
+            .address
+            .parse::<SocketAddr>()
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let listen = SocketAddr::from((Ipv6Addr::LOCALHOST, target.port()));
+        let proxy = crate::rpc_fault_proxy::RpcFaultProxy::start_on(listen, target).await?;
         self.volume_proxy_addresses[node_idx] = Some(proxy.local_addr());
         Ok(proxy)
     }
@@ -1418,6 +1528,7 @@ impl RustFSTestClusterEnvironment {
 
     fn build_volumes_arg(&self) -> String {
         let pools = self.topology.normalized_pools();
+        let scheme = if self.tls_ca_pem.is_some() { "https" } else { "http" };
 
         if pools.len() <= 1 {
             // Single pool: explicit enumeration of every drive on every node.
@@ -1427,7 +1538,7 @@ impl RustFSTestClusterEnvironment {
                 .enumerate()
                 .flat_map(|(node_idx, n)| {
                     let address = self.volume_address(node_idx);
-                    n.data_dirs.iter().map(move |dir| format!("http://{}{}", address, dir))
+                    n.data_dirs.iter().map(move |dir| format!("{scheme}://{address}{dir}"))
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -1447,7 +1558,7 @@ impl RustFSTestClusterEnvironment {
                     .and_then(|d| d.rsplit_once('/').map(|(parent, _)| parent))
                     .unwrap_or(&node.data_dir);
                 format!(
-                    "http://{}{}/drive{{0...{}}}",
+                    "{scheme}://{}{}/drive{{0...{}}}",
                     self.volume_address(node_idx),
                     base,
                     self.topology.drives_per_node - 1
@@ -1499,6 +1610,15 @@ impl RustFSTestClusterEnvironment {
     pub async fn start_node(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let binary_path = rustfs_binary_path();
         self.start_node_from_binary(node_idx, &binary_path).await
+    }
+
+    /// Start a process and wait only for TCP, allowing tests to bring up a
+    /// quorum one node at a time before the S3 service can become ready.
+    pub async fn start_node_process(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        let volumes_arg = self.build_volumes_arg();
+        self.spawn_node(node_idx, &binary_path, &volumes_arg)?;
+        self.wait_for_node_ready(&self.nodes[node_idx].address, node_idx).await
     }
 
     /// Start one stopped cluster node with a specific RustFS binary while
@@ -1575,8 +1695,9 @@ impl RustFSTestClusterEnvironment {
     ///
     /// Verifies service availability by calling the S3 `list_buckets` API against the requested node,
     /// retries up to 120 times with a 1-second interval between attempts.
-    async fn wait_for_node_service_ready(&self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn wait_for_node_service_ready(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.create_s3_client(node_idx)?;
+        let mut last_error = None;
 
         for attempt in 0..120 {
             match client.list_buckets().send().await {
@@ -1584,13 +1705,28 @@ impl RustFSTestClusterEnvironment {
                     info!("Cluster node {} service ready after {} attempts", node_idx, attempt + 1);
                     return Ok(());
                 }
-                Err(_) => {
+                Err(err) => {
+                    last_error = Some(err);
                     sleep(Duration::from_secs(1)).await;
                 }
             }
         }
 
-        Err(format!("Cluster node {} service failed to become ready", node_idx).into())
+        let last_error = last_error.as_ref().map(list_buckets_readiness_error);
+        // Observe liveness only after the existing readiness budget is exhausted, before cleanup.
+        let process_status = match self.nodes[node_idx].process.as_mut() {
+            Some(process) => match process.try_wait() {
+                Ok(Some(status)) => format!("exited ({status})"),
+                Ok(None) => "running".to_string(),
+                Err(error) => format!("unavailable (kind={:?}, os_code={:?})", error.kind(), error.raw_os_error()),
+            },
+            None => "not started".to_string(),
+        };
+        Err(format!(
+            "Cluster node {node_idx} service failed to become ready; last ListBuckets error={last_error:?}; process_status={process_status}; capture_log_path={:?}",
+            self.node_capture_log_paths[node_idx]
+        )
+        .into())
     }
 
     /// Create an S3 client configured to communicate with a specific cluster node.
@@ -1611,13 +1747,20 @@ impl RustFSTestClusterEnvironment {
         if node_idx >= self.nodes.len() {
             return Err("node_idx is invalid".into());
         }
-        Ok(Client::from_conf(build_test_s3_config(
-            &self.nodes[node_idx].url,
-            &self.access_key,
-            &self.secret_key,
-            None,
-            "cluster-test",
-        )))
+        let mut config =
+            build_test_s3_config(&self.nodes[node_idx].url, &self.access_key, &self.secret_key, None, "cluster-test");
+        if let Some(ca_pem) = &self.tls_ca_pem {
+            use aws_smithy_http_client::tls::{Provider, TlsContext, TrustStore, rustls_provider::CryptoMode};
+            let tls = TlsContext::builder()
+                .with_trust_store(TrustStore::empty().with_pem_certificate(ca_pem.clone()))
+                .build()?;
+            let client = SmithyHttpClientBuilder::new()
+                .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
+                .tls_context(tls)
+                .build_https();
+            config = config.to_builder().http_client(client).build();
+        }
+        Ok(Client::from_conf(config))
     }
 
     /// Create S3 clients for all nodes in the RustFS cluster and collect them into a vector.
@@ -1742,7 +1885,7 @@ impl RustFSTestClusterEnvironment {
         }
 
         self.nodes.push(ClusterNode {
-            url: format!("http://{address}"),
+            url: format!("{}://{address}", if self.tls_ca_pem.is_some() { "https" } else { "http" }),
             address,
             data_dir: data_dirs[0].clone(),
             data_dirs,
@@ -1762,6 +1905,47 @@ impl RustFSTestClusterEnvironment {
         }
 
         Ok(new_idx)
+    }
+
+    /// Remove retired single-node pools from a stopped multi-pool cluster.
+    ///
+    /// A decommissioned pool must leave the server command line before the
+    /// next start; the server refuses to start while it is still listed. The
+    /// remaining pools keep their node order and are renumbered from zero.
+    /// Data directories are left on disk for the owning harness to clean up.
+    pub fn remove_single_node_pools(&mut self, retired: &[usize]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.nodes.iter().any(|node| node.process.is_some()) {
+            return Err("stop the cluster before removing a pool".into());
+        }
+        let pools = self.topology.normalized_pools();
+        if pools.iter().any(|nodes| nodes.len() != 1) {
+            return Err("remove_single_node_pools requires one node per pool".into());
+        }
+        if retired.iter().any(|pool| *pool >= pools.len()) || retired.len() >= pools.len() {
+            return Err(format!("cannot remove pools {retired:?} from {} pools", pools.len()).into());
+        }
+        let keep: Vec<usize> = (0..self.nodes.len())
+            .filter(|node_idx| !retired.contains(&self.nodes[*node_idx].pool_idx))
+            .collect();
+        fn retain_indices<T>(values: &mut Vec<T>, keep: &[usize]) {
+            let old = std::mem::take(values);
+            *values = old
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| keep.contains(idx))
+                .map(|(_, value)| value)
+                .collect();
+        }
+        retain_indices(&mut self.nodes, &keep);
+        retain_indices(&mut self.node_extra_env, &keep);
+        retain_indices(&mut self.node_capture_log_paths, &keep);
+        retain_indices(&mut self.volume_proxy_addresses, &keep);
+        for (pool_idx, node) in self.nodes.iter_mut().enumerate() {
+            node.pool_idx = pool_idx;
+        }
+        self.topology.node_count = self.nodes.len();
+        self.topology.pools = (0..self.nodes.len()).map(|node_idx| vec![node_idx]).collect();
+        Ok(())
     }
 
     /// Gracefully stop one cluster node and wait for its process to exit.
@@ -2102,6 +2286,34 @@ mod tests {
     }
 
     #[test]
+    fn readiness_error_reports_transport_without_sensitive_source_text() {
+        use aws_sdk_s3::error::ConnectorError;
+
+        let sensitive = "request credentials must not appear in diagnostics";
+        for (connector, category) in [
+            (
+                ConnectorError::io(std::io::Error::new(ErrorKind::ConnectionReset, sensitive).into()),
+                "io",
+            ),
+            (ConnectorError::timeout(sensitive.into()), "timeout"),
+            (ConnectorError::user(sensitive.into()), "user"),
+            (ConnectorError::other(sensitive.into(), None), "other"),
+        ] {
+            let diagnostic = list_buckets_readiness_error(&SdkError::dispatch_failure(connector));
+            assert!(diagnostic.contains(&format!("transport=Some(\"{category}\")")), "{diagnostic}");
+            assert!(diagnostic.contains("http_status=None"), "{diagnostic}");
+            assert!(!diagnostic.contains(sensitive), "{diagnostic}");
+            if category == "io" {
+                assert!(diagnostic.contains("io_error=Some((ConnectionReset, None))"), "{diagnostic}");
+            }
+        }
+        let os_error = std::io::Error::from_raw_os_error(13);
+        let expected = format!("io_error=Some(({:?}, Some(13)))", os_error.kind());
+        let diagnostic = list_buckets_readiness_error(&SdkError::dispatch_failure(ConnectorError::io(os_error.into())));
+        assert!(diagnostic.contains(&expected), "{diagnostic}");
+    }
+
+    #[test]
     fn capture_log_path_uses_temp_directory_basename() {
         assert_eq!(
             capture_log_path(Path::new("/tmp/e2e-logs"), "/tmp/rustfs_e2e_test_abc"),
@@ -2287,6 +2499,7 @@ mod tests {
             node_capture_log_paths: vec![None; topology.node_count],
             topology,
             volume_proxy_addresses: vec![None; node_count],
+            tls_ca_pem: None,
         }
     }
 
@@ -2304,8 +2517,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn volumes_single_pool_multidrive_enumerates_every_drive() {
+    #[tokio::test]
+    async fn volumes_single_pool_multidrive_enumerates_every_drive() {
         // 4 nodes x 2 drives -> 8 explicit endpoints, one legacy pool. No
         // ellipses, so the server parser keeps this as a single DistErasure pool.
         let env = fake_cluster(ClusterTopology::single_pool_multidrive(4, 2));
@@ -2317,6 +2530,25 @@ mod tests {
             .join(" ");
         assert_eq!(env.build_volumes_arg(), expected);
         assert_eq!(env.build_volumes_arg().split(' ').count(), 8);
+
+        let directory = tempfile::tempdir().expect("TLS fixture directory");
+        crate::tls_gen::run(crate::tls_gen::Args {
+            out_dir: directory.path().to_owned(),
+            days: 1,
+            force: false,
+        })
+        .expect("generate TLS bundle");
+        for topology in [
+            ClusterTopology::single_pool_multidrive(4, 4),
+            ClusterTopology::per_node_pools(4, vec![vec![0], vec![1]]),
+        ] {
+            let mut cluster = fake_cluster(topology);
+            let plaintext_volumes = cluster.build_volumes_arg();
+            cluster.enable_tls(directory.path()).await.expect("configure TLS");
+            assert_eq!(cluster.build_volumes_arg(), plaintext_volumes.replace("http://", "https://"));
+            assert!(cluster.nodes.iter().all(|node| node.url.starts_with("https://")));
+            assert!(cluster.create_s3_client(0).is_ok(), "trusted SDK client should build");
+        }
     }
 
     #[test]
@@ -2386,8 +2618,38 @@ mod tests {
 
         assert!(volumes.contains(&proxied), "volumes must use the proxy address: {volumes}");
         assert!(!volumes.contains(&direct), "volumes must not retain the direct address: {volumes}");
+        assert_eq!(proxy.local_addr().port(), proxy.target_addr().port());
+        assert_ne!(proxy.local_addr().ip(), proxy.target_addr().ip());
+        assert_eq!(env.nodes[0].address, direct, "S3 clients must retain the direct address");
+        let mut endpoint =
+            crate::storage_api::Endpoint::try_from(volumes.as_str()).expect("proxied volume should be a valid endpoint");
+        endpoint
+            .update_is_local(proxy.target_addr().port())
+            .expect("proxied endpoint locality should resolve");
+        assert!(endpoint.is_local, "the proxied node must keep its local disk and first-disk authority");
+        assert_eq!(
+            endpoint.host_port(),
+            proxied,
+            "the local RPC audience must be the advertised proxy authority"
+        );
 
         proxy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cluster_data_dirs_use_os_temporary_directory() {
+        let cluster = RustFSTestClusterEnvironment::new(1).await.expect("allocate isolated cluster");
+        let root = PathBuf::from(&cluster.temp_dir);
+        assert!(
+            root.starts_with(std::env::temp_dir()),
+            "cluster must honor the selected temporary filesystem"
+        );
+        for node in &cluster.nodes {
+            assert!(Path::new(&node.data_dir).starts_with(&root));
+            assert!(node.data_dirs.iter().all(|drive| Path::new(drive).starts_with(&root)));
+        }
+        drop(cluster);
+        assert!(!root.exists(), "dropping the fixture must remove its owned directories");
     }
 
     #[test]

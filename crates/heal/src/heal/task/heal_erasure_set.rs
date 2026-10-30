@@ -22,7 +22,17 @@ pub(super) async fn load_verified_replacement_resume(disk: &DiskStore, task_id: 
 }
 
 impl HealTask {
+    #[cfg(test)]
     pub(super) async fn heal_erasure_set(&self, buckets: Vec<String>, set_disk_id: String) -> Result<()> {
+        self.heal_erasure_set_owned(buckets, set_disk_id, None).await
+    }
+
+    pub(super) async fn heal_erasure_set_owned(
+        &self,
+        buckets: Vec<String>,
+        set_disk_id: String,
+        parent: Option<&super::super::manager::HealWork>,
+    ) -> Result<()> {
         debug!(
             target: "rustfs::heal::task",
             event = EVENT_HEAL_ERASURE_SET_STAGE,
@@ -41,6 +51,55 @@ impl HealTask {
             progress.set_current_object(Some(format!("erasure_set: {} ({} buckets)", set_disk_id, buckets.len())));
             progress.update_stage(0, 4);
         }
+
+        let mut heal_opts = HealOpts {
+            recursive: self.options.recursive,
+            dry_run: self.options.dry_run,
+            remove: self.options.remove_corrupted,
+            recreate: self.options.recreate_missing,
+            scan_mode: self.options.scan_mode,
+            update_parity: self.options.update_parity,
+            no_lock: self.options.no_lock,
+            read_repair: false,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
+        };
+        let admin_resume_disk = if self.source == HealRequestSource::Admin {
+            let (pool, set) = crate::heal::utils::parse_set_disk_id(&set_disk_id)?;
+            if heal_opts.pool.is_some_and(|expected| expected != pool) || heal_opts.set.is_some_and(|expected| expected != set) {
+                return Err(Error::InvalidHealType {
+                    heal_type: "Conflicting administrator erasure-set selectors".to_string(),
+                });
+            }
+            heal_opts.pool = Some(pool);
+            heal_opts.set = Some(set);
+            let owner = match &self.admin_recovery {
+                Some(recovery) => self.await_with_control(recovery.resume_disk(&self.id)).await?,
+                None => None,
+            };
+            let disk = match owner {
+                Some(disk) => disk,
+                None => {
+                    self.await_with_control(self.storage.get_disk_for_resume(&set_disk_id))
+                        .await?
+                }
+            };
+            // Restore acknowledged work before any fallible format or listing
+            // prepass can produce a terminal result for this token.
+            if CheckpointManager::has_checkpoint(&disk, &self.id).await {
+                let snapshot = CheckpointManager::load_from_disk(disk.clone(), &self.id)
+                    .await?
+                    .get_checkpoint()
+                    .await;
+                if let Some(admin) = snapshot.admin {
+                    admin.validate_scope(&set_disk_id, &heal_opts)?;
+                    self.restore_outcome(admin.outcome).await;
+                }
+            }
+            Some(disk)
+        } else {
+            None
+        };
 
         let mut is_auto_replacement = matches!(self.source, HealRequestSource::AutoHeal) && !self.heal_endpoints.is_empty();
         if is_auto_replacement
@@ -129,6 +188,13 @@ impl HealTask {
             None
         };
 
+        let replacement_execution = if is_auto_replacement {
+            let execution = self.storage.replacement_execution(&self.heal_endpoints).await?;
+            *self.replacement_execution.write().await = Some(execution.clone());
+            Some(execution)
+        } else {
+            None
+        };
         let replacement_resume_disk = if is_auto_replacement {
             Some(match replacement_resume_disk {
                 Some(disk) => disk,
@@ -141,7 +207,7 @@ impl HealTask {
             None
         };
 
-        let mut buckets = if buckets.is_empty() {
+        let mut buckets = if buckets.is_empty() && self.source != HealRequestSource::Admin {
             debug!(
                 target: "rustfs::heal::task",
                 event = EVENT_HEAL_ERASURE_SET_STAGE,
@@ -178,7 +244,10 @@ impl HealTask {
                 identities.clone(),
             )
             .await?;
-            buckets = manager.get_state().await.replacement_buckets;
+            *self.replacement_resume_disk.write().await = Some(disk.clone());
+            let state = manager.get_state().await;
+            self.replacement_start_retry_count.store(state.retry_count, Ordering::Release);
+            buckets = state.replacement_buckets;
             Some((disk, manager, identities))
         } else {
             None
@@ -299,7 +368,7 @@ impl HealTask {
                         message: format!("Failed to verify formatted replacement targets for {set_disk_id}"),
                     });
                 }
-                if let Some((_, replacement_resume, expected_identities)) = &replacement_resume {
+                if let Some((_, _, expected_identities)) = &replacement_resume {
                     let identities = self
                         .await_with_control(self.storage.replacement_target_identities(&self.heal_endpoints))
                         .await?;
@@ -308,7 +377,6 @@ impl HealTask {
                             message: format!("Replacement target changed after format for automatic heal {set_disk_id}"),
                         });
                     }
-                    replacement_resume.mark_replacement_rebuilding(identities).await?;
                 }
             }
             Err(Error::TaskCancelled) => return Err(Error::TaskCancelled),
@@ -345,7 +413,19 @@ impl HealTask {
 
         // The rebuilt disks are formatted now: mark them as healing so
         // DiskInfo.healing reflects the rebuild until it completes.
-        super::super::set_healing_markers(&self.heal_endpoints, &healing_marker).await?;
+        if let (Some(execution), Some((_, manager, _))) = (&replacement_execution, &replacement_resume) {
+            manager.acquire_replacement_markers(execution).await?;
+        } else {
+            super::super::set_healing_markers(&self.heal_endpoints, &healing_marker).await?;
+        }
+        if let Some((_, replacement_resume, expected_identities)) = &replacement_resume {
+            self.verify_replacement_identity_fence(expected_identities, &set_disk_id, "marker acquisition")
+                .await?;
+            replacement_resume
+                .mark_replacement_rebuilding(expected_identities.clone())
+                .await?;
+            self.replacement_running.store(true, Ordering::Release);
+        }
 
         // Step 2: Get disk for resume functionality
         debug!(
@@ -361,10 +441,13 @@ impl HealTask {
         let replacement_target_identities = replacement_resume.as_ref().map(|(_, _, identities)| identities.clone());
         let disk = match replacement_resume.as_ref() {
             Some((disk, _, _)) => disk.clone(),
-            None => {
-                self.await_with_control(self.storage.get_disk_for_resume(&set_disk_id))
-                    .await?
-            }
+            None => match admin_resume_disk {
+                Some(disk) => disk,
+                None => {
+                    self.await_with_control(self.storage.get_disk_for_resume(&set_disk_id))
+                        .await?
+                }
+            },
         };
 
         {
@@ -387,7 +470,8 @@ impl HealTask {
             set: self.options.set_index,
         };
 
-        for bucket in buckets.iter() {
+        let mut unresolved_delete_recovery = false;
+        for bucket in buckets.iter().filter(|_| self.source != HealRequestSource::Admin) {
             // Check control flags before starting each bucket heal
             self.check_control_flags().await?;
             if let Some(expected_identities) = replacement_target_identities.as_ref() {
@@ -417,6 +501,17 @@ impl HealTask {
                     return Err(err);
                 }
             }
+            // Adopt delete proofs only after their publication bucket exists.
+            if let Some(result) = self
+                .await_with_control(
+                    self.storage
+                        .recover_delete_transactions(bucket, None, None, &bucket_heal_opts),
+                )
+                .await?
+            {
+                unresolved_delete_recovery |= result.delete_recovery.is_some_and(|status| status.has_unresolved());
+                self.record_result_item(result).await;
+            }
         }
 
         // Create erasure set healer with resume support
@@ -430,18 +525,6 @@ impl HealTask {
             stage = "build_resumable_healer",
             "Heal erasure set stage entered"
         );
-        let heal_opts = HealOpts {
-            recursive: self.options.recursive,
-            dry_run: self.options.dry_run,
-            remove: self.options.remove_corrupted,
-            recreate: self.options.recreate_missing,
-            scan_mode: self.options.scan_mode,
-            update_parity: self.options.update_parity,
-            no_lock: self.options.no_lock,
-            read_repair: false,
-            pool: self.options.pool_index,
-            set: self.options.set_index,
-        };
         let erasure_healer = ErasureSetHealer::new(
             self.storage.clone(),
             self.progress.clone(),
@@ -450,6 +533,7 @@ impl HealTask {
             heal_opts,
             self.source,
         )
+        .with_unresolved_delete_recovery(unresolved_delete_recovery)
         .with_replacement_targets(replacement_targets, is_auto_replacement.then(|| self.id.clone()))
         .with_pool_metadata_targets(if self.options.recreate_missing && !self.options.dry_run {
             self.heal_endpoints.clone()
@@ -457,7 +541,10 @@ impl HealTask {
             Vec::new()
         })
         .with_replacement_identity_fence(replacement_target_identities.clone())
-        .with_mainline_pacer(self.mainline_pacer.clone());
+        .with_replacement_execution(replacement_execution)
+        .with_work_parent(parent.cloned())
+        .with_mainline_pacer(self.mainline_pacer.clone())
+        .with_admin_task((self.source == HealRequestSource::Admin).then(|| self.clone()));
 
         {
             let mut progress = self.progress.write().await;
@@ -478,6 +565,38 @@ impl HealTask {
         let result = self
             .await_with_control(erasure_healer.heal_erasure_set(&buckets, &set_disk_id))
             .await;
+
+        let result = if result.is_ok() && self.source == HealRequestSource::Admin {
+            let progress = self.get_progress().await;
+            let failed = progress.objects_failed.saturating_add(progress.skipped_objects);
+            if failed > 0 {
+                let outcome = self.get_outcome().await;
+                let first = outcome.objects.iter().find(|item| {
+                    matches!(
+                        item.disposition,
+                        HealObjectDisposition::Failed(_) | HealObjectDisposition::Deferred { .. }
+                    )
+                });
+                Err(self
+                    .record_batch_failure(BatchHealFailure {
+                        scope: set_disk_id.clone(),
+                        failed,
+                        retryable: 0,
+                        permanent: failed,
+                        first_object: first
+                            .map(|item| format!("{}/{}", item.identity.bucket, item.identity.object))
+                            .unwrap_or_else(|| "outside retained outcome window".to_string()),
+                        first_error: first
+                            .and_then(|item| item.detail.clone())
+                            .unwrap_or_else(|| "Object repair attempts were exhausted".to_string()),
+                    })
+                    .await)
+            } else {
+                result
+            }
+        } else {
+            result
+        };
 
         // Keep the markers on failure: the resume state also persists, and the
         // next run of this set heal re-marks and eventually clears them.
@@ -526,6 +645,7 @@ impl HealTask {
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
+            Err(error @ Error::StaleBucketIncarnation { .. }) => Err(error),
             Err(e) if e.is_recoverable_heal() => Err(e),
             Err(e) => {
                 error!(

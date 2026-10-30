@@ -17,6 +17,11 @@ use std::collections::BTreeSet;
 use std::sync::RwLock as StdRwLock;
 
 pub(super) static DIRTY_USAGE_BUCKET_GENERATION: AtomicU64 = AtomicU64::new(0);
+// Advances, under the `DIRTY_USAGE_BUCKETS` lock, whenever an entry leaves the
+// dirty map or is overwritten by durable replay. Records only insert or raise
+// generations; this counter is what lets a scanner cycle tell the two apart
+// across its bucket-listing window (`covers_listed_pending`).
+static DIRTY_USAGE_REMOVAL_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(super) static DIRTY_USAGE_BUCKETS: LazyLock<StdMutex<DirtyUsageBuckets>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 // Lock order when dirty usage state is updated is `DIRTY_USAGE_BUCKETS`,
 // `DIRTY_USAGE_BUCKET_SCOPES`, then `DIRTY_USAGE_PRODUCER_IDENTITIES`. All
@@ -233,6 +238,71 @@ pub enum ScannerDurableDirtyUsageReplayScope {
     TopLevelEntries { entries: BTreeSet<String> },
 }
 
+impl ScannerDurableDirtyUsageReplayRecord {
+    /// Replays decoded producer hints with the canonical byte limit and semantic checks.
+    ///
+    /// Callers must retain their framing and owner checks. This performs the same
+    /// state update as [`replay_durable_dirty_usage_producer_record`]; it does not
+    /// establish storage-verified source authority.
+    pub fn replay(self) -> std::result::Result<ScannerDirtyUsageState, ScannerDurableDirtyUsageReplayError> {
+        check_durable_dirty_usage_replay_bytes(&self)?;
+        replay_decoded_dirty_usage_record(&self)
+    }
+}
+
+struct ReplayByteLimit {
+    remaining: usize,
+}
+
+impl std::io::Write for ReplayByteLimit {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or_else(|| std::io::Error::other("dirty replay byte limit"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn check_durable_dirty_usage_replay_bytes(
+    record: &ScannerDurableDirtyUsageReplayRecord,
+) -> std::result::Result<(), ScannerDurableDirtyUsageReplayError> {
+    // Bound structure traversal and string scanning before counting escaped JSON.
+    // Each entry or prefix contributes at least one additional serialized byte.
+    let mut remaining = SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES;
+    let mut charge = |size: usize| -> std::result::Result<(), ScannerDurableDirtyUsageReplayError> {
+        remaining = remaining
+            .checked_sub(size)
+            .ok_or(ScannerDurableDirtyUsageReplayError::ByteLimit)?;
+        Ok(())
+    };
+    charge(record.writer_epoch.len())?;
+    charge(record.entries.len())?;
+    for entry in &record.entries {
+        charge(entry.bucket.len())?;
+        if let ScannerDurableDirtyUsageReplayScope::TopLevelEntries { entries } = &entry.scope {
+            charge(entries.len())?;
+            for entry in entries {
+                charge(entry.len())?;
+            }
+        }
+    }
+    let mut limit = ReplayByteLimit {
+        remaining: SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES,
+    };
+    serde_json::to_writer(&mut limit, record).map_err(|error| {
+        if error.is_io() {
+            ScannerDurableDirtyUsageReplayError::ByteLimit
+        } else {
+            ScannerDurableDirtyUsageReplayError::InvalidJson
+        }
+    })
+}
+
 pub fn encode_durable_dirty_usage_producer_replay_record(
     entries: Vec<ScannerDurableDirtyUsageReplayEntry>,
 ) -> std::result::Result<Vec<u8>, ScannerDurableDirtyUsageReplayError> {
@@ -243,7 +313,11 @@ pub fn encode_durable_dirty_usage_producer_replay_record(
         entries,
     };
     validate_durable_dirty_usage_replay_record(&record)?;
-    serde_json::to_vec(&record).map_err(|_| ScannerDurableDirtyUsageReplayError::InvalidJson)
+    let bytes = serde_json::to_vec(&record).map_err(|_| ScannerDurableDirtyUsageReplayError::InvalidJson)?;
+    if bytes.len() > SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES {
+        return Err(ScannerDurableDirtyUsageReplayError::ByteLimit);
+    }
+    Ok(bytes)
 }
 
 pub fn replay_durable_dirty_usage_producer_record(
@@ -254,7 +328,13 @@ pub fn replay_durable_dirty_usage_producer_record(
     }
     let record: ScannerDurableDirtyUsageReplayRecord =
         serde_json::from_slice(bytes).map_err(|_| ScannerDurableDirtyUsageReplayError::InvalidJson)?;
-    let replay = validate_durable_dirty_usage_replay_record(&record)?;
+    replay_decoded_dirty_usage_record(&record)
+}
+
+fn replay_decoded_dirty_usage_record(
+    record: &ScannerDurableDirtyUsageReplayRecord,
+) -> std::result::Result<ScannerDirtyUsageState, ScannerDurableDirtyUsageReplayError> {
+    let replay = validate_durable_dirty_usage_replay_record(record)?;
     let max_generation = replay.iter().map(|entry| entry.generation).max().unwrap_or(0);
     set_dirty_usage_generation_floor(max_generation)?;
     let pending = {
@@ -277,6 +357,7 @@ pub fn replay_durable_dirty_usage_producer_record(
             );
         }
         DIRTY_USAGE_PRODUCER_COVERAGE.fetch_or(coverage, Ordering::AcqRel);
+        advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending));
@@ -411,6 +492,7 @@ pub fn acknowledge_scoped_dirty_usage(
         if cleared > 0 {
             producer_identities.retain(|bucket, _| dirty.contains_key(bucket));
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
+            advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
         }
         (cleared, dirty.len(), cleared_buckets)
     };
@@ -451,6 +533,88 @@ fn apply_scoped_dirty_usage_ack(
         }
     }
     Ok(cleared)
+}
+
+#[cfg(test)]
+mod status_class_mutation_tests {
+    use super::*;
+    use crate::segment_invalidation::SegmentInvalidationProducerIdentity;
+    use serial_test::serial;
+
+    fn bucket(name: &str) -> BucketInfo {
+        BucketInfo {
+            name: name.to_string(),
+            created: None,
+            deleted: None,
+            versioning: false,
+            object_locking: false,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn status_class_mutation_is_not_namespace_activity() {
+        clear_dirty_usage_buckets_for_tests();
+        let generation_before = dirty_usage_generation();
+        let snapshot = snapshot_dirty_usage_buckets(&[bucket("photos")], generation_before);
+        assert_eq!(dirty_usage_snapshot_status(&snapshot), DirtyUsageSnapshotStatus::Current);
+
+        record_status_class_mutation("photos", "2026/image.jpg", SegmentInvalidationProducerIdentity::Replication);
+
+        assert_eq!(
+            dirty_usage_generation(),
+            generation_before,
+            "a status-class writeback must not advance the dirty generation"
+        );
+        assert!(
+            !dirty_usage_buckets_pending(),
+            "a status-class writeback must not count as pending dirty usage"
+        );
+        assert!(
+            dirty_usage_buckets_for_tests().is_empty(),
+            "a status-class writeback must not enter the dirty map"
+        );
+        assert_eq!(
+            dirty_usage_snapshot_status(&snapshot),
+            DirtyUsageSnapshotStatus::Current,
+            "a status-class writeback during a walk must not supersede the cycle"
+        );
+        assert_ne!(
+            DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire)
+                & SegmentInvalidationProducerIdentity::Replication
+                    .production_coverage_bit()
+                    .expect("replication has a coverage bit"),
+            0,
+            "producer coverage keeps recording the reclassified producer"
+        );
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn status_class_mutation_does_not_reach_the_mutation_observer() {
+        use std::sync::{Arc, Mutex};
+
+        clear_dirty_usage_buckets_for_tests();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let previous = set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, producer| {
+            sink.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((bucket.to_string(), object.to_string(), producer));
+        })));
+
+        record_status_class_mutation("photos", "2026/image.jpg", SegmentInvalidationProducerIdentity::Replication);
+        record_status_class_mutation("", "2026/image.jpg", SegmentInvalidationProducerIdentity::Replication);
+        record_status_class_mutation("photos", "", SegmentInvalidationProducerIdentity::Replication);
+
+        set_scanner_dirty_usage_mutation_observer(previous);
+        assert!(
+            observed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty(),
+            "the durable dirty journal must never see a status-class writeback"
+        );
+        clear_dirty_usage_buckets_for_tests();
+    }
 }
 
 #[cfg(test)]
@@ -662,6 +826,127 @@ mod scoped_dirty_usage_tests {
     }
 
     #[test]
+    fn durable_dirty_usage_encoder_rejects_unreplayable_byte_size() {
+        let entries = (0..3)
+            .map(|bucket| ScannerDurableDirtyUsageReplayEntry {
+                bucket: format!("bucket-{bucket}"),
+                generation: 7,
+                scope: ScannerDurableDirtyUsageReplayScope::TopLevelEntries {
+                    entries: (0..128).map(|entry| format!("{entry:03}{}", "x".repeat(197))).collect(),
+                },
+                producers: BTreeSet::from([SegmentInvalidationProducerIdentity::PutObject]),
+            })
+            .collect();
+        assert_eq!(
+            encode_durable_dirty_usage_producer_replay_record(entries),
+            Err(ScannerDurableDirtyUsageReplayError::ByteLimit)
+        );
+    }
+
+    fn decoded_replay_fixture() -> ScannerDurableDirtyUsageReplayRecord {
+        ScannerDurableDirtyUsageReplayRecord {
+            schema: SCANNER_DURABLE_DIRTY_USAGE_REPLAY_SCHEMA,
+            cache_key_format: crate::DATA_USAGE_CACHE_KEY_FORMAT,
+            writer_epoch: "writer".to_string(),
+            entries: vec![ScannerDurableDirtyUsageReplayEntry {
+                bucket: "photos".to_string(),
+                generation: 7,
+                scope: ScannerDurableDirtyUsageReplayScope::TopLevelEntries {
+                    entries: BTreeSet::from(["2026".to_string(), "archive".to_string()]),
+                },
+                producers: SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION.into_iter().collect(),
+            }],
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn durable_dirty_usage_decoded_replay_matches_byte_replay_at_size_boundary() {
+        let record = decoded_replay_fixture();
+        let fixed_bytes = serde_json::to_vec(&record).expect("fixture encoding").len() - record.writer_epoch.len();
+        for size in [
+            SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES - 1,
+            SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES,
+            SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES + 1,
+        ] {
+            clear_dirty_usage_buckets_for_tests();
+            let mut record = record.clone();
+            record.writer_epoch = "x".repeat(size - fixed_bytes);
+            let bytes = serde_json::to_vec(&record).expect("bounded fixture encoding");
+            assert_eq!(bytes.len(), size);
+            let expected = replay_durable_dirty_usage_producer_record(&bytes);
+            let buckets = dirty_usage_buckets_for_tests();
+            let scopes = dirty_usage_bucket_scopes_for_tests();
+            let identities = dirty_usage_producer_identities().clone();
+            let coverage = DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire);
+
+            clear_dirty_usage_buckets_for_tests();
+            assert_eq!(record.replay(), expected, "canonical size {size}");
+            assert_eq!(dirty_usage_buckets_for_tests(), buckets);
+            assert_eq!(dirty_usage_bucket_scopes_for_tests(), scopes);
+            assert_eq!(*dirty_usage_producer_identities(), identities);
+            assert_eq!(DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire), coverage);
+        }
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    fn durable_dirty_usage_decoded_size_counts_escaped_utf8() {
+        for repeats in [6000, 8000] {
+            let mut record = decoded_replay_fixture();
+            record.writer_epoch = "\"\n雪\\".repeat(repeats);
+            let bytes = serde_json::to_vec(&record).expect("escaped fixture encoding");
+            let expected = if bytes.len() > SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES {
+                Err(ScannerDurableDirtyUsageReplayError::ByteLimit)
+            } else {
+                Ok(())
+            };
+            assert_eq!(check_durable_dirty_usage_replay_bytes(&record), expected);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn durable_dirty_usage_decoded_replay_rejects_large_values_before_state_changes() {
+        for field in ["epoch", "prefix", "entries"] {
+            clear_dirty_usage_buckets_for_tests();
+            let before = scanner_dirty_usage_state();
+            let mut record = decoded_replay_fixture();
+            match field {
+                "epoch" => record.writer_epoch = "x".repeat(1024 * 1024),
+                "prefix" => {
+                    record.entries[0].scope = ScannerDurableDirtyUsageReplayScope::TopLevelEntries {
+                        entries: BTreeSet::from(["x".repeat(1024 * 1024)]),
+                    };
+                }
+                _ => record.entries = vec![record.entries[0].clone(); SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES + 1],
+            }
+            assert_eq!(record.replay(), Err(ScannerDurableDirtyUsageReplayError::ByteLimit), "{field}");
+            assert_eq!(scanner_dirty_usage_state(), before);
+            assert!(dirty_usage_buckets_for_tests().is_empty());
+            assert!(dirty_usage_bucket_scopes_for_tests().is_empty());
+            assert!(dirty_usage_producer_identities().is_empty());
+            assert_eq!(DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire), 0);
+        }
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn durable_dirty_usage_decoded_replay_preserves_generation_exhaustion() {
+        clear_dirty_usage_buckets_for_tests();
+        let generation = DIRTY_USAGE_BUCKET_GENERATION.swap(u64::MAX, Ordering::AcqRel);
+        let result = decoded_replay_fixture().replay();
+        DIRTY_USAGE_BUCKET_GENERATION.store(generation, Ordering::Release);
+        assert_eq!(result, Err(ScannerDurableDirtyUsageReplayError::InvalidGeneration));
+        assert!(dirty_usage_buckets_for_tests().is_empty());
+        assert!(dirty_usage_bucket_scopes_for_tests().is_empty());
+        assert!(dirty_usage_producer_identities().is_empty());
+        assert_eq!(DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire), 0);
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
     #[serial]
     fn durable_dirty_usage_replay_rejects_invalid_records_without_partial_state() {
         let valid_entry = ScannerDurableDirtyUsageReplayEntry {
@@ -732,9 +1017,17 @@ mod scoped_dirty_usage_tests {
 
         for (bytes, expected_error) in invalid_cases {
             clear_dirty_usage_buckets_for_tests();
-            assert_eq!(replay_durable_dirty_usage_producer_record(&bytes), Err(expected_error));
+            let before = scanner_dirty_usage_state();
+            assert_eq!(replay_durable_dirty_usage_producer_record(&bytes), Err(expected_error.clone()));
             assert!(dirty_usage_buckets_for_tests().is_empty());
             assert!(dirty_usage_bucket_scopes_for_tests().is_empty());
+            let record: ScannerDurableDirtyUsageReplayRecord = serde_json::from_slice(&bytes).expect("typed invalid record");
+            assert_eq!(record.replay(), Err(expected_error));
+            assert_eq!(scanner_dirty_usage_state(), before);
+            assert!(dirty_usage_buckets_for_tests().is_empty());
+            assert!(dirty_usage_bucket_scopes_for_tests().is_empty());
+            assert!(dirty_usage_producer_identities().is_empty());
+            assert_eq!(DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire), 0);
         }
 
         clear_dirty_usage_buckets_for_tests();
@@ -912,6 +1205,31 @@ where
     DIRTY_USAGE_BUCKET_NOTIFY.notify_one();
 }
 
+/// Record a status-class barrier hit: a committed writeback that changed only
+/// replication or restore state on an existing version.
+///
+/// Such a writeback changes no size, version count or delete marker, so it is
+/// not namespace activity: it must not advance the dirty-usage generation,
+/// enter the activity snapshot, wake the scanner or reach the durable dirty
+/// journal, because any of those makes a cycle `Superseded` for as long as
+/// replication runs. It needs no rescan queue either: a deployment with an
+/// active replication rule walks every bucket on every cycle
+/// (`ScannerMaintenanceFeatures::needs_regular_cycle`), and that walk is what
+/// refreshes `replication_stats`. Only the process-local producer coverage is
+/// recorded so segment-reuse evidence keeps its meaning.
+pub fn record_status_class_mutation(
+    bucket: &str,
+    object: &str,
+    producer: crate::segment_invalidation::SegmentInvalidationProducerIdentity,
+) {
+    if bucket.is_empty() || object.is_empty() {
+        return;
+    }
+    if let Some(coverage_bit) = producer.production_coverage_bit() {
+        DIRTY_USAGE_PRODUCER_COVERAGE.fetch_or(coverage_bit, Ordering::AcqRel);
+    }
+}
+
 fn record_segment_invalidation_producer_identities_for_generation<I>(
     identities: &mut DirtyUsageProducerIdentities,
     bucket: &str,
@@ -1001,6 +1319,11 @@ pub fn scanner_dirty_usage_state() -> ScannerDirtyUsageState {
     }
 }
 
+/// Read one bucket generation without allocating a cluster-wide snapshot.
+pub fn scanner_dirty_usage_bucket_generation(bucket: &str) -> Option<u64> {
+    dirty_usage_buckets().get(bucket).copied()
+}
+
 pub fn scanner_dirty_usage_snapshot(max_entries: usize) -> ScannerDirtyUsageSnapshot {
     let (generation, pending_bucket_count, complete, mut buckets) = {
         let dirty_buckets = dirty_usage_buckets();
@@ -1062,6 +1385,7 @@ pub fn acknowledge_dirty_usage_generation(
         let cleared_buckets = before.saturating_sub(dirty_buckets.len());
         if cleared_buckets > 0 {
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
+            advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
         }
         (cleared_buckets, dirty_buckets.len(), cleared)
     };
@@ -1092,6 +1416,9 @@ pub fn clear_dirty_usage_bucket(bucket: &str) {
         producer_identities.remove(bucket);
         DIRTY_USAGE_PRODUCER_COVERAGE.store(0, Ordering::Release);
         advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
+        if cleared.is_some() {
+            advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
+        }
         (dirty_buckets.len(), cleared)
     };
     if let Some(cleared) = cleared {
@@ -1100,8 +1427,59 @@ pub fn clear_dirty_usage_bucket(bucket: &str) {
     global_metrics().record_scanner_dirty_usage_clear(usize_to_u64_saturated(pending_buckets));
 }
 
+/// Dirty-usage state captured immediately before a cycle lists its buckets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DirtyUsageListingCutoff {
+    pub(super) generation: u64,
+    /// `None` when the caller did not capture removals; the snapshot then
+    /// admits scoping only under the strict `covers_all_pending` rule.
+    removal_generation: Option<u64>,
+}
+
+pub(super) fn dirty_usage_listing_cutoff() -> DirtyUsageListingCutoff {
+    // Removals advance both counters under this lock, so reading them under
+    // it pairs the generation with every removal that precedes it.
+    let _dirty_buckets = dirty_usage_buckets();
+    DirtyUsageListingCutoff {
+        generation: DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire),
+        removal_generation: Some(DIRTY_USAGE_REMOVAL_GENERATION.load(Ordering::Acquire)),
+    }
+}
+
+#[cfg(test)]
 pub(super) fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo], absent_generation_cutoff: u64) -> DirtyUsageSnapshot {
-    let (snapshot, scopes, generation, covers_all_pending) = {
+    snapshot_dirty_usage_buckets_after_listing(
+        buckets,
+        DirtyUsageListingCutoff {
+            generation: absent_generation_cutoff,
+            removal_generation: None,
+        },
+    )
+}
+
+/// Snapshot the dirty map after the bucket listing taken at `cutoff`.
+///
+/// The snapshot holds every entry recorded at or before the cutoff and every
+/// later entry for a listed bucket. The only entries it leaves out are
+/// buckets this cycle did not list that became dirty after the cutoff: the
+/// walk cannot visit them, certification never clears them, and
+/// `pending_dirty_usage_buckets` reports them, so the next cycle selects them.
+///
+/// `covers_all_pending` keeps its strict meaning (nothing moved during the
+/// listing) because segment-reuse evidence and `DirtyUsageSnapshotStatus`
+/// bind to an unchanged generation window. `covers_listed_pending` is the
+/// weaker property a bucket-scoped walk needs: no entry was removed or
+/// replaced during the listing, so every bucket changed since the baseline
+/// that this cycle can walk is still in the snapshot. A removal in the window
+/// may be a certification against a publication newer than the baseline the
+/// cycle loaded, and scoping would then reuse a stale baseline value for that
+/// bucket, so any removal keeps the strict rule.
+pub(super) fn snapshot_dirty_usage_buckets_after_listing(
+    buckets: &[BucketInfo],
+    cutoff: DirtyUsageListingCutoff,
+) -> DirtyUsageSnapshot {
+    let absent_generation_cutoff = cutoff.generation;
+    let (snapshot, scopes, generation, covers_all_pending, covers_listed_pending) = {
         let dirty_buckets = dirty_usage_buckets();
         let dirty_scopes = dirty_usage_bucket_scopes();
         let listed_buckets = dirty_buckets
@@ -1132,7 +1510,24 @@ pub(super) fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo], absent_genera
             .collect::<DirtyUsageBucketScopes>();
         let generation = DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire);
         let covers_all_pending = generation == absent_generation_cutoff && snapshot.len() == dirty_buckets.len();
-        (snapshot, scopes, generation, covers_all_pending)
+        let removal_generation = DIRTY_USAGE_REMOVAL_GENERATION.load(Ordering::Acquire);
+        let no_removal_since_cutoff = cutoff
+            .removal_generation
+            .is_some_and(|before| before == removal_generation && removal_generation != u64::MAX);
+        // The filter above already guarantees the second clause; it is
+        // restated so a change to the filter cannot silently drop a listed
+        // bucket from a scoped walk.
+        let covers_listed_pending = covers_all_pending
+            || (generation != u64::MAX
+                && no_removal_since_cutoff
+                && dirty_buckets.iter().all(|(bucket, dirty_generation)| {
+                    snapshot.contains_key(bucket)
+                        || (*dirty_generation > absent_generation_cutoff
+                            && listed_buckets
+                                .as_ref()
+                                .is_some_and(|listed_buckets| !listed_buckets.contains(bucket.as_str())))
+                }));
+        (snapshot, scopes, generation, covers_all_pending, covers_listed_pending)
     };
     global_metrics().record_scanner_dirty_usage_cycle_snapshot(usize_to_u64_saturated(snapshot.len()));
     DirtyUsageSnapshot {
@@ -1140,6 +1535,7 @@ pub(super) fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo], absent_genera
         scopes: Arc::new(scopes),
         generation,
         covers_all_pending,
+        covers_listed_pending,
     }
 }
 
@@ -1172,6 +1568,7 @@ pub(super) fn clear_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) {
         if cleared_buckets > 0 {
             producer_identities.retain(|bucket, _| dirty_buckets.contains_key(bucket));
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
+            advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
         }
         (cleared_buckets, dirty_buckets.len(), cleared)
     };
@@ -1191,19 +1588,41 @@ pub(super) fn dirty_usage_buckets_excluding_failed(
         .collect()
 }
 
+/// Plan the per-bucket certification of a walk. The returned snapshot is
+/// applied by `clear_dirty_usage_buckets`, which removes only the buckets
+/// whose generation still equals the start snapshot: a bucket written during
+/// the walk keeps its newer generation and stays pending. The dirty-usage
+/// generation therefore does not need to be unchanged; only the guardrail
+/// must have passed.
 pub(super) fn should_clear_dirty_usage_snapshot(
     result_ok: bool,
     completed_all_sets: bool,
     budget_elapsed: bool,
-    activity_and_generation_current: bool,
+    guardrail_passed: bool,
     dirty_buckets: &DirtyUsageBuckets,
     failed_buckets: &HashSet<String>,
 ) -> Option<DirtyUsageBuckets> {
-    if result_ok && completed_all_sets && !budget_elapsed && activity_and_generation_current {
+    if result_ok && completed_all_sets && !budget_elapsed && guardrail_passed {
         return Some(dirty_usage_buckets_excluding_failed(dirty_buckets, failed_buckets));
     }
 
     None
+}
+
+/// Buckets the walk cannot certify against its start snapshot: every dirty
+/// bucket whose generation differs from the snapshot's, including buckets
+/// dirtied after the snapshot was taken. Only a `Complete` cycle reads this,
+/// and a failed bucket never reaches `Complete`, so the failed set that
+/// `dirty_usage_buckets_excluding_failed` removes is empty here. The caller
+/// adds the buckets whose walk stopped early behind a certified value; they
+/// are pending whether or not the dirty map names them.
+pub(super) fn pending_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) -> BTreeSet<String> {
+    let dirty_buckets = dirty_usage_buckets();
+    dirty_buckets
+        .iter()
+        .filter(|(bucket, generation)| snapshot.get(bucket.as_str()) != Some(*generation))
+        .map(|(bucket, _)| bucket.clone())
+        .collect()
 }
 
 pub(super) async fn record_failed_dirty_bucket(failed_buckets: &Arc<Mutex<HashSet<String>>>, bucket: &str) {
@@ -1309,6 +1728,7 @@ pub(super) fn dirty_usage_bucket_count() -> usize {
 #[cfg(test)]
 pub(crate) fn clear_dirty_usage_buckets_for_tests() {
     dirty_usage_buckets().clear();
+    advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
     dirty_usage_bucket_scopes().clear();
     dirty_usage_producer_identities().clear();
     DIRTY_USAGE_PRODUCER_COVERAGE.store(0, Ordering::Release);

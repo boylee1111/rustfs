@@ -142,11 +142,11 @@ fn same_replication_service(edited: &BucketTarget, previous: &BucketTarget) -> b
         && access_key(edited) == access_key(previous)
 }
 
-/// Page size and page budget for [`TargetClient::locate_replica_by_etag`].
+/// Page size and page budget for [`TargetClient::replica_candidates`].
 const FIND_VERSION_BY_ETAG_PAGE_SIZE: i32 = 1000;
 const FIND_VERSION_BY_ETAG_MAX_PAGES: usize = 8;
-/// Candidate cap for [`TargetClient::replica_candidates_by_etag`]: more than
-/// this many same-content versions of one key is ambiguity by any measure.
+/// Candidate cap for [`TargetClient::replica_candidates`]: more than this
+/// many matching versions of one key is ambiguity by any measure.
 const FIND_VERSION_BY_ETAG_MAX_MATCHES: usize = 16;
 pub type GetObjectSdkError = Box<SdkError<GetObjectError>>;
 pub type GetObjectTaggingSdkError = Box<SdkError<GetObjectTaggingError>>;
@@ -409,6 +409,11 @@ pub struct BucketTargetSys {
     /// lock (never held across an await) so the replication worker can record
     /// a verdict from inside its synchronous PUT-response audit.
     version_identity_map: Arc<std::sync::RwLock<HashMap<String, VersionIdentityCapability>>>,
+    /// Target ARNs whose remote rejected a PUT / CreateMultipartUpload
+    /// `versionId` query with `InvalidArgument`; later requests to the same
+    /// ARN omit the query instead of failing again. Reset alongside
+    /// `version_identity_map` — same lifetime, same reasoning.
+    put_version_id_query_rejected: Arc<std::sync::RwLock<HashSet<String>>>,
     pub targets_map: Arc<RwLock<HashMap<String, Vec<BucketTarget>>>>,
     /// Buckets whose persisted `bucket-targets.json` exists but cannot be
     /// decoded (rustfs/backlog#2282). Written under the bucket's update mutex
@@ -458,6 +463,7 @@ impl BucketTargetSys {
             arn_remotes_map: Arc::new(RwLock::new(HashMap::new())),
             ssec_passthrough_map: Arc::new(RwLock::new(HashMap::new())),
             version_identity_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            put_version_id_query_rejected: Arc::new(std::sync::RwLock::new(HashSet::new())),
             targets_map: Arc::new(RwLock::new(HashMap::new())),
             unreadable_targets: Arc::new(RwLock::new(HashSet::new())),
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
@@ -782,8 +788,34 @@ impl BucketTargetSys {
                 health_map.remove(&target.arn);
                 ssec_map.remove(&target.arn);
                 self.forget_version_identity_capability(&target.arn);
+                self.forget_put_version_id_query_rejected(&target.arn);
             }
         }
+    }
+
+    /// Whether this target ARN is already known to reject a `versionId`
+    /// query on PUT / CreateMultipartUpload.
+    pub fn put_version_id_query_rejected(&self, arn: &str) -> bool {
+        self.put_version_id_query_rejected
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(arn)
+    }
+
+    /// Record that this target ARN rejected a `versionId` query on PUT /
+    /// CreateMultipartUpload, so later requests to it omit the query.
+    pub fn record_put_version_id_query_rejected(&self, arn: &str) {
+        self.put_version_id_query_rejected
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(arn.to_string());
+    }
+
+    fn forget_put_version_id_query_rejected(&self, arn: &str) {
+        self.put_version_id_query_rejected
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(arn);
     }
 
     /// Cached version-identity verdict for a target ARN; `Unknown` until a
@@ -1252,6 +1284,7 @@ impl BucketTargetSys {
                     .is_none_or(|edited| !same_replication_service(edited, &target))
                 {
                     self.forget_version_identity_capability(&target.arn);
+                    self.forget_put_version_id_query_rejected(&target.arn);
                 }
                 self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
@@ -1449,14 +1482,26 @@ pub fn resolve_delete_api_version_id(version_id: Option<String>, opts: &RemoveOb
 /// "null" (the delete path already maps it via `target_delete_version_id`),
 /// and an empty id means the source object carries no version: send no query
 /// so an unversioned target stays valid.
-fn resolve_put_api_version_id(source_version_id: &str) -> Option<&str> {
-    if source_version_id.is_empty() {
+///
+/// A standard S3 target (AWS S3 included) instead rejects this query on PUT /
+/// CreateMultipartUpload outright with `InvalidArgument: This operation does
+/// not accept a version-id`. Once a target ARN has been observed to reject
+/// it (`arn_rejected_query`), it is never sent to that ARN again.
+fn resolve_put_api_version_id(source_version_id: &str, arn_rejected_query: bool) -> Option<&str> {
+    if arn_rejected_query || source_version_id.is_empty() {
         None
     } else if Uuid::parse_str(source_version_id).is_ok_and(|uuid| uuid.is_nil()) {
         Some(rustfs_filemeta::NULL_VERSION_ID)
     } else {
         Some(source_version_id)
     }
+}
+
+/// True when a PUT / CreateMultipartUpload service error is the standard S3
+/// rejection of a `versionId` query on those operations (AWS S3 and other
+/// strict S3-compatible targets; MinIO/RustFS peers accept the query).
+fn is_put_version_id_query_rejected(code: Option<&str>, message: Option<&str>) -> bool {
+    code == Some("InvalidArgument") && message.is_some_and(|m| m.to_ascii_lowercase().contains("version-id"))
 }
 
 /// Resolve the S3 `versionId` for a proxied read against a remote target.
@@ -1967,7 +2012,7 @@ impl TargetClient {
             .head_object()
             .bucket(bucket)
             .key(object)
-            .set_version_id(version_id)
+            .set_version_id(resolve_read_api_version_id(version_id))
             .customize()
             .map_request(move |mut req| {
                 for (k, v) in headers.clone().into_iter() {
@@ -1985,27 +2030,28 @@ impl TargetClient {
 
     /// Candidate replicas by content identity on a target that mints its own
     /// version ids: page `ListObjectVersions` under the exact key and report
-    /// the live versions whose ETag matches `source_etag`, newest first.
-    /// Delete markers and prefix siblings never match. Bounded to
+    /// the live versions that match `identity`, newest first. Delete markers
+    /// and prefix siblings never match. Bounded to
     /// [`FIND_VERSION_BY_ETAG_MAX_PAGES`] pages and
-    /// [`FIND_VERSION_BY_ETAG_MAX_MATCHES`] candidates so a key with a very
-    /// deep history cannot turn one convergence check into an unbounded scan;
-    /// a replica beyond that window reads as missing, which only costs a
-    /// re-PUT (today's behaviour), never a lost object.
+    /// [`FIND_VERSION_BY_ETAG_MAX_MATCHES`] candidates per kind so a key with
+    /// a very deep history cannot turn one convergence check into an
+    /// unbounded scan; a replica beyond that window reads as missing, which
+    /// only costs a re-PUT (today's behaviour), never a lost object.
     ///
     /// Content identity is not version identity: two source generations with
-    /// the same bytes have the same ETag. Callers drop the candidates other
-    /// source versions already claim through their ledgers and refuse an
-    /// [`ReplicaLocation::Ambiguous`] remainder before mutating or deleting.
-    pub async fn replica_candidates_by_etag(
+    /// the same bytes have the same ETag, and two with the same size have the
+    /// same shape. Callers drop the candidates other source versions already
+    /// claim through their ledgers and decide through
+    /// [`ReplicaCandidates::locate`].
+    pub async fn replica_candidates(
         &self,
         bucket: &str,
         object: &str,
-        source_etag: &str,
-    ) -> Result<Vec<String>, Box<SdkError<aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError>>> {
+        identity: &ReplicaIdentity<'_>,
+    ) -> Result<ReplicaCandidates, Box<SdkError<aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError>>> {
         let mut key_marker: Option<String> = None;
         let mut version_id_marker: Option<String> = None;
-        let mut matches: Vec<String> = Vec::new();
+        let mut candidates = ReplicaCandidates::default();
         for _ in 0..FIND_VERSION_BY_ETAG_MAX_PAGES {
             let page = self
                 .client
@@ -2018,19 +2064,27 @@ impl TargetClient {
                 .send()
                 .await
                 .map_err(Box::new)?;
-            matches.extend(
-                page.versions()
-                    .iter()
-                    .filter(|version| {
-                        version.key() == Some(object)
-                            && version.version_id().is_some_and(|id| !id.is_empty())
-                            && replication_etags_match(Some(source_etag), version.e_tag())
-                    })
-                    .filter_map(|version| version.version_id().map(str::to_string)),
-            );
+            for version in page.versions() {
+                let Some(version_id) = version.version_id().filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                if version.key() != Some(object) {
+                    continue;
+                }
+                match identity.evidence(version.e_tag(), version.size(), version.last_modified()) {
+                    Some(ReplicaEvidence::Etag) => candidates.exact.push(version_id.to_string()),
+                    // An unversioned target overwrites the key in place: its
+                    // `null` version holds whichever generation was written
+                    // last, so a shape match there identifies nothing.
+                    Some(ReplicaEvidence::Shape) if version_id != "null" => candidates.shaped.push(version_id.to_string()),
+                    Some(ReplicaEvidence::Shape) => {}
+                    None => {}
+                }
+            }
             // A listing that moved past the exact key (every listed key is >=
-            // the prefix), ended, or already filled the candidate cap decides.
-            if matches.len() >= FIND_VERSION_BY_ETAG_MAX_MATCHES
+            // the prefix), ended, or already filled a candidate cap decides.
+            if candidates.exact.len() >= FIND_VERSION_BY_ETAG_MAX_MATCHES
+                || candidates.shaped.len() >= FIND_VERSION_BY_ETAG_MAX_MATCHES
                 || page
                     .versions()
                     .iter()
@@ -2045,8 +2099,9 @@ impl TargetClient {
                 break;
             }
         }
-        matches.truncate(FIND_VERSION_BY_ETAG_MAX_MATCHES);
-        Ok(matches)
+        candidates.exact.truncate(FIND_VERSION_BY_ETAG_MAX_MATCHES);
+        candidates.shaped.truncate(FIND_VERSION_BY_ETAG_MAX_MATCHES);
+        Ok(candidates)
     }
 
     /// PutObjectRetention against a replica version on a target that does not
@@ -2251,7 +2306,9 @@ impl TargetClient {
         if !version_id.is_empty() {
             insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
         }
-        let api_version_id = resolve_put_api_version_id(&version_id).map(ToOwned::to_owned);
+        let api_version_id =
+            resolve_put_api_version_id(&version_id, BucketTargetSys::get().put_version_id_query_rejected(&self.arn))
+                .map(ToOwned::to_owned);
 
         // A PUT carrying Object Lock parameters must also carry Content-MD5 or
         // an x-amz-checksum-* header on AWS-compatible targets (rustfs#7082).
@@ -2333,6 +2390,9 @@ impl TargetClient {
                 SdkError::ServiceError(service_err) => {
                     let err = service_err.into_err();
                     let meta = err.meta();
+                    if is_put_version_id_query_rejected(meta.code(), meta.message()) {
+                        BucketTargetSys::get().record_put_version_id_query_rejected(&self.arn);
+                    }
                     let error = match (meta.code(), meta.message()) {
                         (Some(code), Some(message)) => format!("put_object failed: {code}: {message}"),
                         (Some(code), None) => format!("put_object failed: {code}"),
@@ -2369,7 +2429,9 @@ impl TargetClient {
         let version_id = opts.internal.source_version_id.clone();
         // The remote version of a multipart replication is decided at initiate
         // time; CompleteMultipartUpload does not read a versionId.
-        let api_version_id = resolve_put_api_version_id(&version_id).map(ToOwned::to_owned);
+        let api_version_id =
+            resolve_put_api_version_id(&version_id, BucketTargetSys::get().put_version_id_query_rejected(&self.arn))
+                .map(ToOwned::to_owned);
 
         match self
             .client
@@ -2395,7 +2457,15 @@ impl TargetClient {
             .await
         {
             Ok(res) => Ok(res.upload_id.unwrap_or_default()),
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                if let SdkError::ServiceError(service_err) = &e {
+                    let meta = service_err.err().meta();
+                    if is_put_version_id_query_rejected(meta.code(), meta.message()) {
+                        BucketTargetSys::get().record_put_version_id_query_rejected(&self.arn);
+                    }
+                }
+                Err(e.into())
+            }
         }
     }
 
@@ -2554,19 +2624,18 @@ impl TargetClient {
 }
 
 /// Where a replica stands on a target that mints its own version ids, by
-/// content identity (exact key + ETag) after the candidates other source
-/// versions claim were removed. See
-/// [`TargetClient::replica_candidates_by_etag`].
+/// content identity after the candidates other source versions claim were
+/// removed. See [`TargetClient::replica_candidates`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplicaLocation {
-    /// No live version under the key carries the source ETag.
+    /// No live version under the key matches the source.
     Missing,
-    /// Exactly one live version carries it: safe to address.
+    /// Exactly one live version matches: safe to address.
     Unique(String),
-    /// More than one live version carries it (same bytes replicated for
-    /// several source generations). `newest` is the most recently listed
-    /// one — good enough to prove the replica exists, never good enough to
-    /// pick which one to mutate or delete.
+    /// More than one live version carries the source ETag (same bytes
+    /// replicated for several source generations). `newest` is the most
+    /// recently listed one — good enough to prove the replica exists, never
+    /// good enough to pick which one to mutate or delete.
     Ambiguous { newest: String },
 }
 
@@ -2589,6 +2658,107 @@ impl ReplicaLocation {
             Self::Missing => None,
             Self::Unique(version_id) | Self::Ambiguous { newest: version_id } => Some(version_id),
         }
+    }
+}
+
+/// What a replica of an encrypted source version still has in common with
+/// it on a target that computes its own ETags. The source ETag is a keyed
+/// fingerprint (docs/operations/encrypted-etags.md) or a legacy plaintext
+/// MD5 the target's re-encrypted replica never reports, so the replica is
+/// recognised by the byte count the replication PUT sent and by a write time
+/// no earlier than the source version's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptedReplicaShape {
+    /// Bytes on the replication wire: the plaintext size for managed SSE,
+    /// the stored ciphertext size for an SSE-C passthrough.
+    pub size: i64,
+    /// The source version's mtime in whole seconds; listings and HEAD report
+    /// second-precision times.
+    pub not_before_secs: i64,
+}
+
+impl EncryptedReplicaShape {
+    pub fn matches(&self, size: Option<i64>, last_modified: Option<&aws_sdk_s3::primitives::DateTime>) -> bool {
+        size == Some(self.size) && last_modified.is_some_and(|written| written.secs() >= self.not_before_secs)
+    }
+}
+
+/// How a source version recognises its replica among a key's target
+/// versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaIdentity<'a> {
+    /// Unencrypted source: its ETag is the MD5 of the replicated bytes, which
+    /// every target reports back — exact identity.
+    Etag(&'a str),
+    /// Encrypted source: a target that adopts the source ETag (RustFS,
+    /// MinIO) still reports `etag`; any other target only keeps the shape.
+    Encrypted {
+        etag: Option<&'a str>,
+        shape: EncryptedReplicaShape,
+    },
+}
+
+/// Which kind of evidence tied a target version to the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaEvidence {
+    /// The target reports the source ETag.
+    Etag,
+    /// Encrypted source on a target that computes its own ETag: same size,
+    /// written no earlier than the source version.
+    Shape,
+}
+
+impl ReplicaIdentity<'_> {
+    pub fn evidence(
+        &self,
+        etag: Option<&str>,
+        size: Option<i64>,
+        last_modified: Option<&aws_sdk_s3::primitives::DateTime>,
+    ) -> Option<ReplicaEvidence> {
+        match *self {
+            Self::Etag(source_etag) => replication_etags_match(Some(source_etag), etag).then_some(ReplicaEvidence::Etag),
+            Self::Encrypted {
+                etag: source_etag,
+                shape,
+            } => {
+                if replication_etags_match(source_etag, etag) {
+                    Some(ReplicaEvidence::Etag)
+                } else {
+                    shape.matches(size, last_modified).then_some(ReplicaEvidence::Shape)
+                }
+            }
+        }
+    }
+}
+
+/// Content-identity candidates of one key, newest first, by evidence kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicaCandidates {
+    /// Versions that report the source ETag.
+    pub exact: Vec<String>,
+    /// Encrypted sources only: versions without the source ETag whose shape
+    /// matches.
+    pub shaped: Vec<String>,
+}
+
+impl ReplicaCandidates {
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.shaped.is_empty()
+    }
+
+    /// Drop the candidates other source versions claim and decide. An ETag
+    /// match outranks any shape match. A shape is weaker evidence than an
+    /// ETag — two generations of one size share it — so several shape
+    /// matches are never resolved by picking one: they read as
+    /// [`ReplicaLocation::Missing`] for convergence (the caller re-PUTs, a
+    /// duplicate at worst) and as ambiguous for a purge (it refuses).
+    pub fn locate(mut self, claimed: &HashSet<String>) -> (ReplicaLocation, ReplicaEvidence) {
+        self.exact.retain(|candidate| !claimed.contains(candidate));
+        if !self.exact.is_empty() {
+            return (ReplicaLocation::from_matches(self.exact), ReplicaEvidence::Etag);
+        }
+        self.shaped.retain(|candidate| !claimed.contains(candidate));
+        (ReplicaLocation::from_matches(self.shaped), ReplicaEvidence::Shape)
     }
 }
 
@@ -3302,23 +3472,47 @@ mod tests {
         (port, handle)
     }
 
-    fn spawn_http_status_server(status: u16) -> (u16, std::thread::JoinHandle<()>) {
-        use std::io::{Read, Write};
+    fn spawn_http_status_server(status: u16) -> (u16, std::sync::mpsc::Sender<()>, std::thread::JoinHandle<usize>) {
+        use std::io::{ErrorKind, Read, Write};
 
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test HTTP listener should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("test HTTP listener should be nonblocking");
         let port = listener
             .local_addr()
             .expect("test HTTP listener should have an address")
             .port();
+        let (stop, stopped) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("test HTTP client should connect");
-            let mut request = [0_u8; 8192];
-            let bytes_read = stream.read(&mut request).expect("test HTTP request should be read");
-            assert!(bytes_read > 0, "test HTTP request should not be empty");
-            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .expect("test HTTP response should be written");
+            let mut requests = 0;
+            loop {
+                match stopped.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(err) => panic!("test HTTP listener failed: {err}"),
+                };
+                stream.set_nonblocking(false).expect("test HTTP stream should be blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("test HTTP read timeout should configure");
+                let mut request = [0_u8; 8192];
+                let bytes_read = stream.read(&mut request).expect("test HTTP request should be read");
+                assert!(bytes_read > 0, "test HTTP request should not be empty");
+                requests += 1;
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .expect("test HTTP response should be written");
+            }
+            requests
         });
-        (port, handle)
+        (port, stop, handle)
     }
 
     fn spawn_delayed_http_server() -> (
@@ -3595,6 +3789,87 @@ mod tests {
         // A rebuilt target may point at a different service.
         sys.forget_version_identity_capability(arn);
         assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::Unknown);
+    }
+
+    #[test]
+    fn put_version_id_query_rejection_is_per_arn_and_forgotten_with_the_target() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:rustfs:replication:us-east-1:bucket:versionid";
+        assert!(!sys.put_version_id_query_rejected(arn));
+        sys.record_put_version_id_query_rejected(arn);
+        assert!(sys.put_version_id_query_rejected(arn));
+        assert!(!sys.put_version_id_query_rejected("other"));
+        // A rebuilt target may point at a different service.
+        sys.forget_put_version_id_query_rejected(arn);
+        assert!(!sys.put_version_id_query_rejected(arn));
+    }
+
+    #[tokio::test]
+    async fn update_all_targets_forgets_put_version_id_rejection_when_endpoint_changes() {
+        // Editing a target's ARN to point at a different endpoint must not
+        // carry over a stale "this remote rejects versionId" verdict from the
+        // service it used to point at (rustfs review follow-up on the
+        // versionId-on-PUT fix): otherwise a peer that legitimately needs the
+        // query silently loses version-id fidelity until the process restarts.
+        let sys = BucketTargetSys::default();
+        let arn = "arn:rustfs:replication:us-east-1:bucket:versionid";
+        let target = |endpoint: &str| BucketTarget {
+            arn: arn.to_string(),
+            endpoint: endpoint.to_string(),
+            target_bucket: "target-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: None,
+                expiration: None,
+            }),
+            ..Default::default()
+        };
+
+        sys.update_all_targets(
+            "bucket",
+            Some(&BucketTargets {
+                targets: vec![target("aws-s3.example:9000")],
+            }),
+        )
+        .await;
+        sys.record_put_version_id_query_rejected(arn);
+        assert!(sys.put_version_id_query_rejected(arn));
+
+        // Same ARN, different endpoint: the update path (not `delete`) is the
+        // only thing that runs here, so the reset must come from
+        // `update_all_targets_locked` itself.
+        sys.update_all_targets(
+            "bucket",
+            Some(&BucketTargets {
+                targets: vec![target("minio-peer.example:9000")],
+            }),
+        )
+        .await;
+
+        assert!(
+            !sys.put_version_id_query_rejected(arn),
+            "editing the target to a different endpoint must forget the stale rejection verdict"
+        );
+    }
+
+    #[test]
+    fn resolve_put_api_version_id_omits_query_once_rejected() {
+        let version_id = Uuid::new_v4().to_string();
+        assert_eq!(resolve_put_api_version_id(&version_id, false), Some(version_id.as_str()));
+        assert_eq!(resolve_put_api_version_id(&version_id, true), None);
+    }
+
+    #[test]
+    fn is_put_version_id_query_rejected_matches_aws_invalid_argument() {
+        assert!(is_put_version_id_query_rejected(
+            Some("InvalidArgument"),
+            Some("This operation does not accept a version-id.")
+        ));
+        assert!(!is_put_version_id_query_rejected(Some("AccessDenied"), Some("access denied")));
+        assert!(!is_put_version_id_query_rejected(Some("InvalidArgument"), Some("bucket name is invalid")));
+        assert!(!is_put_version_id_query_rejected(None, None));
     }
 
     #[test]
@@ -3919,6 +4194,34 @@ mod tests {
         );
     }
 
+    /// The worker's convergence HEAD addresses a source null version (nil
+    /// UUID) as `versionId=null`, the spelling every S3 target understands,
+    /// like the proxy and audit reads do.
+    #[tokio::test]
+    async fn head_object_addresses_nil_source_version_as_null() {
+        let (client, request_uris) = recording_target_client();
+        let versioned = Uuid::new_v4().to_string();
+        // Only the request URI matters here; the canned empty response may or
+        // may not parse as a HEAD result.
+        let _ = client
+            .head_object("target-bucket", "object", Some(Uuid::nil().to_string()))
+            .await;
+        let _ = client.head_object("target-bucket", "object", Some(versioned.clone())).await;
+
+        let request_uris = request_uris.lock().expect("recorded request lock should not be poisoned");
+        assert_eq!(request_uris.len(), 2);
+        assert!(
+            request_uris[0].contains("versionId=null") && !request_uris[0].contains(&Uuid::nil().to_string()),
+            "a nil source version must be addressed as the null version: {}",
+            request_uris[0]
+        );
+        assert!(
+            request_uris[1].contains(&format!("versionId={versioned}")),
+            "a concrete source version must pass through unchanged: {}",
+            request_uris[1]
+        );
+    }
+
     #[tokio::test]
     async fn put_object_sends_source_version_id_query_to_target() {
         // MinIO reads the replicated version only from the `versionId` query
@@ -4213,16 +4516,26 @@ mod tests {
     #[tokio::test]
     async fn target_health_check_treats_client_errors_as_online_and_server_errors_as_offline() {
         for (status, expected_online) in [(403, true), (500, false)] {
-            let (port, server) = spawn_http_status_server(status);
+            let (port, stop, server) = spawn_http_status_server(status);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let target = target_client_for_test(
-                &format!("arn:http-{status}"),
-                endpoint.clone(),
-                s3_client_for_endpoint_test(endpoint, None),
-            );
+            let client = s3_client_for_endpoint_test(endpoint.clone(), None);
+            let config = client
+                .config()
+                .to_builder()
+                .retry_config(
+                    aws_sdk_s3::config::retry::RetryConfig::standard()
+                        .with_max_attempts(2)
+                        .with_initial_backoff(Duration::from_millis(1))
+                        .with_max_backoff(Duration::from_millis(1)),
+                )
+                .build();
+            let target = target_client_for_test(&format!("arn:http-{status}"), endpoint, S3Client::from_conf(config));
 
-            assert_eq!(BucketTargetSys::check_endpoint_health(&target).await, expected_online);
-            server.join().expect("test HTTP server should stop");
+            let online = BucketTargetSys::check_endpoint_health(&target).await;
+            stop.send(()).expect("test HTTP server should be running");
+            let requests = server.join().expect("test HTTP server should stop");
+            assert_eq!(requests, if status == 500 { 2 } else { 1 }, "unexpected probe count for HTTP {status}");
+            assert_eq!(online, expected_online, "unexpected health for HTTP {status}");
         }
     }
 

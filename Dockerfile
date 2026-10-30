@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM alpine:3.24.1 AS build
+FROM alpine:3.24.2 AS build
 
 ARG TARGETARCH
 ARG RELEASE=latest
@@ -70,7 +70,7 @@ RUN set -eux; \
     rm -rf rustfs.zip /build/.tmp || true
 
 
-FROM alpine:3.24.1
+FROM alpine:3.24.2
 
 ARG RELEASE=latest
 ARG BUILD_DATE
@@ -106,7 +106,9 @@ RUN chmod +x /usr/bin/rustfs /entrypoint.sh
 
 RUN addgroup -g 10001 -S rustfs && \
     adduser -u 10001 -G rustfs -S rustfs -D && \
-    mkdir -p /data /logs && \
+    mkdir -p /data/.rustfs/events /data/.rustfs/audit /logs /opt/rustfs && \
+    ln -s /data/.rustfs/events /opt/rustfs/events && \
+    ln -s /data/.rustfs/audit /opt/rustfs/audit && \
     chown -R rustfs:rustfs /data /logs && \
     chmod 0750 /data /logs
 

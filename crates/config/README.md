@@ -100,6 +100,7 @@ when restoring `/rustfs/console` for a custom OEM build.
 ## S3 API environment variables
 
 - `RUSTFS_API_OBJECT_MAX_VERSIONS` caps the number of retained versions for a single object. It defaults to `9223372036854775807`, matching MinIO's practical-unlimited default. Set a positive integer to enforce a lower per-object metadata bound.
+- `RUSTFS_VEEAM_SOSAPI_ENABLE` serves Veeam SOSAPI `system.xml` and `capacity.xml` for an authenticated GET or HEAD of those exact bucket-root keys. It defaults to `true`. Explicit version reads use the normal object path. Capacity requests return `ServiceUnavailable` until the scanner publishes a complete snapshot certified for the current bucket incarnation and authoritative quota metadata can be read. Legacy or mixed-version snapshots without an incarnation proof cannot serve capacity until a compatible scanner publishes a certified snapshot. Capacity also returns `ServiceUnavailable` when cluster or disk observations are missing, stale, or degraded. Retry after scanner convergence and storage or metadata recovery. Capacity assumes shard paths have independent backing space; shared physical storage can make the estimate optimistic. Set the flag to `false` to restore the normal object path, including deletion of a real object previously stored at that key.
 - `MINIO_API_OBJECT_MAX_VERSIONS` is accepted as a compatibility alias when the canonical RustFS variable is not set.
 
 ## Distributed endpoint locality
@@ -116,14 +117,29 @@ when restoring `/rustfs/console` for a custom OEM build.
 - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` (deprecated alias for compatibility)
 - `RUSTFS_SCANNER_IDLE_MODE` (canonical)
 - `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (canonical)
+- `RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (canonical)
+- `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` (canonical)
+- `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` (canonical)
+- `RUSTFS_SCANNER_WALKERS_PER_DISK` (canonical)
 
 Scanner cycle budget controls:
 
 - When `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` is unset, the finite default is 1800 seconds (30 minutes), matching the scanner benchmark guidance.
 - An explicit `0` preserves the compatibility behavior of an unbounded runtime budget. Object and directory budgets likewise remain unbounded when explicitly set to `0`.
+
+Scanner recovery retry controls:
+
+- `RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS` caps the wait between automatic startup recovery retries. The persistent admin key is `scanner.recovery_backoff_cap`; the environment takes precedence over the persistent value, and the unset default remains 600 seconds (10 minutes). Values must be positive integer seconds within the platform timer range; `0`, malformed values, and overflow are rejected. A valid environment override does not hide an invalid persistent value from `admin config set` validation.
+- The cap bounds the existing exponential retry schedule. Updating the persistent value applies to the next computed retry; it does not reschedule a wait already in progress. Retryable observations continue retrying after the short retry budget. Admin scanner status reports the effective value and source at `runtime_config.recovery_backoff_cap_seconds`.
+
+Scanner walker controls:
+
+- `RUSTFS_SCANNER_WALKERS_PER_DISK` sets how many bucket walkers each local disk of an erasure set runs; the default `1` walks one bucket per disk at a time, which is the right value for rotational media. On flash, `2` to `4` lets one disk walk several buckets concurrently, which matters most for single-disk deployments with many buckets, where the walk is otherwise fully serial. Values outside `1` through `16` are rejected by `admin config set`; an out-of-range or non-numeric environment value is logged as a scanner runtime config error (`state = "startup_apply_failed"`) and the scanner keeps the default. The walkers of one disk share that disk's scanner admission, so peers still see one scan session per physical disk, and `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` still caps the total.
+- The same value is available as the persistent `scanner.walkers_per_disk` key and is reported under `runtime_config.walkers_per_disk` in the admin scanner status; see [Scanner Runtime Controls](../../docs/operations/scanner-runtime-controls.md).
+
 - A timed-out cycle cancels cooperative scanner work, then fences its leader epoch before releasing the lease. An uncooperative I/O operation is dropped after the bounded shutdown window; its cursor is not claimed to be durable and the scanner reports `recovery-required` when the worker cannot stop cooperatively, the cycle state was not confirmed durable, or epoch fencing cannot be persisted.
 
 ## Mmap read environment aliases
@@ -168,16 +184,19 @@ Scanner cycle budget controls:
 
 ## Foreground write admission environment variables
 
-Large direct `PutObject` requests and multipart `UploadPart` requests share one
-per-process permit pool that bounds how many bodies are ingested and written
-concurrently. Small direct PUTs stay on the legacy path.
+Large direct `PutObject` requests, multipart `UploadPart` requests, and
+server-side multipart `UploadPartCopy` requests share one per-process permit
+pool that bounds concurrent body ingest and storage writes. Small direct PUTs
+stay on the legacy path.
 
 - `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE`
   - enables the default-on pool; `false` keeps only the soft request counter.
   - default is `true`.
 - `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT`
-  - permits in the pool; `0` derives half of `RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS`, clamped to `32`.
-  - default is `0` (32 permits at stock settings).
+  - a positive value is an exact request-count limit shared by all gated writes.
+  - default is `0`: derive half of `RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS`, clamped to `32`, as large-write slots. Each slot has eight units. A gated direct PUT or unknown-size multipart part uses eight units; known-size parts use one unit per 8 MiB, rounded up, with a minimum of one and maximum of eight.
+  - stock settings therefore share 256 units across at most 32 large/unknown writes or 256 parts of up to 8 MiB. Mixed sizes consume the same budget. Admitted known parts of up to 64 MiB total at most 2 GiB of declared payload; larger streaming writes and queued bodies are separate. This is not a bound on total process or kernel memory.
+  - admission snapshots report allocated or reserved units in `active` and the unit budget in `limit` under automatic sizing. Explicit and strict limits still report request-count permits.
 - `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES`
   - smallest direct `PutObject` that takes a permit; unknown-size requests always do.
   - default is `33554432` (32 MiB).
@@ -188,13 +207,13 @@ concurrently. Small direct PUTs stay on the legacy path.
   - smallest `UploadPart` that takes a permit; `0` gates every part.
   - default is `0`.
 - `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`
-  - how long an `UploadPart` waits in the bounded queue for a permit before returning S3 `SlowDown`; `0` rejects immediately when the pool is full.
-  - default is `10000`. Parts wait before body ingest, so SDK-default clients that send every part of an upload concurrently drain through the pool instead of failing on a full pool.
-  - RustFS does not read the request body while a part is queued, so the client's socket write stalls for the whole wait and whatever timeout the client or an intermediary has configured competes with this value. Keep it with margin below the shortest such timeout in use (botocore applies its 60 s `connect_timeout` to the body write; the AWS SDK for Java v2 has a 30 s socket write timeout; reverse proxies add their own body timeouts); a wait that outlives the client timeout surfaces as a dropped connection instead of `SlowDown`.
+  - how long an `UploadPart` or `UploadPartCopy` waits in the bounded queue for a permit before returning S3 `SlowDown`; `0` rejects immediately when the pool is full.
+  - default is `10000`. Parts wait before body ingest or source-object reads, so SDK-default clients that send every part of an upload concurrently drain through the pool instead of failing on a full pool.
+  - RustFS does not read the request body while a part is queued, so the client's socket write stalls for the whole wait and whatever timeout the client or an intermediary has configured competes with this value. `UploadPartCopy` waits before taking bucket lifecycle locks or opening source readers, and uses the unknown-size weight because the authoritative copy length is available only after source metadata and range validation. Keep the wait with margin below the shortest client/proxy timeout in use (botocore applies its 60 s `connect_timeout` to the body write; the AWS SDK for Java v2 has a 30 s socket write timeout; reverse proxies add their own body timeouts); a wait that outlives the client timeout surfaces as a dropped connection instead of `SlowDown`.
 - `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING`
-  - maximum `UploadPart` requests waiting for a permit at once; parts beyond it return `SlowDown` without waiting.
-  - default is `0`, which derives 16 times the permit limit (512 at stock settings).
-  - each queued HTTP/1 part holds whatever unread body the client already pushed into the connection's kernel receive buffer (an HTTP/2 part holds up to its flow-control window in process memory), so this depth also bounds that memory. RustFS leaves the receive buffer to kernel autotuning (see `RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES` below), which keeps an unread connection at the kernel's initial size (128 KiB on current Linux).
+  - maximum `UploadPart` and `UploadPartCopy` requests waiting for a permit at once; parts beyond it return `SlowDown` without waiting.
+  - default is `0`, which derives 16 times the large-write slot count, or the explicit request-count limit (512 at stock settings). Automatic subdivision does not enlarge this queue.
+  - each queued HTTP/1 part holds whatever unread body the client already pushed into the connection's kernel receive buffer (an HTTP/2 part holds up to its flow-control window in process memory). Autotuned receive buffers can remain large on reused connections; queue depth does not imply a fixed per-connection memory cost.
 - `RUSTFS_PUT_FOREGROUND_ADMISSION_ENABLE`, `RUSTFS_PUT_FOREGROUND_ADMISSION_LIMIT`, `RUSTFS_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`
   - experimental strict gate that applies to every foreground write regardless of size and replaces the pool above when enabled.
   - default is disabled; enabling it with limit `0` disables foreground write admission entirely.
@@ -203,9 +222,9 @@ concurrently. Small direct PUTs stay on the legacy path.
 
 - `RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES`
   - fixed `SO_RCVBUF` for the API listener, inherited by every accepted socket; `0` leaves the receive buffer to kernel autotuning.
-  - default is `0`. Earlier releases hard-coded 4 MiB, which Linux doubles to 8 MiB and which disables autotuning, so every connection whose body was not being read yet (a multipart part queued for a foreground write permit) could accumulate up to 8 MiB of unread body in kernel memory; at SDK-default multipart concurrency that was enough to push a node into TCP memory pressure.
-  - with autotuning the per-connection receive ceiling is the kernel's (`net.ipv4.tcp_rmem` max, 6 MiB on stock Linux) instead of the former fixed 8 MiB, so a single very high-bandwidth-delay connection may see a somewhat lower ceiling; raise `net.ipv4.tcp_rmem` first, and set this variable only on kernels without receive-buffer autotuning (illumos/Solaris) or where the sysctl cannot be changed.
-  - the send buffer stays fixed at 4 MiB because the stock Linux send autotuning ceiling (`net.ipv4.tcp_wmem` max, 4 MiB) is lower than a GB-level response stream needs.
+  - default is `0`. A fixed buffer disables receive autotuning. Linux doubles the requested value for socket-memory accounting, subject to kernel limits; that capacity is not a measurement of queued payload or allocated memory.
+  - with autotuning the receive ceiling is controlled by the kernel (`net.ipv4.tcp_rmem` on Linux); its defaults vary with kernel version and memory. A connection can retain a buffer enlarged by previous requests while its next request is queued. Tune the kernel ceiling first, and set this variable only on kernels without receive-buffer autotuning (illumos/Solaris) or where the sysctl cannot be changed.
+  - the send buffer remains fixed at 4 MiB; this setting only controls the receive side.
 
 ## Remote tier timeout environment variables
 
@@ -263,7 +282,7 @@ Drive timeout profile preset:
   - `warn` (default): log warning and continue startup.
   - `fail`: abort startup with an error.
 
-RustFS production guidance remains direct-attached local POSIX filesystems. Network-mounted filesystems (for example `nfs`, `cifs`, `smb2`, and `fuse.*`) are treated as unsupported by this startup guard.
+RustFS production guidance remains direct-attached local POSIX filesystems. Network-mounted filesystems (for example `nfs`, `cifs`, `smb2`, and `fuse.*`) are treated as unsupported by this startup guard. On Windows, endpoints on network drives (UNC shares such as `\\server\share` and mapped drive letters) are treated the same way, even though Windows reports the server's filesystem (usually `NTFS`) for them.
 
 ## 📄 License
 

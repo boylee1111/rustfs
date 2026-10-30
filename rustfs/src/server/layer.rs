@@ -19,6 +19,7 @@ use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
 use crate::server::hybrid::{HybridBody, is_grpc_request};
+use crate::server::rate_limit::virtual_host_bucket;
 use crate::server::{
     ADMIN_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HealthProbe, MINIO_ADMIN_PREFIX,
     MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH,
@@ -28,12 +29,15 @@ use crate::server::{
 };
 use crate::shared_types::ReadinessDegradedReason;
 use crate::storage_api::server::layer::apply_cors_headers;
+#[cfg(feature = "diagnostic-local-batch")]
+use crate::storage_api::server::layer::batch_diagnostic;
 use crate::storage_api::server::layer::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 use bytes::{Bytes, BytesMut};
 use futures::future::Either;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
+#[cfg(test)]
 use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use quick_xml::events::Event;
@@ -41,6 +45,7 @@ use rustfs_common::GlobalReadiness;
 use rustfs_common::trace_bus::{
     TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit, telemetry_trace_subscriber_count,
 };
+use rustfs_concurrency::foreground::{CompletionOutcome, ForegroundClass, ForegroundObservation};
 use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
 use rustfs_obs::HTTP_SERVER_LOG_TARGET;
 #[cfg(feature = "swift")]
@@ -52,6 +57,7 @@ use s3s::S3Error;
 use s3s::S3ErrorCode;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -69,6 +75,10 @@ const HTTP_REQUEST_INFLIGHT_SLOW_EVENT: &str = "http_request_inflight_slow";
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const REDACTED_QUERY_VALUE: &str = "redacted";
+#[cfg(feature = "diagnostic-local-batch")]
+type BatchDiagnosticRequest = Option<Arc<str>>;
+#[cfg(not(feature = "diagnostic-local-batch"))]
+type BatchDiagnosticRequest = ();
 const OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads/";
 const HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 static HTTP_SERVER_ERROR_LOGS: [rustfs_utils::LogThrottle; 100] = [const { rustfs_utils::LogThrottle::new(5_000) }; 100];
@@ -211,12 +221,16 @@ fn uses_server_owned_s3_request_id<B>(req: &HttpRequest<B>, console_redirect_ena
 #[derive(Clone, Default)]
 pub struct ExternalRequestContextLayer {
     console_redirect_enabled: bool,
+    #[cfg(test)]
+    feedback_recorder: Option<&'static rustfs_concurrency::foreground::ForegroundRecorder>,
 }
 
 impl ExternalRequestContextLayer {
     pub(crate) fn new(console_redirect_enabled: bool) -> Self {
         Self {
             console_redirect_enabled,
+            #[cfg(test)]
+            feedback_recorder: None,
         }
     }
 }
@@ -228,6 +242,8 @@ impl<S> Layer<S> for ExternalRequestContextLayer {
         ExternalRequestContextService {
             inner,
             console_redirect_enabled: self.console_redirect_enabled,
+            #[cfg(test)]
+            feedback_recorder: self.feedback_recorder,
         }
     }
 }
@@ -236,13 +252,15 @@ impl<S> Layer<S> for ExternalRequestContextLayer {
 pub struct ExternalRequestContextService<S> {
     inner: S,
     console_redirect_enabled: bool,
+    #[cfg(test)]
+    feedback_recorder: Option<&'static rustfs_concurrency::foreground::ForegroundRecorder>,
 }
 
 impl<S, B, ResBody> Service<HttpRequest<B>> for ExternalRequestContextService<S>
 where
     S: Service<HttpRequest<B>, Response = Response<ResBody>>,
 {
-    type Response = Response<ResBody>;
+    type Response = Response<ForegroundResponseBody<ResBody>>;
     type Error = S::Error;
     type Future = ExternalRequestContextFuture<S::Future>;
 
@@ -273,27 +291,57 @@ where
         } else {
             req.headers().get(REQUEST_ID_HEADER).cloned()
         };
+        #[cfg(feature = "diagnostic-local-batch")]
+        let diagnostic_request = is_s3
+            .then(|| batch_diagnostic::request_context(&request_context.request_id))
+            .flatten();
+        #[cfg(not(feature = "diagnostic-local-batch"))]
+        let diagnostic_request = ();
         req.extensions_mut().insert(request_context);
 
         // This outer boundary includes readiness, rate-limit and auth
         // rejections. Metric attribution never depends on an enabled span.
+        let mut feedback = is_s3
+            .then(|| {
+                #[cfg(test)]
+                if let Some(recorder) = self.feedback_recorder {
+                    return Some(recorder.start());
+                }
+                crate::foreground_observation::start_request()
+            })
+            .flatten();
+        let head_request = req.method() == Method::HEAD;
         let mut metrics = is_s3.then(|| s3_http_request_guard(req.method().as_str()));
+        #[cfg(feature = "diagnostic-local-batch")]
+        let inner = batch_diagnostic::in_request_context(diagnostic_request.as_ref(), || match metrics.as_mut() {
+            Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
+            None => self.inner.call(req),
+        });
+        #[cfg(not(feature = "diagnostic-local-batch"))]
         let inner = match metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
             None => self.inner.call(req),
         };
+        if let Some(feedback) = feedback.as_mut() {
+            feedback.set_class(foreground_class(metrics.as_ref().and_then(S3HttpRequestGuard::operation)));
+        }
         ExternalRequestContextFuture {
             inner,
+            diagnostic_request,
             request_id,
             is_s3,
             metrics,
+            feedback,
+            head_request,
         }
     }
 }
 
 /// Start accounting for an external S3 request. While a typed telemetry trace
 /// is being recorded, the finished request is also published to the trace bus
-/// as a pre-classified event; otherwise no clock is read.
+/// as a pre-classified event. The separate metrics-gated entry-to-dispatch
+/// timer measures wall time through authentication, parsing and scheduling.
+/// Neither timer reads a clock when its own gate is disabled.
 pub fn s3_http_request_guard(method: &str) -> S3HttpRequestGuard {
     let guard = S3HttpRequestGuard::new(method);
     if telemetry_trace_subscriber_count() == 0 {
@@ -329,9 +377,12 @@ pin_project! {
     pub struct ExternalRequestContextFuture<F> {
         #[pin]
         inner: F,
+        diagnostic_request: BatchDiagnosticRequest,
         request_id: Option<HeaderValue>,
         is_s3: bool,
         metrics: Option<S3HttpRequestGuard>,
+        feedback: Option<ForegroundObservation<'static>>,
+        head_request: bool,
     }
 }
 
@@ -339,19 +390,31 @@ impl<F, ResBody, E> Future for ExternalRequestContextFuture<F>
 where
     F: Future<Output = Result<Response<ResBody>, E>>,
 {
-    type Output = Result<Response<ResBody>, E>;
+    type Output = Result<Response<ForegroundResponseBody<ResBody>>, E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
+        #[cfg(feature = "diagnostic-local-batch")]
+        let result = batch_diagnostic::in_request_context(this.diagnostic_request.as_ref(), || match this.metrics.as_mut() {
+            Some(metrics) => metrics.in_scope(|| this.inner.poll(cx)),
+            None => this.inner.poll(cx),
+        });
+        #[cfg(not(feature = "diagnostic-local-batch"))]
         let result = match this.metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| this.inner.poll(cx)),
             None => this.inner.poll(cx),
         };
+        if let Some(feedback) = this.feedback.as_mut() {
+            feedback.set_class(foreground_class(this.metrics.as_ref().and_then(S3HttpRequestGuard::operation)));
+        }
         let mut response = match result {
             Poll::Ready(Ok(response)) => response,
             Poll::Ready(Err(error)) => {
                 if let Some(metrics) = this.metrics.as_mut() {
                     metrics.service_error();
+                }
+                if let Some(mut feedback) = this.feedback.take() {
+                    feedback.finish(CompletionOutcome::Failed);
                 }
                 return Poll::Ready(Err(error));
             }
@@ -370,7 +433,126 @@ where
             }
         }
 
-        Poll::Ready(Ok(response))
+        let status = response.status();
+        let suppressed = *this.head_request
+            || status.is_informational()
+            || status == StatusCode::NO_CONTENT
+            || status == StatusCode::NOT_MODIFIED;
+        Poll::Ready(Ok(response.map(|body| {
+            ForegroundResponseBody::new(
+                body,
+                this.feedback.take(),
+                !status.is_client_error() && !status.is_server_error(),
+                suppressed,
+            )
+        })))
+    }
+}
+
+fn foreground_class(operation: Option<rustfs_s3_ops::S3Operation>) -> ForegroundClass {
+    use rustfs_s3_ops::S3Operation;
+    match operation {
+        Some(S3Operation::GetObject | S3Operation::SelectObjectContent) => ForegroundClass::Read,
+        Some(
+            S3Operation::PutObject
+            | S3Operation::CopyObject
+            | S3Operation::UploadPart
+            | S3Operation::UploadPartCopy
+            | S3Operation::CompleteMultipartUpload
+            | S3Operation::AbortMultipartUpload
+            | S3Operation::DeleteObject
+            | S3Operation::DeleteObjects,
+        ) => ForegroundClass::Write,
+        Some(_) => ForegroundClass::Metadata,
+        None => ForegroundClass::Other,
+    }
+}
+
+pin_project! {
+    /// Inline ownership of a foreground observation through the response body.
+    /// EOF means the server produced the body, not that the client acknowledged
+    /// its bytes. Other drops are censored and never successful latency samples.
+    pub struct ForegroundResponseBody<B> {
+        #[pin]
+        inner: B,
+        // Body::is_end_stream only has a shared reference. Empty responses can
+        // finish there without being polled; Cell adds no mutex or allocation.
+        observation: Cell<Option<ForegroundObservation<'static>>>,
+        succeeded: bool,
+    }
+}
+
+fn finish_foreground_observation(observation: &Cell<Option<ForegroundObservation<'_>>>, outcome: CompletionOutcome) {
+    if let Some(mut observation) = observation.take() {
+        observation.finish(outcome);
+    }
+}
+
+impl<B> ForegroundResponseBody<B> {
+    fn new(inner: B, observation: Option<ForegroundObservation<'static>>, succeeded: bool, suppressed: bool) -> Self {
+        let body = Self {
+            inner,
+            observation: Cell::new(observation),
+            succeeded,
+        };
+        if suppressed {
+            body.complete();
+        }
+        body
+    }
+
+    fn complete(&self) {
+        finish_foreground_observation(
+            &self.observation,
+            if self.succeeded {
+                CompletionOutcome::Success
+            } else {
+                CompletionOutcome::Failed
+            },
+        );
+    }
+}
+
+impl<B: Body> Body for ForegroundResponseBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        let result = this.inner.as_mut().poll_frame(cx);
+        if this.observation.get_mut().is_none() {
+            return result;
+        }
+        let outcome = match &result {
+            Poll::Ready(Some(Err(_))) => Some(CompletionOutcome::Failed),
+            Poll::Ready(None) => Some(if *this.succeeded {
+                CompletionOutcome::Success
+            } else {
+                CompletionOutcome::Failed
+            }),
+            Poll::Ready(Some(Ok(_))) if this.inner.as_ref().get_ref().is_end_stream() => Some(if *this.succeeded {
+                CompletionOutcome::Success
+            } else {
+                CompletionOutcome::Failed
+            }),
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            finish_foreground_observation(this.observation, outcome);
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        let finished = self.inner.is_end_stream();
+        if finished {
+            self.complete();
+        }
+        finished
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -586,6 +768,7 @@ where
                 let watchdog_context = context.clone();
                 async move {
                     tokio::select! {
+                        biased;
                         _ = watchdog.cancelled() => {}
                         _ = tokio::time::sleep(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD) => {
                             watchdog_context.log_slow_inflight();
@@ -595,11 +778,11 @@ where
             });
         }
 
+        // An unpolled response future must also cancel its watchdog on drop.
+        let watchdog_guard = watchdog.map(CancellationToken::drop_guard);
         Box::pin(async move {
             let result = inner.call(req).await;
-            if let Some(watchdog) = watchdog {
-                watchdog.cancel();
-            }
+            drop(watchdog_guard);
             match &result {
                 Ok(response) => context.log_response(response),
                 Err(error) => context.log_failure(error),
@@ -639,11 +822,12 @@ fn is_console_redirect_request<B>(req: &HttpRequest<B>) -> bool {
         && (path.is_empty() || path == "/rustfs" || path == "/index.html")
 }
 
-impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for RedirectService<S>
+impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for RedirectService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ReqBody: Send + 'static,
     RestBody: Default + Send + 'static,
     GrpcBody: Send + 'static,
 {
@@ -655,7 +839,7 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let path = req.uri().path().trim_end_matches('/');
         if is_console_redirect_request(&req) {
             debug!("Redirecting browser request from {} to console", path);
@@ -861,7 +1045,20 @@ where
                     }
                     Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
-                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+                HybridBody::Grpc {
+                    grpc_body,
+                    first_frame_started,
+                    body_started,
+                    first_frame_recorded,
+                } => Response::from_parts(
+                    parts,
+                    HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded,
+                    },
+                ),
             };
 
             Ok(response)
@@ -1010,7 +1207,20 @@ where
                     }
                     Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
-                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+                HybridBody::Grpc {
+                    grpc_body,
+                    first_frame_started,
+                    body_started,
+                    first_frame_recorded,
+                } => Response::from_parts(
+                    parts,
+                    HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded,
+                    },
+                ),
             };
 
             Ok(response)
@@ -1161,7 +1371,20 @@ where
 
                     Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
-                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+                HybridBody::Grpc {
+                    grpc_body,
+                    first_frame_started,
+                    body_started,
+                    first_frame_recorded,
+                } => Response::from_parts(
+                    parts,
+                    HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded,
+                    },
+                ),
             };
 
             Ok(response)
@@ -1173,15 +1396,9 @@ where
 /// responses whose HTTP status code MUST NOT carry a body per RFC 9110 §6.4.1
 /// and §15 (1xx, 204, 205, 304).
 ///
-/// The inner s3s layer serializes every `S3Error` — including 304 `NotModified`
-/// preconditions — as an XML body. Returning that body for a 304 is a protocol
-/// violation: hyper's HTTP/1.1 encoder forces the body to zero length but
-/// preserves the response, while the HTTP/2 path fills in `content-length`
-/// from the body's size hint and writes DATA frames after a HEADERS frame that
-/// should have carried END_STREAM. h2 clients (curl, browsers) and proxies see
-/// the malformed response as a connection-level failure — in the wild this
-/// surfaces as `GOAWAY error=0` on h2 and as an upstream-disconnect 5xx from
-/// reverse proxies like ngrok (`ERR_NGROK_3004`).
+/// s3s already suppresses bodyless error responses. This layer also protects
+/// REST routes and custom responses: unlike the HTTP/1.1 encoder, hyper's
+/// HTTP/2 sender relies on the body rather than the status to end the stream.
 #[derive(Clone)]
 pub struct BodylessStatusFixLayer;
 
@@ -1238,7 +1455,20 @@ where
                         },
                     )
                 }
-                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+                HybridBody::Grpc {
+                    grpc_body,
+                    first_frame_started,
+                    body_started,
+                    first_frame_recorded,
+                } => Response::from_parts(
+                    parts,
+                    HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded,
+                    },
+                ),
             };
 
             Ok(response)
@@ -1306,7 +1536,20 @@ where
                         rest_body: RestBody::from(Bytes::new()),
                     },
                 ),
-                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+                HybridBody::Grpc {
+                    grpc_body,
+                    first_frame_started,
+                    body_started,
+                    first_frame_recorded,
+                } => Response::from_parts(
+                    parts,
+                    HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded,
+                    },
+                ),
             };
 
             Ok(response)
@@ -2015,12 +2258,24 @@ fn is_object_attributes_request<B>(req: &HttpRequest<B>) -> bool {
 #[derive(Clone)]
 pub struct ConditionalCorsLayer {
     cors_origins: Option<String>,
+    /// Port-stripped `RUSTFS_SERVER_DOMAINS` hosts, used to resolve the bucket
+    /// of virtual-hosted-style requests. Empty when virtual hosting is off.
+    vh_domain_hosts: Arc<[String]>,
 }
 
 impl ConditionalCorsLayer {
     pub fn new() -> Self {
         let cors_origins = get_env_opt_str(rustfs_config::ENV_CORS_ALLOWED_ORIGINS).filter(|s| !s.is_empty());
-        Self { cors_origins }
+        Self {
+            cors_origins,
+            vh_domain_hosts: Arc::default(),
+        }
+    }
+
+    /// Resolve bucket-level CORS for virtual-hosted-style requests on these domains.
+    pub fn with_vh_domain_hosts(mut self, vh_domain_hosts: Arc<[String]>) -> Self {
+        self.vh_domain_hosts = vh_domain_hosts;
+        self
     }
 
     /// Exact paths that should be excluded from being treated as S3 paths.
@@ -2107,6 +2362,7 @@ impl<S> Layer<S> for ConditionalCorsLayer {
         ConditionalCorsService {
             inner,
             cors_origins: Arc::new(self.cors_origins.clone()),
+            vh_domain_hosts: self.vh_domain_hosts.clone(),
         }
     }
 }
@@ -2116,6 +2372,7 @@ impl<S> Layer<S> for ConditionalCorsLayer {
 pub struct ConditionalCorsService<S> {
     inner: S,
     cors_origins: Arc<Option<String>>,
+    vh_domain_hosts: Arc<[String]>,
 }
 
 async fn resolve_s3_options_cors_headers(bucket: &str, request_headers: &HeaderMap) -> Option<HeaderMap> {
@@ -2169,8 +2426,11 @@ where
         let method = req.method().clone();
         let request_headers = req.headers().clone();
         let cors_origins = self.cors_origins.clone();
+        // A virtual-hosted-style request carries its bucket in the host, so its
+        // path is the object key (or `/` for a bucket-level request).
+        let vh_bucket = virtual_host_bucket(&req, &self.vh_domain_hosts).map(str::to_owned);
         let is_s3 = ConditionalCorsLayer::is_s3_path(&path);
-        let is_root = path == "/";
+        let is_root = path == "/" && vh_bucket.is_none();
 
         if is_options {
             let has_acrm = request_headers.contains_key(cors::request::ACCESS_CONTROL_REQUEST_METHOD);
@@ -2190,6 +2450,7 @@ where
                         .expect("valid response body");
                     let cors_layer = ConditionalCorsLayer {
                         cors_origins: (*cors_origins).clone(),
+                        vh_domain_hosts: Arc::default(),
                     };
                     cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
                     Ok(response)
@@ -2197,8 +2458,8 @@ where
             }
 
             if is_s3 {
-                let path_trimmed = path.trim_start_matches('/');
-                let bucket = path_trimmed.split('/').next().unwrap_or("").to_string();
+                let bucket =
+                    vh_bucket.unwrap_or_else(|| path.trim_start_matches('/').split('/').next().unwrap_or("").to_string());
 
                 return Box::pin(async move {
                     if !has_acrm || !request_headers.contains_key(cors::standard::ORIGIN) {
@@ -2210,6 +2471,7 @@ where
 
                     let cors_layer = ConditionalCorsLayer {
                         cors_origins: (*cors_origins).clone(),
+                        vh_domain_hosts: Arc::default(),
                     };
 
                     if let Some(cors_headers) = resolve_s3_options_cors_headers(&bucket, &request_headers).await {
@@ -2246,6 +2508,7 @@ where
                     .expect("valid response body");
                 let cors_layer = ConditionalCorsLayer {
                     cors_origins: (*cors_origins).clone(),
+                    vh_domain_hosts: Arc::default(),
                 };
                 cors_layer.apply_cors_headers(&request_headers_clone, response.headers_mut());
                 Ok(response)
@@ -2262,11 +2525,14 @@ where
             {
                 let cors_layer = ConditionalCorsLayer {
                     cors_origins: (*cors_origins).clone(),
+                    vh_domain_hosts: Arc::default(),
                 };
 
                 if is_s3 {
-                    let bucket = path.trim_start_matches('/').split('/').next().unwrap_or("");
-                    if path == "/" {
+                    let bucket = vh_bucket
+                        .as_deref()
+                        .unwrap_or_else(|| path.trim_start_matches('/').split('/').next().unwrap_or(""));
+                    if is_root {
                         cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
                     } else if !bucket.is_empty() {
                         match apply_cors_headers(bucket, &method, &request_headers).await {
@@ -2368,6 +2634,409 @@ fn rewrite_double_slash_root(uri: &Uri) -> Option<Uri> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diagnostic-local-batch")]
+    #[test]
+    fn diagnostic_external_request_uses_server_id_not_client_header() {
+        const CHILD: &str = "RUSTFS_TEST_BATCH_REQUEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "server::layer::tests::diagnostic_external_request_uses_server_id_not_client_header",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RUSTFS_DIAGNOSTIC_LOCAL_BATCH_SAMPLE_EVERY", "1")
+                .status()
+                .expect("run isolated request correlation test");
+            assert!(status.success(), "isolated request correlation test failed");
+            return;
+        }
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let inner = tower::service_fn(|request: HttpRequest<Full<Bytes>>| {
+                let context = request
+                    .extensions()
+                    .get::<RequestContext>()
+                    .expect("canonical request context");
+                let expected = context.request_id.clone();
+                assert_ne!(expected, "client-controlled-id");
+                assert_eq!(batch_diagnostic::current_request_id().as_deref(), Some(expected.as_str()));
+                async move {
+                    assert_eq!(batch_diagnostic::current_request_id().as_deref(), Some(expected.as_str()));
+                    Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::new())))
+                }
+            });
+            let mut service = ExternalRequestContextLayer::new(false).layer(inner);
+            let request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("/diagnostic-bucket/object")
+                .header(REQUEST_ID_HEADER, "client-controlled-id")
+                .body(Full::new(Bytes::new()))
+                .expect("test request");
+            let response = futures::executor::block_on(service.call(request)).expect("correlated response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(batch_diagnostic::current_request_id().is_none());
+        });
+    }
+
+    #[cfg(feature = "diagnostic-local-batch")]
+    #[test]
+    fn diagnostic_request_scope_is_present_on_every_poll_and_restored() {
+        let mut polls = 0;
+        let inner = std::future::poll_fn(|cx| {
+            assert_eq!(batch_diagnostic::current_request_id().as_deref(), Some("server-owned-test"));
+            polls += 1;
+            if polls == 1 {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Full::new(Bytes::new()))))
+            }
+        });
+        let future = ExternalRequestContextFuture {
+            inner,
+            diagnostic_request: Some(Arc::from("server-owned-test")),
+            request_id: None,
+            is_s3: false,
+            metrics: None,
+            feedback: None,
+            head_request: false,
+        };
+        let response = futures::executor::block_on(future).expect("diagnostic request future");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(polls, 2);
+        assert!(batch_diagnostic::current_request_id().is_none());
+    }
+    #[tokio::test]
+    async fn foreground_feedback_unobserved_body_is_a_direct_passthrough() {
+        struct EndProbe(Full<Bytes>);
+        impl Body for EndProbe {
+            type Data = Bytes;
+            type Error = Infallible;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+                Pin::new(&mut self.0).poll_frame(cx)
+            }
+
+            fn is_end_stream(&self) -> bool {
+                panic!("unobserved frame polling must not add EOF queries")
+            }
+
+            fn size_hint(&self) -> http_body::SizeHint {
+                self.0.size_hint()
+            }
+        }
+
+        let mut body =
+            ForegroundResponseBody::new(EndProbe(Full::new(Bytes::from_static(b"unobserved body"))), None, false, false);
+        assert_eq!(body.size_hint().exact(), Some(15));
+        assert_eq!(
+            body.frame().await.expect("frame").expect("data").into_data().expect("bytes"),
+            Bytes::from_static(b"unobserved body")
+        );
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_empty_head_and_bodyless_responses_finish_once() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|req: Request<()>| async move {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::HeadObject);
+            let status = match req.uri().path() {
+                "/bucket/no-content" => StatusCode::NO_CONTENT,
+                "/bucket/not-modified" => StatusCode::NOT_MODIFIED,
+                _ => StatusCode::OK,
+            };
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .status(status)
+                    .body(Empty::<Bytes>::new())
+                    .expect("empty response"),
+            )
+        }));
+        for (method, path) in [
+            (Method::GET, "/bucket/empty"),
+            (Method::HEAD, "/bucket/head"),
+            (Method::GET, "/bucket/no-content"),
+            (Method::GET, "/bucket/not-modified"),
+        ] {
+            let response = service
+                .call(Request::builder().method(method).uri(path).body(()).expect("request"))
+                .await
+                .expect("response");
+            assert!(response.body().is_end_stream());
+            assert!(response.body().is_end_stream(), "repeated inspection is idempotent");
+            drop(response);
+        }
+        let window = reader.sample().expect("completed empty bodies");
+        let metadata = window.classes[2].expect("metadata count");
+        assert_eq!(window.started, Some(4));
+        assert_eq!(
+            (window.in_flight, metadata.finished, metadata.failed, metadata.cancelled),
+            (Some(0), 4, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_preserves_service_and_body_errors() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let layer = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        };
+        let mut service = layer.layer(tower::service_fn(|_: Request<()>| async {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+            Err::<Response<Empty<Bytes>>, _>(io::Error::new(io::ErrorKind::PermissionDenied, "service sentinel"))
+        }));
+        let error = match service
+            .call(Request::builder().uri("/bucket/object").body(()).expect("request"))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("service error must be preserved"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "service sentinel");
+
+        let mut streaming = layer.layer(tower::service_fn(|_: Request<()>| async {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+            let frames = futures::stream::iter([
+                Ok(http_body::Frame::data(Bytes::from_static(b"partial"))),
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "body sentinel")),
+            ]);
+            Ok::<_, Infallible>(Response::new(http_body_util::StreamBody::new(frames)))
+        }));
+        let mut response = streaming
+            .call(Request::builder().uri("/bucket/object").body(()).expect("request"))
+            .await
+            .expect("headers");
+        assert_eq!(
+            response
+                .body_mut()
+                .frame()
+                .await
+                .expect("partial frame")
+                .expect("data frame")
+                .into_data()
+                .expect("bytes"),
+            Bytes::from_static(b"partial")
+        );
+        let error = response
+            .body_mut()
+            .frame()
+            .await
+            .expect("error frame")
+            .expect_err("must preserve body error");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "body sentinel");
+        drop(response);
+        let window = reader.sample().expect("failed requests");
+        assert_eq!((window.started, window.in_flight), (Some(2), Some(0)));
+        for class in [0, 1] {
+            let counts = window.classes[class].expect("known class");
+            assert_eq!((counts.finished, counts.failed, counts.cancelled), (1, 1, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_http_failure_and_trailers_are_preserved() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|_: Request<()>| async {
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-body-sentinel", HeaderValue::from_static("unchanged"));
+            let frames = futures::stream::iter([
+                Ok::<_, Infallible>(http_body::Frame::data(Bytes::from_static(b"failure"))),
+                Ok(http_body::Frame::trailers(trailers)),
+            ]);
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .status(503)
+                    .body(http_body_util::StreamBody::new(frames))
+                    .expect("response"),
+            )
+        }));
+        let mut response = service
+            .call(Request::builder().uri("/bucket/object").body(()).expect("request"))
+            .await
+            .expect("headers");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .body_mut()
+                .frame()
+                .await
+                .expect("data")
+                .expect("frame")
+                .into_data()
+                .expect("bytes"),
+            Bytes::from_static(b"failure")
+        );
+        assert_eq!(reader.sample().expect("before trailers").in_flight, Some(1));
+        let trailers = response
+            .body_mut()
+            .frame()
+            .await
+            .expect("trailers")
+            .expect("frame")
+            .into_trailers()
+            .expect("trailers");
+        assert_eq!(trailers["x-body-sentinel"], "unchanged");
+        assert!(response.body_mut().frame().await.is_none());
+        drop(response);
+        let window = reader.sample().expect("complete failure body");
+        let other = window.classes[3].expect("pre-dispatch failure");
+        assert_eq!((window.in_flight, other.finished, other.failed, other.cancelled), (Some(0), 1, 1, 0));
+    }
+
+    #[test]
+    fn foreground_feedback_classifies_synchronous_dispatch_before_first_poll() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|_: Request<()>| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+            std::future::pending::<Result<Response<Empty<Bytes>>, Infallible>>()
+        }));
+        let request = service.call(Request::builder().uri("/bucket/object").body(()).expect("request"));
+        drop(request);
+        let window = reader.sample().expect("cancelled unpolled request");
+        let write = window.classes[1].expect("dispatched write");
+        assert_eq!((window.started, window.in_flight, write.cancelled), (Some(1), Some(0), 1));
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_excludes_control_plane_and_internal_requests() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|_: Request<()>| async {
+            Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+        }));
+        for path in ["/health/ready", "/rustfs/admin/v3/info", "/minio/health/live"] {
+            let response = service
+                .call(Request::builder().uri(path).body(()).expect("request"))
+                .await
+                .expect("response");
+            assert!(response.body().is_end_stream());
+        }
+        let window = reader.sample().expect("no S3 events");
+        assert_eq!((window.started, window.in_flight), (Some(0), Some(0)));
+        assert!(window.classes.iter().all(|class| class.expect("known class").finished == 0));
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_keeps_body_ownership_after_response_headers() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let layer = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        };
+        let inner = tower::service_fn(|_: Request<()>| async {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"body is still owned"))))
+        });
+        let mut response = layer
+            .layer(inner)
+            .call(Request::builder().uri("/bucket/object").body(()).expect("request"))
+            .await
+            .expect("response headers");
+        let headers = reader.sample().expect("header boundary");
+        assert_eq!(headers.started, Some(1));
+        assert_eq!(headers.in_flight, Some(1), "headers do not finish the body");
+        assert_eq!(headers.classes[0].expect("read count").finished, 0);
+        let frame = response.body_mut().frame().await.expect("data frame").expect("body success");
+        assert_eq!(frame.into_data().expect("data"), Bytes::from_static(b"body is still owned"));
+        drop(response);
+        let body = reader.sample().expect("body boundary");
+        let read = body.classes[0].expect("read count");
+        assert_eq!((body.in_flight, read.finished, read.failed, read.cancelled), (Some(0), 1, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_records_dropped_body_as_censored() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|_: Request<()>| async {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"undrained"))))
+        }));
+        let response = service
+            .call(Request::builder().uri("/bucket/object").body(()).expect("request"))
+            .await
+            .expect("response");
+        drop(response);
+        let window = reader.sample().expect("cancelled body");
+        assert_eq!(window.started, Some(1));
+        let read = window.classes[0].expect("read count");
+        assert_eq!((window.in_flight, read.finished, read.cancelled, read.p99), (Some(0), 1, 1, None));
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_counts_cancellation_before_headers() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|_: Request<()>| async {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+            std::future::pending::<Result<Response<Full<Bytes>>, Infallible>>().await
+        }));
+        let mut pending = Box::pin(
+            service.call(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/bucket/object")
+                    .body(())
+                    .expect("request"),
+            ),
+        );
+        assert!(matches!(futures::poll!(pending.as_mut()), Poll::Pending));
+        drop(pending);
+        let window = reader.sample().expect("cancelled service future");
+        assert_eq!(window.started, Some(1));
+        let write = window.classes[1].expect("write count");
+        assert_eq!((window.in_flight, write.finished, write.cancelled), (Some(0), 1, 1));
+    }
+
     #[tokio::test]
     async fn console_prefix_process_case_browser_redirect() {
         if std::env::var_os("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS").is_none() {
@@ -2473,6 +3142,108 @@ mod tests {
         PublicHealthEndpointLayer::new(crate::runtime_sources::ServerContextSlot::new(), readiness)
     }
 
+    #[test]
+    fn external_s3_http_entry_to_dispatch_metrics() {
+        const CHILD_ENV: &str = "RUSTFS_TEST_HTTP_DISPATCH_METRICS_PROCESS";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // The metric gate is process-wide. Match the console-prefix test
+            // pattern to isolate this switch from other server unit tests.
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "server::layer::tests::external_s3_http_entry_to_dispatch_metrics",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("run isolated dispatch timing test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "isolated dispatch timing test must execute exactly once: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::record_s3_op;
+        use rustfs_s3_ops::S3Operation;
+
+        let previous_gate = rustfs_io_metrics::metrics_enabled();
+        let recorder = DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            rustfs_io_metrics::set_metrics_enabled(true);
+            let inner = tower::service_fn(|req: Request<()>| async move {
+                match req.uri().path() {
+                    "/bucket/rejected" => Ok(Response::builder().status(403).body(()).expect("rejected response")),
+                    "/bucket/service-error" => Err(io::Error::other("pre-dispatch service failure")),
+                    "/bucket/cancelled" => std::future::pending::<Result<Response<()>, io::Error>>().await,
+                    _ => {
+                        record_s3_op(S3Operation::DeleteObjects);
+                        Ok(Response::new(()))
+                    }
+                }
+            });
+            let mut service = ExternalRequestContextLayer::default().layer(inner);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            for path in [
+                "/bucket/dispatched",
+                "/bucket/rejected",
+                "/health/ready",
+                "/rustfs/admin/v3/info",
+            ] {
+                let mut response = Box::pin(service.call(Request::builder().uri(path).body(()).expect("request")));
+                assert!(matches!(response.as_mut().poll(&mut cx), Poll::Ready(Ok(_))), "{path}");
+            }
+            let mut failed = Box::pin(
+                service.call(
+                    Request::builder()
+                        .uri("/bucket/service-error")
+                        .body(())
+                        .expect("service-error request"),
+                ),
+            );
+            assert!(matches!(failed.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+            let mut cancelled = Box::pin(
+                service.call(
+                    Request::builder()
+                        .uri("/bucket/cancelled")
+                        .body(())
+                        .expect("cancelled request"),
+                ),
+            );
+            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+            drop(cancelled);
+            rustfs_io_metrics::set_metrics_enabled(previous_gate);
+        });
+        let samples: std::collections::BTreeMap<_, _> = recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "rustfs_s3_http_entry_to_dispatch_duration_seconds")
+            .map(|(key, _, _, value)| {
+                let labels: std::collections::BTreeMap<_, _> =
+                    key.key().labels().map(|label| (label.key(), label.value())).collect();
+                assert_eq!(labels.keys().copied().collect::<Vec<_>>(), ["op", "outcome"]);
+                let DebugValue::Histogram(samples) = value else {
+                    panic!("dispatch timing must be a histogram");
+                };
+                ((labels["op"].to_owned(), labels["outcome"].to_owned()), samples.len())
+            })
+            .collect();
+        assert_eq!(samples.len(), 4, "health/admin requests cannot manufacture S3 timing samples");
+        for (operation, outcome) in [
+            ("s3:DeleteObjects", "dispatched"),
+            ("unknown", "4xx"),
+            ("unknown", "service_error"),
+            ("unknown", "cancelled"),
+        ] {
+            assert_eq!(samples[&(operation.to_owned(), outcome.to_owned())], 1, "{operation}/{outcome}");
+        }
+    }
+
     #[tokio::test]
     async fn external_s3_http_outcomes_cover_response_error_cancel_and_exclusions_at_warn() {
         use rustfs_io_metrics::{record_s3_op, s3_http_metrics::s3_http_metrics_snapshot};
@@ -2538,7 +3309,7 @@ mod tests {
         assert!(futures::poll!(cancelled.as_mut()).is_pending());
         drop(cancelled);
         for path in [
-            "/rustfs/admin/v3/metrics",
+            "/rustfs/admin/v3/realtime",
             "/minio/admin/v3/storageinfo",
             CONSOLE_PREFIX,
             "/rustfs/rpc/test",
@@ -5005,7 +5776,10 @@ mod tests {
 
     #[test]
     fn test_generic_cors_layer_omits_headers_without_configured_origins() {
-        let cors = ConditionalCorsLayer { cors_origins: None };
+        let cors = ConditionalCorsLayer {
+            cors_origins: None,
+            vh_domain_hosts: Arc::default(),
+        };
         let mut req_headers = HeaderMap::new();
         req_headers.insert("origin", "https://example.com".parse().unwrap());
 
@@ -5023,6 +5797,7 @@ mod tests {
     fn test_generic_cors_layer_respects_configured_origins() {
         let cors = ConditionalCorsLayer {
             cors_origins: Some("https://allowed.com".to_string()),
+            vh_domain_hosts: Arc::default(),
         };
 
         let mut req_headers = HeaderMap::new();
@@ -5052,6 +5827,7 @@ mod tests {
     fn test_generic_cors_layer_wildcard_does_not_allow_credentials() {
         let cors = ConditionalCorsLayer {
             cors_origins: Some("*".to_string()),
+            vh_domain_hosts: Arc::default(),
         };
 
         let mut req_headers = HeaderMap::new();
@@ -5095,6 +5871,7 @@ mod tests {
     async fn conditional_cors_passthrough_without_origin() {
         let layer = ConditionalCorsLayer {
             cors_origins: Some("*".to_string()),
+            vh_domain_hosts: Arc::default(),
         };
         let mut service = layer.layer(CorsOkService);
         let request = Request::builder()
@@ -5113,6 +5890,7 @@ mod tests {
     async fn conditional_cors_applies_origin_headers() {
         let layer = ConditionalCorsLayer {
             cors_origins: Some("*".to_string()),
+            vh_domain_hosts: Arc::default(),
         };
         let mut service = layer.layer(CorsOkService);
         let request = Request::builder()
@@ -5308,6 +6086,62 @@ mod tests {
 
             let bytes = collect_body(body).await;
             assert!(bytes.is_empty(), "304 response body must be empty");
+        }
+
+        #[tokio::test]
+        async fn bodyless_304_is_valid_on_http1_and_http2() {
+            use hyper_util::rt::{TokioExecutor, TokioIo};
+            use hyper_util::service::TowerToHyperService;
+            for http2 in [false, true] {
+                let (client_io, server_io) = tokio::io::duplex(4096);
+                let service = TowerToHyperService::new(BodylessStatusFixLayer.layer(FixedResponse {
+                    status: StatusCode::NOT_MODIFIED,
+                    body: Bytes::from_static(b"<Error><Code>NotModified</Code></Error>"),
+                    content_type: Some("application/xml"),
+                }));
+                let server = tokio::spawn(async move {
+                    if http2 {
+                        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                            .serve_connection(TokioIo::new(server_io), service)
+                            .await
+                            .expect("HTTP/2 server");
+                    } else {
+                        hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(server_io), service)
+                            .await
+                            .expect("HTTP/1 server");
+                    }
+                });
+                let request = Request::builder()
+                    .uri("http://localhost/object")
+                    .body(Empty::<Bytes>::new())
+                    .expect("request");
+                let (response, client) = if http2 {
+                    let (mut sender, connection) =
+                        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(client_io))
+                            .await
+                            .expect("HTTP/2 handshake");
+                    let client = tokio::spawn(async move {
+                        connection.await.expect("HTTP/2 client");
+                    });
+                    (sender.send_request(request).await.expect("HTTP/2 response"), client)
+                } else {
+                    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                        .await
+                        .expect("HTTP/1 handshake");
+                    let client = tokio::spawn(async move {
+                        connection.await.expect("HTTP/1 client");
+                    });
+                    (sender.send_request(request).await.expect("HTTP/1 response"), client)
+                };
+                assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+                assert_eq!(response.headers()[http::header::ETAG], "\"abc123\"");
+                assert!(!response.headers().contains_key(http::header::CONTENT_LENGTH));
+                assert!(!response.headers().contains_key(http::header::CONTENT_TYPE));
+                assert!(collect_body(response.into_body()).await.is_empty());
+                client.abort();
+                server.abort();
+            }
         }
 
         #[tokio::test]
@@ -5628,6 +6462,154 @@ mod tests {
         let uri: http::Uri = "/rustfs/admin/v3/users?token=not-a-download-token".parse().expect("uri");
 
         assert_eq!(redact_sensitive_uri_query(&uri), "/rustfs/admin/v3/users?token=not-a-download-token");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_logging_watchdog_cancels_dropped_futures() {
+        for poll_request in [false, true] {
+            for deadline_ready in [false, true] {
+                let attempts = if deadline_ready { 32 } else { 1 };
+                for attempt in 0..attempts {
+                    let writer = SharedWriter::default();
+                    let captured = writer.buffer.clone();
+                    let _subscriber = tracing::subscriber::set_default(
+                        tracing_subscriber::fmt()
+                            .without_time()
+                            .with_ansi(false)
+                            .with_writer(writer)
+                            .finish(),
+                    );
+                    assert!(tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN));
+                    let inner =
+                        tower::service_fn(|_: HttpRequest<()>| std::future::pending::<Result<Response<()>, Infallible>>());
+                    let mut service = RequestLoggingLayer.layer(inner);
+                    let mut response = service.call(HttpRequest::new(()));
+                    if poll_request {
+                        assert!(futures::poll!(&mut response).is_pending());
+                    }
+                    tokio::task::yield_now().await;
+                    if deadline_ready {
+                        tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD).await;
+                    }
+                    drop(response);
+                    tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD + Duration::from_millis(1)).await;
+                    tokio::task::yield_now().await;
+
+                    let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+                    assert!(
+                        !output.contains(HTTP_REQUEST_INFLIGHT_SLOW_EVENT),
+                        "polled={poll_request}, deadline_ready={deadline_ready}, attempt={attempt}: {output}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_logging_watchdog_cancels_panicking_future() {
+        let writer = SharedWriter::default();
+        let captured = writer.buffer.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(writer)
+                .finish(),
+        );
+        assert!(tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN));
+        let inner = tower::service_fn(|_: HttpRequest<()>| {
+            std::future::poll_fn(|_| -> Poll<Result<Response<()>, Infallible>> { panic!("test service panic") })
+        });
+        let mut service = RequestLoggingLayer.layer(inner);
+        let mut response = service.call(HttpRequest::new(()));
+        tokio::task::yield_now().await;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            response.as_mut().poll(&mut Context::from_waker(std::task::Waker::noop()))
+        }));
+        assert!(panic.is_err());
+        tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+
+        let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+        assert!(!output.contains(HTTP_REQUEST_INFLIGHT_SLOW_EVENT), "{output}");
+        drop(response);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_logging_watchdog_cancels_completed_futures() {
+        for fail_request in [false, true] {
+            let writer = SharedWriter::default();
+            let captured = writer.buffer.clone();
+            let _subscriber = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .finish(),
+            );
+            assert!(tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN));
+            let inner = tower::service_fn(move |_: HttpRequest<()>| {
+                std::future::ready(if fail_request {
+                    Err(io::Error::other("test service failure"))
+                } else {
+                    Ok(Response::new(()))
+                })
+            });
+            let mut service = RequestLoggingLayer.layer(inner);
+            let mut response = service.call(HttpRequest::new(()));
+            tokio::task::yield_now().await;
+            let Poll::Ready(result) = futures::poll!(&mut response) else {
+                panic!("service should complete immediately");
+            };
+            assert_eq!(result.is_err(), fail_request);
+            // Retaining a completed future must not retain an active watchdog.
+            tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+
+            let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+            assert!(!output.contains(HTTP_REQUEST_INFLIGHT_SLOW_EVENT), "{output}");
+            let expected_event = if fail_request {
+                HTTP_REQUEST_FAILED_EVENT
+            } else {
+                HTTP_REQUEST_COMPLETED_EVENT
+            };
+            assert_eq!(output.matches(expected_event).count(), 1, "{output}");
+            drop(response);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_logging_watchdog_warns_once_for_pending_request() {
+        let writer = SharedWriter::default();
+        let captured = writer.buffer.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(writer)
+                .finish(),
+        );
+        assert!(tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN));
+        let inner = tower::service_fn(|_: HttpRequest<()>| std::future::pending::<Result<Response<()>, Infallible>>());
+        let mut service = RequestLoggingLayer.layer(inner);
+        let mut response = service.call(HttpRequest::new(()));
+        assert!(futures::poll!(&mut response).is_pending());
+        tokio::task::yield_now().await;
+        tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(captured.lock().expect("logs").is_empty());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+        assert_eq!(output.matches(HTTP_REQUEST_INFLIGHT_SLOW_EVENT).count(), 1, "{output}");
+        assert!(output.contains("response_pending"), "{output}");
+
+        tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD).await;
+        tokio::task::yield_now().await;
+        let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+        assert_eq!(output.matches(HTTP_REQUEST_INFLIGHT_SLOW_EVENT).count(), 1, "{output}");
+        drop(response);
     }
 
     #[tokio::test]

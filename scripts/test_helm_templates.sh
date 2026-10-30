@@ -73,6 +73,84 @@ render_server_cert() {
     '
 }
 
+# Gateway routes must resolve to the rendered Kubernetes Service without Traefik CRDs.
+for gateway_class in traefik contour istio; do
+  for distributed in false true; do
+    standalone=true
+    if [[ "$distributed" == true ]]; then standalone=false; fi
+    gateway_output=$(render_chart \
+      --set "mode.distributed.enabled=$distributed" \
+      --set "mode.standalone.enabled=$standalone" \
+      --set gatewayApi.enabled=true \
+      --set "gatewayApi.gatewayClass=$gateway_class" \
+      --set fullnameOverride=gateway-test \
+      --set service.console.port=19001 \
+      --set service.endpoint.port=19000 \
+      --set gatewayApi.hostname=console.example.com \
+      --set gatewayApi.endpointHostname=s3.example.com \
+      --set gatewayApi.existingGateway.name=shared-gateway \
+      --set gatewayApi.existingGateway.namespace=gateway-system \
+      --set gatewayApi.listeners.https.name=https)
+    yq eval -e 'select(.kind == "Service" and .metadata.name == "gateway-test-svc") |
+      .metadata.namespace == "rustfs" and
+      .spec.ports[0].port == 19000 and .spec.ports[1].port == 19001' - <<<"$gateway_output" >/dev/null
+    for route in route endpoint-route; do
+      expected_port=19001
+      expected_host=console.example.com
+      if [[ "$route" == endpoint-route ]]; then
+        expected_port=19000
+        expected_host=s3.example.com
+      fi
+      ROUTE_NAME="gateway-test-$route" EXPECTED_PORT="$expected_port" EXPECTED_HOST="$expected_host" \
+        yq eval -e 'select(.kind == "HTTPRoute" and .metadata.name == strenv(ROUTE_NAME)) |
+          .metadata.namespace == "rustfs" and
+          .spec.hostnames[0] == strenv(EXPECTED_HOST) and
+          .spec.parentRefs[0].name == "shared-gateway" and
+          .spec.parentRefs[0].namespace == "gateway-system" and
+          .spec.parentRefs[0].sectionName == "https" and
+          .spec.rules[0].matches[0].path.type == "PathPrefix" and
+          .spec.rules[0].matches[0].path.value == "/" and
+          (.spec.rules[0].backendRefs | length) == 1 and
+          .spec.rules[0].backendRefs[0].name == "gateway-test-svc" and
+          .spec.rules[0].backendRefs[0].port == env(EXPECTED_PORT) and
+          (.spec.rules[0].backendRefs[0].kind // "Service") == "Service" and
+          (.spec.rules[0].backendRefs[0].group // "") == ""' - <<<"$gateway_output" >/dev/null
+    done
+    if grep -q 'kind: TraefikService' <<<"$gateway_output"; then
+      echo "Gateway API must not require a TraefikService CRD" >&2
+      exit 1
+    fi
+  done
+done
+
+gateway_default=$(render_chart --set gatewayApi.enabled=true)
+yq eval -e 'select(.kind == "HTTPRoute" and .metadata.name == "rustfs-route") |
+  .spec.rules[0].backendRefs[0].name == "rustfs-svc" and
+  .spec.rules[0].backendRefs[0].port == 9001 and
+  .spec.parentRefs[0].name == "rustfs-gateway" and
+  .spec.parentRefs[0].sectionName == "websecure"' - <<<"$gateway_default" >/dev/null
+if grep -q 'name: rustfs-endpoint-route' <<<"$gateway_default"; then
+  echo "The S3 route must be opt-in" >&2
+  exit 1
+fi
+
+gateway_no_redirect=$(render_chart --set gatewayApi.enabled=true --set gatewayApi.endpointHostname=s3.example.com --set gatewayApi.httpToHttpsRedirect=false)
+if grep -q 'type: RequestRedirect' <<<"$gateway_no_redirect"; then
+  echo "Disabling HTTPS redirects must suppress the redirect route" >&2
+  exit 1
+fi
+
+if render_chart --set gatewayApi.enabled=true --set gatewayApi.endpointHostname=example.rustfs.com >/dev/null 2>&1; then
+  echo "Console and S3 routes must not share a hostname" >&2
+  exit 1
+fi
+
+gateway_disabled=$(render_chart --set gatewayApi.endpointHostname=s3.example.com)
+if grep -q 'kind: HTTPRoute' <<<"$gateway_disabled"; then
+  echo "Disabling Gateway API must suppress all HTTP routes" >&2
+  exit 1
+fi
+
 recreate_output=$(render_standalone_deployment --set mode.standalone.strategy.type=Recreate)
 grep -q "type: Recreate" <<<"$recreate_output"
 if grep -q "rollingUpdate:" <<<"$recreate_output"; then
@@ -100,8 +178,10 @@ scanner_config_output=$(render_chart \
   --set config.rustfs.scanner.bitrot_cycle_secs=0 \
   --set config.rustfs.scanner.idle_mode=false \
   --set config.rustfs.scanner.cache_save_timeout_secs=30 \
+  --set config.rustfs.scanner.recovery_backoff_cap_secs=1200 \
   --set config.rustfs.scanner.max_concurrent_set_scans=2 \
   --set config.rustfs.scanner.max_concurrent_disk_scans=1 \
+  --set config.rustfs.scanner.walkers_per_disk=2 \
   --set config.rustfs.scanner.yield_every_n_objects=128 \
   --set config.rustfs.scanner.alert_excess_versions=100 \
   --set config.rustfs.scanner.alert_excess_version_size=1099511627776 \
@@ -117,8 +197,10 @@ grep -q 'RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES: "100000"' <<<"$scanner_config_out
 grep -q 'RUSTFS_SCANNER_BITROT_CYCLE_SECS: "0"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_IDLE_MODE: "false"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS: "30"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS: "1200"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS: "2"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS: "1"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_WALKERS_PER_DISK: "2"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS: "128"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS: "100"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE: "1099511627776"' <<<"$scanner_config_output"
@@ -423,6 +505,102 @@ if grep -q "name: data$" <<<"$generic_eight_by_two"; then
   exit 1
 fi
 
+# Issue #8665: an empty storageclass.dataStorageSize means the drives come from
+# extraVolumes/extraVolumeMounts, so no data PVC templates, no data mounts and
+# no empty `storage:` request may be rendered. The logs PVC is unaffected.
+jbod_extra_volumes='[{"name":"disk0","hostPath":{"path":"/mnt/disk0"}},{"name":"disk1","hostPath":{"path":"/mnt/disk1"}}]'
+jbod_extra_mounts='[{"name":"disk0","mountPath":"/data/rustfs0"},{"name":"disk1","mountPath":"/data/rustfs1"}]'
+jbod_statefulset=$(render_distributed_statefulset \
+  --set replicaCount=3 \
+  --set drivesPerNode=2 \
+  --set storageclass.dataStorageSize= \
+  --set-json "extraVolumes=${jbod_extra_volumes}" \
+  --set-json "extraVolumeMounts=${jbod_extra_mounts}")
+if grep -Eq 'name: data(-rustfs-[0-9]+)?$' <<<"$jbod_statefulset"; then
+  echo "Empty dataStorageSize must not render data PVC templates or data volume mounts" >&2
+  exit 1
+fi
+if grep -Eq 'storage:[[:space:]]*$' <<<"$jbod_statefulset"; then
+  echo "Empty dataStorageSize must not render an empty storage request" >&2
+  exit 1
+fi
+if grep -Eq 'DRIVES_PER_NODE|mkdir -p /data' <<<"$jbod_statefulset"; then
+  echo "Empty dataStorageSize must not initialize data directories in the init container" >&2
+  exit 1
+fi
+if ! grep -Fq 'mountPath: /data/rustfs1' <<<"$jbod_statefulset" || ! grep -Fq 'path: /mnt/disk1' <<<"$jbod_statefulset"; then
+  echo "Empty dataStorageSize must keep user-supplied extraVolumes and extraVolumeMounts" >&2
+  exit 1
+fi
+if ! grep -Eq '^[[:space:]]+name: logs$' <<<"$jbod_statefulset"; then
+  echo "Empty dataStorageSize must not affect the logs PVC" >&2
+  exit 1
+fi
+
+# With neither data nor logs PVCs there is nothing to claim or initialize.
+jbod_no_pvc_statefulset=$(render_distributed_statefulset \
+  --set replicaCount=3 \
+  --set drivesPerNode=2 \
+  --set storageclass.dataStorageSize= \
+  --set config.rustfs.obs_log_directory=)
+for absent_key in volumeClaimTemplates initContainers; do
+  if grep -Fq "${absent_key}:" <<<"$jbod_no_pvc_statefulset"; then
+    echo "StatefulSet without data or logs PVCs must not render ${absent_key}" >&2
+    exit 1
+  fi
+done
+
+# A pool may disable its data PVCs independently of the other pools.
+pools_mixed=$(helm template rustfs "$CHART_DIR" \
+  --namespace rustfs \
+  --set secret.rustfs.access_key=test-access-key \
+  --set secret.rustfs.secret_key=test-secret-key \
+  --set pools.enabled=true \
+  --set-json 'pools.list=[{},{"storageclass":{"dataStorageSize":""}}]')
+if grep -Eq 'storage:[[:space:]]*$' <<<"$pools_mixed"; then
+  echo "A pool with empty dataStorageSize must not render an empty storage request" >&2
+  exit 1
+fi
+statefulset_named() {
+  awk -v metadata_name="$1" '
+    function flush() {
+      if (doc ~ /kind: StatefulSet/ && index(doc, "\n  name: " metadata_name "\n") > 0) printf "%s", doc
+      doc = ""
+    }
+    /^---$/ { flush(); next }
+    { doc = doc "\n" $0 }
+    END { flush() }
+  '
+}
+pool0_statefulset=$(statefulset_named rustfs <<<"$pools_mixed")
+pool1_statefulset=$(statefulset_named rustfs-pool1 <<<"$pools_mixed")
+if ! grep -Eq 'name: data-rustfs-0$' <<<"$pool0_statefulset"; then
+  echo "A pool that keeps dataStorageSize must still render its data PVC templates" >&2
+  exit 1
+fi
+if [[ -z "$pool1_statefulset" ]] || grep -Eq 'name: data(-rustfs-[0-9]+)?$' <<<"$pool1_statefulset"; then
+  echo "A pool with empty dataStorageSize must not render data PVC templates or mounts" >&2
+  exit 1
+fi
+
+# Standalone mode: no data PVC and no data volume unless an existing claim is named.
+standalone_jbod=$(render_chart --set storageclass.dataStorageSize=)
+if grep -Eq 'rustfs-data$|storage:[[:space:]]*$' <<<"$standalone_jbod"; then
+  echo "Standalone mode with empty dataStorageSize must not render a data PVC" >&2
+  exit 1
+fi
+if grep -Eq '^[[:space:]]+- name: data$|mountPath: /data$' <<<"$standalone_jbod"; then
+  echo "Standalone mode with empty dataStorageSize must not mount a data volume" >&2
+  exit 1
+fi
+standalone_jbod_claim=$(render_chart \
+  --set storageclass.dataStorageSize= \
+  --set mode.standalone.existingClaim.dataClaim=existing-data)
+if ! grep -Fq 'claimName: existing-data' <<<"$standalone_jbod_claim"; then
+  echo "Standalone existingClaim.dataClaim must still mount when dataStorageSize is empty" >&2
+  exit 1
+fi
+
 # Issue #5416's exact three-node, one-drive topology must render all three
 # ordinal hosts while each StatefulSet pod receives its own explicit anchor.
 three_by_one_configmap=$(render_distributed_configmap --set replicaCount=3 --set drivesPerNode=1)
@@ -490,7 +668,7 @@ nondefault_statefulset=$(awk '
 nondefault_local_host=$(statefulset_env_value RUSTFS_LOCAL_ENDPOINT_HOST <<<"$nondefault_statefulset")
 nondefault_namespace=$(yq eval '.metadata.namespace' - <<<"$nondefault_statefulset")
 nondefault_endpoint_port=$(yq eval '.spec.template.spec.containers[0].ports[] | select(.name == "endpoint") | .containerPort' - <<<"$nondefault_statefulset")
-mtls_liveness_command=$(yq eval '.spec.template.spec.containers[0].livenessProbe.exec.command[-1]' - <<<"$nondefault_statefulset")
+mtls_liveness_port=$(yq eval '.spec.template.spec.containers[0].livenessProbe.tcpSocket.port' - <<<"$nondefault_statefulset")
 mtls_readiness_command=$(yq eval '.spec.template.spec.containers[0].readinessProbe.exec.command[-1]' - <<<"$nondefault_statefulset")
 if [[ "$nondefault_local_host" != '$(RUSTFS_CHART_POD_NAME).tenant-rustfs-headless.object-storage.svc.cluster.corp' ]]; then
   echo "Combined generated topology produced an unexpected local endpoint host: $nondefault_local_host" >&2
@@ -500,9 +678,8 @@ if [[ "$nondefault_namespace" != "object-storage" || "$nondefault_endpoint_port"
   echo "Combined generated topology must retain its namespace and custom endpoint port" >&2
   exit 1
 fi
-if ! grep -Fq 'https://127.0.0.1:9443/health' <<<"$mtls_liveness_command" ||
-   grep -Fq '/health/ready' <<<"$mtls_liveness_command"; then
-  echo "mTLS liveness must use the process health endpoint, not readiness" >&2
+if [[ "$mtls_liveness_port" != 9443 ]]; then
+  echo "mTLS liveness must check the listener independently of certificate validity" >&2
   exit 1
 fi
 if ! grep -Fq 'https://127.0.0.1:9443/health/ready' <<<"$mtls_readiness_command"; then

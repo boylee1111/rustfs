@@ -11,10 +11,51 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-/// object-level heal: metadata dir canonicalization and missing-object recreation
+/// object-level heal: metadata dir canonicalization and the storage-decided absent verdict
 use super::*;
 
 impl HealTask {
+    pub(super) async fn heal_delete_marker_purge(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        purge: &rustfs_common::mrf_channel::MrfDeleteMarkerPurge,
+    ) -> Result<()> {
+        self.check_control_flags().await?;
+        let heal_opts = HealOpts {
+            recursive: false,
+            dry_run: self.options.dry_run,
+            remove: true,
+            recreate: false,
+            scan_mode: HealScanMode::Deep,
+            update_parity: false,
+            no_lock: self.options.no_lock,
+            read_repair: false,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
+        };
+        let mut expected =
+            self.outcome_identity(bucket, object, Some(version_id), self.options.pool_index, self.options.set_index);
+        expected.bucket_incarnation_id = Some(purge.bucket_incarnation_id);
+        let storage_result = self
+            .await_with_control(
+                self.storage
+                    .purge_delete_marker(bucket, object, version_id, purge, &heal_opts),
+            )
+            .await?;
+        if let Some(error) = storage_result.error {
+            return Err(error);
+        }
+        if !self.record_verified_storage_receipt(&expected, storage_result.receipt).await {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("delete-marker purge returned no exact storage proof for {bucket}/{object}/{version_id}"),
+            });
+        }
+        self.progress.write().await.update_object_progress(1, 1, 0, 0, 0);
+        Ok(())
+    }
+
     // specific heal implementation method
     #[tracing::instrument(skip(self), fields(bucket = %bucket, object = %object, version_id = ?version_id))]
     #[hotpath::measure]
@@ -52,6 +93,46 @@ impl HealTask {
             "Heal object stage entered"
         );
         self.check_control_flags().await?;
+        if self.source == HealRequestSource::Mrf {
+            // Durable partial writes always use the incarnation-fenced storage
+            // path, including for present objects. A normal heal can inspect a
+            // recreated bucket after the replay anchor was captured.
+            return self.heal_mrf_partial_write_object(bucket, object, version_id).await;
+        }
+        let heal_opts = HealOpts {
+            recursive: self.options.recursive,
+            dry_run: self.options.dry_run,
+            remove: self.options.remove_corrupted,
+            recreate: self.options.recreate_missing,
+            scan_mode: self.options.scan_mode,
+            update_parity: self.options.update_parity,
+            no_lock: self.options.no_lock,
+            read_repair: self.source == HealRequestSource::ReadRepair,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
+        };
+        let mut recovery_handled = false;
+        if matches!(self.source, HealRequestSource::Admin | HealRequestSource::Internal) {
+            let recovery_opts = HealOpts {
+                remove: heal_opts.remove && version_id.is_none_or(str::is_empty),
+                ..heal_opts
+            };
+            if let Some(result) = self
+                .await_with_control(self.storage.recover_delete_transactions(
+                    bucket,
+                    Some(object),
+                    self.bucket_incarnation_id,
+                    &recovery_opts,
+                ))
+                .await?
+            {
+                recovery_handled = true;
+                self.record_result_item(result).await;
+                if self.options.dry_run {
+                    return Ok(());
+                }
+            }
+        }
         let mut object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
             Ok(exists) => exists,
             Err(err @ Error::TransientSkip { .. }) => {
@@ -82,7 +163,7 @@ impl HealTask {
             object
         };
 
-        if !object_exists {
+        if !object_exists && !recovery_handled {
             // Background loops (scanner/MRF/autoheal/read-repair) routinely
             // race object deletion, so a missing target is per-object noise
             // for them; only foreground admin/internal requests keep the warn.
@@ -98,36 +179,22 @@ impl HealTask {
                 recreate_missing = self.options.recreate_missing,
                 "Heal target object is missing"
             });
-            if self.options.recreate_missing {
-                debug!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_OBJECT_STAGE,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    task_id = %self.id,
-                    bucket,
-                    object,
-                    stage = "recreate_missing",
-                    "Heal object recreate requested"
-                );
-                return self.recreate_missing_object(bucket, object, version_id).await;
-            } else if self.source == HealRequestSource::Scanner {
-                debug!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_OBJECT_STAGE,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    task_id = %self.id,
-                    bucket,
-                    object,
-                    stage = "scanner_missing_probe",
-                    "Heal scanner missing object will be checked by storage layer"
-                );
-            } else {
-                return Err(Error::TaskExecutionFailed {
-                    message: format!("Object not found: {bucket}/{object}"),
-                });
-            }
+            // The unlocked existence check is only a hint. The locked storage
+            // heal below reads every disk; its object-level not-found is the
+            // absence verdict for every source and every `recreate_missing`
+            // value. A recreate from parity happens only on the durable MRF
+            // path above, which carries the write anchor.
+            debug!(
+                target: "rustfs::heal::task",
+                event = EVENT_HEAL_OBJECT_STAGE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                task_id = %self.id,
+                bucket,
+                object,
+                stage = "missing_probe",
+                "Heal missing object will be checked by storage layer"
+            );
         }
 
         {
@@ -150,21 +217,14 @@ impl HealTask {
             update_parity = self.options.update_parity,
             "Heal object stage entered"
         );
-        let heal_opts = HealOpts {
-            recursive: self.options.recursive,
-            dry_run: self.options.dry_run,
-            remove: self.options.remove_corrupted,
-            recreate: self.options.recreate_missing,
-            scan_mode: self.options.scan_mode,
-            update_parity: self.options.update_parity,
-            no_lock: self.options.no_lock,
-            read_repair: self.source == HealRequestSource::ReadRepair,
-            pool: self.options.pool_index,
-            set: self.options.set_index,
-        };
         let mut expected_identity =
             self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
         expected_identity.bucket_incarnation_id = self.outcome_bucket_incarnation_id(bucket, self.options.dry_run).await?;
+        if matches!(self.heal_type, HealType::Object { .. }) {
+            expected_identity.bucket_incarnation_id = *self
+                .single_object_incarnation
+                .get_or_init(|| expected_identity.bucket_incarnation_id);
+        }
 
         let heal_fut = self.storage.heal_object_with_receipt(bucket, object, version_id, &heal_opts);
         let heal_result = if self.source == HealRequestSource::ReadRepair {
@@ -180,10 +240,17 @@ impl HealTask {
 
         match heal_result {
             Ok(storage_result) => {
+                if let Some(resolved_version_id) = storage_result.item.resolved_version_id {
+                    let resolved_version = Uuid::from_bytes(resolved_version_id);
+                    if !resolved_version.is_nil() {
+                        expected_identity.version_id = Some(resolved_version.to_string());
+                    }
+                }
                 let result = storage_result.item;
                 let error = storage_result.error;
                 if let Some(e) = error {
-                    if self.skip_dangling_delete_grace_error(bucket, object, &e).await {
+                    if self.skip_retired_marker_error(&e).await || self.skip_dangling_delete_grace_error(bucket, object, &e).await
+                    {
                         return Ok(());
                     }
 
@@ -191,37 +258,23 @@ impl HealTask {
                         return Ok(());
                     }
 
-                    if Self::is_object_not_found_heal_error(&e) {
-                        debug!(
-                            target: "rustfs::heal::task",
-                            event = EVENT_HEAL_OBJECT_RESULT,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_OBJECT,
-                            task_id = %self.id,
-                            bucket,
-                            object,
-                            result = "treated_as_deleted",
-                            "Heal missing object treated as deleted"
-                        );
-                        {
-                            let mut progress = self.progress.write().await;
-                            progress.update_stage(3, 3);
-                        }
-                        return Ok(());
+                    if e.is_object_absent() {
+                        return self.complete_absent_object(bucket, object, &e).await;
                     }
 
-                    error!(
-                        target: "rustfs::heal::task",
+                    demote_to_debug_when!(
+                        !self.should_log_failure(&e),
+                        error, target: "rustfs::heal::task", {
                         event = EVENT_HEAL_OBJECT_RESULT,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_OBJECT,
+                        result = "failed",
                         task_id = %self.id,
                         bucket,
                         object,
-                        result = "failed",
                         error = %e,
                         "Heal object operation failed"
-                    );
+                    });
 
                     {
                         let mut progress = self.progress.write().await;
@@ -250,6 +303,18 @@ impl HealTask {
                     "Heal object stage entered"
                 );
                 let object_size = result.object_size as u64;
+                let ok_drive_state = DriveState::Ok.to_string();
+                if self.source == HealRequestSource::Admin
+                    && !self.options.dry_run
+                    && !result.after.drives.is_empty()
+                    && result.after.drives.iter().any(|drive| drive.state != ok_drive_state)
+                {
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!(
+                            "Heal left one or more drives unhealthy for {bucket}/{object}; retry after the missing drives are restored"
+                        ),
+                    });
+                }
                 debug!(
                     target: "rustfs::heal::task",
                     event = EVENT_HEAL_OBJECT_RESULT,
@@ -269,15 +334,26 @@ impl HealTask {
                     let mut progress = self.progress.write().await;
                     progress.update_object_progress(1, 1, 0, 0, object_size);
                 }
-                self.record_verified_storage_receipt(expected_identity, storage_result.receipt)
-                    .await;
+                if !self
+                    .record_verified_storage_receipt(&expected_identity, storage_result.receipt)
+                    .await
+                    && !self.options.dry_run
+                {
+                    self.outcome.write().await.record(HealObjectOutcome {
+                        deep_check_observed: false,
+                        quorum_selected_data_dir: None,
+                        identity: expected_identity,
+                        disposition: HealObjectDisposition::Unknown,
+                        detail: (!result.detail.is_empty()).then(|| result.detail.clone()),
+                    });
+                }
                 self.record_result_item(result).await;
                 Ok(())
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                if self.skip_dangling_delete_grace_error(bucket, object, &e).await {
+                if self.skip_retired_marker_error(&e).await || self.skip_dangling_delete_grace_error(bucket, object, &e).await {
                     return Ok(());
                 }
 
@@ -285,37 +361,23 @@ impl HealTask {
                     return Ok(());
                 }
 
-                if Self::is_object_not_found_heal_error(&e) {
-                    debug!(
-                        target: "rustfs::heal::task",
-                        event = EVENT_HEAL_OBJECT_RESULT,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_OBJECT,
-                        task_id = %self.id,
-                        bucket,
-                        object,
-                        result = "treated_as_deleted",
-                        "Heal missing object treated as deleted"
-                    );
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_stage(3, 3);
-                    }
-                    return Ok(());
+                if e.is_object_absent() {
+                    return self.complete_absent_object(bucket, object, &e).await;
                 }
 
-                error!(
-                    target: "rustfs::heal::task",
+                demote_to_debug_when!(
+                    !self.should_log_failure(&e),
+                    error, target: "rustfs::heal::task", {
                     event = EVENT_HEAL_OBJECT_RESULT,
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_OBJECT,
+                    result = "failed",
                     task_id = %self.id,
                     bucket,
                     object,
-                    result = "failed",
                     error = %e,
                     "Heal object operation failed"
-                );
+                });
 
                 {
                     let mut progress = self.progress.write().await;
@@ -367,22 +429,32 @@ impl HealTask {
         }
     }
 
-    /// Recreate missing object (for EC decode scenarios)
-    async fn recreate_missing_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
+    /// The locked storage read found no replica: there is nothing to repair
+    /// and the heal completes for every source. No absence proof is recorded;
+    /// only storage's incarnation-fenced receipt can carry one.
+    async fn complete_absent_object(&self, bucket: &str, object: &str, err: &Error) -> Result<()> {
+        self.mark_object_absent();
         debug!(
             target: "rustfs::heal::task",
-            event = EVENT_HEAL_OBJECT_STAGE,
+            event = EVENT_HEAL_OBJECT_RESULT,
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_OBJECT,
             task_id = %self.id,
             bucket,
             object,
-            version_id = ?version_id,
-            stage = "recreate_missing",
-            "Heal object recreate started"
+            source = self.source.as_str(),
+            result = "treated_as_deleted",
+            error = %err,
+            "Heal missing object treated as deleted"
         );
+        let mut progress = self.progress.write().await;
+        progress.update_object_progress(1, 0, 0, 1, 0);
+        progress.update_stage(3, 3);
+        Ok(())
+    }
 
-        // Use ecstore's heal_object with recreate option
+    /// Durable MRF partial writes may complete only with an incarnation-fenced storage proof.
+    async fn heal_mrf_partial_write_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
         let heal_opts = HealOpts {
             recursive: false,
             dry_run: self.options.dry_run,
@@ -392,81 +464,95 @@ impl HealTask {
             update_parity: true,
             no_lock: self.options.no_lock,
             read_repair: false,
-            pool: None,
-            set: None,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
         };
+        let mut expected = self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
+        let current_bucket_incarnation_id = self
+            .outcome_bucket_incarnation_id(bucket, self.options.dry_run)
+            .await?
+            .ok_or_else(|| Error::TaskExecutionFailed {
+                message: format!("Missing bucket incarnation for durable MRF repair {bucket}/{object}"),
+            })?;
+        let bucket_incarnation_id = self
+            .expected_mrf_bucket_incarnation_id
+            .ok_or_else(|| Error::TaskExecutionFailed {
+                message: format!("Missing source bucket incarnation for durable MRF repair {bucket}/{object}"),
+            })?;
+        if current_bucket_incarnation_id != bucket_incarnation_id {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Bucket incarnation changed before durable MRF repair {bucket}/{object}"),
+            });
+        }
+        expected.bucket_incarnation_id = Some(bucket_incarnation_id);
 
-        match self
-            .await_with_control(self.storage.heal_object(bucket, object, version_id, &heal_opts))
-            .await
-        {
-            Ok((result, error)) => {
-                if let Some(e) = error {
-                    if self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await {
-                        return Ok(());
-                    }
-
-                    error!(
-                        target: "rustfs::heal::task",
-                        event = EVENT_HEAL_OBJECT_RESULT,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_OBJECT,
-                        task_id = %self.id,
-                        bucket,
-                        object,
-                        result = "recreate_failed",
-                        error = %e,
-                        "Heal object recovery failed"
-                    );
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to recreate missing object {bucket}/{object}: {e}"),
-                    });
-                }
-
-                let object_size = result.object_size as u64;
-                debug!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_OBJECT_RESULT,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    task_id = %self.id,
-                    bucket,
-                    object,
-                    object_size,
-                    result = "recreated",
-                    "Heal object recreated"
-                );
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_object_progress(1, 1, 0, 0, object_size);
-                }
-                self.record_result_item(result).await;
-                Ok(())
+        let storage_result = self
+            .await_with_control(self.storage.heal_mrf_object_at_incarnation(
+                bucket,
+                object,
+                version_id,
+                bucket_incarnation_id,
+                &heal_opts,
+            ))
+            .await?;
+        if let Some(error) = storage_result.error {
+            if error.is_dangling_delete_grace() {
+                // Preserve the existing MRF grace retry ownership.
+                return Err(Error::TaskExecutionFailed {
+                    message: format!("Failed to recreate missing object {bucket}/{object}: {error}"),
+                });
             }
-            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
-            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
-            Err(e) => {
-                if self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await {
-                    return Ok(());
-                }
+            return Err(error);
+        }
 
-                error!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_OBJECT_RESULT,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    task_id = %self.id,
-                    bucket,
-                    object,
-                    result = "recreate_failed",
-                    error = %e,
-                    "Heal object recovery failed"
-                );
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to recreate missing object {bucket}/{object}: {e}"),
-                })
+        let object_size = storage_result.item.object_size as u64;
+        let authoritatively_absent = matches!(
+            storage_result.receipt.as_ref().map(|receipt| &receipt.disposition),
+            Some(HealObjectDisposition::AuthoritativelyAbsent)
+        );
+        let receipt_missing = storage_result.receipt.is_none();
+        if !self.record_verified_storage_receipt(&expected, storage_result.receipt).await {
+            let ok_drive_state = DriveState::Ok.to_string();
+            let healthy_legacy_without_repair = receipt_missing
+                && storage_result.item.legacy_identity_unverified
+                && storage_result.item.drives_healed() == Some(0)
+                && !storage_result.item.after.drives.is_empty()
+                && storage_result
+                    .item
+                    .after
+                    .drives
+                    .iter()
+                    .all(|drive| drive.state == ok_drive_state);
+            if healthy_legacy_without_repair {
+                self.outcome.write().await.record(HealObjectOutcome {
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
+                    identity: expected,
+                    disposition: HealObjectDisposition::Unknown,
+                    detail: Some(storage_result.item.detail.clone()),
+                });
+            }
+            self.record_result_item(storage_result.item).await;
+            return Err(if healthy_legacy_without_repair {
+                Error::LegacyMrfUnverified {
+                    target: format!("{bucket}/{object}"),
+                }
+            } else {
+                Error::TaskExecutionFailed {
+                    message: format!("{}{bucket}/{object}", crate::error::MRF_MISSING_PROOF_PREFIX),
+                }
+            });
+        }
+
+        {
+            let mut progress = self.progress.write().await;
+            if authoritatively_absent {
+                progress.update_object_progress(1, 0, 0, 1, 0);
+            } else {
+                progress.update_object_progress(1, 1, 0, 0, object_size);
             }
         }
+        self.record_result_item(storage_result.item).await;
+        Ok(())
     }
 }

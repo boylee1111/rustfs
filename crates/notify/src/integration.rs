@@ -298,6 +298,22 @@ impl NotificationSystem {
             .await
     }
 
+    /// Replace a target only if its persisted configuration still matches the validated snapshot.
+    pub async fn set_target_config_if_unchanged(
+        &self,
+        target_type: &str,
+        target_name: &str,
+        expected: Option<KVS>,
+        expected_default: Option<KVS>,
+        expected_generation: Option<String>,
+        kvs: KVS,
+    ) -> Result<(), NotificationError> {
+        self.services
+            .config_manager
+            .set_target_config_if_unchanged(target_type, target_name, expected, expected_default, expected_generation, kvs)
+            .await
+    }
+
     /// Removes all notification configurations for a bucket.
     /// If the configuration is successfully removed, the entire notification system will be automatically reloaded.
     ///
@@ -370,6 +386,19 @@ impl NotificationSystem {
     /// Returns whether the latest accepted lifecycle generation is active.
     pub fn runtime_lifecycle_is_converged(&self) -> bool {
         self.services.config_manager.lifecycle().is_converged()
+    }
+
+    /// Validates a bucket notification configuration against the runtime targets
+    /// without publishing it, so callers can reject a request before persisting.
+    pub async fn validate_bucket_notification_config(
+        &self,
+        bucket: &str,
+        cfg: &BucketNotificationConfig,
+    ) -> Result<(), NotificationError> {
+        self.services
+            .bucket_config_manager
+            .validate_bucket_notification_config(bucket, cfg)
+            .await
     }
 
     /// Loads the bucket notification configuration

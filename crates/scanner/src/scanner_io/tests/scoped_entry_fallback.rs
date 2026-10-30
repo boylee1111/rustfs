@@ -138,6 +138,8 @@ async fn run_entry(
                 requires_full_scan: false,
                 service_cohort: None,
                 resolved_scope_observer: Some(observer),
+                post_walk_gate: None,
+                peer_observations: None,
             },
         ),
     )
@@ -366,7 +368,7 @@ async fn scoped_entry_fallback_rejects_invalid_persisted_baseline_at_the_walker_
     let baseline = run_entry(&store, 1, None, true, false, false).await;
     for (index, kind) in [
         "malformed",
-        "unconverged",
+        "observational",
         "missing-set",
         "wrong-source",
         "mixed-plan",
@@ -378,7 +380,12 @@ async fn scoped_entry_fallback_rejects_invalid_persisted_baseline_at_the_walker_
         let mut candidate = baseline.clone();
         candidate.usage_snapshot_converged = Some(true);
         match kind {
-            "unconverged" => candidate.usage_snapshot_converged = Some(false),
+            // An unconverged authoritative snapshot is a valid baseline since
+            // per-bucket certification; only the observational mark rejects.
+            "observational" => {
+                candidate.usage_snapshot_converged = Some(false);
+                candidate.usage_snapshot_observational = true;
+            }
             "missing-set" => {
                 candidate.usage_snapshot_set_states.pop();
             }

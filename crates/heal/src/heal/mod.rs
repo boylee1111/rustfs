@@ -14,11 +14,13 @@
 
 pub mod channel;
 pub mod erasure_healer;
+mod failure_logging;
 pub mod manager;
 pub mod mrf_queue;
 pub mod outcome;
 pub(crate) mod pacing;
 pub mod progress;
+mod replacement_execution;
 pub(crate) mod replacement_readiness;
 pub mod resume;
 pub mod storage;

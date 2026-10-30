@@ -17,12 +17,11 @@ use crate::storage::storage_api::options_consumer::contract::{object::HTTPPrecon
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
-    SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
-    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_PROXY_REQUEST,
-    SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST,
-    SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID,
-    SUFFIX_TAGGING_TIMESTAMP, get_header,
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG,
+    SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_PROXY_REQUEST, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID, SUFFIX_TAGGING_TIMESTAMP, get_header,
     header_compat::{MINIO_ENCRYPTION_PREFIX, RUSTFS_ENCRYPTION_PREFIX},
     insert_header_map, insert_str,
     metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, starts_with_ignore_ascii_case},
@@ -219,9 +218,17 @@ pub fn del_opts_with_versioning(
         StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())
     })?;
 
-    opts.delete_prefix = get_header(headers, SUFFIX_FORCE_DELETE)
-        .map(|v| v.as_ref() == "true")
-        .unwrap_or_default();
+    opts.delete_prefix = match rustfs_utils::http::force_delete_header(headers) {
+        Ok(Some(true)) => true,
+        Ok(_) => false,
+        Err(_) => {
+            return Err(StorageError::InvalidArgument(
+                bucket.to_owned(),
+                object.to_owned(),
+                "invalid force-delete header".to_owned(),
+            ));
+        }
+    };
 
     opts.version_id = synthetic_version_id.then(|| Uuid::nil().to_string()).or(vid);
     opts.synthetic_version_id = synthetic_version_id;
@@ -361,6 +368,13 @@ pub async fn put_opts_with_replication_authorization(
     metadata: HashMap<String, String>,
     replication_request_authorized: bool,
 ) -> Result<ObjectOptions> {
+    if vid.is_some() && !replication_request_authorized {
+        return Err(StorageError::InvalidArgument(
+            bucket.to_owned(),
+            object.to_owned(),
+            "A destination versionId requires replication authorization".to_owned(),
+        ));
+    }
     let versioning_cfg = bucket_versioning_config_for_write(bucket).await?;
     let versioned = versioning_cfg.prefix_enabled(object);
     let version_suspended = versioning_cfg.prefix_suspended(object);
@@ -1043,9 +1057,25 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
         Err(s3_error!(InvalidArgument, "Invalid range format"))
     }
 }
+/// Returns the `x-amz-content-sha256` digest the storage layer still has to
+/// verify itself, or `None` when the payload hash has already been enforced.
+///
+/// The s3s auth layer wraps a single-chunk body in a hash-checking
+/// `UploadStream` whenever the `x-amz-content-sha256` *header* carries a real
+/// digest, for both header-signed and presigned SigV4 requests, and rejects a
+/// malformed header outright. Every request that reaches a handler with that
+/// header has therefore already had its body verified (or is about to fail in
+/// the body stream with `XAmzContentSHA256Mismatch`), so hashing it again in
+/// `HashReader` would cost a second full SHA-256 pass per PUT for no extra
+/// protection. Streaming payloads are verified chunk by chunk by s3s and never
+/// produced a digest here.
+///
+/// s3s reads the header only. The one case it does not cover is a presigned
+/// request whose digest arrives in the query string alone, which is why that
+/// path still hands the digest to the storage layer.
 pub(crate) fn get_content_sha256_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> Option<String> {
     match get_request_auth_type_with_query(headers, query) {
-        AuthType::Presigned | AuthType::Signed => {
+        AuthType::Presigned if !headers.contains_key(AMZ_CONTENT_SHA256) => {
             if skip_content_sha256_cksum_with_query(headers, query) {
                 None
             } else {
@@ -1371,12 +1401,10 @@ mod tests {
         let opts = result.unwrap();
         assert!(!opts.delete_prefix);
 
-        // Test with RUSTFS_FORCE_DELETE header set to other value
+        // A non-boolean force-delete header is rejected rather than ignored.
         insert_header(&mut headers, SUFFIX_FORCE_DELETE, "maybe");
         let result = del_opts("test-bucket", "test-object", None, &headers, metadata).await;
-        assert!(result.is_ok());
-        let opts = result.unwrap();
-        assert!(!opts.delete_prefix);
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1511,7 +1539,15 @@ mod tests {
         let headers = create_test_headers();
         let invalid_uuid = "invalid-uuid".to_string();
 
-        let result = put_opts("test-bucket", "test-object", Some(invalid_uuid), &headers, HashMap::new()).await;
+        let result = put_opts_with_replication_authorization(
+            "test-bucket",
+            "test-object",
+            Some(invalid_uuid),
+            &headers,
+            HashMap::new(),
+            true,
+        )
+        .await;
 
         assert!(result.is_err());
         if let Err(err) = result {
@@ -1535,11 +1571,33 @@ mod tests {
         // get_opts / del_opts already do.
         let headers = create_test_headers();
 
-        let opts = put_opts("test-bucket", "test-object", Some("null".to_string()), &headers, HashMap::new())
-            .await
-            .expect("PUT with versionId=null must be accepted as the null version");
+        let opts = put_opts_with_replication_authorization(
+            "test-bucket",
+            "test-object",
+            Some("null".to_string()),
+            &headers,
+            HashMap::new(),
+            true,
+        )
+        .await
+        .expect("PUT with versionId=null must be accepted as the null version");
 
         assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+    }
+
+    #[tokio::test]
+    async fn ordinary_writes_cannot_choose_a_destination_version() {
+        let headers = create_test_headers();
+        for version in ["null", "", "0194e0f1-0000-7000-8000-000000000000"] {
+            let err = put_opts("test-bucket", "test-object", Some(version.to_owned()), &headers, HashMap::new())
+                .await
+                .expect_err("ordinary PUT must not overwrite a selected version");
+            assert!(matches!(err, StorageError::InvalidArgument(_, _, _)));
+            let err = copy_dst_opts("test-bucket", "test-object", Some(version.to_owned()), &headers, HashMap::new())
+                .await
+                .expect_err("ordinary COPY must not overwrite a selected version");
+            assert!(matches!(err, StorageError::InvalidArgument(_, _, _)));
+        }
     }
 
     #[tokio::test]
@@ -2746,5 +2804,74 @@ mod tests {
             metadata.contains_key("x-amz-meta-x-rustfs-source-proxy-request"),
             "disguised key must be namespaced back under x-amz-meta-: {metadata:?}"
         );
+    }
+
+    const PAYLOAD_SHA256: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+    const PRESIGNED_QUERY: &str = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ak%2F20260916%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=deadbeef";
+
+    fn signed_v4_headers(content_sha256: &'static str) -> HeaderMap<HeaderValue> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static(
+                "AWS4-HMAC-SHA256 Credential=ak/20260916/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=deadbeef",
+            ),
+        );
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(content_sha256));
+        headers
+    }
+
+    /// The s3s auth layer already wraps a header-signed single-chunk body in a
+    /// hash-checking stream, so the storage layer must not schedule a second
+    /// SHA-256 pass over the same payload.
+    #[test]
+    fn signed_single_chunk_put_leaves_payload_sha256_to_the_auth_layer() {
+        let headers = signed_v4_headers(PAYLOAD_SHA256);
+        assert_eq!(super::get_content_sha256_with_query(&headers, None), None);
+    }
+
+    #[test]
+    fn streaming_signed_put_never_hands_a_digest_to_the_storage_layer() {
+        for value in [
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            "UNSIGNED-PAYLOAD",
+        ] {
+            let headers = signed_v4_headers(value);
+            assert_eq!(super::get_content_sha256_with_query(&headers, None), None, "{value}");
+        }
+    }
+
+    /// s3s verifies the header digest of a presigned request too, so a header
+    /// digest is left to the auth layer exactly like the header-signed case.
+    #[test]
+    fn presigned_request_with_header_digest_leaves_payload_sha256_to_the_auth_layer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(PAYLOAD_SHA256));
+        assert_eq!(super::get_content_sha256_with_query(&headers, Some(PRESIGNED_QUERY)), None);
+    }
+
+    /// s3s only reads the header, so a digest that arrives in the query string
+    /// alone is the one case the storage layer still verifies itself.
+    #[test]
+    fn presigned_request_with_query_only_digest_is_still_verified_by_the_storage_layer() {
+        let headers = HeaderMap::new();
+
+        let query = format!("{PRESIGNED_QUERY}&x-amz-content-sha256={PAYLOAD_SHA256}");
+        assert_eq!(
+            super::get_content_sha256_with_query(&headers, Some(&query)),
+            Some(PAYLOAD_SHA256.to_string())
+        );
+
+        let query = format!("{PRESIGNED_QUERY}&x-amz-content-sha256=UNSIGNED-PAYLOAD");
+        assert_eq!(super::get_content_sha256_with_query(&headers, Some(&query)), None);
+    }
+
+    #[test]
+    fn anonymous_request_hands_no_digest_to_the_storage_layer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(PAYLOAD_SHA256));
+        assert_eq!(super::get_content_sha256_with_query(&headers, None), None);
     }
 }

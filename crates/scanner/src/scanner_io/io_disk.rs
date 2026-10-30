@@ -11,9 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-/// ScannerIODisk implementation for Disk: get_size and the per-disk bucket scan.
 use super::*;
 use crate::UNKNOWN_TIER;
+/// ScannerIODisk implementation for Disk: get_size and the per-disk bucket scan.
+use crate::data_usage_define::clone_cache_value;
 
 ///
 /// Seed [`SizeSummary::tier_stats`] from the cached tier-name list.
@@ -38,6 +39,13 @@ pub(super) fn tier_stats_template(tier_names: &[String]) -> HashMap<String, Tier
     tier_stats
 }
 
+fn ensure_scanner_node_operation_active(cancellation: Option<&CancellationToken>) -> Result<()> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(StorageError::other("Scanner operation cancelled"));
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl ScannerIODisk for Disk {
     async fn get_size(&self, item: ScannerItem) -> Result<SizeSummary> {
@@ -45,14 +53,19 @@ impl ScannerIODisk for Disk {
     }
 
     async fn get_size_with_tier_names(&self, mut item: ScannerItem, tier_names: &[String]) -> Result<SizeSummary> {
+        let cancellation = crate::workload_admission::scanner_node_operation_cancellation();
         let done_object = Metrics::time(Metric::ScanObject);
 
         if !is_xl_meta_path(&item.path) {
             return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
         }
 
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
         let metadata_object_path = item.object_path();
-        let data = match self.read_metadata(&item.bucket, &metadata_object_path).await {
+        let metadata_result =
+            crate::workload_admission::with_scanner_metadata_io(self.read_metadata(&item.bucket, &metadata_object_path)).await;
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
+        let data = match metadata_result {
             Ok(data) => data,
             Err(e) if DiskError::is_err_object_not_found(&e) || DiskError::is_err_version_not_found(&e) => {
                 return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
@@ -86,7 +99,10 @@ impl ScannerIODisk for Disk {
         // (which used to query it a second time). On failure keep the
         // historical fallback: default configuration (versioned = false) plus
         // the warn that `apply_actions` used to emit.
-        let versioning_config = match BucketVersioningSys::get(&item.bucket).await {
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
+        let versioning_result = BucketVersioningSys::get(&item.bucket).await;
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
+        let versioning_config = match versioning_result {
             Ok(versioning_config) => versioning_config,
             Err(_) => {
                 warn!(
@@ -122,7 +138,9 @@ impl ScannerIODisk for Disk {
             ..Default::default()
         };
 
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
         let lock_config = object_lock_config_for_scanner_item(&item).await;
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
 
         // Count every version this object contributes to the scan, independent
         // of any lifecycle configuration, so scan-coverage metrics stay honest
@@ -130,17 +148,35 @@ impl ScannerIODisk for Disk {
         // `object_infos`.
         global_metrics().record_scanner_versions_scanned(object_infos.len() as u64);
 
-        item.apply_actions(object_infos, lock_config, versioning_config, tier_names, &mut size_summary)
-            .await;
+        // A caller-provided item or persisted usage cache cannot choose another set.
+        item.heal_scope = crate::scanner_folder::scanner_disk_heal_scope(self);
+        #[cfg(test)]
+        let _ = crate::scanner_folder::observe_test_size_dispatch_boundary("apply_actions");
+        item.apply_actions_cancellable(
+            object_infos,
+            lock_config,
+            versioning_config,
+            tier_names,
+            &mut size_summary,
+            cancellation.as_ref(),
+        )
+        .await;
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
 
         if !free_version_infos.is_empty() {
             for oi in free_version_infos {
+                ensure_scanner_node_operation_active(cancellation.as_ref())?;
                 if ScannerItem::tier_is_known(&oi, tier_names) {
-                    enqueue_runtime_free_version(oi).await;
+                    #[cfg(test)]
+                    if crate::scanner_folder::observe_test_size_dispatch_boundary("free_version_dispatch") {
+                        continue;
+                    }
+                    enqueue_runtime_free_version(oi, cancellation.as_ref()).await;
                 }
             }
         }
 
+        ensure_scanner_node_operation_active(cancellation.as_ref())?;
         done_object();
 
         Ok(size_summary)
@@ -159,10 +195,11 @@ impl ScannerIODisk for Disk {
         let ScannerDiskScanOptions {
             scan_mode,
             prefix_scan_scope,
+            checkpoint_tx,
         } = options;
         let done_drive = Metrics::time(Metric::ScanBucketDrive);
         let drive_start = std::time::Instant::now();
-        let bucket = cache.info.name.clone();
+        let bucket = clone_cache_value(&cache.info.name);
         let disk_path = self.path().to_string_lossy().to_string();
         let source = match scan_mode {
             HealScanMode::Deep => rustfs_scanner_metrics::metrics::ScannerWorkSource::Bitrot,
@@ -174,21 +211,25 @@ impl ScannerIODisk for Disk {
 
         let mut cache = cache;
 
-        let (lifecycle_config, _) = get_lifecycle_config(&cache.info.name)
-            .await
-            .unwrap_or_else(|_| (BucketLifecycleConfiguration::default(), OffsetDateTime::now_utc()));
+        let (lifecycle_config, _) =
+            crate::storage_api::ecstore_with_background_disk_io(ctx.clone(), get_lifecycle_config(&cache.info.name))
+                .await
+                .unwrap_or_else(|_| (BucketLifecycleConfiguration::default(), OffsetDateTime::now_utc()));
 
-        if lifecycle_config.has_active_rules("") {
-            cache.info.lifecycle = Some(Arc::new(lifecycle_config));
-        }
+        // Persisted usage caches are not an authority for lifecycle policy.
+        // Clear their old snapshot when configuration is absent, disabled, or unreadable.
+        cache.info.lifecycle = lifecycle_config.has_active_rules("").then(|| Arc::new(lifecycle_config));
 
-        let (replication_config, _) = get_replication_config(&cache.info.name).await.unwrap_or((
-            ReplicationConfiguration {
-                role: "".to_string(),
-                rules: vec![],
-            },
-            OffsetDateTime::now_utc(),
-        ));
+        let (replication_config, _) =
+            crate::storage_api::ecstore_with_background_disk_io(ctx.clone(), get_replication_config(&cache.info.name))
+                .await
+                .unwrap_or((
+                    ReplicationConfiguration {
+                        role: "".to_string(),
+                        rules: vec![],
+                    },
+                    OffsetDateTime::now_utc(),
+                ));
 
         if replication_config.has_active_rules("", true)
             && let Ok(targets) = BucketTargetSys::get().list_bucket_targets(&cache.info.name).await
@@ -196,7 +237,8 @@ impl ScannerIODisk for Disk {
             cache.info.replication = Some(Arc::new(ReplicationConfig::new(Some(replication_config), Some(targets))));
         }
 
-        if let Ok((object_lock_config, _)) = get_object_lock_config(&cache.info.name).await
+        if let Ok((object_lock_config, _)) =
+            crate::storage_api::ecstore_with_background_disk_io(ctx.clone(), get_object_lock_config(&cache.info.name)).await
             && object_lock_config_enabled(&object_lock_config)
         {
             cache.info.object_lock = Some(Arc::new(object_lock_config));
@@ -214,16 +256,21 @@ impl ScannerIODisk for Disk {
         .then_some(prefix_scan_scope)
         .flatten();
 
-        let result = scan_data_folder_scoped(
+        let result = crate::storage_api::ecstore_with_background_disk_io(
             ctx.clone(),
-            budget,
-            set_disks,
-            self.clone(),
-            cache,
-            updates,
-            scan_mode,
-            SCANNER_SLEEPER.clone(),
-            prefix_scan_scope,
+            scan_data_folder_scoped(
+                ctx.clone(),
+                budget,
+                set_disks,
+                self.clone(),
+                cache,
+                updates,
+                scan_mode,
+                // Every walker of this local disk shares its background I/O budget.
+                SCANNER_SLEEPER.for_disk(&self.path()),
+                prefix_scan_scope,
+                checkpoint_tx,
+            ),
         )
         .await;
 

@@ -7,13 +7,14 @@ use super::meta::{
     validate_start_rebalance_state,
 };
 use super::worker::{
-    resolve_rebalance_bucket_result, resolve_rebalance_meta_save_result, resolve_rebalance_save_task_result,
-    resolve_rebalance_terminal_error, send_rebalance_done_signal,
+    rebalance_max_attempts, resolve_rebalance_bucket_result, resolve_rebalance_meta_save_result,
+    resolve_rebalance_save_task_result, resolve_rebalance_terminal_error, retry_rebalance_metadata_access,
+    send_rebalance_done_signal,
 };
 use super::{
     EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
-    REBALANCE_LISTING_RETRY_BASE_DELAY, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX, RebalSaveOpt, RebalStatus,
-    RebalanceBucketOutcome,
+    REBALANCE_LISTING_RETRY_BASE_DELAY, REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX, REBALANCE_SOURCE_CLEANUP_MAX_DEFERS,
+    RebalSaveOpt, RebalStatus, RebalanceBucketOutcome, RebalanceDeferKind,
 };
 use crate::error::{Error, Result};
 use crate::runtime::sources as runtime_sources;
@@ -25,6 +26,11 @@ use time::OffsetDateTime;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static REBALANCE_WORKER_WRITE_UPGRADE_BARRIER: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
 
 pub(super) fn should_fail_repeated_rebalance_bucket_defer(
     deferred_buckets: &mut HashSet<String>,
@@ -38,6 +44,12 @@ pub(super) fn source_cleanup_defer_attempt(deferred_attempts: &mut HashMap<Strin
     let attempts = deferred_attempts.entry(bucket.to_string()).or_default();
     *attempts = attempts.saturating_add(1);
     *attempts
+}
+
+/// Retryable source cleanup conflicts are bounded per run, so a source replica that stays
+/// unreclaimable fails the bucket explicitly instead of deferring forever.
+pub(super) fn reached_rebalance_source_cleanup_defer_limit(attempt: usize) -> bool {
+    attempt >= REBALANCE_SOURCE_CLEANUP_MAX_DEFERS
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,6 +218,22 @@ impl ECStore {
         }
 
         if must_persist {
+            // Shared admission grants no write authority. Release it before
+            // taking the exclusive metadata fences, then recheck stop/run/pool
+            // state before publishing the locally staged terminal candidate.
+            drop(activation_fence);
+            #[cfg(test)]
+            if let Ok((arrived, release)) = REBALANCE_WORKER_WRITE_UPGRADE_BARRIER.try_with(Clone::clone) {
+                arrived.notify_one();
+                release.notified().await;
+            }
+            let Some(activation_fence) = self
+                .fence_rebalance_worker_metadata_update(pool.clone(), expected_id.as_ref())
+                .await?
+            else {
+                cancel_tx.cancel();
+                return Ok(false);
+            };
             let save_result = resolve_rebalance_meta_save_result(
                 self.save_rebalance_meta_under_activation_fence(
                     pool,
@@ -235,13 +263,14 @@ impl ECStore {
                 cancel_tx.cancel();
                 return Err(err);
             }
+        } else {
+            if let Err(err) = activation_fence.ensure_held() {
+                let mut rebalance_meta = self.rebalance_meta.write().await;
+                rollback_local_rebalance_worker_activation(rebalance_meta.as_mut(), expected_id.as_ref(), &rx);
+                return Err(err);
+            }
+            drop(activation_fence);
         }
-        if !must_persist && let Err(err) = activation_fence.ensure_held() {
-            let mut rebalance_meta = self.rebalance_meta.write().await;
-            rollback_local_rebalance_worker_activation(rebalance_meta.as_mut(), expected_id.as_ref(), &rx);
-            return Err(err);
-        }
-        drop(activation_fence);
 
         if activation_outcome != RebalanceLocalActivationOutcome::Started {
             return Ok(must_persist);
@@ -443,13 +472,14 @@ impl ECStore {
                         };
 
                         if terminal_state_present {
-                            if let Err(err) = store
-                                .save_rebalance_stats_inner(
+                            if let Err(err) = retry_rebalance_metadata_access(None, rebalance_max_attempts(), || {
+                                store.save_rebalance_stats_inner(
                                     pool_index,
                                     RebalSaveOpt::Stats,
                                     Some(save_rebalance_id.as_ref()),
                                 )
-                                .await
+                            })
+                            .await
                             {
                                 let mut rebalance_meta = store.rebalance_meta.write().await;
                                 *rebalance_meta = previous_meta;
@@ -469,9 +499,10 @@ impl ECStore {
                 }
 
                 if !terminal_state_saved
-                    && let Err(err) = store
-                        .save_rebalance_stats_for_id(pool_index, RebalSaveOpt::Stats, save_rebalance_id.as_ref())
-                        .await
+                    && let Err(err) = retry_rebalance_metadata_access(None, rebalance_max_attempts(), || {
+                        store.save_rebalance_stats_for_id(pool_index, RebalSaveOpt::Stats, save_rebalance_id.as_ref())
+                    })
+                    .await
                 {
                     let wrapped = Error::other(format!("rebalance save_task stats save failed for pool {pool_index}: {err}"));
                     error!("{} err: {:?}", msg, wrapped);
@@ -623,6 +654,11 @@ impl ECStore {
                     } else {
                         0
                     };
+                    let defer_kind = if source_cleanup_deferred {
+                        RebalanceDeferKind::SourceCleanup
+                    } else {
+                        RebalanceDeferKind::Entry
+                    };
                     warn!(
                         event = EVENT_REBALANCE_BUCKET,
                         component = LOG_COMPONENT_ECSTORE,
@@ -634,7 +670,7 @@ impl ECStore {
                         "Deferred rebalance bucket after transient object failures"
                     );
                     if let Err(err) = self
-                        .defer_rebalance_bucket(pool_index, bucket.clone(), last_error.clone(), rebalance_id.as_ref())
+                        .defer_rebalance_bucket(pool_index, bucket.clone(), last_error.clone(), rebalance_id.as_ref(), defer_kind)
                         .await
                     {
                         error!(
@@ -654,10 +690,10 @@ impl ECStore {
                         break;
                     }
                     if source_cleanup_deferred {
-                        if source_cleanup_attempt >= super::REBALANCE_SOURCE_CLEANUP_MAX_DEFERS {
+                        if reached_rebalance_source_cleanup_defer_limit(source_cleanup_attempt) {
                             let err = Error::other(format!(
                                 "rebalance bucket {bucket} source cleanup remained unstable after {} deferrals: {last_error}",
-                                super::REBALANCE_SOURCE_CLEANUP_MAX_DEFERS
+                                REBALANCE_SOURCE_CLEANUP_MAX_DEFERS
                             ));
                             warn!(
                                 event = EVENT_REBALANCE_BUCKET,

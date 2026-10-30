@@ -16,13 +16,97 @@ use crate::storage_api::error::contract::{StorageErrorCode, range::HTTPRangeErro
 use crate::storage_api::error::{PoolMetadataError, QuotaError, StorageError, unreadable_config_refusal};
 use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
+use rustfs_lock::LockError;
+use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
 use s3s::{S3Error, S3ErrorCode};
+
+const CONTENT_SHA256_MISMATCH_CODE: &str = "XAmzContentSHA256Mismatch";
+const CONTENT_SHA256_MISMATCH_MESSAGE: &str = "The provided 'x-amz-content-sha256' header does not match what was computed.";
 
 const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";
 const MAX_VERSIONS_EXCEEDED_MESSAGE: &str = "You've exceeded the limit on the number of versions you can create on this object";
+const SLOW_DOWN_READ_CODE: &str = "SlowDownRead";
+const SLOW_DOWN_READ_MESSAGE: &str = "Resource requested is unreadable, please reduce your request rate";
+const NAMESPACE_LOCK_TIMEOUT_CAUSE: &str = "namespace_lock_timeout";
+/// Public message for `StorageError::UnsupportedDisk` on a request path. The
+/// only request-time producer is the delete-transaction protocol when a
+/// participant answers Unimplemented (a peer still on a release without the
+/// recovery RPC, or a protocol-version mismatch); the variant's Display text
+/// ("drive does not support O_DIRECT") describes the startup drive probe and
+/// would send an operator mid-upgrade after the wrong cause.
+const UNSUPPORTED_PARTICIPANT_MESSAGE: &str = "A storage participant does not support this operation's protocol version. If the cluster is being upgraded, finish upgrading every node and retry.";
 
 /// S3 error code for a request that names a KMS key the KMS does not hold.
 pub const KMS_KEY_NOT_FOUND_ERROR_CODE: &str = "KMS.NotFoundException";
+
+fn lock_resource_class(resource: Option<&str>) -> &'static str {
+    let Some(resource) = resource else {
+        return "unknown";
+    };
+    if resource == ".rustfs.sys/multipart"
+        || resource.starts_with(".rustfs.sys/multipart/")
+        || resource == ".minio.sys/multipart"
+        || resource.starts_with(".minio.sys/multipart/")
+    {
+        return "multipart_metadata";
+    }
+    if resource.starts_with(".rustfs.sys/") || resource.starts_with(".minio.sys/") {
+        return "system_metadata";
+    }
+    let Some((bucket, object)) = resource.split_once('/') else {
+        return "unknown";
+    };
+    let object = object.split('@').next().unwrap_or(object);
+    if object.is_empty() || object == bucket {
+        "bucket_namespace"
+    } else {
+        "object_namespace"
+    }
+}
+
+fn lock_failure_reason(error: &LockError) -> &'static str {
+    match error {
+        LockError::Timeout { .. } => "timeout",
+        LockError::AlreadyLocked { .. } => "contention",
+        LockError::QuorumNotReached { .. } => "quorum",
+        LockError::InsufficientNodes { .. } => "insufficient_nodes",
+        LockError::Network { .. } => "network",
+        LockError::Internal { .. } => "internal",
+        _ => "other",
+    }
+}
+
+fn record_s3_lock_failure(err: &StorageError) {
+    let record = |resource: Option<&str>, mode: &'static str, reason: &'static str| {
+        rustfs_io_metrics::s3_http_metrics::record_s3_http_lock_failure(lock_resource_class(resource), mode, reason);
+    };
+    match err {
+        StorageError::Lock(lock_error) => {
+            let resource = match lock_error {
+                LockError::Timeout { resource, .. } | LockError::AlreadyLocked { resource, .. } => Some(resource.as_str()),
+                _ => None,
+            };
+            let reason = match lock_failure_reason(lock_error) {
+                "insufficient_nodes" => "quorum",
+                "network" | "internal" => "transport",
+                reason => reason,
+            };
+            record(resource, "unknown", reason);
+        }
+        StorageError::NamespaceLockQuorumUnavailable {
+            mode, bucket, object, ..
+        } => {
+            let resource = format!("{bucket}/{object}");
+            let mode = match *mode {
+                "read" => "read",
+                "write" => "write",
+                _ => "other",
+            };
+            record(Some(&resource), mode, "quorum");
+        }
+        _ => {}
+    }
+}
 
 /// Map a KMS failure that surfaced on the S3 data path to its S3 error code.
 ///
@@ -102,11 +186,58 @@ fn data_plane_kms_error(error: &rustfs_kms::KmsError) -> Option<(S3ErrorCode, St
 /// exist" has to say so itself.
 fn custom_error_status(code: &S3ErrorCode) -> Option<StatusCode> {
     match code {
-        S3ErrorCode::Custom(custom) if &**custom == KMS_KEY_NOT_FOUND_ERROR_CODE || &**custom == MAX_VERSIONS_EXCEEDED_CODE => {
+        S3ErrorCode::Custom(custom)
+            if matches!(
+                &**custom,
+                KMS_KEY_NOT_FOUND_ERROR_CODE | MAX_VERSIONS_EXCEEDED_CODE | CONTENT_SHA256_MISMATCH_CODE
+            ) =>
+        {
             Some(StatusCode::BAD_REQUEST)
         }
+        S3ErrorCode::Custom(custom) if &**custom == SLOW_DOWN_READ_CODE => Some(StatusCode::SERVICE_UNAVAILABLE),
         _ => None,
     }
+}
+
+pub(crate) fn slow_down_read_api_error(err: StorageError) -> ApiError {
+    ApiError {
+        code: S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()),
+        message: SLOW_DOWN_READ_MESSAGE.to_string(),
+        source: Some(Box::new(err)),
+    }
+}
+
+/// Normalize a storage read-quorum failure at PUT and LIST boundaries.
+///
+/// Storage-level read quorum failures keep their `SlowDownRead` code for GET
+/// compatibility. PUT and LIST expose storage unavailability instead of
+/// throttling, while retaining the typed source for diagnostics and audit consumers.
+pub(crate) fn normalize_read_quorum_error(mut err: S3Error) -> S3Error {
+    let is_slow_down_read = matches!(
+        err.code(),
+        S3ErrorCode::Custom(code) if &**code == SLOW_DOWN_READ_CODE
+    );
+    if !is_slow_down_read {
+        return err;
+    }
+    let has_read_quorum_source = err.source().is_some_and(|source| {
+        error_chain_find(source, |error| {
+            matches!(
+                error.downcast_ref::<StorageError>(),
+                Some(StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))
+            )
+            .then_some(())
+        })
+        .is_some()
+    });
+
+    if has_read_quorum_source {
+        err.set_code(S3ErrorCode::ServiceUnavailable);
+        err.set_message(ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable));
+        err.set_status_code(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    err
 }
 
 /// Marks a request body that exceeded a presigned upload size capability.
@@ -195,7 +326,9 @@ impl std::error::Error for ApiError {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ApiErrorDiagnostic {
     pub storage_code: Option<StorageErrorCode>,
+    pub lock_reason: Option<&'static str>,
     pub io_kind: Option<std::io::ErrorKind>,
+    pub io_os_error: Option<i32>,
     pub rpc_code: Option<tonic::Code>,
     pub pool_metadata: Option<PoolMetadataDiagnostic>,
     pub truncated: bool,
@@ -219,16 +352,34 @@ impl From<&PoolMetadataError> for PoolMetadataDiagnostic {
     }
 }
 
-impl ApiError {
-    pub(crate) fn diagnostic(&self) -> ApiErrorDiagnostic {
+impl ApiErrorDiagnostic {
+    pub(crate) fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
         let mut diagnostic = ApiErrorDiagnostic::default();
-        let mut current = std::error::Error::source(self);
+        // S3Error retains its payload through an inherent accessor; its
+        // std::error::Error implementation does not expose that source.
+        let mut current = if let Some(error) = error.downcast_ref::<S3Error>() {
+            error.source().map(|source| source as &(dyn std::error::Error + 'static))
+        } else {
+            std::error::Error::source(error)
+        };
         for _ in 0..16 {
             let Some(error) = current else {
                 return diagnostic;
             };
             if let Some(storage) = error.downcast_ref::<StorageError>() {
                 diagnostic.storage_code = Some(storage.code());
+                match storage {
+                    StorageError::Lock(lock_error) => {
+                        diagnostic.lock_reason = Some(lock_failure_reason(lock_error));
+                    }
+                    StorageError::NamespaceLockQuorumUnavailable { .. } => {
+                        diagnostic.lock_reason = Some("quorum");
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(lock_error) = error.downcast_ref::<LockError>() {
+                diagnostic.lock_reason = Some(lock_failure_reason(lock_error));
             }
             if let Some(status) = error.downcast_ref::<tonic::Status>() {
                 diagnostic.rpc_code = Some(status.code());
@@ -240,14 +391,23 @@ impl ApiError {
             }
             current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
                 diagnostic.io_kind = Some(io.kind());
+                diagnostic.io_os_error = io.raw_os_error();
                 // io::Error::source can skip the wrapped error itself.
                 io.get_ref().map(|source| source as &(dyn std::error::Error + 'static))
+            } else if let Some(error) = error.downcast_ref::<S3Error>() {
+                error.source().map(|source| source as &(dyn std::error::Error + 'static))
             } else {
                 error.source()
             };
         }
         diagnostic.truncated = current.is_some();
         diagnostic
+    }
+}
+
+impl ApiError {
+    pub(crate) fn diagnostic(&self) -> ApiErrorDiagnostic {
+        ApiErrorDiagnostic::from_error(self)
     }
 
     /// Access-denied error with the exact message emitted by the authorization
@@ -293,6 +453,9 @@ impl ApiError {
             S3ErrorCode::InvalidArgument => "Invalid argument".to_string(),
             S3ErrorCode::InvalidStorageClass => "Invalid storage class.".to_string(),
             S3ErrorCode::AccessDenied => "Access Denied.".to_string(),
+            S3ErrorCode::Custom(code) if &**code == CONTENT_SHA256_MISMATCH_CODE => {
+                CONTENT_SHA256_MISMATCH_MESSAGE.to_string()
+            }
             S3ErrorCode::BadDigest => "The Content-Md5 you specified did not match what we received.".to_string(),
             S3ErrorCode::EntityTooSmall => "Your proposed upload is smaller than the minimum allowed object size.".to_string(),
             S3ErrorCode::EntityTooLarge => "Your proposed upload exceeds the maximum allowed object size.".to_string(),
@@ -423,37 +586,67 @@ impl ApiError {
             S3ErrorCode::Custom(code) if &**code == MAX_VERSIONS_EXCEEDED_CODE => {
                 MAX_VERSIONS_EXCEEDED_MESSAGE.to_string()
             }
+            S3ErrorCode::Custom(code) if &**code == SLOW_DOWN_READ_CODE => SLOW_DOWN_READ_MESSAGE.to_string(),
             _ => code.as_str().to_string(),
         }
     }
 }
 
-fn error_chain_has_type<T>(err: &(dyn std::error::Error + 'static)) -> bool
-where
-    T: std::error::Error + 'static,
-{
-    error_chain_find(err, |error| error.is::<T>().then_some(())).is_some()
-}
+/// Classify body failures in one bounded pass, retaining precedence across wrappers.
+/// A digest failure wins immediately; other markers must wait for deeper causes.
+fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3ErrorCode> {
+    let mut upload_limit_exceeded = false;
+    let mut server_source_failed = false;
+    let mut client_body_timed_out = false;
+    let mut body_size_exceeded = false;
+    let mut aws_chunked_error = None;
+    let mut incomplete_body = false;
+    let mut rpc_unavailable = false;
+    let digest = error_chain_find(err, |error| {
+        let upload_error = error.downcast_ref::<UploadStreamError>();
+        if matches!(upload_error, Some(UploadStreamError::Sha256Mismatch)) || error.is::<rustfs_rio::Sha256Mismatch>() {
+            return Some(S3ErrorCode::Custom(CONTENT_SHA256_MISMATCH_CODE.into()));
+        }
+        if error.is::<rustfs_rio::ChecksumMismatch>() || error.is::<rustfs_rio::BadDigest>() {
+            return Some(S3ErrorCode::BadDigest);
+        }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum S3sBodyStreamError {
-    Sha256Mismatch,
-    IncompleteBody,
-}
-
-fn classify_s3s_body_stream_error_display(err: &(dyn std::error::Error + 'static)) -> Option<S3sBodyStreamError> {
-    match err.to_string().as_str() {
-        "UploadStreamError: Sha256Mismatch" => Some(S3sBodyStreamError::Sha256Mismatch),
-        "UploadStreamError: LengthMismatch"
-        | "UploadStreamError: Incomplete"
-        | "AwsChunkedStreamError: LengthMismatch"
-        | "AwsChunkedStreamError: Incomplete" => Some(S3sBodyStreamError::IncompleteBody),
-        _ => None,
-    }
-}
-
-fn error_chain_s3s_body_stream_error(err: &(dyn std::error::Error + 'static)) -> Option<S3sBodyStreamError> {
-    error_chain_find(err, classify_s3s_body_stream_error_display)
+        rpc_unavailable |= error
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|status| status.code() == tonic::Code::Unavailable);
+        upload_limit_exceeded |= error.is::<UploadLimitExceeded>();
+        server_source_failed |= error.is::<ServerSideSourceReadError>();
+        client_body_timed_out |= error.is::<ClientBodyReadTimeout>();
+        body_size_exceeded |= error.is::<s3s::BodySizeLimitExceeded>();
+        if let Some(chunked) = error.downcast_ref::<AwsChunkedStreamError>()
+            && !matches!(chunked, AwsChunkedStreamError::Underlying(_))
+        {
+            aws_chunked_error = Some(chunked.to_s3_error_code());
+        }
+        incomplete_body |= error.is::<rustfs_rio::IncompleteBody>()
+            || matches!(upload_error, Some(UploadStreamError::LengthMismatch | UploadStreamError::Incomplete))
+            || is_hyper_body_eof(error);
+        None
+    });
+    digest.or_else(|| {
+        if upload_limit_exceeded {
+            Some(S3ErrorCode::EntityTooLarge)
+        } else if server_source_failed {
+            Some(S3ErrorCode::ServiceUnavailable)
+        } else if client_body_timed_out {
+            Some(S3ErrorCode::RequestTimeout)
+        } else if body_size_exceeded {
+            Some(S3ErrorCode::EntityTooLarge)
+        } else if let Some(code) = aws_chunked_error {
+            Some(code)
+        } else if incomplete_body {
+            Some(S3ErrorCode::IncompleteBody)
+        } else if rpc_unavailable {
+            Some(S3ErrorCode::ServiceUnavailable)
+        } else {
+            None
+        }
+    })
 }
 
 /// `io::Error::source` skips its custom payload itself. Visit that payload
@@ -478,10 +671,6 @@ fn error_chain_find<T>(
     None
 }
 
-fn error_chain_has_body_size_limit_exceeded(err: &(dyn std::error::Error + 'static)) -> bool {
-    error_chain_has_type::<s3s::BodySizeLimitExceeded>(err)
-}
-
 /// hyper reports a request body whose connection hit EOF before
 /// `Content-Length` bytes arrived as a `Kind::Body` error carrying an
 /// `UnexpectedEof` `io::Error` (its `IncompleteBody` marker is private).
@@ -493,14 +682,51 @@ fn is_hyper_body_eof(err: &(dyn std::error::Error + 'static)) -> bool {
         .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::UnexpectedEof)
 }
 
-fn error_chain_has_hyper_body_eof(err: &(dyn std::error::Error + 'static)) -> bool {
-    error_chain_find(err, |error| is_hyper_body_eof(error).then_some(())).is_some()
+/// A nested lock timeout retains its retry advice even when an outer lock
+/// failure supplies a less specific cause. Share one bounded source walk.
+fn service_unavailable_cause(source: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut cause = None;
+    let timeout = error_chain_find(source, |error| match error.downcast_ref::<LockError>() {
+        Some(LockError::Timeout { .. }) => Some(NAMESPACE_LOCK_TIMEOUT_CAUSE),
+        Some(_) => {
+            cause.get_or_insert("namespace_lock_unavailable");
+            None
+        }
+        None => {
+            if cause.is_none() {
+                cause = match error.downcast_ref::<StorageError>() {
+                    Some(StorageError::NamespaceLockQuorumUnavailable { .. }) => Some("namespace_lock_unavailable"),
+                    Some(StorageError::ErasureWriteQuorum | StorageError::InsufficientWriteQuorum(_, _)) => {
+                        Some("storage_write_quorum")
+                    }
+                    _ => None,
+                };
+            }
+            None
+        }
+    });
+    timeout.or(cause)
 }
 
 impl From<ApiError> for S3Error {
     fn from(err: ApiError) -> Self {
         let status = custom_error_status(&err.code);
+        let cause = if err.code == S3ErrorCode::ServiceUnavailable {
+            err.source.as_deref().and_then(|source| service_unavailable_cause(source))
+        } else {
+            None
+        };
         let mut s3e = S3Error::with_message(err.code, err.message);
+        if let Some(cause) = cause {
+            let mut headers = http::HeaderMap::new();
+            // s3s replaces the generated headers when a custom map is supplied.
+            headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/xml"));
+            headers.insert("x-rustfs-error-cause", http::HeaderValue::from_static(cause));
+            if cause == NAMESPACE_LOCK_TIMEOUT_CAUSE {
+                headers.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("1"));
+            }
+            s3e.set_headers(headers);
+        }
         if let Some(status) = status {
             s3e.set_status_code(status);
         }
@@ -511,8 +737,29 @@ impl From<ApiError> for S3Error {
     }
 }
 
+impl From<crate::table_catalog::TableCatalogStoreError> for ApiError {
+    fn from(err: crate::table_catalog::TableCatalogStoreError) -> Self {
+        if let crate::table_catalog::TableCatalogStoreError::LockUnavailable { source, .. } = err {
+            // Use the storage boundary once so typed lock failures share its
+            // bounded metrics, public message, and retry advice.
+            return Self::from(StorageError::Lock(*source));
+        }
+        let code = if err.is_unavailable() {
+            S3ErrorCode::ServiceUnavailable
+        } else {
+            S3ErrorCode::InternalError
+        };
+        Self {
+            message: Self::error_code_to_message(&code),
+            code,
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
+        record_s3_lock_failure(&err);
         if err.pool_metadata_failure().is_some() {
             return ApiError {
                 code: S3ErrorCode::ServiceUnavailable,
@@ -533,65 +780,10 @@ impl From<StorageError> for ApiError {
         if let StorageError::Io(ref io_err) = err
             && let Some(inner) = io_err.get_ref()
         {
-            let s3s_body_stream_error = error_chain_s3s_body_stream_error(inner);
-
-            // Preserve client-provided body and digest failures across I/O boundaries.
-            if inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some()
-                || inner.downcast_ref::<rustfs_rio::BadDigest>().is_some()
-                || inner.downcast_ref::<rustfs_rio::Sha256Mismatch>().is_some()
-                || matches!(s3s_body_stream_error, Some(S3sBodyStreamError::Sha256Mismatch))
-            {
+            if let Some(code) = body_read_error_code(inner) {
                 return ApiError {
-                    code: S3ErrorCode::BadDigest,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_type::<UploadLimitExceeded>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::EntityTooLarge,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_type::<ServerSideSourceReadError>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::ServiceUnavailable,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_type::<ClientBodyReadTimeout>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::RequestTimeout,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::RequestTimeout),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_body_size_limit_exceeded(inner) {
-                return ApiError {
-                    code: S3ErrorCode::EntityTooLarge,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_hyper_body_eof(inner) {
-                return ApiError {
-                    code: S3ErrorCode::IncompleteBody,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if matches!(s3s_body_stream_error, Some(S3sBodyStreamError::IncompleteBody)) {
-                return ApiError {
-                    code: S3ErrorCode::IncompleteBody,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
+                    message: ApiError::error_code_to_message(&code),
+                    code,
                     source: Some(Box::new(err)),
                 };
             }
@@ -624,16 +816,20 @@ impl From<StorageError> for ApiError {
             StorageError::BucketNameInvalid(_) => S3ErrorCode::InvalidBucketName,
             StorageError::ObjectNameInvalid(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
-            StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
+            StorageError::DiskFull | StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
+            // Retryable on an upgraded node (or once the cluster upgrade
+            // completes); see UNSUPPORTED_PARTICIPANT_MESSAGE.
+            StorageError::UnsupportedDisk => S3ErrorCode::ServiceUnavailable,
             StorageError::SlowDown => S3ErrorCode::SlowDown,
             StorageError::FaultyDisk
             | StorageError::FaultyRemoteDisk
             | StorageError::DiskNotFound
+            | StorageError::Timeout
             | StorageError::TooManyOpenFiles => S3ErrorCode::ServiceUnavailable,
-            StorageError::ErasureReadQuorum
-            | StorageError::InsufficientReadQuorum(_, _)
-            | StorageError::ErasureWriteQuorum
-            | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::ServiceUnavailable,
+            StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => {
+                S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into())
+            }
+            StorageError::ErasureWriteQuorum | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::ServiceUnavailable,
             StorageError::NamespaceLockQuorumUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
             StorageError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
             StorageError::MaxVersionsExceeded => S3ErrorCode::Custom(MAX_VERSIONS_EXCEEDED_CODE.into()),
@@ -660,6 +856,8 @@ impl From<StorageError> for ApiError {
             StorageError::EntityTooSmall(_, _, _) => S3ErrorCode::EntityTooSmall,
             StorageError::EntityTooLarge(_, _) => S3ErrorCode::EntityTooLarge,
             StorageError::PreconditionFailed => S3ErrorCode::PreconditionFailed,
+            StorageError::ConditionalDeleteConflict => S3ErrorCode::OperationAborted,
+            StorageError::GuardedDeleteUnsupported => S3ErrorCode::NotImplemented,
             StorageError::NotModified => S3ErrorCode::NotModified,
             StorageError::InvalidRangeSpec(_) => S3ErrorCode::InvalidRange,
             _ => S3ErrorCode::InternalError,
@@ -667,6 +865,8 @@ impl From<StorageError> for ApiError {
 
         let message = if matches!(&err, StorageError::QuotaExceeded { .. }) {
             err.to_string()
+        } else if matches!(&err, StorageError::UnsupportedDisk) {
+            UNSUPPORTED_PARTICIPANT_MESSAGE.to_string()
         } else if matches!(&err, StorageError::MaxVersionsExceeded)
             || (code == S3ErrorCode::InternalError && matches!(&err, StorageError::Io(_)))
         {
@@ -703,72 +903,14 @@ impl From<HTTPRangeError> for ApiError {
 
 impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
-        // Map client-provided digest mismatches to BadDigest.
-        if let Some(inner) = err.get_ref() {
-            let s3s_body_stream_error = error_chain_s3s_body_stream_error(inner);
-            if error_chain_has_type::<rustfs_rio::ChecksumMismatch>(inner)
-                || error_chain_has_type::<rustfs_rio::BadDigest>(inner)
-                || error_chain_has_type::<rustfs_rio::Sha256Mismatch>(inner)
-                || matches!(s3s_body_stream_error, Some(S3sBodyStreamError::Sha256Mismatch))
-            {
-                return ApiError {
-                    code: S3ErrorCode::BadDigest,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
-                    source: Some(Box::new(err)),
-                };
-            }
-            if error_chain_has_type::<UploadLimitExceeded>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::EntityTooLarge,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
-                    source: Some(Box::new(err)),
-                };
-            }
-            if error_chain_has_type::<ServerSideSourceReadError>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::ServiceUnavailable,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
-                    source: Some(Box::new(err)),
-                };
-            }
-            if error_chain_has_type::<ClientBodyReadTimeout>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::RequestTimeout,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::RequestTimeout),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_body_size_limit_exceeded(inner) {
-                return ApiError {
-                    code: S3ErrorCode::EntityTooLarge,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_hyper_body_eof(inner) {
-                return ApiError {
-                    code: S3ErrorCode::IncompleteBody,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if matches!(s3s_body_stream_error, Some(S3sBodyStreamError::IncompleteBody)) {
-                return ApiError {
-                    code: S3ErrorCode::IncompleteBody,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
-                    source: Some(Box::new(err)),
-                };
-            }
-            if error_chain_has_type::<rustfs_rio::IncompleteBody>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::IncompleteBody,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
-                    source: Some(Box::new(err)),
-                };
-            }
+        if let Some(inner) = err.get_ref()
+            && let Some(code) = body_read_error_code(inner)
+        {
+            return ApiError {
+                message: ApiError::error_code_to_message(&code),
+                code,
+                source: Some(Box::new(err)),
+            };
         }
         ApiError {
             code: S3ErrorCode::InternalError,
@@ -812,8 +954,303 @@ impl From<QuotaError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics::with_local_recorder;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
+    use rustfs_s3_ops::S3Operation;
+    use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
     use s3s::{S3Error, S3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
+
+    fn error_chain_has_type<T>(err: &(dyn std::error::Error + 'static)) -> bool
+    where
+        T: std::error::Error + 'static,
+    {
+        error_chain_find(err, |error| error.is::<T>().then_some(())).is_some()
+    }
+
+    #[tokio::test]
+    async fn lock_timeout_response_advises_retry_without_exposing_resource() {
+        use http_body_util::BodyExt as _;
+
+        let storage_error =
+            StorageError::Lock(LockError::timeout("private-bucket/private-key@latest", std::time::Duration::from_secs(5)));
+        let error = S3Error::from(ApiError::from(storage_error));
+        assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+        let source = error.source().expect("retain the typed storage cause");
+        assert!(source.downcast_ref::<StorageError>().is_some());
+        assert!(error_chain_has_type::<LockError>(source));
+        let response = error.to_http_response().expect("serialize lock timeout response");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+        assert_eq!(response.headers()["x-rustfs-error-cause"], "namespace_lock_timeout");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("read timeout error XML")
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("S3 XML is UTF-8");
+        assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(!body.contains("private-bucket"));
+        assert!(!body.contains("private-key"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_participant_is_retryable_with_an_actionable_message() {
+        use http_body_util::BodyExt as _;
+
+        let error = S3Error::from(ApiError::from(StorageError::UnsupportedDisk));
+        assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(error.message(), Some(UNSUPPORTED_PARTICIPANT_MESSAGE));
+        assert!(matches!(
+            error.source().and_then(|source| source.downcast_ref::<StorageError>()),
+            Some(StorageError::UnsupportedDisk)
+        ));
+
+        let response = error
+            .to_http_response()
+            .expect("unsupported participant error must serialize");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !response.headers().contains_key(http::header::RETRY_AFTER),
+            "retrying the same node does not help until it or its peers are upgraded"
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("error XML must be readable")
+            .to_bytes();
+        let xml = std::str::from_utf8(&body).expect("error XML must be UTF-8");
+        assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(
+            !xml.contains("O_DIRECT"),
+            "the drive-probe Display text must not leak as the public message"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_failures_share_service_unavailable_without_lock_retry_advice() {
+        use crate::storage_api::error::DiskError;
+        use http_body_util::BodyExt as _;
+
+        for failure in [
+            StorageError::DiskFull,
+            StorageError::StorageFull,
+            StorageError::from(DiskError::DiskFull),
+        ] {
+            let expected_code = failure.code();
+            let error = S3Error::from(ApiError::from(failure));
+            assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(error.message(), Some("The service is unavailable. Please retry."));
+            let source = error
+                .source()
+                .and_then(|source| source.downcast_ref::<StorageError>())
+                .expect("retain the original capacity failure");
+            assert_eq!(source.code(), expected_code);
+            let response = error.to_http_response().expect("serialize capacity refusal");
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+            let body = response.into_body().collect().await.expect("read S3 error XML").to_bytes();
+            let xml = std::str::from_utf8(&body).expect("S3 XML is UTF-8");
+            assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
+            assert!(!xml.contains("InternalError"));
+        }
+    }
+
+    #[test]
+    fn lock_timeout_response_preserves_wrapped_source_and_requires_503() {
+        for code in [S3ErrorCode::ServiceUnavailable, S3ErrorCode::RequestTimeout] {
+            let should_advise_retry = code == S3ErrorCode::ServiceUnavailable;
+            for source in [
+                IoError::other(LockError::timeout("bucket/object@latest", std::time::Duration::from_secs(5))),
+                IoError::other(LockError::Network {
+                    message: "private-peer".to_owned(),
+                    source: Box::new(LockError::timeout("bucket/object@latest", std::time::Duration::from_secs(5))),
+                }),
+            ] {
+                let error = S3Error::from(ApiError {
+                    message: ApiError::error_code_to_message(&code),
+                    code: code.clone(),
+                    source: Some(Box::new(source)),
+                });
+                assert_eq!(error.code(), &code);
+                let source = error.source().expect("preserve wrapped lock timeout");
+                assert!(error_chain_has_type::<LockError>(source));
+                let response = error.to_http_response().expect("serialize wrapped timeout");
+                assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
+                assert_eq!(response.headers().contains_key(http::header::RETRY_AFTER), should_advise_retry);
+                assert_eq!(response.headers().contains_key("x-rustfs-error-cause"), should_advise_retry);
+                if should_advise_retry {
+                    assert_eq!(response.headers()["x-rustfs-error-cause"], "namespace_lock_timeout");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_response_attributes_typed_causes_without_exposing_resources() {
+        use http_body_util::BodyExt as _;
+
+        for (failure, cause) in [
+            (
+                StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "quota_capability",
+                    bucket: "private-bucket".to_owned(),
+                    object: "private-object".to_owned(),
+                    required: 3,
+                    achieved: 2,
+                },
+                "namespace_lock_unavailable",
+            ),
+            (
+                StorageError::Lock(LockError::QuorumNotReached {
+                    required: 3,
+                    achieved: 2,
+                }),
+                "namespace_lock_unavailable",
+            ),
+            (StorageError::ErasureWriteQuorum, "storage_write_quorum"),
+            (
+                StorageError::InsufficientWriteQuorum("private-bucket".to_owned(), "private-object".to_owned()),
+                "storage_write_quorum",
+            ),
+        ] {
+            let expected_code = failure.code();
+            let error = S3Error::from(ApiError::from(failure));
+            assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(error.message(), Some("The service is unavailable. Please retry."));
+            let source = error
+                .source()
+                .and_then(|source| source.downcast_ref::<StorageError>())
+                .expect("retain the original storage failure");
+            assert_eq!(source.code(), expected_code);
+            let response = error.to_http_response().expect("serialize typed unavailable response");
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
+            assert_eq!(response.headers()["x-rustfs-error-cause"], cause);
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+            let body = response.into_body().collect().await.expect("read S3 error XML").to_bytes();
+            let xml = std::str::from_utf8(&body).expect("S3 XML is UTF-8");
+            assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
+            assert!(!xml.contains("private-bucket"));
+            assert!(!xml.contains("private-object"));
+        }
+    }
+
+    #[test]
+    fn unavailable_response_does_not_infer_a_cause_from_timeout_text() {
+        for failure in [
+            StorageError::Timeout,
+            StorageError::DiskFull,
+            StorageError::DiskNotFound,
+            StorageError::Io(IoError::other("Lock acquisition timeout for private-bucket/private-object after 5s")),
+            StorageError::Io(IoError::new(std::io::ErrorKind::TimedOut, "body stalled")),
+        ] {
+            let error = S3Error::from(ApiError::from(failure));
+            let response = error.to_http_response().expect("serialize unattributed failure");
+            assert!(!response.headers().contains_key("x-rustfs-error-cause"));
+        }
+    }
+
+    #[test]
+    fn unrelated_unavailable_responses_do_not_inherit_lock_retry_advice() {
+        for failure in [
+            StorageError::Timeout,
+            StorageError::DiskNotFound,
+            StorageError::FileCorrupt,
+            StorageError::NamespaceLockQuorumUnavailable {
+                mode: "read",
+                bucket: "bucket".to_owned(),
+                object: "object".to_owned(),
+                required: 2,
+                achieved: 1,
+            },
+            StorageError::Io(IoError::other("Lock acquisition timeout for bucket/object after 5s")),
+            StorageError::SlowDown,
+        ] {
+            let error = S3Error::from(ApiError::from(failure));
+            let response = error.to_http_response().expect("serialize unrelated storage failure");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+        }
+    }
+
+    #[test]
+    fn lock_503_mapping_records_operation_and_resource_class_without_resource_name() {
+        let recorder = DebuggingRecorder::new();
+        with_local_recorder(&recorder, || {
+            let mut request = S3HttpRequestGuard::new("PUT");
+            request.in_scope(|| {
+                rustfs_io_metrics::record_s3_op(S3Operation::PutObject);
+                let error = ApiError::from(StorageError::Lock(LockError::timeout(
+                    ".rustfs.sys/scanner/durable-dirty-producer-replay.json",
+                    std::time::Duration::from_secs(5),
+                )));
+                assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
+            });
+        });
+
+        let metrics = recorder.snapshotter().snapshot().into_vec();
+        let (key, _, _, value) = metrics
+            .iter()
+            .find(|(key, _, _, _)| key.key().name() == "rustfs_s3_lock_failures_total")
+            .expect("S3 lock failures should be observable");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let labels = key
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(labels["op"], S3Operation::PutObject.as_str());
+        assert_eq!(labels["mode"], "unknown");
+        assert_eq!(labels["reason"], "timeout");
+        assert_eq!(labels["resource_class"], "system_metadata");
+        assert!(!labels.values().any(|value| value.contains("durable-dirty-producer-replay")));
+    }
+
+    #[test]
+    fn catalog_lock_failure_uses_canonical_metrics_and_retry_advice_once() {
+        let recorder = DebuggingRecorder::new();
+        let error = with_local_recorder(&recorder, || {
+            let mut request = S3HttpRequestGuard::new("PUT");
+            request.in_scope(|| {
+                rustfs_io_metrics::record_s3_op(S3Operation::PutObject);
+                S3Error::from(ApiError::from(crate::table_catalog::TableCatalogStoreError::LockUnavailable {
+                    message: "private catalog operation".to_owned(),
+                    source: Box::new(LockError::timeout(
+                        "private-bucket/.rustfs-table/warehouses/default/publication.lock@latest",
+                        std::time::Duration::from_secs(5),
+                    )),
+                }))
+            })
+        });
+        let response = error.to_http_response().expect("serialize catalog lock timeout");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+        let metrics = recorder.snapshotter().snapshot().into_vec();
+        let (key, _, _, value) = metrics
+            .iter()
+            .find(|(key, _, _, _)| key.key().name() == "rustfs_s3_lock_failures_total")
+            .expect("catalog lock failures should use the canonical counter");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let labels = key
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(labels["op"], S3Operation::PutObject.as_str());
+        assert_eq!(labels["reason"], "timeout");
+        assert_eq!(labels["resource_class"], "object_namespace");
+        assert!(!labels.values().any(|value| value.contains("private")));
+    }
+
+    #[test]
+    fn multipart_lock_resources_have_a_distinct_bounded_class() {
+        assert_eq!(lock_resource_class(Some(".rustfs.sys/multipart/upload-1")), "multipart_metadata");
+        assert_eq!(lock_resource_class(Some(".minio.sys/multipart/upload-1")), "multipart_metadata");
+    }
 
     /// rustfs/backlog#1734: a refusal to act on a stored bucket config that
     /// cannot be parsed is recoverable once an operator repairs the bytes, so
@@ -857,6 +1294,120 @@ mod tests {
     }
 
     #[test]
+    fn api_error_diagnostic_classifies_lock_failures_without_exposing_resources() {
+        let cases = [
+            (
+                LockError::timeout("private-bucket/private-key", std::time::Duration::from_secs(5)),
+                "timeout",
+            ),
+            (
+                LockError::AlreadyLocked {
+                    resource: "private-bucket/private-key".into(),
+                    owner: "private-owner".into(),
+                },
+                "contention",
+            ),
+            (
+                LockError::QuorumNotReached {
+                    required: 3,
+                    achieved: 2,
+                },
+                "quorum",
+            ),
+            (
+                LockError::InsufficientNodes {
+                    required: 3,
+                    available: 2,
+                },
+                "insufficient_nodes",
+            ),
+            (LockError::internal("private-transport-detail"), "internal"),
+            (LockError::network("private-network-detail", IoError::other("private-source")), "network"),
+            (
+                LockError::QueueFull {
+                    message: "private-queue-detail".into(),
+                },
+                "other",
+            ),
+        ];
+        for (failure, expected) in cases {
+            let api = ApiError::from(StorageError::Lock(failure));
+            assert_eq!(api.code, S3ErrorCode::ServiceUnavailable);
+            let diagnostic = api.diagnostic();
+            assert_eq!(diagnostic.storage_code, Some(StorageErrorCode::Lock));
+            assert_eq!(diagnostic.lock_reason, Some(expected));
+            assert!(!format!("{diagnostic:?}").contains("private"));
+            let s3: S3Error = api.into();
+            assert_eq!(s3.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(super::ApiErrorDiagnostic::from_error(&s3).lock_reason, Some(expected));
+        }
+
+        let nested = ApiError::from(StorageError::Io(IoError::other(StorageError::Lock(LockError::timeout(
+            "private-bucket/private-key",
+            std::time::Duration::from_secs(5),
+        )))));
+        assert_eq!(nested.diagnostic().lock_reason, Some("timeout"));
+        assert!(!format!("{:?}", nested.diagnostic()).contains("private"));
+
+        let nested_lock = ApiError::from(StorageError::Lock(LockError::network(
+            "private-transport",
+            StorageError::Lock(LockError::timeout("private-bucket/private-key", std::time::Duration::from_secs(5))),
+        )));
+        assert_eq!(nested_lock.diagnostic().storage_code, Some(StorageErrorCode::Lock));
+        assert_eq!(nested_lock.diagnostic().lock_reason, Some("timeout"));
+        assert!(!format!("{:?}", nested_lock.diagnostic()).contains("private"));
+
+        let nested_direct = ApiError::from(StorageError::Lock(LockError::network(
+            "private-transport",
+            LockError::timeout("private-bucket/private-key", std::time::Duration::from_secs(5)),
+        )));
+        assert_eq!(nested_direct.diagnostic().lock_reason, Some("timeout"));
+        assert!(!format!("{:?}", nested_direct.diagnostic()).contains("private"));
+
+        let unavailable = ApiError::from(StorageError::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: "private-bucket".into(),
+            object: "private-key".into(),
+            required: 3,
+            achieved: 2,
+        });
+        assert_eq!(unavailable.diagnostic().lock_reason, Some("quorum"));
+        assert!(!format!("{:?}", unavailable.diagnostic()).contains("private"));
+
+        let other = ApiError::from(StorageError::ErasureWriteQuorum);
+        assert_eq!(other.diagnostic().lock_reason, None);
+    }
+
+    #[test]
+    fn api_error_diagnostic_survives_s3_conversion_without_changing_response() {
+        let api = ApiError::from(StorageError::Io(IoError::from_raw_os_error(30)));
+        let before = api.diagnostic();
+        assert_eq!(before.io_os_error, Some(30));
+        let mut error: S3Error = api.into();
+        error.set_request_id("server-owned-request");
+        let code = error.code().clone();
+        let status = error.status_code();
+        let message = error.message().map(str::to_owned);
+        assert_eq!(super::ApiErrorDiagnostic::from_error(&error), before);
+        assert_eq!(error.code(), &code);
+        assert_eq!(error.status_code(), status);
+        assert_eq!(error.message(), message.as_deref());
+        assert_eq!(error.request_id(), Some("server-owned-request"));
+        assert!(error.source().is_some());
+        assert!(std::error::Error::source(&error).is_none());
+
+        let error: S3Error = ApiError::from(StorageError::Io(IoError::other(StorageError::ErasureReadQuorum))).into();
+        assert_eq!(
+            super::ApiErrorDiagnostic::from_error(&error).storage_code,
+            Some(StorageErrorCode::ErasureReadQuorum)
+        );
+
+        let nested: S3Error = ApiError::from(StorageError::ErasureReadQuorum).into();
+        let api = ApiError::from(StorageError::Io(IoError::other(nested)));
+        assert_eq!(api.diagnostic().storage_code, Some(StorageErrorCode::ErasureReadQuorum));
+    }
+
+    #[test]
     fn api_error_diagnostic_bounds_cyclic_error_chains() {
         #[derive(Debug)]
         struct Cycle;
@@ -877,34 +1428,19 @@ mod tests {
         };
         assert!(error.diagnostic().truncated);
         assert!(!format!("{:?}", error.diagnostic()).contains("secret"));
-    }
+        let error: S3Error = error.into();
+        let diagnostic = super::ApiErrorDiagnostic::from_error(&error);
+        assert!(diagnostic.truncated);
+        assert!(!format!("{diagnostic:?}").contains("secret"));
 
-    #[derive(Debug)]
-    enum MockUploadStreamError {
-        Underlying(IoError),
-        Sha256Mismatch,
-        LengthMismatch,
-        Incomplete,
-    }
-
-    impl std::fmt::Display for MockUploadStreamError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Underlying(err) => write!(f, "UploadStreamError: Underlying: {err}"),
-                Self::Sha256Mismatch => f.write_str("UploadStreamError: Sha256Mismatch"),
-                Self::LengthMismatch => f.write_str("UploadStreamError: LengthMismatch"),
-                Self::Incomplete => f.write_str("UploadStreamError: Incomplete"),
-            }
-        }
-    }
-
-    impl std::error::Error for MockUploadStreamError {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            match self {
-                Self::Underlying(err) => Some(err),
-                Self::Sha256Mismatch | Self::LengthMismatch | Self::Incomplete => None,
-            }
-        }
+        let error = S3Error::from(ApiError {
+            code: S3ErrorCode::ServiceUnavailable,
+            message: "safe".into(),
+            source: Some(Box::new(Cycle)),
+        });
+        let response = error.to_http_response().expect("serialize cyclic unavailable source");
+        assert!(!response.headers().contains_key("x-rustfs-error-cause"));
+        assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
     }
 
     #[derive(Debug)]
@@ -955,94 +1491,334 @@ mod tests {
     }
 
     #[test]
-    fn sha256_mismatch_io_errors_map_to_bad_digest() {
-        let io_error = IoError::new(
-            ErrorKind::InvalidData,
-            rustfs_rio::Sha256Mismatch {
-                expected_sha256: "expected".to_string(),
-                calculated_sha256: "calculated".to_string(),
-            },
-        );
-        let api_error = ApiError::from(io_error);
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
-
-        let storage_error = StorageError::Io(IoError::new(
-            ErrorKind::InvalidData,
-            rustfs_rio::Sha256Mismatch {
-                expected_sha256: "expected".to_string(),
-                calculated_sha256: "calculated".to_string(),
-            },
-        ));
-        let api_error = ApiError::from(storage_error);
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+    fn payload_sha256_mismatch_io_errors_map_to_content_sha256_mismatch() {
+        for storage in [false, true] {
+            for nested in [false, true] {
+                for error in [
+                    IoError::other(rustfs_rio::Sha256Mismatch {
+                        expected_sha256: "expected".to_string(),
+                        calculated_sha256: "calculated".to_string(),
+                    }),
+                    IoError::other(UploadStreamError::Sha256Mismatch),
+                ] {
+                    let error = if nested { IoError::other(error) } else { error };
+                    let api_error = if storage {
+                        ApiError::from(StorageError::Io(error))
+                    } else {
+                        ApiError::from(error)
+                    };
+                    assert_eq!(api_error.code.as_str(), "XAmzContentSHA256Mismatch");
+                    assert_eq!(
+                        api_error.message,
+                        "The provided 'x-amz-content-sha256' header does not match what was computed."
+                    );
+                    assert!(
+                        error_chain_has_type::<rustfs_rio::Sha256Mismatch>(&api_error)
+                            || error_chain_has_type::<UploadStreamError>(&api_error)
+                    );
+                    let s3_error = S3Error::from(api_error);
+                    assert_eq!(s3_error.status_code(), Some(StatusCode::BAD_REQUEST));
+                    assert!(s3_error.source().is_some());
+                }
+            }
+        }
     }
 
     #[test]
-    fn content_md5_mismatch_io_errors_map_to_bad_digest() {
-        let bad_digest = || rustfs_rio::BadDigest {
-            expected_md5: "expected".to_string(),
-            calculated_md5: "calculated".to_string(),
-        };
-        let api_error = ApiError::from(IoError::new(ErrorKind::InvalidData, bad_digest()));
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
-
-        let api_error = ApiError::from(StorageError::Io(IoError::new(ErrorKind::InvalidData, bad_digest())));
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
-    }
-
-    #[test]
-    fn upload_stream_sha256_mismatch_maps_to_bad_digest() {
-        let api_error = ApiError::from(IoError::other(MockUploadStreamError::Sha256Mismatch));
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
-
-        let api_error = ApiError::from(StorageError::Io(IoError::other(MockUploadStreamError::Sha256Mismatch)));
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+    fn content_md5_and_additional_checksum_mismatches_map_to_bad_digest() {
+        for storage in [false, true] {
+            for nested in [false, true] {
+                for error in [
+                    IoError::other(rustfs_rio::BadDigest {
+                        expected_md5: "expected".to_string(),
+                        calculated_md5: "calculated".to_string(),
+                    }),
+                    IoError::other(rustfs_rio::ChecksumMismatch {
+                        want: "expected".into(),
+                        got: "calculated".into(),
+                    }),
+                ] {
+                    let error = if nested { IoError::other(error) } else { error };
+                    let api_error = if storage {
+                        ApiError::from(StorageError::Io(error))
+                    } else {
+                        ApiError::from(error)
+                    };
+                    assert_eq!(api_error.code, S3ErrorCode::BadDigest);
+                    assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+                    assert_eq!(S3Error::from(api_error).status_code(), Some(StatusCode::BAD_REQUEST));
+                }
+            }
+        }
     }
 
     #[test]
     fn underlying_upload_stream_errors_remain_internal() {
-        let api_error =
-            ApiError::from(IoError::other(MockUploadStreamError::Underlying(IoError::other("underlying body error"))));
+        let api_error = ApiError::from(IoError::other(UploadStreamError::Underlying(Box::new(IoError::other(
+            "underlying body error",
+        )))));
         assert_eq!(api_error.code, S3ErrorCode::InternalError);
 
-        let api_error = ApiError::from(StorageError::Io(IoError::other(MockUploadStreamError::Underlying(IoError::other(
-            "underlying body error",
+        let api_error = ApiError::from(StorageError::Io(IoError::other(UploadStreamError::Underlying(Box::new(
+            IoError::other("underlying body error"),
         )))));
         assert_eq!(api_error.code, S3ErrorCode::InternalError);
     }
 
     #[test]
     fn s3s_incomplete_body_stream_errors_map_to_incomplete_body() {
-        for error in [MockUploadStreamError::LengthMismatch, MockUploadStreamError::Incomplete] {
+        for error in [UploadStreamError::LengthMismatch, UploadStreamError::Incomplete] {
             let api_error = ApiError::from(IoError::other(error));
             assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
             assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
         }
 
-        for error in [MockUploadStreamError::LengthMismatch, MockUploadStreamError::Incomplete] {
+        for error in [UploadStreamError::LengthMismatch, UploadStreamError::Incomplete] {
             let api_error = ApiError::from(StorageError::Io(IoError::other(error)));
             assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
             assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
         }
 
-        for message in ["AwsChunkedStreamError: LengthMismatch", "AwsChunkedStreamError: Incomplete"] {
-            let api_error = ApiError::from(IoError::other(MockS3sBodyStreamError(message)));
-            assert_eq!(api_error.code, S3ErrorCode::IncompleteBody, "{message}");
-            assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+        for storage in [false, true] {
+            for nested in [false, true] {
+                for error in [AwsChunkedStreamError::LengthMismatch, AwsChunkedStreamError::Incomplete] {
+                    let error = IoError::other(error);
+                    let error = if nested { IoError::other(error) } else { error };
+                    let api_error = if storage {
+                        ApiError::from(StorageError::Io(error))
+                    } else {
+                        ApiError::from(error)
+                    };
+                    assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
+                    assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+                }
+            }
+        }
+    }
 
-            let api_error = ApiError::from(IoError::other(IoError::other(MockS3sBodyStreamError(message))));
-            assert_eq!(api_error.code, S3ErrorCode::IncompleteBody, "{message}");
-            assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+    #[test]
+    fn body_error_display_text_does_not_impersonate_typed_failures() {
+        for message in [
+            "UploadStreamError: Sha256Mismatch",
+            "UploadStreamError: Incomplete",
+            "AwsChunkedStreamError: LengthMismatch",
+        ] {
+            for error in [
+                ApiError::from(IoError::other(MockS3sBodyStreamError(message))),
+                ApiError::from(StorageError::Io(IoError::other(MockS3sBodyStreamError(message)))),
+            ] {
+                assert_eq!(error.code, S3ErrorCode::InternalError);
+            }
+        }
+    }
 
-            let api_error = ApiError::from(StorageError::Io(IoError::other(MockS3sBodyStreamError(message))));
-            assert_eq!(api_error.code, S3ErrorCode::IncompleteBody, "{message}");
-            assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+    #[tokio::test]
+    async fn aws_chunked_named_errors_preserve_http_contract_across_io_boundaries() {
+        use http_body_util::BodyExt as _;
+
+        for storage in [false, true] {
+            for nested in [false, true] {
+                for error in [
+                    AwsChunkedStreamError::SignatureMismatch,
+                    AwsChunkedStreamError::FormatError,
+                    AwsChunkedStreamError::Incomplete,
+                    AwsChunkedStreamError::LengthMismatch,
+                    AwsChunkedStreamError::ChunkMetaTooLarge(1025, 1024),
+                    AwsChunkedStreamError::ChunkDataTooLarge(257, 256),
+                    AwsChunkedStreamError::TrailersTooLarge(16385, 16384),
+                    AwsChunkedStreamError::TooManyTrailerHeaders(101, 100),
+                ] {
+                    let expected = error.to_s3_error_code();
+                    let expected_status = if expected == S3ErrorCode::SignatureDoesNotMatch {
+                        StatusCode::FORBIDDEN
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    let error = IoError::other(error);
+                    let error = if nested {
+                        IoError::other(AwsChunkedStreamError::Underlying(Box::new(IoError::other(error))))
+                    } else {
+                        error
+                    };
+                    let api_error = if storage {
+                        ApiError::from(StorageError::Io(error))
+                    } else {
+                        ApiError::from(error)
+                    };
+                    assert_eq!(api_error.code, expected);
+                    assert_eq!(api_error.message, ApiError::error_code_to_message(&expected));
+                    assert!(error_chain_has_type::<AwsChunkedStreamError>(&api_error));
+                    let response = S3Error::from(api_error).to_http_response().expect("serialize chunked error");
+                    assert_eq!(response.status(), expected_status);
+                    let body = response
+                        .into_body()
+                        .collect()
+                        .await
+                        .expect("read chunked error XML")
+                        .to_bytes();
+                    let xml = std::str::from_utf8(&body).expect("error XML is UTF-8");
+                    assert!(xml.contains(&format!("<Code>{}</Code>", expected.as_str())));
+                    assert!(!xml.contains("AwsChunkedStreamError"));
+                    assert!(!xml.contains("16385"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aws_chunked_underlying_errors_retain_typed_marker_precedence() {
+        for storage in [false, true] {
+            for (inner, expected) in [
+                (IoError::other(UploadStreamError::Sha256Mismatch), CONTENT_SHA256_MISMATCH_CODE),
+                (IoError::other(UploadLimitExceeded { limit: 5 }), "EntityTooLarge"),
+                (
+                    IoError::other(ClientBodyReadTimeout {
+                        timeout: std::time::Duration::from_secs(300),
+                        raw_bytes_received: 0,
+                    }),
+                    "RequestTimeout",
+                ),
+                (IoError::other(s3s::BodySizeLimitExceeded { size: 6, limit: 5 }), "EntityTooLarge"),
+                (IoError::other("private underlying body diagnostic"), "InternalError"),
+            ] {
+                let error = IoError::other(AwsChunkedStreamError::Underlying(Box::new(inner)));
+                let error = if storage {
+                    ApiError::from(StorageError::Io(error))
+                } else {
+                    ApiError::from(error)
+                };
+                assert_eq!(error.code.as_str(), expected);
+            }
+            for chunked in [
+                AwsChunkedStreamError::SignatureMismatch,
+                AwsChunkedStreamError::FormatError,
+                AwsChunkedStreamError::ChunkDataTooLarge(257, 256),
+            ] {
+                let error = IoError::other(ServerSideSourceReadError::new("CopyObject", IoError::other(chunked)));
+                let error = if storage {
+                    ApiError::from(StorageError::Io(error))
+                } else {
+                    ApiError::from(error)
+                };
+                assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
+            }
+        }
+    }
+
+    #[test]
+    fn aws_chunked_classification_does_not_format_private_diagnostics() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        #[derive(Debug)]
+        struct Diagnostic {
+            displays: Arc<AtomicUsize>,
+            source: AwsChunkedStreamError,
+        }
+        impl std::fmt::Display for Diagnostic {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.displays.fetch_add(1, Ordering::Relaxed);
+                f.write_str("private chunk signature and body diagnostic")
+            }
+        }
+        impl std::error::Error for Diagnostic {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.source)
+            }
+        }
+        let displays = Arc::new(AtomicUsize::new(0));
+        let error = ApiError::from(IoError::other(Diagnostic {
+            displays: Arc::clone(&displays),
+            source: AwsChunkedStreamError::SignatureMismatch,
+        }));
+        assert_eq!(
+            displays.load(Ordering::Relaxed),
+            0,
+            "classified failures must not format discarded diagnostics"
+        );
+        assert_eq!(error.code, S3ErrorCode::SignatureDoesNotMatch);
+        assert!(!error.message.contains("private"));
+        assert!(error_chain_has_type::<AwsChunkedStreamError>(&error));
+    }
+
+    #[test]
+    fn rpc_unavailable_preserves_service_refusal_across_io_boundaries() {
+        let status = || tonic::Status::unavailable("private transport detail must not reach the S3 response");
+        let storage = || StorageError::from(status());
+        let original = storage();
+        let cloned = original.clone();
+        for error in [
+            ApiError::from(original),
+            ApiError::from(cloned),
+            ApiError::from(StorageError::Io(IoError::other(IoError::other(status())))),
+            ApiError::from(IoError::other(status())),
+            ApiError::from(IoError::other(storage())),
+        ] {
+            assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
+            assert_eq!(error.message, ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable));
+            assert_eq!(error.diagnostic().rpc_code, Some(tonic::Code::Unavailable));
+            let s3_error = S3Error::from(error);
+            assert_eq!(s3_error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+        }
+    }
+
+    #[test]
+    fn rpc_unavailable_mapping_does_not_match_other_codes_or_untyped_messages() {
+        for code in [
+            tonic::Code::Cancelled,
+            tonic::Code::Unknown,
+            tonic::Code::InvalidArgument,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::NotFound,
+            tonic::Code::AlreadyExists,
+            tonic::Code::PermissionDenied,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::Aborted,
+            tonic::Code::OutOfRange,
+            tonic::Code::Unimplemented,
+            tonic::Code::Internal,
+            tonic::Code::DataLoss,
+            tonic::Code::Unauthenticated,
+        ] {
+            for error in [
+                ApiError::from(StorageError::from(tonic::Status::new(code, "rpc unavailable"))),
+                ApiError::from(IoError::other(tonic::Status::new(code, "rpc unavailable"))),
+            ] {
+                assert_eq!(error.code, S3ErrorCode::InternalError, "{code:?}");
+            }
+        }
+        for error in [
+            ApiError::from(StorageError::Io(IoError::other("status: Unavailable"))),
+            ApiError::from(IoError::other("status: Unavailable")),
+        ] {
+            assert_eq!(error.code, S3ErrorCode::InternalError);
+        }
+    }
+
+    #[test]
+    fn rpc_unavailable_mapping_keeps_client_digest_error_precedence() {
+        for sha256 in [false, true] {
+            let source = || {
+                let mut status = tonic::Status::unavailable("private transport failure");
+                if sha256 {
+                    status.set_source(std::sync::Arc::new(UploadStreamError::Sha256Mismatch));
+                } else {
+                    status.set_source(std::sync::Arc::new(rustfs_rio::BadDigest {
+                        expected_md5: "expected".into(),
+                        calculated_md5: "calculated".into(),
+                    }));
+                }
+                status
+            };
+            for error in [
+                ApiError::from(StorageError::Io(IoError::other(source()))),
+                ApiError::from(IoError::other(source())),
+            ] {
+                assert_eq!(error.code.as_str(), if sha256 { CONTENT_SHA256_MISMATCH_CODE } else { "BadDigest" });
+            }
         }
     }
 
@@ -1118,8 +1894,12 @@ mod tests {
 
     #[test]
     fn body_error_classification_bounds_cyclic_source_chains() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
         #[derive(Debug)]
-        struct Cycle;
+        struct Cycle(Arc<AtomicUsize>);
         impl std::fmt::Display for Cycle {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("cycle")
@@ -1127,11 +1907,70 @@ mod tests {
         }
         impl std::error::Error for Cycle {
             fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.0.fetch_add(1, Ordering::Relaxed);
                 Some(self)
             }
         }
-        assert!(!error_chain_has_type::<ClientBodyReadTimeout>(&Cycle));
-        assert_eq!(ApiError::from(IoError::other(Cycle)).code, S3ErrorCode::InternalError);
+        let visits = Arc::new(AtomicUsize::new(0));
+        let error = ApiError::from(IoError::other(Cycle(Arc::clone(&visits))));
+        assert_eq!(error.code, S3ErrorCode::InternalError);
+        assert!(visits.load(Ordering::Relaxed) <= 64, "body classification must share one chain budget");
+    }
+
+    #[test]
+    fn body_error_classification_preserves_nested_marker_precedence() {
+        for storage in [false, true] {
+            for (inner, expected) in [
+                (IoError::other(UploadStreamError::Sha256Mismatch), CONTENT_SHA256_MISMATCH_CODE),
+                (
+                    IoError::other(rustfs_rio::BadDigest {
+                        expected_md5: "expected".into(),
+                        calculated_md5: "calculated".into(),
+                    }),
+                    "BadDigest",
+                ),
+                (IoError::other(UploadLimitExceeded { limit: 5 }), "EntityTooLarge"),
+                (
+                    IoError::other(ClientBodyReadTimeout {
+                        timeout: std::time::Duration::from_secs(300),
+                        raw_bytes_received: 0,
+                    }),
+                    "ServiceUnavailable",
+                ),
+                (IoError::other(s3s::BodySizeLimitExceeded { size: 6, limit: 5 }), "ServiceUnavailable"),
+            ] {
+                let error = IoError::other(ServerSideSourceReadError::new("CopyObject", inner));
+                let error = if storage {
+                    ApiError::from(StorageError::Io(error))
+                } else {
+                    ApiError::from(error)
+                };
+                assert_eq!(error.code.as_str(), expected);
+                assert!(error.source.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn short_hash_reader_body_maps_to_incomplete_body_across_io_boundaries() {
+        use tokio::io::AsyncReadExt;
+        for storage in [false, true] {
+            let mut reader =
+                rustfs_rio::HashReader::from_stream(std::io::Cursor::new(b"short".to_vec()), 10, 10, None, None, false)
+                    .expect("valid declared body length");
+            let error = reader
+                .read_to_end(&mut Vec::new())
+                .await
+                .expect_err("five bytes cannot satisfy declared ten");
+            let error = if storage {
+                ApiError::from(StorageError::Io(error))
+            } else {
+                ApiError::from(error)
+            };
+            assert_eq!(error.code, S3ErrorCode::IncompleteBody);
+            assert!(error_chain_has_type::<rustfs_rio::IncompleteBody>(&error));
+            assert_eq!(S3Error::from(error).status_code(), Some(StatusCode::BAD_REQUEST));
+        }
     }
 
     /// Exercise the public error type through the actual body budget.
@@ -1485,6 +2324,98 @@ mod tests {
     }
 
     #[test]
+    fn test_slow_down_read_api_error_maps_to_retryable_status() {
+        let api_error = slow_down_read_api_error(StorageError::PartMissingOrCorrupt);
+
+        assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
+        assert_eq!(S3Error::from(api_error).status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn put_read_quorum_error_preserves_context_and_is_idempotent() {
+        for source in [
+            StorageError::ErasureReadQuorum,
+            StorageError::InsufficientReadQuorum("bucket".into(), "object".into()),
+        ] {
+            for nested in [false, true] {
+                let mut err: S3Error = ApiError::from(source.clone()).into();
+                if nested {
+                    err.set_source(Box::new(IoError::other(source.clone())));
+                }
+                err.set_request_id("put-quorum-request");
+                let mut headers = http::HeaderMap::new();
+                headers.insert("retry-after", http::HeaderValue::from_static("2"));
+                err.set_headers(headers);
+
+                let err = normalize_read_quorum_error(normalize_read_quorum_error(err));
+                assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+                assert_eq!(err.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+                assert_eq!(err.message(), Some("The service is unavailable. Please retry."));
+                assert_eq!(err.request_id(), Some("put-quorum-request"));
+                assert_eq!(err.headers().expect("retry headers must survive")["retry-after"], "2");
+                let retained = error_chain_find(err.source().expect("typed source must survive"), |error| {
+                    error.downcast_ref::<StorageError>().cloned()
+                });
+                assert_eq!(retained, Some(source.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn put_read_quorum_error_preserves_other_error_contracts() {
+        for code in [
+            S3ErrorCode::SlowDown,
+            S3ErrorCode::AccessDenied,
+            S3ErrorCode::InvalidRequest,
+            S3ErrorCode::PreconditionFailed,
+            S3ErrorCode::BadDigest,
+            S3ErrorCode::IncompleteBody,
+            S3ErrorCode::NoSuchKey,
+            S3ErrorCode::NoSuchBucket,
+            S3ErrorCode::InternalError,
+            S3ErrorCode::ServiceUnavailable,
+        ] {
+            let mut err = S3Error::with_message(code.clone(), "original message");
+            err.set_source(Box::new(StorageError::ErasureReadQuorum));
+            let original_status = err.status_code();
+            let err = normalize_read_quorum_error(err);
+            assert_eq!(err.code(), &code);
+            assert_eq!(err.message(), Some("original message"));
+            assert_eq!(err.status_code(), original_status);
+        }
+        for source in [
+            None,
+            Some(StorageError::ErasureWriteQuorum),
+            Some(StorageError::PartMissingOrCorrupt),
+        ] {
+            let mut err = S3Error::with_message(S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()), "original message");
+            if let Some(source) = source {
+                err.set_source(Box::new(source));
+            }
+            let err = normalize_read_quorum_error(err);
+            assert_eq!(err.code(), &S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
+            assert_eq!(err.message(), Some("original message"));
+        }
+    }
+
+    #[test]
+    fn conditional_delete_storage_errors_preserve_api_contract() {
+        for (source, expected) in [
+            (StorageError::ConditionalDeleteConflict, S3ErrorCode::OperationAborted),
+            (StorageError::GuardedDeleteUnsupported, S3ErrorCode::NotImplemented),
+        ] {
+            let error = ApiError::from(source.clone());
+            assert_eq!(error.code, expected);
+            assert!(
+                error
+                    .source
+                    .as_ref()
+                    .is_some_and(|value| value.downcast_ref::<StorageError>() == Some(&source))
+            );
+        }
+    }
+
+    #[test]
     fn test_unknown_authoritative_quota_usage_maps_to_retryable_error() {
         let api_error = ApiError::from(QuotaError::UsageUnavailable {
             bucket: "bucket".to_string(),
@@ -1551,16 +2482,18 @@ mod tests {
                 S3ErrorCode::InvalidArgument,
             ),
             (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyOwnedByYou),
+            (StorageError::DiskFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
+            (StorageError::UnsupportedDisk, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
             (StorageError::FaultyDisk, S3ErrorCode::ServiceUnavailable),
             (StorageError::FaultyRemoteDisk, S3ErrorCode::ServiceUnavailable),
             (StorageError::DiskNotFound, S3ErrorCode::ServiceUnavailable),
             (StorageError::TooManyOpenFiles, S3ErrorCode::ServiceUnavailable),
-            (StorageError::ErasureReadQuorum, S3ErrorCode::ServiceUnavailable),
+            (StorageError::ErasureReadQuorum, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into())),
             (
                 StorageError::InsufficientReadQuorum("test".into(), "test".into()),
-                S3ErrorCode::ServiceUnavailable,
+                S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()),
             ),
             (StorageError::ErasureWriteQuorum, S3ErrorCode::ServiceUnavailable),
             (
@@ -1599,6 +2532,37 @@ mod tests {
             let api_error: ApiError = storage_error.into();
             assert_eq!(api_error.code, expected_code);
             assert!(api_error.source.is_some());
+        }
+    }
+
+    #[test]
+    fn disk_quorum_timeouts_map_to_retryable_service_unavailable() {
+        use crate::storage_api::error::{DiskError, OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs};
+
+        let errors = [
+            Some(DiskError::Timeout),
+            Some(DiskError::Timeout),
+            Some(DiskError::Timeout),
+            None,
+        ];
+        for reduced in [
+            reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 2),
+            reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 3),
+        ] {
+            let reduced = reduced.expect("quorum of timeouts must retain its typed cause");
+            assert_eq!(reduced, DiskError::Timeout);
+            let error = ApiError::from(StorageError::from(reduced));
+            assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
+            let response = S3Error::from(error);
+            assert_eq!(response.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+        }
+        let degraded = [None, None, None, Some(DiskError::Timeout)];
+        assert!(reduce_write_quorum_errs(&degraded, OBJECT_OP_IGNORED_ERRS, 3).is_none());
+        for failure in [DiskError::FileCorrupt, DiskError::Io(IoError::other("unknown disk failure"))] {
+            let errors = [Some(failure.clone()), Some(failure.clone()), Some(failure), None];
+            let reduced =
+                reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 3).expect("permanent failures must remain errors");
+            assert_eq!(ApiError::from(StorageError::from(reduced)).code, S3ErrorCode::InternalError);
         }
     }
 
@@ -1696,6 +2660,21 @@ mod tests {
 
         assert_eq!(*s3_error.code(), S3ErrorCode::ServiceUnavailable);
         assert_eq!(s3_error.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn read_quorum_failure_matches_minio_slow_down_read_response() {
+        for error in [
+            StorageError::ErasureReadQuorum,
+            StorageError::InsufficientReadQuorum("bucket".into(), "object".into()),
+        ] {
+            let api_error = ApiError::from(error);
+            assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
+            assert_eq!(api_error.message, SLOW_DOWN_READ_MESSAGE);
+
+            let s3_error: S3Error = api_error.into();
+            assert_eq!(s3_error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+        }
     }
 
     #[test]

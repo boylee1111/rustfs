@@ -46,6 +46,10 @@ REQUIRED_GATES = {
 }
 
 
+def is_sha(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 40 and all(char in "0123456789abcdef" for char in value)
+
+
 def command(*parts: str) -> list[str]:
     return list(parts)
 
@@ -72,6 +76,14 @@ def load_registry() -> dict[str, Any]:
     if registry.get("schema") != 2:
         raise ValueError("Scanner/Heal release registry must use schema 2")
     return registry
+
+
+def read_json_object(path: Path) -> dict[str, Any]:
+    with path.open() as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected JSON object: {path}")
+    return payload
 
 
 def validate_registry(registry: dict[str, Any]) -> None:
@@ -353,7 +365,7 @@ def performance_steps() -> list[dict[str, Any]]:
         {
             "id": "scanner-heal-abba",
             "description": "Run the isolated EC8+4 Scanner/Heal ABBA matrix through the deployment adapter.",
-            "covers": {"gates": ["G10", "P1", "P2", "P3"], "issues": ["2266", "2273", "2274", "2275"]},
+            "covers": {"gates": ["G10", "P1", "P3"], "issues": ["2266", "2273", "2274", "2275"]},
             "commands": [
                 existing_script_command(
                     "scripts/python_bin.sh",
@@ -373,7 +385,7 @@ def performance_steps() -> list[dict[str, Any]]:
         {
             "id": "scheduler-pressure",
             "description": "Assemble scheduler-pressure, profile, RSS, throughput, and latency descriptors.",
-            "covers": {"gates": ["G10", "P1", "P2", "P3"], "issues": ["2266", "2274", "2275"]},
+            "covers": {"gates": ["G10", "P1", "P3"], "issues": ["2266", "2274", "2275"]},
             "commands": [
                 existing_script_command(
                     "scripts/python_bin.sh",
@@ -390,11 +402,27 @@ def performance_steps() -> list[dict[str, Any]]:
                     "rss-samples=$RUN_ROOT/profile/rss-samples.json",
                     "--profile-artifact",
                     "save-frequency=$RUN_ROOT/profile/save-frequency.json",
+                    "--started-at",
+                    "$ORIGINAL_WINDOW_STARTED_AT",
+                    "--finished-at",
+                    "$ORIGINAL_WINDOW_FINISHED_AT",
+                    "--run-id",
+                    "$ORIGINAL_RUN_ID",
+                    "--measurement-window-id",
+                    "$ORIGINAL_WINDOW_ID",
                     "--out-dir",
                     "$RUN_ROOT/descriptors/scheduler-pressure",
                 )
             ],
             "expected_outputs": expected_outputs("$RUN_ROOT/descriptors/scheduler-pressure/release-bundle-scheduler-pressure.json"),
+        },
+        {
+            "id": "p2-independent-evidence",
+            "description": "P2 needs original post-stop and segment observations with independent full-walk and root oracles.",
+            "covers": {"gates": ["P2"], "issues": ["2274"]},
+            "commands": [],
+            "expected_outputs": [],
+            "pending_reason": "No producer verifies the required independent P2 evidence yet.",
         },
     ]
 
@@ -455,7 +483,7 @@ def build_plan(registry: dict[str, Any], revision: str, phases: set[str]) -> dic
         "registry": str(REGISTRY.relative_to(ROOT)),
         "run_root_env": "RUN_ROOT",
         "requirements": {
-            "base_branch": "release",
+            "base_branch": "main",
             "platform": "Linux",
             "tracked_source_clean": True,
             "measured_evidence_required": True,
@@ -549,7 +577,10 @@ def build_status(plan: dict[str, Any], run_root: Path) -> dict[str, Any]:
             for key in counts:
                 totals[key] += counts[key]
             totals["expected"] += len(outputs)
-            if not outputs:
+            pending_reason = step.get("pending_reason")
+            if isinstance(pending_reason, str) and pending_reason:
+                status = "pending"
+            elif not outputs:
                 status = "not_tracked"
             elif counts["invalid"] or counts["empty"]:
                 status = "invalid"
@@ -566,12 +597,17 @@ def build_status(plan: dict[str, Any], run_root: Path) -> dict[str, Any]:
                         "status": status,
                         "commands": step["commands"],
                     }
-            step_statuses.append({
+                    if pending_reason:
+                        next_step["reason"] = pending_reason
+            step_status = {
                 "id": step["id"],
                 "status": status,
                 "covers": step.get("covers", {}),
                 "outputs": outputs,
-            })
+            }
+            if pending_reason:
+                step_status["reason"] = pending_reason
+            step_statuses.append(step_status)
         tracked = [step for step in step_statuses if step["status"] != "not_tracked"]
         if not tracked:
             stage_state = "not_tracked"
@@ -586,7 +622,7 @@ def build_status(plan: dict[str, Any], run_root: Path) -> dict[str, Any]:
         stage_statuses.append({"id": stage["id"], "status": stage_state, "steps": step_statuses})
     if totals["invalid"] or totals["empty"]:
         decision = "invalid"
-    elif totals["missing"]:
+    elif totals["missing"] or pending_gates:
         decision = "blocked"
     else:
         decision = "complete"
@@ -601,6 +637,89 @@ def build_status(plan: dict[str, Any], run_root: Path) -> dict[str, Any]:
         "pending_gates": sorted(pending_gates),
         "next_step": next_step,
         "stages": stage_statuses,
+    }
+
+
+def descriptor_gate_names(payload: dict[str, Any]) -> list[str]:
+    gates = payload.get("gates")
+    if not isinstance(gates, dict):
+        return []
+    return sorted(gate for gate in gates if isinstance(gate, str))
+
+
+def build_descriptor_ledger(descriptor_paths: list[Path], revision: str) -> dict[str, Any]:
+    entries = []
+    same_head_gates: set[str] = set()
+    old_head_gates: set[str] = set()
+    duplicate_gates: dict[str, list[str]] = {}
+    gate_sources: dict[str, list[str]] = {}
+    for raw_path in descriptor_paths:
+        path = raw_path.resolve()
+        entry: dict[str, Any] = {
+            "path": str(raw_path),
+            "file_name": path.name,
+        }
+        try:
+            if not path.is_file():
+                raise ValueError("descriptor is missing")
+            if path.stat().st_size <= 0:
+                raise ValueError("descriptor is empty")
+            payload = read_json_object(path)
+            evidence = payload.get("evidence")
+            descriptor_revision = payload.get("source_revision")
+            gates = descriptor_gate_names(payload)
+            if evidence != "measured":
+                classification = "case-level only"
+            elif not is_sha(descriptor_revision):
+                classification = "invalid"
+            elif not gates:
+                classification = "case-level only"
+            elif descriptor_revision == revision:
+                classification = "same-head verified"
+                same_head_gates.update(gates)
+            else:
+                classification = "old-head measured, drift-readable"
+                old_head_gates.update(gates)
+            for gate in gates:
+                gate_sources.setdefault(gate, []).append(path.name)
+            entry.update({
+                "status": "present",
+                "classification": classification,
+                "evidence": evidence,
+                "source_revision": descriptor_revision,
+                "gates": gates,
+            })
+        except (ValueError, OSError, json.JSONDecodeError) as error:
+            entry.update({
+                "status": "invalid",
+                "classification": "invalid",
+                "error": str(error),
+                "gates": [],
+            })
+        entries.append(entry)
+    for gate, sources in sorted(gate_sources.items()):
+        if len(sources) > 1:
+            duplicate_gates[gate] = sorted(sources)
+    measured_gates = same_head_gates | old_head_gates
+    return {
+        "schema": 1,
+        "kind": "scanner-heal-descriptor-ledger",
+        "source_revision": revision,
+        "release_approved": False,
+        "entries": entries,
+        "same_head_verified_gates": sorted(same_head_gates),
+        "old_head_measured_gates": sorted(old_head_gates - same_head_gates),
+        "missing_measured_gates": sorted(REQUIRED_GATES - measured_gates),
+        "missing_current_head_gates": sorted(REQUIRED_GATES - same_head_gates),
+        "duplicate_gates": duplicate_gates,
+        "totals": {
+            "descriptors": len(entries),
+            "same_head_verified_gates": len(same_head_gates),
+            "old_head_measured_gates": len(old_head_gates - same_head_gates),
+            "missing_measured_gates": len(REQUIRED_GATES - measured_gates),
+            "missing_current_head_gates": len(REQUIRED_GATES - same_head_gates),
+            "invalid_descriptors": sum(1 for entry in entries if entry["status"] == "invalid"),
+        },
     }
 
 
@@ -658,7 +777,8 @@ def self_test() -> None:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("{}\n")
     complete = build_status(plan, complete_root)
-    assert complete["decision"] == "complete"
+    assert complete["decision"] == "blocked"
+    assert "P2" in complete["pending_gates"]
     assert complete["release_approved"] is False
     print("PASS: scanner/heal Linux evidence plan self-test")
 
@@ -672,6 +792,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--run-preflight", action="store_true")
     parser.add_argument("--status-root", type=Path)
+    parser.add_argument("--descriptor-ledger", type=Path, nargs="+")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args(argv)
 
@@ -687,9 +808,15 @@ def main(argv: list[str] | None = None) -> int:
         phases = set(args.phase or ["all"])
         if "all" in phases and len(phases) > 1:
             raise ValueError("--phase all cannot be combined with another phase")
-        if args.status_root is not None and (args.write_plan or args.run_preflight):
-            raise ValueError("--status-root cannot be combined with --write-plan or --run-preflight")
-        plan = build_plan(registry, source_revision(args.source_revision), phases)
+        if args.status_root is not None and (args.write_plan or args.run_preflight or args.descriptor_ledger):
+            raise ValueError("--status-root cannot be combined with --write-plan, --run-preflight, or --descriptor-ledger")
+        if args.descriptor_ledger and (args.write_plan or args.run_preflight):
+            raise ValueError("--descriptor-ledger cannot be combined with --write-plan or --run-preflight")
+        revision = source_revision(args.source_revision)
+        if args.descriptor_ledger:
+            print(json.dumps(build_descriptor_ledger(args.descriptor_ledger, revision), indent=2, sort_keys=True))
+            return 0
+        plan = build_plan(registry, revision, phases)
         if args.status_root is not None:
             status = build_status(plan, args.status_root)
             print(json.dumps(status, indent=2, sort_keys=True))

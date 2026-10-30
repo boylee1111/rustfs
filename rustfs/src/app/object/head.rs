@@ -14,6 +14,7 @@
 
 //! HeadObject path.
 
+use super::veeam_sosapi;
 use super::*;
 use crate::on_demand_migration::{
     BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, SourceClient, SourceError, SourceHead,
@@ -104,6 +105,7 @@ pub(super) fn odm_head_output(head: SourceHead) -> S3Result<HeadObjectOutput> {
         e_tag: head.etag.as_deref().map(to_s3s_etag),
         last_modified: head.last_modified.map(OffsetDateTime::from).map(Timestamp::from),
         metadata: (!head.user_metadata.is_empty()).then_some(head.user_metadata),
+        website_redirect_location: head.website_redirect_location,
         ..Default::default()
     })
 }
@@ -286,6 +288,7 @@ impl DefaultObjectUsecase {
             storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
             expiration: remote.expiration,
             restore: remote.restore,
+            website_redirect_location: remote.website_redirect_location,
             checksum_crc32: remote.checksum_crc32,
             checksum_crc32c: remote.checksum_crc32_c,
             checksum_crc64nvme: remote.checksum_crc64_nvme,
@@ -294,6 +297,40 @@ impl DefaultObjectUsecase {
             checksum_type: remote.checksum_type.map(|ct| ChecksumType::from(ct.as_str().to_string())),
             ..Default::default()
         }
+    }
+
+    async fn serve_veeam_sosapi_head(
+        &self,
+        req: &S3Request<HeadObjectInput>,
+        store: &Arc<ECStore>,
+        kind: veeam_sosapi::SosapiKind,
+        part_number: Option<usize>,
+        range: Option<&HTTPRangeSpec>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        let representation =
+            veeam_sosapi::read_representation(store, &req.input.bucket, kind, &req.headers, part_number, range).await?;
+        let content_type = ContentType::from_str(veeam_sosapi::CONTENT_TYPE)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid SOSAPI content type"))?;
+        let content_range = representation.content_range;
+        let output = HeadObjectOutput {
+            content_length: Some(representation.content_length),
+            content_type: Some(content_type),
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            last_modified: Some(Timestamp::from(representation.last_modified)),
+            e_tag: Some(to_s3s_etag(&representation.etag_hex)),
+            ..Default::default()
+        };
+        let mut response = wrap_response_with_cors(&req.input.bucket, &req.method, &req.headers, output).await;
+        inject_accept_ranges_header(&mut response.headers);
+        if let Some(content_range) = content_range {
+            response.headers.insert(
+                http::header::CONTENT_RANGE,
+                HeaderValue::from_str(&content_range)
+                    .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid content range"))?,
+            );
+            response.status = Some(StatusCode::PARTIAL_CONTENT);
+        }
+        Ok(response)
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -310,10 +347,6 @@ impl DefaultObjectUsecase {
             version_id,
             part_number,
             range,
-            if_none_match,
-            if_match,
-            if_modified_since,
-            if_unmodified_since,
             ..
         } = req.input.clone();
 
@@ -338,9 +371,21 @@ impl DefaultObjectUsecase {
         };
         validate_bucket_exists(&store, &bucket).await?;
 
+        if version_id.is_none()
+            && let Some(kind) = veeam_sosapi::handled_kind(&key)
+        {
+            let response = self
+                .serve_veeam_sosapi_head(&req, &store, kind, part_number, rs.as_ref())
+                .await?;
+            let result = Ok(response);
+            let _ = helper.complete(&result);
+            return result;
+        }
+
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
             .await
             .map_err(ApiError::from)?;
+        let opts = internal_object_info_lookup_opts(opts);
 
         prepare_odm_read_generation(&store, &mut req, &bucket).await;
 
@@ -411,41 +456,6 @@ impl DefaultObjectUsecase {
                 opts.version_id.as_deref(),
             ));
         }
-        if let Some(match_etag) = if_none_match
-            && let Some(strong_etag) = match_etag.into_etag()
-            && info
-                .etag
-                .as_ref()
-                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
-        {
-            return Err(S3Error::new(S3ErrorCode::NotModified));
-        }
-        if let Some(modified_since) = if_modified_since {
-            // obj_time < givenTime + 1s
-            if info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = modified_since.into();
-                mod_time < give_time.add(time::Duration::seconds(1))
-            }) {
-                return Err(S3Error::new(S3ErrorCode::NotModified));
-            }
-        }
-        if let Some(match_etag) = if_match {
-            if let Some(strong_etag) = match_etag.into_etag()
-                && info
-                    .etag
-                    .as_ref()
-                    .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
-            {
-                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-            }
-        } else if let Some(unmodified_since) = if_unmodified_since
-            && info.mod_time.is_some_and(|mod_time| {
-                let give_time: OffsetDateTime = unmodified_since.into();
-                mod_time > give_time.add(time::Duration::seconds(1))
-            })
-        {
-            return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
-        }
         // An authorized replication convergence check only needs etag/size/mtime
         // to compare source and replica; it holds no customer key, so the SSE-C
         // read validation is skipped for it (and only it).
@@ -462,6 +472,14 @@ impl DefaultObjectUsecase {
                 req.input.sse_customer_key_md5.as_ref(),
             )?;
         }
+
+        let conditions = check_preconditions(&req.headers, &info);
+        if conditions.is_err() && !replication_check {
+            let principal = SseKmsPrincipal::from_request(&req);
+            crate::storage::sse::validate_conditional_read(&bucket, &key, &info.user_defined, &req.headers, principal.as_ref())
+                .await?;
+        }
+        conditions?;
 
         // Compute x-amz-expiration header from lifecycle prediction (before info is partially moved)
         let expiration_header = resolve_put_object_expiration(&bucket, &info).await;
@@ -490,12 +508,13 @@ impl DefaultObjectUsecase {
         })?;
 
         let metadata_map = info.user_defined.clone();
-        let server_side_encryption = metadata_map
-            .get("x-amz-server-side-encryption")
-            .map(|v| ServerSideEncryption::from(v.clone()));
         let sse_customer_algorithm = metadata_map
             .get("x-amz-server-side-encryption-customer-algorithm")
             .map(|v| SSECustomerAlgorithm::from(v.clone()));
+        let server_side_encryption = metadata_map
+            .get("x-amz-server-side-encryption")
+            .filter(|_| sse_customer_algorithm.is_none())
+            .map(|v| ServerSideEncryption::from(v.clone()));
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
         let sse_kms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
         let storage_class = response_storage_class(&info, &metadata_map);
@@ -553,7 +572,7 @@ impl DefaultObjectUsecase {
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: filter_object_metadata(&metadata_map),
-            version_id: info.version_id.map(|v| v.to_string()),
+            version_id: s3_response_version_id(info.version_id),
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
@@ -777,6 +796,7 @@ mod tests {
             content_language: Some("en".to_string()),
             cache_control: Some("max-age=60".to_string()),
             expires: Some("Thu, 01 Jan 2026 00:00:00 GMT".to_string()),
+            website_redirect_location: None,
             user_metadata: HashMap::from([("owner".to_string(), "alice".to_string())]),
             version_id: Some("v1".to_string()),
             storage_class: Some("STANDARD_IA".to_string()),

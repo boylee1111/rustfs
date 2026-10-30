@@ -32,9 +32,11 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 
 | Document | Use this when |
 |---|---|
+| [local-descriptor-cache.md](local-descriptor-cache.md) | changing descriptor cache keys/open modes or invalidation after local mutations |
 | [erasure-coding.md](erasure-coding.md) | changing anything under `crates/ecstore/src/erasure/`, `crates/filemeta/`, `crates/ecstore/src/set_disk/`, storage-class or layout code, or any decode, quorum, or heal boundary (normative spec) |
 | [placement-repair-invariants.md](placement-repair-invariants.md) | changing anything that resolves an object to a pool, set, or disk, or that admits scanner or heal work |
 | [heal-concurrency-model.md](heal-concurrency-model.md) | changing heal, PUT/multipart commit, delete, lifecycle expiry, or data-movement code that shares the `(bucket, object)` commit surface, or asking whether RustFS needs a persistent healing marker |
+| [heal-terminal-reports.md](heal-terminal-reports.md) | changing retained admin heal outcomes, terminal report publication, cancellation refinement, or report upgrade/rollback behavior |
 | [unified-object-generation.md](unified-object-generation.md) | adding or changing anything that fences a commit, scopes a read lease, gates old-directory cleanup, binds prepared pool reads, or settles quota against the current object version |
 | [ilm-tiering-persistence-contracts.md](ilm-tiering-persistence-contracts.md) | changing an ILM transition, tier configuration mutation, manual transition job, tier-delete recovery path, pool decommission, or any code that can create, transfer, or destroy ownership of a remote-tier object |
 | [decommission-compatibility.md](decommission-compatibility.md) | changing pool decommission or rebalance behavior, its admin API shape, the persisted `PoolMeta` fields, or how tier free versions move between pools |
@@ -44,8 +46,11 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 | [background-controller-contract.md](background-controller-contract.md) | adding a status snapshot or reconcile surface for a background service, or being tempted to fold several services into a generic controller |
 | [background-services-inventory.md](background-services-inventory.md) | you need one audited background service's desired source, current-status inputs, status surface, and declared side effects |
 | [scanner-usage-publication.md](scanner-usage-publication.md) | changing scanner data-usage cache publication, quota-visible usage snapshots, scanner cycle recovery, or the persisted scanner usage artifacts |
+| [scanner-dirty-journal-source-contract.md](scanner-dirty-journal-source-contract.md) | designing storage-verified provenance, completion receipts, repair responsibility or replay for the node-owned scanner dirty-producer journal (proposed; not runtime implemented) |
 | [scanner-usage-authority-decision.md](scanner-usage-authority-decision.md) | deciding whether quota admission depends on scanner data usage, removing scanner publication layers, or designing a scanner storage boundary |
+| [scanner-per-bucket-convergence.md](scanner-per-bucket-convergence.md) | changing what makes a scanner cycle `Complete`, `Superseded`, or converged, adding or re-classifying a dirty-usage producer, deciding whether a background writeback may invalidate a cycle, changing scanner worker concurrency or throttling, or activating scoped dirty acknowledgements |
 | [config-model-boundary-adr.md](config-model-boundary-adr.md) | touching the server-config model (`Config`, `KV`, `KVS`) or its persistence, or asking which crate owns which part of server configuration |
+| [plugin-delegation.md](plugin-delegation.md) | changing original-user plugin delegation, attempt credentials, or Runner task APIs |
 | [admin-route-action-snapshot.md](admin-route-action-snapshot.md) | adding, moving, or re-authorizing an admin route and needing to know where the route → handler → `AdminAction` contract is enforced |
 | [kms-bulk-rekey-contract.md](kms-bulk-rekey-contract.md) | changing the bulk envelope re-wrap sweep, its admin endpoints, the re-wrap primitive, or which objects a rekey may touch |
 | [remote-credential-sealing-adr.md](remote-credential-sealing-adr.md) | adding, reading, or persisting a stored remote credential (replication target, remote tier, on-demand migration source), or needing the sealed-envelope format, the mixed-version rules, or the reason this is worth doing in one deployment and not in another |

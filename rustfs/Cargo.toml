@@ -68,15 +68,24 @@ license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope", "gcs"]
-e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks"]
+e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks", "rustfs-scanner/e2e-test-hooks"]
 # Shortens Connect credentials only in debug E2E builds.
 connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
-pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope"]
+pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symbolic-demangle"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
+# Diagnostic-only Rust GlobalAlloc live-byte accounting; adds per-allocation atomic updates.
+diagnostic-allocator-live = []
+# Default-off sampled local batch wall/CPU and request correlation diagnostics.
+diagnostic-local-batch = ["rustfs-ecstore/diagnostic-local-batch", "rustfs-obs/diagnostic-local-batch"]
+# Diagnostic-only S3-operation attribution for internode ReadVersion and list-walker metrics.
+diagnostic-read-version-caller = ["rustfs-ecstore/diagnostic-read-version-caller", "rustfs-io-metrics/diagnostic-read-version-caller", "rustfs-scanner/diagnostic-read-version-caller"]
+# Diagnostic-only fixed-prefix attribution for actual Scanner metadata visits.
+diagnostic-prefix-attribution = ["rustfs-scanner/diagnostic-prefix-attribution"]
+http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
@@ -292,14 +301,17 @@ tokio-rustls = { workspace = true, default-features = false, features = ["loggin
 aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
 aws-smithy-types = { workspace = true }
 google-cloud-auth = { workspace = true, optional = true }
-moka = { workspace = true, features = ["sync"] }
+moka = { workspace = true, features = ["future", "sync"] }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 tokio-stream.workspace = true
-tokio-util = { workspace = true, features = ["io", "compat", "time"] }
+tokio-util = { workspace = true, features = ["io", "compat", "time", "rt"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 tower = { workspace = true, features = ["timeout"] }
 tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id", "add-extension"] }
+h3 = { workspace = true, optional = true }
+h3-quinn = { workspace = true, optional = true }
+quinn = { workspace = true, optional = true }
 
 # Serialization and Data Formats
 apache-avro = { workspace = true }
@@ -321,7 +333,7 @@ zstd.workspace = true
 ed25519-dalek.workspace = true
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = { workspace = true }
-rustix.workspace = true
+rustix = { workspace = true, features = ["param"] }
 x509-parser = { workspace = true }
 subtle = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }
@@ -379,8 +391,14 @@ libsystemd.workspace = true
 [target.'cfg(any(all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64"))))'.dependencies]
 pyroscope = { workspace = true, optional = true, features = ["backend-pprof-rs"] }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+object = { workspace = true, optional = true, features = ["read", "std", "elf"] }
+symbolic-demangle = { version = "=13.9.0", default-features = false, features = ["rust"], optional = true }
+
 [dev-dependencies]
+rustfs-targets = { workspace = true, features = ["test-support"] }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
+rustfs-iam = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }

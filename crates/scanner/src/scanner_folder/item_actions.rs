@@ -325,7 +325,7 @@ pub(super) fn build_bucket_heal_request(bucket: String, priority: HealChannelPri
         priority,
         recreate_missing: Some(false),
         source: HealRequestSource::Scanner,
-        ..Default::default()
+        ..HealChannelRequest::new()
     }
 }
 
@@ -345,7 +345,7 @@ pub(super) fn build_object_heal_request(
         remove_corrupted: Some(HEAL_DELETE_DANGLING),
         recreate_missing: Some(false),
         source: HealRequestSource::Scanner,
-        ..Default::default()
+        ..HealChannelRequest::new()
     }
 }
 
@@ -474,14 +474,31 @@ pub(super) fn record_heal_candidate_admission(
     }
 }
 
+pub(crate) fn scanner_disk_heal_scope(disk: &Disk) -> Option<DataUsageCacheSource> {
+    let location = disk.get_disk_location();
+    location.valid().then_some(())?;
+    Some(DataUsageCacheSource::new(location.pool_idx?, location.set_idx?))
+}
+
 pub(super) async fn send_scanner_heal_request(
     candidate_type: &'static str,
-    request: HealChannelRequest,
+    mut request: HealChannelRequest,
+    data_dir: Option<uuid::Uuid>,
+    scope: Option<DataUsageCacheSource>,
 ) -> Result<HealAdmissionResult, ScannerError> {
+    if request.object_prefix.as_deref().is_some_and(|object| !object.is_empty()) {
+        let scope = scope
+            .ok_or_else(|| ScannerError::Other("scanner object heal requires the scanning disk's pool and set".to_string()))?;
+        request.pool_index = Some(scope.pool_index);
+        request.set_index = Some(scope.set_index);
+    }
     let priority = request.priority;
     let trace_context = scanner_heal_candidate_trace_context(&request);
-    match send_heal_request_with_admission(request).await {
-        Ok(result) => {
+    let candidate = crate::heal_completion::prepare(&request, data_dir);
+    match send_heal_request_with_receipt(request).await {
+        Ok(receipt) => {
+            crate::heal_completion::observe(candidate, Ok(&receipt));
+            let result = receipt.result;
             record_heal_candidate_admission(candidate_type, priority, result);
             if let Some(trace_context) = trace_context.as_ref() {
                 emit_scanner_heal_candidate_trace(ScannerHealCandidateTrace {
@@ -498,6 +515,7 @@ pub(super) async fn send_scanner_heal_request(
             Ok(result)
         }
         Err(err) => {
+            crate::heal_completion::observe(candidate, Err(()));
             counter!(
                 "rustfs_heal_candidate_enqueue_total",
                 "type" => candidate_type.to_string(),
@@ -533,6 +551,8 @@ pub struct ScannerItem {
     pub lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
     pub object_lock: Option<Arc<ObjectLockConfiguration>>,
     pub replication: Option<Arc<ReplicationConfig>>,
+    /// Actual scanning-disk location; refreshed by the disk reader before actions.
+    pub heal_scope: Option<DataUsageCacheSource>,
     pub heal_enabled: bool,
     pub heal_bitrot: bool,
     pub debug: bool,
@@ -624,6 +644,22 @@ impl ScannerItem {
         tier_names: &[String],
         size_summary: &mut SizeSummary,
     ) {
+        self.apply_actions_cancellable(object_infos, lock_retention, versioning_config, tier_names, size_summary, None)
+            .await;
+    }
+
+    pub(crate) async fn apply_actions_cancellable(
+        &mut self,
+        object_infos: Vec<ObjectInfo>,
+        lock_retention: Option<Arc<ObjectLockConfiguration>>,
+        versioning_config: VersioningConfiguration,
+        tier_names: &[String],
+        size_summary: &mut SizeSummary,
+        cancellation: Option<&CancellationToken>,
+    ) {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let object_path = self.object_path();
         if object_infos.is_empty() {
             debug!(
@@ -667,6 +703,9 @@ impl ScannerItem {
         let Some(lifecycle) = self.lifecycle.clone() else {
             let mut cumulative_size: i64 = 0;
             for (oi, resolved_size) in object_infos.iter().zip(resolved_sizes.iter()) {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return;
+                }
                 let accounting_size = match resolved_size {
                     SizeResolution::Known { logical, .. } => *logical,
                     // A valid compressed legacy sentinel has no logical size,
@@ -674,7 +713,7 @@ impl ScannerItem {
                     // physical size is only an input to those operations; it
                     // is not folded into the logical total below.
                     SizeResolution::Unknown { physical, .. } => {
-                        self.heal_actions(oi, *physical, size_summary).await;
+                        self.heal_actions(oi, *physical, size_summary, cancellation).await;
                         size_summary.actions_accounting_unknown(oi);
                         continue;
                     }
@@ -684,13 +723,16 @@ impl ScannerItem {
                     }
                 };
 
-                let size = self.heal_actions(oi, accounting_size, size_summary).await;
+                let size = self.heal_actions(oi, accounting_size, size_summary, cancellation).await;
 
                 size_summary.actions_accounting(oi, size, accounting_size);
 
                 cumulative_size = cumulative_size.saturating_add(size);
             }
 
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return;
+            }
             self.alert_excessive_versions(object_infos.len(), cumulative_size);
 
             debug!(
@@ -732,6 +774,10 @@ impl ScannerItem {
             }
         };
 
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
+
         // Every version handed to the evaluator counts as an ILM-checked
         // version, whether or not a rule matched (NoneAction included). This is
         // reached only for buckets with lifecycle rules; it feeds
@@ -750,6 +796,9 @@ impl ScannerItem {
             .all(|candidate| Self::tier_is_known(candidate, tier_names));
         'eventLoop: {
             for (i, event) in events.iter().enumerate() {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return;
+                }
                 let oi = &object_infos[i];
                 let known_size = resolved_sizes[i].known_size();
                 if has_corrupt_size
@@ -768,7 +817,7 @@ impl ScannerItem {
                     // accounting. Size-filtered or deferred events remain
                     // pending, so retain the version-only physical counters.
                     if let SizeResolution::Unknown { physical, .. } = &resolved_sizes[i] {
-                        self.heal_actions(oi, *physical, size_summary).await;
+                        self.heal_actions(oi, *physical, size_summary, cancellation).await;
                         size_summary.actions_accounting_unknown(oi);
                     }
                     continue;
@@ -825,7 +874,7 @@ impl ScannerItem {
                                     noncurrent_unknown.push(oi);
                                 } else {
                                     if let SizeResolution::Unknown { physical, .. } = &resolved_sizes[i] {
-                                        self.heal_actions(oi, *physical, size_summary).await;
+                                        self.heal_actions(oi, *physical, size_summary, cancellation).await;
                                     }
                                     size_summary.actions_accounting_unknown(oi);
                                 }
@@ -842,7 +891,7 @@ impl ScannerItem {
                             }
                             IlmAction::NoneAction | IlmAction::ActionCount => {
                                 if let SizeResolution::Unknown { physical, .. } = &resolved_sizes[i] {
-                                    self.heal_actions(oi, *physical, size_summary).await;
+                                    self.heal_actions(oi, *physical, size_summary, cancellation).await;
                                 }
                                 size_summary.actions_accounting_unknown(oi);
                             }
@@ -860,7 +909,7 @@ impl ScannerItem {
                 // side-effecting tier actions fail closed until the registry
                 // recognizes the source again.
                 if Self::action_blocked_by_unknown_tier(event.action, oi, all_versions_known, tier_names, &event.storage_class) {
-                    size = self.heal_actions(oi, actual_size, size_summary).await;
+                    size = self.heal_actions(oi, actual_size, size_summary, cancellation).await;
                     size_summary.actions_accounting(oi, size, actual_size);
                     cumulative_size += size;
                     continue;
@@ -969,7 +1018,7 @@ impl ScannerItem {
                     }
 
                     IlmAction::NoneAction | IlmAction::ActionCount => {
-                        size = self.heal_actions(oi, actual_size, size_summary).await;
+                        size = self.heal_actions(oi, actual_size, size_summary, cancellation).await;
                     }
                 }
 
@@ -980,6 +1029,9 @@ impl ScannerItem {
             }
         }
 
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         if !to_delete_objs.is_empty()
             && let Some(event) = noncurrent_events.first().cloned()
         {
@@ -987,7 +1039,8 @@ impl ScannerItem {
             let count = u64::try_from(to_delete_objs.len()).unwrap_or(u64::MAX);
             let done_ilm = Metrics::time_ilm(action);
             let trace_started_at = trace_start_instant();
-            let queued = enqueue_runtime_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner).await;
+            let queued =
+                enqueue_runtime_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner, cancellation).await;
             if let Some(trace_started_at) = trace_started_at {
                 let state = if queued { "queued" } else { "not_queued" };
                 trace_emit(|| {
@@ -1018,21 +1071,38 @@ impl ScannerItem {
                 }
             }
         }
-        self.alert_excessive_versions(remaining_versions, cumulative_size);
+        if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+            self.alert_excessive_versions(remaining_versions, cumulative_size);
+        }
     }
 
-    pub(super) async fn heal_actions(&mut self, oi: &ObjectInfo, actual_size: i64, size_summary: &mut SizeSummary) -> i64 {
+    pub(super) async fn heal_actions(
+        &mut self,
+        oi: &ObjectInfo,
+        actual_size: i64,
+        size_summary: &mut SizeSummary,
+        cancellation: Option<&CancellationToken>,
+    ) -> i64 {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return actual_size;
+        }
         if self.heal_enabled {
             self.enqueue_heal(oi).await;
         }
 
-        self.heal_replication(oi, size_summary).await;
+        if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+            self.heal_replication(oi, size_summary).await;
+        }
 
         actual_size
     }
 
     pub(super) async fn heal_replication(&mut self, oi: &ObjectInfo, size_summary: &mut SizeSummary) {
-        if oi.version_id.is_none_or(|version| version.is_nil()) && !oi.delete_marker && oi.version_purge_status.is_empty() {
+        // Only an unversioned listing (no version id) carries nothing to
+        // replicate. A versioned or suspended bucket lists its null version as
+        // the nil UUID — MinIO's "null" — and it is an existing object like
+        // any other (rustfs/rustfs#8747).
+        if oi.version_id.is_none() && !oi.delete_marker && oi.version_purge_status.is_empty() {
             return;
         }
 
@@ -1153,6 +1223,8 @@ impl ScannerItem {
                 scan_mode,
                 HealChannelPriority::Low,
             ),
+            oi.data_dir,
+            self.heal_scope,
         )
         .await;
 
@@ -1292,41 +1364,10 @@ pub(super) fn classify_get_size_failure(item: &ScannerItem, err: &StorageError) 
     GetSizeFailureAction::RecordFailed
 }
 
-pub(super) async fn contains_erasure_part_file(path: &str) -> Result<bool, ScannerError> {
-    let mut entries = match tokio::fs::read_dir(path).await {
-        Ok(entries) => entries,
-        Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(false),
-        Err(err) => return Err(ScannerError::Io(err)),
-    };
-
-    for _ in 0..ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return Ok(false),
-            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(false),
-            Err(err) => return Err(ScannerError::Io(err)),
-        };
-        let file_name = entry.file_name();
-        let Some(part_number) = file_name
-            .to_str()
-            .and_then(|name| name.strip_prefix("part."))
-            .and_then(|number| number.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if part_number == 0 {
-            continue;
-        }
-
-        match entry.file_type().await {
-            Ok(file_type) if file_type.is_file() => return Ok(true),
-            Ok(_) => {}
-            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::TooManyLinks) => {}
-            Err(err) => return Err(ScannerError::Io(err)),
-        }
-    }
-
-    Ok(false)
+pub(super) fn is_erasure_part_name(name: &str) -> bool {
+    name.strip_prefix("part.")
+        .and_then(|number| number.parse::<u32>().ok())
+        .is_some_and(|number| number > 0)
 }
 
 #[cfg(test)]
@@ -1345,6 +1386,7 @@ mod tests {
             lifecycle: None,
             object_lock: None,
             replication: None,
+            heal_scope: None,
             heal_enabled: false,
             heal_bitrot: false,
             debug: false,

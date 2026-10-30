@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+use crate::disk::DiskIoClass;
 use crate::disk::disk_store::{get_drive_walkdir_peek_timeout, get_drive_walkdir_stall_timeout};
 use crate::disk::error::DiskError;
-use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions};
+use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions, current_disk_io_context, with_optional_disk_io_context};
 use futures::future::join_all;
 use metrics::counter;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
@@ -38,7 +40,7 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_METACACHE: &str = "metacache";
 const EVENT_METACACHE_LISTING: &str = "metacache_listing";
 
-pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = Result<(), DiskError>> + Send>> + Send + 'static>;
 pub type PartialFn =
     Box<dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 type FinishedFn = Box<dyn Fn(&[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
@@ -53,6 +55,7 @@ impl FallbackClaimTracker {
         self.claimed.lock().await.insert(disk.endpoint().to_string());
     }
 
+    #[cfg(test)]
     pub(crate) async fn claimed_keys(&self) -> HashSet<String> {
         self.claimed.lock().await.clone()
     }
@@ -191,6 +194,8 @@ pub(crate) enum TestReaderBehavior {
         stopped: Arc<tokio::sync::Notify>,
     },
     IgnoreCancel,
+    /// Entries followed by a terminator trailer saying the producer stopped at its limit.
+    LimitReached(Vec<MetaCacheEntry>),
     ProducerError(DiskError),
     PrimaryErrorThenFallback(DiskError),
     PartialThenTimeout(Vec<MetaCacheEntry>),
@@ -222,6 +227,8 @@ pub struct ListPathRawOptions {
     pub filter_prefix: Option<String>,
     pub forward_to: Option<String>,
     pub min_disks: usize,
+    /// Deliver every replica to the partial callback, including matching headers.
+    pub preserve_replica_metadata: bool,
     pub report_not_found: bool,
     pub per_disk_limit: i32,
     pub skip_walkdir_total_timeout: bool,
@@ -236,6 +243,8 @@ pub struct ListPathRawOptions {
     pub(crate) test_fallback_reader_behaviors: Vec<TestReaderBehavior>,
     #[cfg(test)]
     pub(crate) peek_timeout: Option<Duration>,
+    #[cfg(test)]
+    pub(crate) test_disk_io_context_observed: Option<Arc<std::sync::atomic::AtomicBool>>,
     // pub agreed: Option<Arc<dyn Fn(MetaCacheEntry) + Send + Sync>>,
     // pub partial: Option<Arc<dyn Fn(MetaCacheEntries, &[Option<Error>]) + Send + Sync>>,
     // pub finished: Option<Arc<dyn Fn(&[Option<Error>]) + Send + Sync>>,
@@ -254,6 +263,7 @@ impl Clone for ListPathRawOptions {
             filter_prefix: self.filter_prefix.clone(),
             forward_to: self.forward_to.clone(),
             min_disks: self.min_disks,
+            preserve_replica_metadata: self.preserve_replica_metadata,
             report_not_found: self.report_not_found,
             per_disk_limit: self.per_disk_limit,
             skip_walkdir_total_timeout: self.skip_walkdir_total_timeout,
@@ -265,6 +275,8 @@ impl Clone for ListPathRawOptions {
             test_fallback_reader_behaviors: self.test_fallback_reader_behaviors.clone(),
             #[cfg(test)]
             peek_timeout: self.peek_timeout,
+            #[cfg(test)]
+            test_disk_io_context_observed: self.test_disk_io_context_observed.clone(),
             ..Default::default()
         }
     }
@@ -288,7 +300,27 @@ fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
     }
 }
 
+/// How a merged raw listing stream ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListPathRawOutcome {
+    /// At least one producer stopped at its per-disk limit instead of at the
+    /// end of its namespace, so the closed stream is not proof of exhaustion.
+    /// Carried in-band by the metacache stream trailer, so remote producers
+    /// report it as well.
+    pub limit_reached: bool,
+}
+
 pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> disk::error::Result<()> {
+    let rx = rx.child_token();
+    let _cancel_guard = rx.clone().drop_guard();
+    list_path_raw_inner(rx, opts, None).await.map(|_| ())
+}
+
+/// Like [`list_path_raw`], but reports how the merged stream ended.
+pub(crate) async fn list_path_raw_with_outcome(
+    rx: CancellationToken,
+    opts: ListPathRawOptions,
+) -> disk::error::Result<ListPathRawOutcome> {
     let rx = rx.child_token();
     let _cancel_guard = rx.clone().drop_guard();
     list_path_raw_inner(rx, opts, None).await
@@ -298,7 +330,7 @@ pub(crate) async fn list_path_raw_with_claim_tracker(
     rx: CancellationToken,
     opts: ListPathRawOptions,
     claim_tracker: FallbackClaimTracker,
-) -> disk::error::Result<()> {
+) -> disk::error::Result<ListPathRawOutcome> {
     let rx = rx.child_token();
     let _cancel_guard = rx.clone().drop_guard();
     list_path_raw_inner(rx, opts, Some(claim_tracker)).await
@@ -308,7 +340,7 @@ async fn list_path_raw_inner(
     rx: CancellationToken,
     opts: ListPathRawOptions,
     fallback_claim_tracker: Option<FallbackClaimTracker>,
-) -> disk::error::Result<()> {
+) -> disk::error::Result<ListPathRawOutcome> {
     if opts.disks.is_empty() {
         return Err(DiskError::ErasureReadQuorum);
     }
@@ -320,6 +352,7 @@ async fn list_path_raw_inner(
     let log_path = opts.path.clone();
 
     let mut jobs = JoinSet::new();
+    let disk_io_context = current_disk_io_context();
     let mut readers = Vec::with_capacity(opts.disks.len());
     let fds = Arc::new(TokioMutex::new(opts.fallback_disks.iter().flatten().cloned().collect::<VecDeque<_>>()));
     #[cfg(test)]
@@ -340,10 +373,18 @@ async fn list_path_raw_inner(
         let test_fallbacks_clone = test_fallbacks.clone();
         let cancel_rx_clone = cancel_rx.clone();
         let producer_errs_clone = producer_errs.clone();
-        let (rd, wr) = tokio::io::duplex(64);
+        let disk_io_context_clone = disk_io_context.clone();
+        let (rd, wr) = tokio::io::duplex(64 * 1024);
         readers.push(MetacacheReader::new(rd));
-        jobs.spawn(async move {
+        jobs.spawn(with_optional_disk_io_context(disk_io_context_clone, async move {
             let mut wr = PublishedBytesWriter::new(wr);
+            #[cfg(test)]
+            if let Some(observer) = &opts_clone.test_disk_io_context_observed {
+                observer.store(
+                    crate::disk::current_disk_io_context().is_some_and(|context| context.class == DiskIoClass::Background),
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
             #[cfg(test)]
             let test_primary_error = if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).cloned() {
                 match behavior {
@@ -352,6 +393,14 @@ async fn list_path_raw_inner(
                         let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
                         out.write(&entries).await.expect("test entries should be written");
                         out.close().await.expect("test entries should close");
+                        return Ok(());
+                    }
+                    TestReaderBehavior::LimitReached(entries) => {
+                        let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                        out.write(&entries).await.expect("test entries should be written");
+                        out.close_with_limit_reached(true)
+                            .await
+                            .expect("test entries should close at the limit");
                         return Ok(());
                     }
                     TestReaderBehavior::Stall => {
@@ -492,6 +541,16 @@ async fn list_path_raw_inner(
                             last_err = None;
                             continue;
                         }
+                        TestReaderBehavior::LimitReached(entries) => {
+                            let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                            out.write(&entries).await.expect("test fallback entries should be written");
+                            out.close_with_limit_reached(true)
+                                .await
+                                .expect("test fallback entries should close at the limit");
+                            need_fallback = false;
+                            last_err = None;
+                            continue;
+                        }
                         TestReaderBehavior::ProducerError(err) | TestReaderBehavior::PrimaryErrorThenFallback(err) => {
                             last_err = Some(err);
                             continue;
@@ -628,7 +687,7 @@ async fn list_path_raw_inner(
 
             // warn!("list_path_raw: while need_fallback done");
             Ok(())
-        });
+        }));
     }
 
     let revjob_rx = rx.clone();
@@ -660,9 +719,13 @@ async fn list_path_raw_inner(
         }
         let mut pending_entries: Vec<Option<MetaCacheEntry>> = vec![None; readers.len()];
         let mut peek_outcomes: Vec<Option<PeekOutcome>> = std::iter::repeat_with(|| None).take(readers.len()).collect();
+        // Sticky across rounds: once any reader's trailer says its producer
+        // stopped at the per-disk limit, the merged stream may hide more keys.
+        let mut limit_reached = false;
 
         loop {
             let mut current = MetaCacheEntry::default();
+            let mut current_idx: Option<usize> = None;
 
             // warn!(
             //     "list_path_raw: loop start, bucket: {}, path: {}, current: {:?}",
@@ -670,7 +733,7 @@ async fn list_path_raw_inner(
             // );
 
             if revjob_rx.is_cancelled() {
-                return Ok(());
+                return Ok(ListPathRawOutcome { limit_reached });
             }
 
             let mut top_entries: Vec<Option<MetaCacheEntry>> = vec![None; readers.len()];
@@ -720,6 +783,7 @@ async fn list_path_raw_inner(
                                     continue;
                                 }
                                 // eof
+                                limit_reached |= r.limit_reached() == Some(true);
                                 at_eof += 1;
                                 // warn!("list_path_raw: peek eof, disk: {}", i);
                                 continue;
@@ -793,7 +857,7 @@ async fn list_path_raw_inner(
                             *r = MetacacheReader::new(detached_rd);
                             continue;
                         }
-                        PeekOutcome::Cancelled => return Ok(()),
+                        PeekOutcome::Cancelled => return Ok(ListPathRawOutcome { limit_reached }),
                     }
                 };
 
@@ -801,22 +865,10 @@ async fn list_path_raw_inner(
 
                 // If no current, add it.
                 if current.name.is_empty() {
-                    top_entries[i] = Some(entry.clone());
+                    current_idx = Some(i);
                     current = entry;
                     agree += 1;
 
-                    continue;
-                }
-                // If exact match, we agree.
-                if let (_, true) = current.matches(Some(&entry), true) {
-                    top_entries[i] = Some(entry);
-                    agree += 1;
-
-                    continue;
-                }
-                // If only the name matches we didn't agree, but add it for resolution.
-                if entry.name == current.name {
-                    top_entries[i] = Some(entry);
                     continue;
                 }
                 // We got different entries
@@ -824,7 +876,21 @@ async fn list_path_raw_inner(
                     pending_entries[i] = Some(entry);
                     continue;
                 }
+                if entry.name == current.name {
+                    // If exact match, we agree.
+                    if current.matches_strict(&entry) {
+                        top_entries[i] = Some(entry);
+                        agree += 1;
+                    } else {
+                        // If only the name matches we didn't agree, but add it for resolution.
+                        top_entries[i] = Some(entry);
+                    }
+                    continue;
+                }
 
+                if let Some(idx) = current_idx.take() {
+                    pending_entries[idx] = Some(std::mem::take(&mut current));
+                }
                 for (idx, item) in top_entries.iter_mut().enumerate().take(i) {
                     if let Some(entry) = item.take() {
                         pending_entries[idx] = Some(entry);
@@ -832,7 +898,7 @@ async fn list_path_raw_inner(
                 }
 
                 agree = 1;
-                top_entries[i] = Some(entry.clone());
+                current_idx = Some(i);
                 current = entry;
             }
 
@@ -850,7 +916,7 @@ async fn list_path_raw_inner(
                 if let Some(finished_fn) = opts.finished.as_ref() {
                     tokio::select! {
                         biased;
-                        _ = revjob_rx.cancelled() => return Ok(()),
+                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
                         _ = finished_fn(&errs) => {}
                     }
                 }
@@ -907,7 +973,7 @@ async fn list_path_raw_inner(
                 {
                     tokio::select! {
                         biased;
-                        _ = revjob_rx.cancelled() => return Ok(()),
+                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
                         _ = finished_fn(&errs) => {}
                     }
                 }
@@ -918,7 +984,7 @@ async fn list_path_raw_inner(
                 break;
             }
 
-            if agree == readers.len() {
+            if agree == readers.len() && !opts.preserve_replica_metadata {
                 for r in readers.iter_mut() {
                     let _ = r.skip(1).await;
                 }
@@ -927,8 +993,8 @@ async fn list_path_raw_inner(
                     // warn!("list_path_raw: agreed_fn start, current: {:?}", &current.name);
                     tokio::select! {
                         biased;
-                        _ = revjob_rx.cancelled() => return Ok(()),
-                        _ = agreed_fn(current) => {}
+                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
+                        result = agreed_fn(current) => result?
                     }
                     // warn!("list_path_raw: agreed_fn done");
                 }
@@ -937,6 +1003,10 @@ async fn list_path_raw_inner(
             }
 
             // warn!("list_path_raw: skip start, current: {:?}", &current.name);
+
+            if let Some(idx) = current_idx.take() {
+                top_entries[idx] = Some(current);
+            }
 
             for (i, r) in readers.iter_mut().enumerate() {
                 if top_entries[i].is_some() {
@@ -947,52 +1017,55 @@ async fn list_path_raw_inner(
             if let Some(partial_fn) = opts.partial.as_ref() {
                 tokio::select! {
                     biased;
-                    _ = revjob_rx.cancelled() => return Ok(()),
+                    _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
                     _ = partial_fn(MetaCacheEntries(top_entries), &errs) => {}
                 }
             }
         }
-        Ok(())
+        Ok(ListPathRawOutcome { limit_reached })
     });
 
     let merge_started = std::time::Instant::now();
     let Some(revjob) = revjobs.join_next().await else {
         return Err(DiskError::Unexpected);
     };
-    if let Err(err) = revjob.map_err(std::io::Error::other)? {
-        rustfs_io_metrics::record_stage_duration("metacache_merge_failed", merge_started.elapsed().as_secs_f64() * 1000.0);
-        if is_missing_path_error(&err) {
-            debug!(
-                event = EVENT_METACACHE_LISTING,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_METACACHE,
-                bucket = %log_bucket,
-                path = %log_path,
-                state = "merge_job_missing_path",
-                error = ?err,
-                "Metacache merge job missing path skipped"
-            );
-        } else {
-            error!(
-                event = EVENT_METACACHE_LISTING,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_METACACHE,
-                bucket = %log_bucket,
-                path = %log_path,
-                state = "merge_job_failed",
-                error = ?err,
-                "Metacache merge job failed"
-            );
-        }
-        cancel_rx.cancel();
-        jobs.abort_all();
+    let outcome = match revjob.map_err(std::io::Error::other)? {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            rustfs_io_metrics::record_stage_duration("metacache_merge_failed", merge_started.elapsed().as_secs_f64() * 1000.0);
+            if is_missing_path_error(&err) {
+                debug!(
+                    event = EVENT_METACACHE_LISTING,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_METACACHE,
+                    bucket = %log_bucket,
+                    path = %log_path,
+                    state = "merge_job_missing_path",
+                    error = ?err,
+                    "Metacache merge job missing path skipped"
+                );
+            } else {
+                error!(
+                    event = EVENT_METACACHE_LISTING,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_METACACHE,
+                    bucket = %log_bucket,
+                    path = %log_path,
+                    state = "merge_job_failed",
+                    error = ?err,
+                    "Metacache merge job failed"
+                );
+            }
+            cancel_rx.cancel();
+            jobs.abort_all();
 
-        return Err(err);
-    }
+            return Err(err);
+        }
+    };
     if rx.is_cancelled() {
         cancel_rx.cancel();
         jobs.abort_all();
-        return Ok(());
+        return Ok(outcome);
     }
     rustfs_io_metrics::record_stage_duration("metacache_merge", merge_started.elapsed().as_secs_f64() * 1000.0);
 
@@ -1061,7 +1134,7 @@ async fn list_path_raw_inner(
     }
 
     // warn!("list_path_raw: done");
-    Ok(())
+    Ok(outcome)
 }
 
 #[inline]
@@ -1080,6 +1153,7 @@ mod tests {
     use rustfs_filemeta::MetacacheWriter;
     use rustfs_filemeta::{FileInfo, FileMeta, MetadataResolutionParams};
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
     use time::OffsetDateTime;
     use uuid::Uuid;
 
@@ -1139,6 +1213,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_path_raw_joinset_producers_inherit_scanner_disk_io_class() {
+        let observed = Arc::new(AtomicBool::new(false));
+        crate::disk::with_background_disk_io(
+            CancellationToken::new(),
+            list_path_raw(
+                CancellationToken::new(),
+                ListPathRawOptions {
+                    disks: vec![None],
+                    min_disks: 1,
+                    test_reader_behaviors: vec![TestReaderBehavior::Eof],
+                    test_disk_io_context_observed: Some(observed.clone()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("empty test producer should complete the listing");
+
+        assert!(
+            observed.load(std::sync::atomic::Ordering::Acquire),
+            "the per-disk JoinSet producer must retain the scanner background class"
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_joinset_walk_uses_the_local_disk_background_gate() {
+        let root = tempfile::tempdir().expect("local disk root should be created");
+        let endpoint = crate::disk::endpoint::Endpoint::try_from(root.path().to_str().expect("disk path should be UTF-8"))
+            .expect("endpoint should parse");
+        let local = Arc::new(
+            crate::disk::local::LocalDisk::new(&endpoint, false)
+                .await
+                .expect("local disk should open"),
+        );
+        let wrapper = crate::disk::disk_store::LocalDiskWrapper::new(local, false);
+        wrapper.make_volume("bucket").await.expect("bucket volume should be created");
+        let disk = Arc::new(crate::disk::Disk::Local(Box::new(wrapper.clone())));
+        let cancellation = CancellationToken::new();
+
+        crate::disk::with_background_disk_io(
+            cancellation.clone(),
+            list_path_raw(
+                cancellation,
+                ListPathRawOptions {
+                    disks: vec![Some(disk)],
+                    bucket: "bucket".to_string(),
+                    min_disks: 1,
+                    recursive: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("scanner metacache walk should complete");
+
+        assert!(
+            wrapper.background_io_admissions_for_tests() > 0,
+            "the LocalDiskWrapper walk should acquire background admission inside its JoinSet producer"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_reports_limit_reached_from_any_reader_trailer() {
+        let first = fallback_test_entry();
+        let second = MetaCacheEntry {
+            name: "bucket/object-2".to_string(),
+            ..fallback_test_entry()
+        };
+        // One bounded producer, one that ends naturally, one legacy empty
+        // stream without any trailer.
+        let outcome = list_path_raw_inner(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None],
+                min_disks: 1,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::LimitReached(vec![first.clone()]),
+                    TestReaderBehavior::Entries(vec![first, second]),
+                    TestReaderBehavior::Eof,
+                ],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("listing should complete");
+
+        assert!(
+            outcome.limit_reached,
+            "a reader whose trailer reports a limit stop must mark the merged stream as possibly incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_reports_natural_end_when_no_reader_trailer_says_limit() {
+        let outcome = list_path_raw_inner(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None],
+                min_disks: 1,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Entries(vec![fallback_test_entry()]),
+                    TestReaderBehavior::Eof,
+                ],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("listing should complete");
+
+        assert!(!outcome.limit_reached, "natural and legacy stream ends must not claim a limit stop");
+    }
+
+    #[tokio::test]
     async fn list_path_raw_returns_typed_quorum_error_for_multiple_drive_failures() {
         let err = list_path_raw(
             CancellationToken::new(),
@@ -1174,6 +1363,17 @@ mod tests {
         let mixed_timeout =
             classify_listing_quorum_failure(&[DiskError::Timeout, DiskError::FileAccessDenied, DiskError::ErasureReadQuorum]);
         assert_eq!(mixed_timeout, DiskError::Timeout);
+    }
+
+    #[test]
+    fn mixed_missing_and_body_io_errors_remain_an_actionable_quorum_failure() {
+        let failures = [
+            DiskError::FileNotFound,
+            DiskError::Io(std::io::Error::other("remote body stream aborted")),
+        ];
+
+        assert!(!is_benign_not_found_listing_failure(&failures));
+        assert_eq!(classify_listing_quorum_failure(&failures), DiskError::ErasureReadQuorum);
     }
 
     #[test]
@@ -1586,6 +1786,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_path_raw_propagates_agreed_callback_failure() {
+        let entry = MetaCacheEntry {
+            name: "bucket/object".to_owned(),
+            metadata: vec![1],
+            ..Default::default()
+        };
+        let result = timeout(
+            Duration::from_secs(1),
+            list_path_raw(
+                CancellationToken::new(),
+                ListPathRawOptions {
+                    disks: vec![None],
+                    min_disks: 1,
+                    test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![entry])],
+                    agreed: Some(Box::new(|_| Box::pin(async { Err(DiskError::ErasureReadQuorum) }))),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("callback failure must terminate the walk");
+        assert_eq!(
+            result.expect_err("agreed resolution must not silently omit the key"),
+            DiskError::ErasureReadQuorum
+        );
+    }
+
+    #[tokio::test]
     async fn list_path_raw_cancels_a_blocked_partial_callback() {
         let cancel = CancellationToken::new();
         let callback_started = Arc::new(tokio::sync::Notify::new());
@@ -1653,6 +1881,7 @@ mod tests {
                     Box::pin(async move {
                         callback_started.notify_one();
                         std::future::pending::<()>().await;
+                        Ok(())
                     })
                 })),
                 ..Default::default()
@@ -1804,6 +2033,7 @@ mod tests {
                     let seen = seen_clone.clone();
                     Box::pin(async move {
                         seen.lock().expect("seen mutex poisoned").push(entry.name);
+                        Ok(())
                     })
                 })),
                 ..Default::default()
@@ -1846,6 +2076,7 @@ mod tests {
                     let seen = seen_clone.clone();
                     Box::pin(async move {
                         seen.lock().expect("seen mutex poisoned").push(entry.name);
+                        Ok(())
                     })
                 })),
                 ..Default::default()
@@ -1918,6 +2149,7 @@ mod tests {
                     let seen = agreed_seen.clone();
                     Box::pin(async move {
                         seen.lock().expect("seen mutex poisoned").push(entry.name);
+                        Ok(())
                     })
                 })),
                 partial: Some(Box::new(move |entries, _| {
@@ -2028,5 +2260,258 @@ mod tests {
         .expect_err("producer access failure must not be treated as an empty listing");
 
         assert_eq!(err, DiskError::FileAccessDenied);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_demotes_current_and_agreed_peers_across_cascading_smaller_keys() {
+        fn make_entry(name: &str, vid: u128, etag: &str) -> MetaCacheEntry {
+            let mut meta = FileMeta::default();
+            let mut fi = FileInfo::new(name, 2, 2);
+            fi.version_id = Some(Uuid::from_u128(vid));
+            fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+            fi.metadata.insert("etag".to_string(), etag.to_string());
+            meta.add_version(fi).expect("add version");
+            MetaCacheEntry {
+                name: name.to_string(),
+                metadata: meta.marshal_msg().expect("marshal metadata"),
+                cached: None,
+                reusable: false,
+            }
+        }
+
+        // Round 1: Disks 0 and 1 BOTH start at "key-d" and strictly agree, populating `current_idx = Some(0)`
+        // and `top_entries[1] = Some(key-d)`. Disk 2 then yields "key-b" (< "key-d"), forcing demotion of
+        // BOTH `current_idx` (`pending_entries[0]`) AND `top_entries[1]` (`pending_entries[1]`).
+        // Disk 3 then yields "key-a" (< "key-b"), forcing a second cascading demotion of Disk 2 to `pending_entries[2]`.
+        // Later at "key-e", all 4 disks present the same name, version_id, and mod_time, but Disk 2 has a different
+        // ETag ("etag-e2" vs "etag-e1"), proving `matches_strict` routes all 4 replicas to `partial` instead of `agreed`.
+        let k_a = make_entry("key-a", 1, "etag-a");
+        let k_b = make_entry("key-b", 2, "etag-b");
+        let k_d = make_entry("key-d", 4, "etag-d");
+        let k_e_v1 = make_entry("key-e", 5, "etag-e1");
+        let k_e_v2 = make_entry("key-e", 5, "etag-e2");
+
+        let disk0 = vec![k_d.clone(), k_e_v1.clone()];
+        let disk1 = vec![k_d.clone(), k_e_v1.clone()];
+        let disk2 = vec![k_b.clone(), k_d.clone(), k_e_v2];
+        let disk3 = vec![k_a, k_b, k_d, k_e_v1];
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let agreed_events = events.clone();
+        let partial_events = events.clone();
+
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None, None],
+                min_disks: 1,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Entries(disk0),
+                    TestReaderBehavior::Entries(disk1),
+                    TestReaderBehavior::Entries(disk2),
+                    TestReaderBehavior::Entries(disk3),
+                ],
+                agreed: Some(Box::new(move |entry| {
+                    let agreed_events = agreed_events.clone();
+                    Box::pin(async move {
+                        agreed_events.lock().expect("events lock").push((entry.name, 4usize, true));
+                        Ok(())
+                    })
+                })),
+                partial: Some(Box::new(move |entries, _| {
+                    let partial_events = partial_events.clone();
+                    Box::pin(async move {
+                        let present = entries.0.iter().flatten().count();
+                        let name = entries
+                            .0
+                            .iter()
+                            .flatten()
+                            .next()
+                            .expect("at least one entry in partial")
+                            .name
+                            .clone();
+                        partial_events.lock().expect("events lock").push((name, present, false));
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cascading demotion listing should succeed");
+
+        assert_eq!(
+            events.lock().expect("events lock").as_slice(),
+            &[
+                ("key-a".to_string(), 1, false),
+                ("key-b".to_string(), 2, false),
+                ("key-d".to_string(), 4, true),
+                ("key-e".to_string(), 4, false),
+            ],
+            "cascading demotions must preserve pending_entries from both current_idx and top_entries, and 4-disk ETag divergence must take partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_seeded_multi_disk_streams_match_reference_oracle() {
+        type Step = (String, Vec<Option<String>>, bool);
+
+        fn make_entry(name: &str, variant: u64) -> MetaCacheEntry {
+            if name.ends_with('/') {
+                return MetaCacheEntry {
+                    name: name.to_string(),
+                    metadata: Vec::new(),
+                    cached: None,
+                    reusable: false,
+                };
+            }
+            let mut meta = FileMeta::default();
+            let mut fi = FileInfo::new(name, 2, 2);
+            fi.version_id = Some(Uuid::from_u128(1));
+            fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+            fi.metadata.insert("etag".to_string(), format!("etag-{variant}"));
+            meta.add_version(fi).expect("add version");
+            MetaCacheEntry {
+                name: name.to_string(),
+                metadata: meta.marshal_msg().expect("marshal metadata"),
+                cached: None,
+                reusable: false,
+            }
+        }
+
+        fn describe_entry(entry: &MetaCacheEntry) -> String {
+            if entry.is_dir() {
+                return format!("{}:0", entry.name);
+            }
+            let fi = entry.to_fileinfo("bucket").expect("decode test entry");
+            let etag = fi.metadata.get("etag").expect("etag present");
+            let v = etag.strip_prefix("etag-").expect("etag prefix");
+            format!("{}:{v}", entry.name)
+        }
+
+        let universe = ["a", "a/", "a/b", "a/b/", "a/c", "a0", "b", "b/", "b/1", "c", "d/", "e"];
+
+        // Deterministic LCG seed using high bits across 24 random 4-disk stream schedules.
+        let mut seed = 0x5eed_cafe_1234_5678_u64;
+        let mut next_rand = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            seed >> 33
+        };
+
+        let mut total_agreed = 0usize;
+        let mut total_partial = 0usize;
+        let mut total_preserved_all_four = 0usize;
+
+        for round in 0..24 {
+            let preserve_replica_metadata = round % 3 == 0;
+            let mut disk_streams: Vec<Vec<MetaCacheEntry>> = vec![Vec::new(); 4];
+            let mut expected_steps: Vec<Step> = Vec::new();
+
+            for &key in &universe {
+                // High-bit mask in 1..=15; force mask 15 on every 4th key so 4-disk agreement/divergence is heavily exercised.
+                let mask = if next_rand() % 4 == 0 {
+                    0b1111_u64
+                } else {
+                    (next_rand() % 15) + 1
+                };
+                let mut slot_variants: Vec<Option<u64>> = Vec::with_capacity(4);
+                let mut first_variant = None;
+                let mut all_present_and_equal = true;
+
+                for (disk_idx, stream) in disk_streams.iter_mut().enumerate() {
+                    if (mask & (1_u64 << disk_idx)) != 0 {
+                        // Directory entries carry no metadata, so their variant is always 0.
+                        let v = if key.ends_with('/') {
+                            first_variant = Some(0);
+                            0
+                        } else if first_variant.is_none() || (next_rand() % 4 != 0) {
+                            let v = first_variant.unwrap_or_else(|| next_rand() % 3);
+                            first_variant = Some(v);
+                            v
+                        } else {
+                            all_present_and_equal = false;
+                            (first_variant.unwrap_or(0) + 1) % 3
+                        };
+                        stream.push(make_entry(key, v));
+                        slot_variants.push(Some(v));
+                    } else {
+                        all_present_and_equal = false;
+                        slot_variants.push(None);
+                    }
+                }
+
+                let expect_agreed = all_present_and_equal && !preserve_replica_metadata;
+                if expect_agreed {
+                    total_agreed += 1;
+                } else {
+                    total_partial += 1;
+                    if all_present_and_equal && preserve_replica_metadata {
+                        total_preserved_all_four += 1;
+                    }
+                }
+                let expected_slots = slot_variants
+                    .into_iter()
+                    .map(|opt| opt.map(|v| format!("{key}:{v}")))
+                    .collect();
+                expected_steps.push((key.to_string(), expected_slots, expect_agreed));
+            }
+
+            let observed: Arc<Mutex<Vec<Step>>> = Arc::new(Mutex::new(Vec::new()));
+            let agreed_obs = observed.clone();
+            let partial_obs = observed.clone();
+
+            list_path_raw(
+                CancellationToken::new(),
+                ListPathRawOptions {
+                    disks: vec![None; 4],
+                    min_disks: 1,
+                    preserve_replica_metadata,
+                    test_reader_behaviors: disk_streams.into_iter().map(TestReaderBehavior::Entries).collect(),
+                    agreed: Some(Box::new(move |entry| {
+                        let agreed_obs = agreed_obs.clone();
+                        let desc = describe_entry(&entry);
+                        let name = entry.name;
+                        Box::pin(async move {
+                            agreed_obs.lock().expect("obs lock").push((name, vec![Some(desc); 4], true));
+                            Ok(())
+                        })
+                    })),
+                    partial: Some(Box::new(move |entries, _| {
+                        let partial_obs = partial_obs.clone();
+                        let name = entries
+                            .0
+                            .iter()
+                            .flatten()
+                            .next()
+                            .expect("partial must contain at least one entry")
+                            .name
+                            .clone();
+                        let slots = entries
+                            .0
+                            .iter()
+                            .map(|opt| opt.as_ref().map(describe_entry))
+                            .collect::<Vec<_>>();
+                        Box::pin(async move {
+                            partial_obs.lock().expect("obs lock").push((name, slots, false));
+                        })
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seeded list_path_raw must succeed");
+
+            assert_eq!(
+                *observed.lock().expect("obs lock"),
+                expected_steps,
+                "round={round}, preserve_replica_metadata={preserve_replica_metadata}"
+            );
+        }
+
+        assert!(total_agreed > 0, "seeded schedule must exercise agreed fast-path");
+        assert!(total_partial > 0, "seeded schedule must exercise partial path");
+        assert!(
+            total_preserved_all_four > 0,
+            "seeded schedule must exercise preserve_replica_metadata on 4-disk agreement"
+        );
     }
 }

@@ -122,12 +122,56 @@ async fn pause_prepared_pool_read_before_refetch(object: &str) {
         state.refetch_release.notified().await;
     }
 }
+/// Capacity that every online drive of one pool reports to free-space target
+/// selection, per store, until the guard drops.
+#[cfg(test)]
+static POOL_SPACE_FOR_TEST: std::sync::Mutex<Vec<(Uuid, usize, crate::disk::DiskInfo)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) struct PoolSpaceForTest(Uuid);
+
+#[cfg(test)]
+impl PoolSpaceForTest {
+    pub(crate) fn install(store: Uuid, pools: &[(usize, crate::disk::DiskInfo)]) -> Self {
+        POOL_SPACE_FOR_TEST
+            .lock()
+            .expect("pool space override must not be poisoned")
+            .extend(pools.iter().map(|(pool, info)| (store, *pool, info.clone())));
+        Self(store)
+    }
+}
+
+#[cfg(test)]
+impl Drop for PoolSpaceForTest {
+    fn drop(&mut self) {
+        POOL_SPACE_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(store, _, _)| *store != self.0);
+    }
+}
+
+#[cfg(test)]
+fn pool_space_for_test(
+    store: Uuid,
+    pool: usize,
+    infos: Vec<Option<crate::disk::DiskInfo>>,
+) -> Vec<Option<crate::disk::DiskInfo>> {
+    let overrides = POOL_SPACE_FOR_TEST.lock().expect("pool space override must not be poisoned");
+    let Some((_, _, info)) = overrides
+        .iter()
+        .find(|(override_store, override_pool, _)| *override_store == store && *override_pool == pool)
+    else {
+        return infos;
+    };
+    infos.into_iter().map(|disk| disk.map(|_| info.clone())).collect()
+}
+
 #[cfg(test)]
 use support::resolve_latest_object_info_candidates;
 use support::{
-    LatestObjectInfoCandidate, PoolErr, PoolObjInfo, RebalanceDeletePoolResult, pool_lookup_not_found_error,
-    rebalance_disk_set_lookup_error, resolve_latest_object_info_candidates_with_pool_state,
-    resolve_rebalance_delete_from_all_pools_result, resolve_rebalance_delete_from_all_pools_results,
+    LatestObjectInfoCandidate, PoolErr, PoolObjInfo, pool_lookup_not_found_error, rebalance_disk_set_lookup_error,
+    resolve_latest_object_info_candidates_with_pool_state, resolve_rebalance_delete_from_all_pools_results,
     resolve_store_rebalance_pool_meta_reload_result, validate_prepared_pool_refetch_identity,
 };
 
@@ -439,30 +483,7 @@ impl ECStore {
     }
 
     pub(super) async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
-        // // Return a random one first
-
-        let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
-        server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
-        let total = server_pools.total_available();
-
-        if total == 0 {
-            return None;
-        }
-
-        let mut rng = rand::rng();
-        let random_u64: u64 = rng.random_range(0..total);
-
-        let choose = random_u64 % total;
-        let mut at_total = 0;
-
-        for pool in server_pools.iter() {
-            at_total += pool.available;
-            if at_total > choose && pool.available > 0 {
-                return Some(pool.index);
-            }
-        }
-
-        None
+        self.get_available_pool_idx_preferring(bucket, object, size, None, None).await
     }
 
     pub(super) async fn get_available_pool_idx_excluding(
@@ -472,11 +493,31 @@ impl ECStore {
         size: i64,
         excluded_pool_idx: usize,
     ) -> Option<usize> {
+        self.get_available_pool_idx_preferring(bucket, object, size, Some(excluded_pool_idx), None)
+            .await
+    }
+
+    /// Free-space choice among the pools that can take `size` more bytes,
+    /// weighted by available space. `preferred_pool_idx` is returned whenever
+    /// it passes the same checks, so a full or excluded pool is never forced.
+    pub(super) async fn get_available_pool_idx_preferring(
+        &self,
+        bucket: &str,
+        object: &str,
+        size: i64,
+        excluded_pool_idx: Option<usize>,
+        preferred_pool_idx: Option<usize>,
+    ) -> Option<usize> {
         let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
         server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
 
-        if let Some(pool) = server_pools.0.get_mut(excluded_pool_idx) {
+        if let Some(pool) = excluded_pool_idx.and_then(|idx| server_pools.0.get_mut(idx)) {
             pool.available = 0;
+        }
+        if let Some(pool_idx) = preferred_pool_idx
+            && server_pools.0.get(pool_idx).is_some_and(|pool| pool.available > 0)
+        {
+            return Some(pool_idx);
         }
 
         let total = server_pools.total_available();
@@ -510,6 +551,8 @@ impl ECStore {
 
             let disks = pool.get_disks_by_key(object).disk_inventory().await;
             let disk_infos = get_disk_infos(&disks).await;
+            #[cfg(test)]
+            let disk_infos = pool_space_for_test(self.id, idx, disk_infos);
 
             (idx, pool.set_count, disk_infos)
         }))
@@ -611,7 +654,18 @@ impl ECStore {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<(PoolObjInfo, Vec<PoolErr>)> {
-        self.internal_get_pool_info_existing_with_opts(bucket, object, opts).await
+        self.internal_get_pool_info_existing_with_opts(bucket, object, opts, false)
+            .await
+    }
+
+    pub(super) async fn get_pool_info_for_delete_marker(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(PoolObjInfo, Vec<PoolErr>)> {
+        self.internal_get_pool_info_existing_with_opts(bucket, object, opts, true)
+            .await
     }
 
     async fn internal_get_pool_info_existing_with_opts(
@@ -619,6 +673,7 @@ impl ECStore {
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
+        require_all_pool_reads: bool,
     ) -> Result<(PoolObjInfo, Vec<PoolErr>)> {
         let mut futures = Vec::new();
         for pool in self.pools.iter() {
@@ -647,6 +702,15 @@ impl ECStore {
                     });
                 }
                 Err(e) => {
+                    // A readable older pool cannot prove ownership of the
+                    // current version while another pool is unreadable. Check
+                    // both raw and object-scoped quorum errors before sorting.
+                    if require_all_pool_reads && !is_err_object_not_found(&e) && !is_err_version_not_found(&e) {
+                        return Err(match e {
+                            Error::ErasureReadQuorum | Error::InsufficientReadQuorum(_, _) => Error::ErasureWriteQuorum,
+                            err => err,
+                        });
+                    }
                     ress.push(PoolObjInfo {
                         index,
                         err: Some(e),
@@ -654,6 +718,34 @@ impl ECStore {
                     });
                 }
             }
+        }
+
+        if require_all_pool_reads {
+            let suspended_pools = {
+                let pool_meta = self.pool_meta.read().await;
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>()
+            };
+            let candidates = ress
+                .iter()
+                .map(|pinfo| LatestObjectInfoCandidate {
+                    info: pinfo.err.is_none().then(|| pinfo.object_info.clone()),
+                    idx: pinfo.index,
+                    err: pinfo.err.clone(),
+                })
+                .collect();
+            let (object_info, index) =
+                resolve_latest_object_info_candidates_with_pool_state(candidates, &suspended_pools, bucket, object, opts)?;
+            let pools_with_object = self.pools_with_object(&ress, opts).await;
+            return Ok((
+                PoolObjInfo {
+                    index,
+                    object_info,
+                    err: None,
+                },
+                pools_with_object,
+            ));
         }
 
         ress.sort_by(|a, b| {
@@ -947,42 +1039,27 @@ impl ECStore {
 
         let mut results = Vec::with_capacity(errs.len());
 
-        for pe in errs.iter() {
-            if let Some(err) = &pe.err
-                && err == &StorageError::ErasureWriteQuorum
-            {
-                if let Some(idx) = pe.index {
-                    results.push(RebalanceDeletePoolResult {
-                        pool_idx: idx,
-                        result: Err(StorageError::ErasureWriteQuorum),
-                    });
-                }
+        for pe in &errs {
+            let Some(idx) = pe.index else { continue };
+            if pe.err.as_ref() == Some(&StorageError::ErasureWriteQuorum) {
+                results.push(Err(StorageError::ErasureWriteQuorum));
                 continue;
             }
-
-            if let Some(idx) = pe.index {
-                let pool = self.pools[idx].clone();
-                results.push(RebalanceDeletePoolResult {
-                    pool_idx: idx,
-                    result: self
-                        .run_external_decommission_capacity_object_delete(
-                            idx,
-                            bucket,
-                            object,
-                            object,
-                            opts.clone(),
-                            |opts| async move { pool.delete_object(bucket, object, opts).await },
-                        )
-                        .await,
-                });
-            }
+            let pool = self.pools[idx].clone();
+            results.push(
+                self.run_external_decommission_capacity_object_delete(
+                    idx,
+                    bucket,
+                    object,
+                    object,
+                    opts.clone(),
+                    |opts| async move { pool.delete_object(bucket, object, opts).await },
+                )
+                .await,
+            );
         }
 
-        resolve_rebalance_delete_from_all_pools_result(
-            resolve_rebalance_delete_from_all_pools_results(results, bucket, object),
-            bucket,
-            object,
-        )
+        resolve_rebalance_delete_from_all_pools_results(results, bucket, object)
     }
 
     /// Peer reload entry: refreshes in-memory pool metadata from the shared
@@ -2090,6 +2167,269 @@ mod tests {
         assert_eq!(info.data_dir, target.data_dir);
     }
 
+    /// A partially moved entry: the retained source lists every version, the
+    /// target only the ones copied so far (rustfs/backlog#2873, defect F).
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_a_moved_copy_with_a_shorter_version_list() {
+        let mut source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        source.data_dir = Some(Uuid::from_u128(1));
+        source.num_versions = 5;
+        source.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid"));
+
+        let mut target = source.clone();
+        target.data_dir = Some(Uuid::from_u128(2));
+        target.num_versions = 4;
+        target.is_latest = !source.is_latest;
+        target.successor_mod_time = None;
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_DATA_MOVED,
+            "true".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+            "0".to_string(),
+        );
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target.clone()),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a version copied by a partially moved entry must stay readable");
+
+        assert_eq!(idx, 1);
+        assert_eq!(info.data_dir, target.data_dir);
+    }
+
+    /// An exact copy of an identified version, such as a delete marker copied
+    /// by a partially moved entry, is the same version whatever each pool's
+    /// version list holds.
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_an_identified_version_with_a_shorter_version_list() {
+        let source = object_info_with_identity(10, true, Uuid::from_u128(1), None);
+        let mut target = source.clone();
+        target.num_versions = source.num_versions + 3;
+        target.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid"));
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("an exact copy of an identified version must resolve");
+
+        assert_eq!(idx, 1);
+        assert!(info.delete_marker);
+    }
+
+    /// The delete marker a partially moved entry copied carries the target's
+    /// bucket incarnation fence and a shorter version list; it is still the
+    /// source's marker, so the latest read answers with that marker.
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_a_copied_delete_marker_with_its_incarnation_fence() {
+        let mut source = object_info_with_identity(10, true, Uuid::from_u128(1), None);
+        source.num_versions = 4;
+        let mut target = source.clone();
+        target.num_versions = 2;
+        rustfs_utils::http::metadata_compat::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID,
+            Uuid::from_u128(2).to_string(),
+        );
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a copied delete marker must resolve as the latest version");
+
+        assert_eq!(idx, 1);
+        assert!(info.delete_marker);
+    }
+
+    fn tiered_null_version_file_info() -> FileInfo {
+        FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: None,
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(10).expect("test timestamp should be valid")),
+            size: 1024,
+            metadata: std::collections::HashMap::from([("etag".to_string(), "tiered-etag".to_string())]),
+            transition_status: rustfs_filemeta::TRANSITION_COMPLETE.to_string(),
+            transition_tier: "WARM".to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version: Some("remote-version".to_string()),
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            num_versions: 3,
+            is_latest: false,
+            successor_mod_time: Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid")),
+            ..FileInfo::new("bucket/object", 2, 2)
+        }
+    }
+
+    /// Tiered migration publishes metadata without a data-moved marker. The
+    /// same null version can be historical on the source and latest on a
+    /// partially populated target.
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_a_tiered_null_version_with_a_shorter_history() {
+        use rustfs_filemeta::TransitionVersionState;
+
+        for (remote_version, state) in [
+            (Some("remote-version"), TransitionVersionState::Exact),
+            (None, TransitionVersionState::KnownDisabled),
+            (Some("null"), TransitionVersionState::SuspendedNull),
+            (Some("legacy-version"), TransitionVersionState::Unknown),
+            (None, TransitionVersionState::Unknown),
+        ] {
+            let mut source_file = tiered_null_version_file_info();
+            source_file.transition_version = remote_version.map(str::to_string);
+            source_file.transition_version_state = state;
+            let mut target_file = source_file.clone();
+            crate::data_movement::prepare_tiered_data_movement_file_info(&mut target_file)
+                .expect("tiered metadata preparation should preserve the remote tuple");
+            target_file.num_versions = 1;
+            target_file.is_latest = true;
+            target_file.successor_mod_time = None;
+
+            for versioned in [false, true] {
+                let source = ObjectInfo::from_file_info(&source_file, "bucket", "object", versioned);
+                let target = ObjectInfo::from_file_info(&target_file, "bucket", "object", versioned);
+                assert_eq!(source.version_id, versioned.then_some(Uuid::nil()));
+                assert!(!rustfs_utils::http::contains_key_str(
+                    &target.user_defined,
+                    rustfs_utils::http::SUFFIX_DATA_MOVED
+                ));
+
+                let (info, idx) = resolve_latest_object_info_candidates(
+                    vec![
+                        LatestObjectInfoCandidate {
+                            info: Some(source),
+                            idx: 0,
+                            err: None,
+                        },
+                        LatestObjectInfoCandidate {
+                            info: Some(target),
+                            idx: 1,
+                            err: None,
+                        },
+                    ],
+                    "bucket",
+                    "object",
+                    &ObjectOptions {
+                        version_id: Some("null".to_string()),
+                        versioned,
+                        ..Default::default()
+                    },
+                )
+                .expect("an exact tiered null-version copy must remain readable before source cleanup");
+
+                assert_eq!(idx, 1);
+                assert_eq!(info.version_id, versioned.then_some(Uuid::nil()));
+                assert_eq!(info.transitioned_object.status, rustfs_filemeta::TRANSITION_COMPLETE);
+                assert_eq!(info.transitioned_object.tier, "WARM");
+                assert_eq!(info.transitioned_object.name, "remote/object");
+                assert_eq!(info.transitioned_object.version_id, remote_version.unwrap_or_default());
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_tiered_null_version_identity_conflicts() {
+        let source = ObjectInfo::from_file_info(&tiered_null_version_file_info(), "bucket", "object", true);
+        let changes: [fn(&mut ObjectInfo); 5] = [
+            |info| info.transitioned_object.tier = "OTHER".to_string(),
+            |info| info.transitioned_object.name = "remote/other".to_string(),
+            |info| info.transitioned_object.version_id = "other-version".to_string(),
+            |info| info.size += 1,
+            |info| info.etag = Some("other-etag".to_string()),
+        ];
+
+        for change in changes {
+            let mut target = source.clone();
+            target.num_versions = 1;
+            change(&mut target);
+            assert_equal_time_identity_conflict(source.clone(), target);
+        }
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_tiered_null_history_without_a_complete_remote_tuple() {
+        let source = ObjectInfo::from_file_info(&tiered_null_version_file_info(), "bucket", "object", true);
+        let changes: [fn(&mut ObjectInfo); 5] = [
+            |info| info.transitioned_object.status.clear(),
+            |info| info.transitioned_object.status = "pending".to_string(),
+            |info| info.transitioned_object.tier.clear(),
+            |info| info.transitioned_object.name.clear(),
+            |info| info.transitioned_object.free_version = true,
+        ];
+
+        for change in changes {
+            let mut source = source.clone();
+            change(&mut source);
+            let mut target = source.clone();
+            target.num_versions = 1;
+            assert_equal_time_identity_conflict(source, target);
+        }
+    }
+
+    /// A null version has no id to prove both pools hold the same version, so
+    /// a differing version list still fails closed.
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_null_version_history_conflict() {
+        let mut left = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        left.version_id = None;
+        let mut right = left.clone();
+        right.num_versions = left.num_versions + 1;
+        assert_equal_time_identity_conflict(left.clone(), right);
+
+        let mut right = left.clone();
+        right.is_latest = !left.is_latest;
+        assert_equal_time_identity_conflict(left.clone(), right);
+
+        let mut right = left.clone();
+        right.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid"));
+        assert_equal_time_identity_conflict(left, right);
+    }
+
     #[test]
     fn resolve_latest_object_info_candidates_rejects_unmarked_data_dir_conflict() {
         let mut left = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
@@ -2412,55 +2752,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rebalance_delete_from_all_pools_result_passthrough_ok() {
-        let info = ObjectInfo {
-            bucket: "bucket".to_string(),
-            name: "object".to_string(),
-            ..Default::default()
-        };
-
-        let resolved = resolve_rebalance_delete_from_all_pools_result(Ok(info.clone()), "bucket", "object")
-            .expect("successful rebalance delete should pass through");
-
-        assert_eq!(resolved.bucket, info.bucket);
-        assert_eq!(resolved.name, info.name);
-    }
-
-    #[test]
-    fn resolve_rebalance_delete_from_all_pools_result_wraps_object_context() {
-        let err = resolve_rebalance_delete_from_all_pools_result(Err(Error::SlowDown), "bucket", "object")
-            .expect_err("failed rebalance delete should be wrapped");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("failed to delete rebalance source object bucket/object"), "{rendered}");
-        assert!(rendered.contains(&Error::SlowDown.to_string()), "{rendered}");
-    }
-
-    #[test]
     fn resolve_rebalance_delete_from_all_pools_results_fails_on_later_pool_error() {
         let err = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Ok(ObjectInfo {
-                        bucket: "bucket".to_string(),
-                        name: "object".to_string(),
-                        ..Default::default()
-                    }),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::SlowDown),
-                },
+                Ok(ObjectInfo {
+                    bucket: "bucket".to_string(),
+                    name: "object".to_string(),
+                    ..Default::default()
+                }),
+                Err(Error::SlowDown),
             ],
             "bucket",
             "object",
         )
         .expect_err("non-ignorable errors from later pools must not be hidden");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
-        assert!(rendered.contains(&Error::SlowDown.to_string()), "{rendered}");
+        assert_eq!(err, Error::SlowDown);
     }
 
     #[test]
@@ -2473,14 +2779,8 @@ mod tests {
 
         let resolved = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Ok(info.clone()),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
-                },
+                Ok(info.clone()),
+                Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
             ],
             "bucket",
             "object",
@@ -2501,14 +2801,8 @@ mod tests {
 
         let resolved = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Ok(info.clone()),
-                },
+                Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+                Ok(info.clone()),
             ],
             "bucket",
             "object",
@@ -2523,50 +2817,35 @@ mod tests {
     fn resolve_rebalance_delete_from_all_pools_results_fails_when_all_results_are_ignored_errors() {
         let err = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())),
-                },
+                Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+                Err(Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())),
             ],
             "bucket",
             "object",
         )
         .expect_err("all ignored errors without any successful delete should still fail");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
-        assert!(rendered.contains("Version not found"), "{rendered}");
+        assert_eq!(
+            err,
+            Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())
+        );
     }
 
     #[test]
     fn resolve_rebalance_delete_from_all_pools_results_fails_on_write_quorum_even_with_success() {
         let err = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Ok(ObjectInfo {
-                        bucket: "bucket".to_string(),
-                        name: "object".to_string(),
-                        ..Default::default()
-                    }),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::ErasureWriteQuorum),
-                },
+                Ok(ObjectInfo {
+                    bucket: "bucket".to_string(),
+                    name: "object".to_string(),
+                    ..Default::default()
+                }),
+                Err(Error::ErasureWriteQuorum),
             ],
             "bucket",
             "object",
         )
         .expect_err("write quorum failures must fail the aggregate delete");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
-        assert!(rendered.contains(&Error::ErasureWriteQuorum.to_string()), "{rendered}");
+        assert_eq!(err, Error::ErasureWriteQuorum);
     }
 
     #[test]
@@ -2659,7 +2938,7 @@ mod tests {
     #[serial_test::serial]
     async fn pool_meta_runtime_load_waits_for_multi_pool_commit_fence() {
         let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-load-fence", &[2, 2]).await;
-        let old = PoolMeta::new(&store.pools, &PoolMeta::default());
+        let old = PoolMeta::new(&store.pools, &PoolMeta::default()).expect("initial pool metadata should be built");
         old.save_for_startup(store.pools.clone())
             .await
             .expect("old V3 pool metadata should persist");

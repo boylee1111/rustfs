@@ -164,13 +164,10 @@ pub const DEFAULT_HTTP1_MAX_BUF_SIZE: usize = 64 * 1024; // 64 KB
 /// autotuning.
 ///
 /// A fixed `SO_RCVBUF` is inherited by every accepted socket and disables
-/// receive-buffer autotuning, so a connection whose request body is not being
-/// read yet (a multipart part queued for a foreground write permit) lets up to
-/// the fixed size of unread body accumulate in kernel memory — Linux doubles
-/// the requested value, so the former hard-coded 4 MiB held up to 8 MiB per
-/// queued connection (issue #7385). Autotuning keeps an unread connection at
-/// the kernel's initial size and grows only connections that are being
-/// drained. Set this only on kernels without receive-buffer autotuning
+/// receive-buffer autotuning. Queued multipart bodies can accumulate in kernel
+/// memory with either policy: a reused autotuned connection may already have
+/// a large buffer. Socket capacity is not the same as queued payload or actual
+/// memory allocation. Set this only on kernels without receive-buffer autotuning
 /// (illumos/Solaris) or on very high-bandwidth-delay links where the kernel's
 /// autotuning ceiling (`net.ipv4.tcp_rmem` on Linux) is too low and cannot be
 /// raised.
@@ -210,3 +207,9 @@ pub const ENV_TLS_RELOAD_INTERVAL: &str = "RUSTFS_TLS_RELOAD_INTERVAL";
 
 /// Default interval for TLS certificate reload check
 pub const DEFAULT_TLS_RELOAD_INTERVAL: u64 = 30;
+
+/// Environment variable to enable experimental HTTP/3 support.
+pub const ENV_HTTP3_ENABLE: &str = "RUSTFS_HTTP3_ENABLE";
+
+/// HTTP/3 is disabled unless explicitly enabled.
+pub const DEFAULT_HTTP3_ENABLE: bool = false;

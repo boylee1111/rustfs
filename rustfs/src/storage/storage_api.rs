@@ -20,7 +20,31 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use rand::RngExt as _;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) use rustfs_ecstore::api::disk::BackgroundMemoryBudget;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+pub(crate) use rustfs_ecstore::api::disk::{PhysicalDiskSample, PhysicalDiskSampler};
 use rustfs_storage_api as storage_contracts;
+
+pub(crate) mod ecstore_integrity {
+    pub(crate) use rustfs_ecstore::api::integrity::{
+        IntegrityError, JobRequest, control_job, create_job, get_job, inventory, readiness, resume_job,
+    };
+}
+
+#[cfg(any(feature = "diagnostic-read-version-caller", feature = "diagnostic-local-batch"))]
+pub(crate) mod ecstore_diagnostic {
+    #[cfg(all(test, feature = "diagnostic-local-batch"))]
+    pub(crate) use rustfs_ecstore::api::diagnostic::current_request_id;
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    pub(crate) use rustfs_ecstore::api::diagnostic::{
+        ReadVersionContextBoundary, ReadVersionEntrySource, with_captured_read_version_context, with_read_version_spawn_context,
+    };
+    #[cfg(all(test, feature = "diagnostic-read-version-caller"))]
+    pub(crate) use rustfs_ecstore::api::diagnostic::{current_read_version_entry_source, with_read_version_entry};
+    #[cfg(feature = "diagnostic-local-batch")]
+    pub(crate) use rustfs_ecstore::api::diagnostic::{in_request_context, request_context};
+}
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
@@ -53,6 +77,8 @@ fn bucket_targets_metadata_lock_shard(bucket: &str) -> usize {
 
 pub(crate) mod contract {
     pub(crate) mod admin {
+        #[cfg(test)]
+        pub(crate) use super::super::storage_contracts::DiskSetSelector;
         pub(crate) use super::super::storage_contracts::StorageAdminApi;
     }
 
@@ -103,11 +129,12 @@ pub(crate) type StorageSelectObjectSnapshot = ecstore_object::SelectObjectSnapsh
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
 pub(crate) use super::ecfs_extend::{
-    RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, get_buffer_size_opt_in,
-    get_validated_store, load_bucket_object_lock_config_state, parse_object_lock_legal_hold, parse_object_lock_retention,
-    parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled_state,
-    validate_list_object_unordered_with_delimiter, validate_object_key, wrap_response_with_cors,
+    RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, evaluate_read_preconditions,
+    get_buffer_size_opt_in, get_validated_store, has_read_preconditions, load_bucket_object_lock_config_state,
+    parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize, process_lambda_configurations,
+    process_queue_configurations, process_topic_configurations, remove_object_lock_metadata_for_copy, validate_bucket_exists,
+    validate_bucket_object_lock_enabled_state, validate_list_object_unordered_with_delimiter, validate_object_key,
+    wrap_response_with_cors,
 };
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal,
@@ -118,11 +145,14 @@ pub(crate) use super::sse::{
 
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
-        PostObjectRequestMarker, ReqInfo, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-        authorize_internal_object_request, authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action,
-        has_bypass_governance_header, load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
+        MultipartStagingOperation, PostObjectRequestMarker, ReqInfo, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX,
+        TableDataPlaneListAccess, TableDataPlaneListCursorPosition, TableDataPlanePublicationGuards,
+        apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_internal_object_request,
+        authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
+        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
-        replication_request_authorized, req_info_mut, req_info_ref,
+        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
+        set_requested_object_lock_retain_until,
     };
 }
 
@@ -232,7 +262,9 @@ pub(crate) mod rpc_consumer {
         #[cfg(test)]
         pub(crate) use super::super::ecstore_disk::DiskAPI;
         #[cfg(test)]
-        pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
+        pub(crate) use rustfs_ecstore::api::disk::{BackgroundEncodeBuffer, DiskOption, new_disk};
+        pub(crate) use rustfs_ecstore::api::disk::{BackgroundPipeWriter, BackgroundReaderStream, background_pipe};
+        pub(crate) use rustfs_ecstore::api::rpc::with_rpc_background_request;
         pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = super::super::DEFAULT_READ_BUFFER_SIZE;
         #[cfg(test)]
         pub(crate) use super::super::storage_contracts::{
@@ -246,9 +278,9 @@ pub(crate) mod rpc_consumer {
             PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, WALK_DIR_STREAM_COMPLETION_V1,
         };
         pub(crate) use super::super::{
-            DeleteOptions, DiskStore, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
-            find_local_disk_by_ref, sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability,
-            verify_put_file_auth_trailer, verify_rpc_signature,
+            DeleteOptions, DiskStore, RemoteBackgroundIo, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
+            find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_checkpoint_coverage,
+            sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
         };
     }
 
@@ -259,16 +291,19 @@ pub(crate) mod rpc_consumer {
             SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
         };
         pub(crate) use super::super::{
-            BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore,
-            ECStore, Error, FileInfoVersions, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN,
-            PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SCANNER_PUBLICATION_LEASE_TTL_MS,
-            SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt,
-            TierDailyStatsWire, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref,
-            get_global_transition_state, get_local_server_property, reload_bucket_metadata, reload_transition_tier_config,
-            remove_bucket_metadata, validate_batch_read_version_item_count,
+            BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, ConditionalFileUpdate, DeleteOptions, DiskError,
+            DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions, GuardedDeleteVersionsPayload, KMS_SIGNAL_SUBSYSTEM,
+            LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq,
+            ReadMultipleResp, ReadOptions, RemoteBackgroundIo, SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG,
+            SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt, TierDailyStatsWire, UpdateMetadataOpts,
+            all_local_disk_path, collect_local_metrics, find_local_disk_by_ref_for_rpc, get_global_transition_state,
+            get_local_server_property, reload_bucket_metadata, reload_transition_tier_config, remove_bucket_metadata_if_absent,
+            validate_batch_read_version_item_count, with_remote_background_io,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
+        #[cfg(test)]
+        pub(crate) use super::super::find_local_disk_by_ref;
         #[cfg(test)]
         pub(crate) type HealBucketInfo = super::super::contract::bucket::BucketInfo;
 
@@ -307,8 +342,8 @@ pub(crate) mod s3_api_consumer {
     pub(crate) mod bucket {
         pub(crate) use super::super::super::s3_api::bucket::{
             ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-            build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
 
         pub(crate) mod contract {
@@ -391,7 +426,7 @@ pub(crate) mod tonic_service_consumer {
 pub(crate) mod test_consumer {
     pub(crate) use super::super::{
         apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, decode_tags_to_map,
-        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal, matches_origin_pattern, parse_etag,
+        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, matches_origin_pattern, parse_etag,
         parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations, process_queue_configurations,
         process_topic_configurations, remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata,
         validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
@@ -419,9 +454,11 @@ pub(crate) mod ecstore_bucket {
 
 pub(crate) mod ecstore_capacity {
     pub(crate) use rustfs_ecstore::api::capacity::{
-        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
-        is_pool_activation_fleet_proof_error, is_reserved_or_invalid_bucket,
+        DecommissionUnresolvedEntry, PoolAdminDiagnostic, PoolDecommissionInfo, PoolMeta, PoolStatus, get_total_usable_capacity,
+        get_total_usable_capacity_free, is_pool_activation_fleet_proof_error, is_reserved_or_invalid_bucket,
     };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::capacity::{PoolAvailability, PoolCapacityStatus, PoolDiagnosticStatus};
 }
 
 pub(crate) mod ecstore_client {
@@ -451,12 +488,11 @@ pub(crate) mod ecstore_config {
 }
 
 pub(crate) mod ecstore_data_usage {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::data_usage::get_bucket_usage_memory;
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend, load_admin_data_usage_from_backend_cached,
-        load_data_usage_from_backend, quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,
-        record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+        apply_bucket_usage_memory_overlay, get_bucket_usage_memory, init_compression_total_memory_from_backend,
+        load_admin_data_usage_from_backend_cached, load_bucket_usage_from_backend_cached, load_data_usage_from_backend,
+        lookup_degraded_bucket_usage_baseline, quota_object_size, record_bucket_delete_marker_memory,
+        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
         record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend,
     };
     // Test-only observables for the rustfs/backlog#1306 revert detector.
@@ -470,13 +506,23 @@ pub(crate) mod ecstore_data_usage {
 #[allow(unused_imports)]
 pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
-        BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo,
-        DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, OldCurrentSize, PartTransactionAction,
-        RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken,
-        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout, validate_batch_read_version_item_count,
+        BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate,
+        DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
+        DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
+        DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
+        GuardedFileInfoVersions, MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartSourceOperation, MultipartSourceRequest,
+        MultipartSourceResponse, OldCurrentSize, POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction,
+        PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
+        RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RemoteBackgroundIo,
+        RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
+        is_quota_mutation_fence_path, require_source_condition, validate_batch_read_version_item_count,
+        with_remote_background_io,
     };
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{
+        CurrentDeleteGeneration, DiskOption, capture_source_condition, new_disk, strip_native_controls,
+        with_background_resource_unit,
+    };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 
@@ -484,8 +530,8 @@ pub(crate) mod ecstore_error {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::error::PoolMetadataFailure;
     pub(crate) use rustfs_ecstore::api::error::{
-        Error, PoolMetadataError, Result, StorageError, is_err_bucket_not_found, is_err_object_not_found,
-        is_err_version_not_found,
+        Error, PoolMetadataError, Result, StorageError, is_err_bucket_not_found, is_err_invalid_upload_id,
+        is_err_object_not_found, is_err_version_not_found,
     };
 }
 
@@ -495,7 +541,7 @@ pub(crate) mod ecstore_event {
 
 pub(crate) mod ecstore_global {
     pub(crate) use rustfs_ecstore::api::global::{
-        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services,
+        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, wait_for_detached_mutations,
     };
 }
 
@@ -517,12 +563,15 @@ pub(crate) mod ecstore_metrics {
 
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::notification::rotate_cross_pool_fence_fleet_proof_for_test;
     pub(crate) use rustfs_ecstore::api::notification::{
         ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
-        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, ilm_recovery_export_local_process_epoch,
-        new_global_notification_sys, start_remote_version_state_fleet_probe,
+        configured_fleet_topology_fingerprint, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
+        ilm_recovery_export_local_process_epoch, mrf_lifecycle_reader_local_process_epoch, new_global_notification_sys,
+        start_remote_version_state_fleet_probe,
+    };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::notification::{
+        rotate_cross_pool_fence_fleet_proof_for_test, without_cross_pool_fence_fleet_proof_for_test,
     };
 }
 
@@ -546,13 +595,16 @@ pub(crate) mod ecstore_rio {
 }
 
 pub(crate) mod ecstore_rpc {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rpc::verify_ns_scanner_capability_with_checkpoint_coverage;
     pub(crate) use rustfs_ecstore::api::rpc::{
         KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION, NetworkPeerProbeClient,
         NetworkPeerProbeError, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, check_and_record_signed_rpc_nonce,
-        decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, sign_ns_scanner_capability_with_tier_registry_generation,
-        sign_put_file_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
-        tonic_rpc_auth_failure_reason, verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
+        decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, rpc_background_admission,
+        sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability, sign_tonic_rpc_response_proof,
+        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
+        verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
         verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned,
         verify_tonic_rpc_signature_with_bootstrap,
     };
@@ -569,10 +621,11 @@ pub(crate) mod ecstore_object {
     pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
         EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup,
-        ObjectEncryptionResolver, ObjectMutationHook, PrepareSelectObjectSnapshotError, ReadEncryptionMaterial,
-        ReadEncryptionMode, ReadEncryptionRequest, SelectObjectSnapshot, WriteCompletion, get_object_body_cache_plaintext_len,
+        GetObjectReadCondition, GetObjectReadMetadata, ObjectEncryptionResolver, ObjectMutationHook,
+        PrepareSelectObjectSnapshotError, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
+        SelectObjectSnapshot, WriteCommitGuard, WriteCompletion, get_object_body_cache_plaintext_len,
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
-        unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        unregister_get_object_body_cache_hook, unregister_object_mutation_hook, with_get_object_read_condition,
     };
 }
 
@@ -587,8 +640,8 @@ pub(crate) mod ecstore_test_support {
 pub(crate) mod ecstore_set_disk {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::set_disk::test_util::{
-        MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
-        fail_next_quota_ledger_save_for_test,
+        ConditionalReadBenchmarkMetadataGuard, MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier,
+        PutObjectCommitPause, fail_next_quota_ledger_save_for_test,
     };
     pub(crate) use rustfs_ecstore::api::set_disk::{
         DEFAULT_READ_BUFFER_SIZE, file_info_quorum_hash, get_lock_acquire_timeout, is_valid_storage_class,
@@ -610,8 +663,8 @@ pub(crate) mod ecstore_storage {
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_ecstore::api::storage::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
-        all_local_disk_path, find_local_disk_by_ref, init_local_disks_with_instance_ctx, init_lock_clients,
-        prewarm_local_disk_id_map_with_instance_ctx,
+        all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, init_local_disks_with_instance_ctx,
+        init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
 
@@ -654,8 +707,10 @@ pub(crate) fn try_current_local_node_name() -> Option<String> {
     crate::storage::runtime_sources::try_current_local_node_name()
 }
 
+pub(crate) use ecstore_disk::{RemoteBackgroundIo, with_remote_background_io};
 #[cfg(test)]
 pub(crate) use ecstore_rpc::gen_signature_headers;
+pub(crate) use ecstore_rpc::rpc_background_admission;
 pub(crate) use ecstore_rpc::sign_tonic_rpc_response_proof;
 #[cfg(test)]
 pub(crate) use ecstore_rpc::verify_tonic_rpc_response_proof;
@@ -696,6 +751,8 @@ pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
 pub(crate) type EventArgs = ecstore_event::EventArgs;
 pub(crate) type ExpiryState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
+pub(crate) type GuardedFileInfoVersions = ecstore_disk::GuardedFileInfoVersions;
+pub(crate) type GuardedDeleteVersionsPayload = ecstore_disk::GuardedDeleteVersionsPayload;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
@@ -704,7 +761,6 @@ pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
 pub(crate) type ServerContextSlot = crate::storage::runtime_sources::ServerContextSlot;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
-#[cfg(test)]
 pub(crate) type PeerRestClient = ecstore_rpc::PeerRestClient;
 #[cfg(test)]
 pub(crate) type ScannerScopedDirtyUsageAckEntry = ecstore_rpc::ScannerScopedDirtyUsageAckEntry;
@@ -720,10 +776,19 @@ pub(crate) type QuotaError = ecstore_bucket::quota::QuotaError;
 pub(crate) type RawFileInfo = rustfs_filemeta::RawFileInfo;
 pub(crate) type BatchReadVersionReq = ecstore_disk::BatchReadVersionReq;
 pub(crate) type BatchReadVersionResp = ecstore_disk::BatchReadVersionResp;
+pub(crate) type ConditionalFileUpdate = ecstore_disk::ConditionalFileUpdate;
 pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type OldCurrentSize = ecstore_disk::OldCurrentSize;
+pub(crate) type DeleteRecoveryCursor = ecstore_disk::DeleteRecoveryCursor;
+pub(crate) type DeleteRecoveryPage = ecstore_disk::DeleteRecoveryPage;
+pub(crate) type DeleteRecoveryInspection = ecstore_disk::DeleteRecoveryInspection;
+pub(crate) type DeleteRecoveryDigest = ecstore_disk::DeleteRecoveryDigest;
+pub(crate) type DeleteRecoveryAction = ecstore_disk::DeleteRecoveryAction;
+pub(crate) type DeleteRecoveryRpcOperation = ecstore_disk::DeleteRecoveryRpcOperation;
+pub(crate) type DeleteRecoveryRpcReply = ecstore_disk::DeleteRecoveryRpcReply;
+pub(crate) const DELETE_RECOVERY_PROTOCOL_VERSION: u32 = ecstore_disk::DELETE_RECOVERY_PROTOCOL_VERSION;
 pub(crate) type PartTransactionAction = ecstore_disk::PartTransactionAction;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
 pub(crate) type ReplicationStatusType = ecstore_bucket::replication::ReplicationStatusType;
@@ -954,23 +1019,45 @@ pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperti
     ecstore_admin::get_local_server_property().await
 }
 
+/// Bridge an ECStore committed replication-path mutation into the scanner's
+/// dirty-usage tracking.
+///
+/// A replication status writeback changes only replication state on an
+/// existing version. It is status class: it must not count as namespace
+/// activity, or every scanner cycle is `Superseded` for as long as replication
+/// runs (#8375). The scanner's own queued replication heals write back through
+/// the same path and are covered by the same rule. Tier-expiration cleanup
+/// removes data and stays on the namespace path.
+pub(crate) fn record_committed_replication_mutation(
+    bucket: &str,
+    object: &str,
+    source: ecstore_bucket::replication::ScannerDirtyUsageMutationSource,
+) {
+    match source {
+        ecstore_bucket::replication::ScannerDirtyUsageMutationSource::Replication => {
+            rustfs_scanner::record_status_class_mutation(
+                bucket,
+                object,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::Replication,
+            );
+        }
+        ecstore_bucket::replication::ScannerDirtyUsageMutationSource::TierExpiration => {
+            rustfs_scanner::record_dirty_usage_object_from_producer(
+                bucket,
+                object,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::TierExpiration,
+            );
+        }
+    }
+}
+
 pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
     let durable_dirty_usage_journal = super::scanner_dirty_journal::start_durable_dirty_usage_journal(store.clone()).await;
     let mutation_journal = durable_dirty_usage_journal.clone();
     rustfs_scanner::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, producer| {
         mutation_journal.record_committed_mutation(bucket, object, producer);
     })));
-    ecstore_bucket::replication::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, source| {
-        let producer = match source {
-            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::Replication => {
-                rustfs_scanner::SegmentInvalidationProducerIdentity::Replication
-            }
-            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::TierExpiration => {
-                rustfs_scanner::SegmentInvalidationProducerIdentity::TierExpiration
-            }
-        };
-        rustfs_scanner::record_dirty_usage_object_from_producer(bucket, object, producer);
-    })));
+    ecstore_bucket::replication::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(record_committed_replication_mutation)));
     rustfs_scanner::set_scanner_dirty_usage_clear_observer(Some(Arc::new(move |cleared| {
         durable_dirty_usage_journal.clear_confirmed_buckets(cleared);
     })));
@@ -1186,8 +1273,8 @@ pub(crate) fn get_global_transition_state() -> Arc<TransitionState> {
     ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state()
 }
 
-pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) -> std::io::Result<()> {
-    ecstore_bucket::migration::try_migrate_bucket_metadata(store)
+pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>, buckets: &[String]) -> std::io::Result<()> {
+    ecstore_bucket::migration::try_migrate_bucket_metadata_for_buckets(store, buckets)
         .await
         .map_err(ecstore_bucket::migration::migration_startup_error)
 }
@@ -1268,12 +1355,22 @@ pub(crate) fn ilm_recovery_export_local_process_epoch() -> uuid::Uuid {
     ecstore_notification::ilm_recovery_export_local_process_epoch()
 }
 
+pub(crate) fn mrf_lifecycle_reader_local_process_epoch() -> uuid::Uuid {
+    ecstore_notification::mrf_lifecycle_reader_local_process_epoch()
+}
+
 pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
     ecstore_config::com::read_config(api, file).await
 }
 
 pub(crate) async fn read_config_no_lock(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>> {
     ecstore_config::com::read_config_no_lock(api, file).await
+}
+
+pub(crate) async fn read_server_config_with_generation(
+    api: Arc<ECStore>,
+) -> Result<(rustfs_config::server_config::Config, Option<uuid::Uuid>)> {
+    ecstore_config::com::read_server_config_with_generation(api).await
 }
 
 pub(crate) async fn read_existing_server_config_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {
@@ -1288,8 +1385,13 @@ pub(crate) fn replication_queue_current_count() -> Option<i64> {
     get_global_replication_stats().and_then(|stats| stats.queue_current_count())
 }
 
-pub(crate) async fn save_config_no_lock(api: Arc<ECStore>, file: &str, data: Vec<u8>) -> Result<()> {
-    ecstore_config::com::save_config_no_lock(api, file, data).await
+pub(crate) async fn save_config_no_lock(
+    api: Arc<ECStore>,
+    file: &str,
+    data: Vec<u8>,
+    guard: &ecstore_object::WriteCommitGuard,
+) -> Result<()> {
+    ecstore_config::com::save_config_no_lock(api, file, data, guard).await
 }
 
 pub(crate) async fn delete_config_no_lock(api: Arc<ECStore>, file: &str) -> Result<()> {
@@ -1298,7 +1400,7 @@ pub(crate) async fn delete_config_no_lock(api: Arc<ECStore>, file: &str) -> Resu
 
 pub(crate) async fn with_config_object_write_lock<F, Fut, T>(api: Arc<ECStore>, object: String, operation: F) -> Result<T>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(ecstore_object::WriteCommitGuard) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
@@ -1327,6 +1429,10 @@ pub(crate) fn shutdown_background_services() {
     ecstore_global::shutdown_background_services();
 }
 
+pub(crate) async fn wait_for_detached_mutations(timeout: std::time::Duration) -> bool {
+    ecstore_global::wait_for_detached_mutations(timeout).await
+}
+
 pub(crate) fn shutdown_background_monitors() {
     rustfs_ecstore::shutdown_background_monitors();
 }
@@ -1350,6 +1456,13 @@ pub(crate) async fn try_migrate_server_config(store: Arc<ECStore>) {
 }
 
 pub(crate) trait StorageDiskRpcExt {
+    async fn supports_guarded_delete_versions(&self) -> DiskResult<()>;
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<DiskInfo>;
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> DiskResult<()>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> DiskResult<Vec<ReadMultipleResp>>;
@@ -1400,6 +1513,15 @@ pub(crate) trait StorageDiskRpcExt {
     async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader>;
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()>;
+    async fn rename_file_durable(
+        &self,
+        _src_volume: &str,
+        _src_path: &str,
+        _dst_volume: &str,
+        _dst_path: &str,
+    ) -> DiskResult<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn rename_part(
         &self,
         src_volume: &str,
@@ -1416,6 +1538,42 @@ pub(crate) trait StorageDiskRpcExt {
         dst_path: &str,
         meta: bytes::Bytes,
     ) -> DiskResult<()>;
+    async fn delete_version_recoverable(
+        &self,
+        volume: &str,
+        object: &str,
+        file_info: rustfs_filemeta::FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> DiskResult<()>;
+    async fn delete_versions_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>>;
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> DiskResult<bool>;
+    async fn discover_delete_transactions(
+        &self,
+        volume: &str,
+        object: Option<&str>,
+        cursor: Option<DeleteRecoveryCursor>,
+        limit: u32,
+    ) -> DiskResult<DeleteRecoveryPage>;
+    async fn inspect_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+    ) -> DiskResult<DeleteRecoveryInspection>;
+    async fn settle_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+        expected_fingerprint: DeleteRecoveryDigest,
+        action: DeleteRecoveryAction,
+    ) -> DiskResult<DeleteRecoveryInspection>;
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> DiskResult<()>;
     async fn delete(&self, volume: &str, path: &str, options: DeleteOptions) -> DiskResult<()>;
     async fn verify_file(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp>;
@@ -1423,6 +1581,13 @@ pub(crate) trait StorageDiskRpcExt {
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> DiskResult<Vec<ObjectPartInfo>>;
     async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> DiskResult<()>;
     async fn write_all(&self, volume: &str, path: &str, data: bytes::Bytes) -> DiskResult<()>;
+    async fn compare_and_update_file(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<bytes::Bytes>,
+        replacement: Option<bytes::Bytes>,
+    ) -> DiskResult<ConditionalFileUpdate>;
     async fn read_all(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes>;
     async fn append_file(&self, volume: &str, path: &str) -> DiskResult<FileWriter>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> DiskResult<FileWriter>;
@@ -1432,6 +1597,17 @@ impl<T> StorageDiskRpcExt for T
 where
     T: ecstore_disk::DiskAPI,
 {
+    async fn supports_guarded_delete_versions(&self) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::supports_guarded_delete_versions(self).await
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        ecstore_disk::DiskAPI::delete_versions_guarded_recoverable(self, volume, versions, opts).await
+    }
     async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<DiskInfo> {
         ecstore_disk::DiskAPI::disk_info(self, opts).await
     }
@@ -1555,6 +1731,10 @@ where
         ecstore_disk::DiskAPI::rename_file(self, src_volume, src_path, dst_volume, dst_path).await
     }
 
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::rename_file_durable(self, src_volume, src_path, dst_volume, dst_path).await
+    }
+
     async fn rename_part(
         &self,
         src_volume: &str,
@@ -1575,6 +1755,57 @@ where
         meta: bytes::Bytes,
     ) -> DiskResult<()> {
         ecstore_disk::DiskAPI::prepare_part_transaction(self, src_volume, src_path, dst_volume, dst_path, meta).await
+    }
+
+    async fn delete_version_recoverable(
+        &self,
+        volume: &str,
+        object: &str,
+        file_info: rustfs_filemeta::FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::delete_version_recoverable(self, volume, object, file_info, force_del_marker, opts).await
+    }
+    async fn delete_versions_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        ecstore_disk::DiskAPI::delete_versions_recoverable(self, volume, versions, opts).await
+    }
+
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> DiskResult<bool> {
+        ecstore_disk::DiskAPI::has_delete_transaction_evidence(self, volume, object).await
+    }
+
+    async fn discover_delete_transactions(
+        &self,
+        volume: &str,
+        object: Option<&str>,
+        cursor: Option<DeleteRecoveryCursor>,
+        limit: u32,
+    ) -> DiskResult<DeleteRecoveryPage> {
+        ecstore_disk::DiskAPI::discover_delete_transactions(self, volume, object, cursor, limit).await
+    }
+    async fn inspect_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+    ) -> DiskResult<DeleteRecoveryInspection> {
+        ecstore_disk::DiskAPI::inspect_delete_transaction(self, volume, object, transaction).await
+    }
+    async fn settle_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+        expected_fingerprint: DeleteRecoveryDigest,
+        action: DeleteRecoveryAction,
+    ) -> DiskResult<DeleteRecoveryInspection> {
+        ecstore_disk::DiskAPI::settle_delete_transaction(self, volume, object, transaction, expected_fingerprint, action).await
     }
 
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> DiskResult<()> {
@@ -1603,6 +1834,16 @@ where
 
     async fn write_all(&self, volume: &str, path: &str, data: bytes::Bytes) -> DiskResult<()> {
         ecstore_disk::DiskAPI::write_all(self, volume, path, data).await
+    }
+
+    async fn compare_and_update_file(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<bytes::Bytes>,
+        replacement: Option<bytes::Bytes>,
+    ) -> DiskResult<ConditionalFileUpdate> {
+        ecstore_disk::DiskAPI::compare_and_update_file(self, volume, path, expected, replacement).await
     }
 
     async fn read_all(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes> {
@@ -1748,6 +1989,117 @@ pub(crate) async fn get_bucket_website_config(bucket: &str) -> Result<(s3s::dto:
     ecstore_bucket::metadata_sys::get_website_config(bucket).await
 }
 
+pub(crate) async fn get_bucket_website_config_for_store(store: &ECStore, bucket: &str) -> Result<s3s::dto::WebsiteConfiguration> {
+    let metadata = store.get_bucket_metadata(bucket).await?;
+    match ecstore_bucket::metadata::ConfigState::of(&metadata.website_config_xml, &metadata.website_config)
+        .require(bucket, ecstore_bucket::metadata::BUCKET_WEBSITE_CONFIG)?
+    {
+        Some(config) => Ok(config.clone()),
+        None => Err(StorageError::ConfigNotFound),
+    }
+}
+
+pub(crate) fn validate_website_configuration(config: &s3s::dto::WebsiteConfiguration) -> s3s::S3Result<()> {
+    if config.redirect_all_requests_to.is_some()
+        && (config.index_document.is_some() || config.error_document.is_some() || config.routing_rules.is_some())
+    {
+        return Err(website_config_error(
+            "RedirectAllRequestsTo cannot be combined with other website settings",
+        ));
+    }
+    if config.redirect_all_requests_to.is_none() && config.index_document.is_none() {
+        return Err(website_config_error(
+            "IndexDocument is required unless RedirectAllRequestsTo is configured",
+        ));
+    }
+    if let Some(index) = &config.index_document
+        && (index.suffix.is_empty() || index.suffix.contains('/'))
+    {
+        return Err(website_config_error("IndexDocument suffix must be a single nonempty name"));
+    }
+    if let Some(error) = &config.error_document
+        && error.key.is_empty()
+    {
+        return Err(website_config_error("ErrorDocument key cannot be empty"));
+    }
+    if let Some(rules) = &config.routing_rules {
+        if rules.len() > 50 {
+            return Err(website_config_error("RoutingRules cannot contain more than 50 rules"));
+        }
+        if rules.is_empty() {
+            return Err(website_config_error("RoutingRules cannot be empty"));
+        }
+        for rule in rules {
+            if let Some(condition) = &rule.condition
+                && condition.key_prefix_equals.is_none()
+                && condition.http_error_code_returned_equals.is_none()
+            {
+                return Err(website_config_error("RoutingRule Condition cannot be empty"));
+            }
+            if rule.redirect.host_name.is_none()
+                && rule.redirect.protocol.is_none()
+                && rule.redirect.replace_key_prefix_with.is_none()
+                && rule.redirect.replace_key_with.is_none()
+                && rule.redirect.http_redirect_code.is_none()
+            {
+                return Err(website_config_error("RoutingRule Redirect cannot be empty"));
+            }
+            if rule.redirect.replace_key_prefix_with.is_some() && rule.redirect.replace_key_with.is_some() {
+                return Err(website_config_error("RoutingRule redirect key replacements are mutually exclusive"));
+            }
+            if let Some(protocol) = rule.redirect.protocol.as_ref().map(|protocol| protocol.as_str())
+                && !matches!(protocol, "http" | "https")
+            {
+                return Err(website_config_error("RoutingRule protocol must be http or https"));
+            }
+            if let Some(code) = rule.redirect.http_redirect_code.as_deref()
+                && !matches!(code, "301" | "302" | "303" | "307" | "308")
+            {
+                return Err(website_config_error("RoutingRule redirect code is invalid"));
+            }
+            if let Some(host) = rule.redirect.host_name.as_deref() {
+                validate_website_redirect_host(host)?;
+            }
+            if let Some(code) = rule
+                .condition
+                .as_ref()
+                .and_then(|condition| condition.http_error_code_returned_equals.as_deref())
+                && (code.parse::<u16>().ok().is_none_or(|value| !(400..=599).contains(&value)))
+            {
+                return Err(website_config_error("RoutingRule error code is invalid"));
+            }
+        }
+    }
+    if let Some(redirect) = &config.redirect_all_requests_to {
+        validate_website_redirect_host(&redirect.host_name)?;
+        if let Some(protocol) = redirect.protocol.as_ref().map(|protocol| protocol.as_str())
+            && !matches!(protocol, "http" | "https")
+        {
+            return Err(website_config_error("RedirectAllRequestsTo protocol must be http or https"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_website_redirect_host(host: &str) -> s3s::S3Result<()> {
+    let url =
+        url::Url::parse(&format!("http://{host}/")).map_err(|_| website_config_error("website redirect host is invalid"))?;
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(website_config_error("website redirect host is invalid"));
+    }
+    Ok(())
+}
+
+fn website_config_error(message: &'static str) -> s3s::S3Error {
+    s3s::S3Error::with_message(s3s::S3ErrorCode::MalformedXML, message)
+}
+
 #[cfg(test)]
 pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<()> {
     ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, bm).await
@@ -1757,8 +2109,8 @@ pub(crate) async fn reload_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> R
     ecstore_bucket::metadata_sys::reload_bucket_metadata(api, bucket).await
 }
 
-pub(crate) async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {
-    ecstore_bucket::metadata_sys::remove_bucket_metadata(bucket).await
+pub(crate) async fn remove_bucket_metadata_if_absent(api: Arc<ECStore>, bucket: &str) -> Result<bool> {
+    ecstore_bucket::metadata_sys::remove_bucket_metadata_if_absent(api, bucket).await
 }
 
 pub(crate) async fn update_bucket_metadata_config(
@@ -1868,6 +2220,10 @@ pub(crate) fn is_err_bucket_not_found(err: &Error) -> bool {
     ecstore_error::is_err_bucket_not_found(err)
 }
 
+pub(crate) fn is_err_invalid_upload_id(err: &Error) -> bool {
+    ecstore_error::is_err_invalid_upload_id(err)
+}
+
 pub(crate) fn is_err_object_not_found(err: &Error) -> bool {
     ecstore_error::is_err_object_not_found(err)
 }
@@ -1957,15 +2313,17 @@ pub(crate) fn verify_put_file_auth_trailer(
     ecstore_rpc::verify_put_file_auth_trailer(url, method, nonce, trailer)
 }
 
-pub(crate) fn sign_ns_scanner_capability_with_tier_registry_generation(
+pub(crate) fn sign_ns_scanner_capability_with_checkpoint_coverage(
     challenge: uuid::Uuid,
     server_epoch: uuid::Uuid,
     supports_tier_registry_generation: bool,
+    supports_checkpoint_coverage: bool,
 ) -> std::io::Result<Vec<u8>> {
-    ecstore_rpc::sign_ns_scanner_capability_with_tier_registry_generation(
+    ecstore_rpc::sign_ns_scanner_capability_with_checkpoint_coverage(
         challenge,
         server_epoch,
         supports_tier_registry_generation,
+        supports_checkpoint_coverage,
     )
 }
 
@@ -2085,8 +2443,10 @@ pub(crate) async fn all_local_disk_path() -> Vec<String> {
     ecstore_storage::all_local_disk_path().await
 }
 
-pub(crate) async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
-    ecstore_storage::find_local_disk_by_ref(disk_ref).await
+pub(crate) use ecstore_storage::find_local_disk_by_ref;
+
+pub(crate) async fn find_local_disk_by_ref_for_rpc(disk_ref: &str) -> std::result::Result<Option<DiskStore>, DiskError> {
+    ecstore_storage::find_local_disk_by_ref_for_rpc(disk_ref).await
 }
 
 pub(crate) trait StorageVersioningConfigExt {
@@ -2121,6 +2481,34 @@ mod tests {
         lock_bucket_targets_metadata, new_instance_ctx, retry_bucket_resync_transaction_lock, scanner_maintenance_config_file,
     };
     use std::time::Duration;
+
+    #[test]
+    #[serial_test::serial]
+    fn replication_status_writebacks_are_status_class_and_tier_expiration_is_namespace() {
+        use ecstore_bucket::replication::ScannerDirtyUsageMutationSource;
+        let bucket = format!("status-class-{}", uuid::Uuid::new_v4().simple());
+        let before = rustfs_scanner::scanner_dirty_usage_state();
+
+        super::record_committed_replication_mutation(&bucket, "2026/object", ScannerDirtyUsageMutationSource::Replication);
+        let after_replication = rustfs_scanner::scanner_dirty_usage_state();
+        assert_eq!(
+            after_replication.generation, before.generation,
+            "a replication status writeback must not advance the scanner dirty-usage generation"
+        );
+        assert!(
+            rustfs_scanner::scanner_dirty_usage_bucket_generation(&bucket).is_none(),
+            "a replication status writeback must not mark the bucket dirty"
+        );
+
+        super::record_committed_replication_mutation(&bucket, "2026/object", ScannerDirtyUsageMutationSource::TierExpiration);
+        let after_expiry = rustfs_scanner::scanner_dirty_usage_state();
+        assert!(
+            after_expiry.generation > before.generation,
+            "tier expiration removes data and must stay on the namespace path"
+        );
+        assert!(rustfs_scanner::scanner_dirty_usage_bucket_generation(&bucket).is_some());
+        rustfs_scanner::clear_dirty_usage_bucket(&bucket);
+    }
 
     #[tokio::test]
     async fn site_metrics_snapshot_includes_live_failure_windows() {

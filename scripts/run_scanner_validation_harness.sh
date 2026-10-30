@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [[ "${1:-}" == "--abba" ]]; then
   shift
-  SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   exec "$SCRIPT_DIR/python_bin.sh" "$SCRIPT_DIR/scanner_abba.py" "$@"
 fi
 
@@ -25,6 +25,10 @@ JQ_BIN="jq"
 SKIP_HOST_TELEMETRY=false
 RUSTFS_PID=""
 TELEMETRY_PIDS=()
+TELEMETRY_NAMES=()
+CAPTURE_PIDS=()
+HEAL_STATUS_FILES=()
+CAPTURE_CLOCK_ID=""
 
 usage() {
   cat <<'USAGE'
@@ -48,7 +52,7 @@ Optional:
   --workload-label        Free-form workload label written to metadata.
   --metrics-endpoints     Optional comma-separated RustFS endpoints for
                           per-endpoint background-heal status and
-                          /metrics?types=1&by-host=true&n=1 capture.
+                          /realtime?types=1&by-host=true&n=1 capture.
   --samples               Number of scanner status samples (default: 30).
   --interval-secs         Seconds between samples (default: 60).
   --out-dir               Output directory (default: target/bench/scanner-validation-<timestamp>).
@@ -167,6 +171,10 @@ setup_output() {
   mkdir -p "$OUT_DIR/status"
   mkdir -p "$OUT_DIR/heal"
   mkdir -p "$OUT_DIR/metrics"
+  mkdir -p "$OUT_DIR/requests"
+  rm -f "$OUT_DIR/pidstat.txt" "$OUT_DIR/iostat.txt" "$OUT_DIR/mpstat.txt" \
+    "$OUT_DIR/host-telemetry-status.tsv"
+  printf 'collector\texit_status\n' >"$OUT_DIR/host-telemetry-status.tsv"
   SUMMARY_CSV="$OUT_DIR/scanner-summary.csv"
   echo "timestamp,primary_pressure,current_cycle_objects_scanned,current_cycle_directories_scanned,last_cycle_result,last_cycle_partial_reason,last_cycle_partial_source,lifecycle_transition_scanner_missed,source_work_missed_total,current_cycle_usage_saves,last_cycle_usage_saves,usage_dirty_pending_buckets,usage_last_cycle_dirty_buckets,usage_last_cycle_cleared_dirty_buckets,usage_last_save_result,usage_last_save_unix_secs,life_time_scan_cycle,life_time_scan_bucket_drive,life_time_scan_object,life_time_save_usage,heal_queue_length,heal_active_tasks,heal_scanner_queued,heal_admin_queued,heal_auto_heal_queued" >"$SUMMARY_CSV"
 }
@@ -209,6 +217,7 @@ first_rustfs_pid() {
 
 start_host_telemetry() {
   TELEMETRY_PIDS=()
+  TELEMETRY_NAMES=()
 
   if [[ "$SKIP_HOST_TELEMETRY" == "true" || "$INTERVAL_SECS" == "0" ]]; then
     return
@@ -220,29 +229,54 @@ start_host_telemetry() {
   if [[ -n "$pid" ]] && command -v pidstat >/dev/null 2>&1; then
     pidstat -p "$pid" "$INTERVAL_SECS" "$SAMPLES" >"$OUT_DIR/pidstat.txt" 2>&1 &
     TELEMETRY_PIDS+=("$!")
+    TELEMETRY_NAMES+=("pidstat")
   fi
 
   if command -v iostat >/dev/null 2>&1; then
-    iostat -xz "$INTERVAL_SECS" "$SAMPLES" >"$OUT_DIR/iostat.txt" 2>&1 &
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      iostat -d -w "$INTERVAL_SECS" -c "$SAMPLES" >"$OUT_DIR/iostat.txt" 2>&1 &
+    else
+      iostat -xz "$INTERVAL_SECS" "$SAMPLES" >"$OUT_DIR/iostat.txt" 2>&1 &
+    fi
     TELEMETRY_PIDS+=("$!")
+    TELEMETRY_NAMES+=("iostat")
   fi
 
   if command -v mpstat >/dev/null 2>&1; then
     mpstat "$INTERVAL_SECS" "$SAMPLES" >"$OUT_DIR/mpstat.txt" 2>&1 &
     TELEMETRY_PIDS+=("$!")
+    TELEMETRY_NAMES+=("mpstat")
   fi
 }
 
-wait_host_telemetry() {
-  local pid
+finalize_host_telemetry() {
+  local run_status="${1:-0}" index pid status write_status=0
 
   if [[ ${#TELEMETRY_PIDS[@]} -eq 0 ]]; then
     return
   fi
 
-  for pid in "${TELEMETRY_PIDS[@]}"; do
-    wait "$pid" || true
+  local collector_pids=("${TELEMETRY_PIDS[@]}")
+  local collector_names=("${TELEMETRY_NAMES[@]}")
+  TELEMETRY_PIDS=()
+  TELEMETRY_NAMES=()
+
+  if [[ "$run_status" != "0" ]]; then
+    for pid in "${collector_pids[@]}"; do
+      kill "$pid" 2>/dev/null || true
+    done
+  fi
+
+  for index in "${!collector_pids[@]}"; do
+    if wait "${collector_pids[$index]}"; then
+      status=0
+    else
+      status=$?
+      printf 'WARN: host telemetry collector %s exited with status %s\n' "${collector_names[$index]}" "$status" >&2 || true
+    fi
+    printf '%s\t%s\n' "${collector_names[$index]}" "$status" >>"$OUT_DIR/host-telemetry-status.tsv" || write_status=$?
   done
+  return "$write_status"
 }
 
 scanner_status_url() {
@@ -254,7 +288,7 @@ background_heal_status_url() {
 }
 
 metrics_url() {
-  printf '%s/rustfs/admin/v3/metrics?types=1&by-host=true&n=1\n' "${1%/}"
+  printf '%s/rustfs/admin/v3/realtime?types=1&by-host=true&n=1\n' "${1%/}"
 }
 
 endpoint_label() {
@@ -285,6 +319,94 @@ background_heal_status_endpoints() {
   if [[ "$emitted" != "true" ]]; then
     printf '%s\n' "$ENDPOINT"
   fi
+}
+
+capture_http_request() {
+  local method="$1" url="$2" output="$3"
+
+  # Run only in the background: exec makes the tracked PID the request owner.
+  AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY" AWS_DEFAULT_REGION="$REGION" \
+    exec "$SCRIPT_DIR/python_bin.sh" - "$SCRIPT_DIR" "$AWSCURL_BIN" "$REGION" "$method" "$url" \
+      "$output" "$OUT_DIR/requests/$(basename "$output").timing.json" "$CAPTURE_CLOCK_ID" <<'PY'
+import json
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, sys.argv[1])
+from scanner_abba import OwnedCommand
+
+_, _, binary, region, method, url, output, timing, clock = sys.argv
+
+def interrupted(signum, _frame):
+    raise SystemExit(128 + signum)
+
+for sig in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(sig, interrupted)
+
+process = None
+status = 1
+started = time.monotonic_ns()
+started_unix = time.time_ns()
+try:
+    with Path(output).open("wb") as stream:
+        process = OwnedCommand([binary, "--service", "s3", "--region", region, "--request", method, url], stream)
+        status = process.wait(300)
+except subprocess.TimeoutExpired:
+    status = 124
+except SystemExit as error:
+    status = error.code
+finally:
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_IGN)
+    try:
+        if process is not None:
+            try:
+                if process.status != 0:
+                    # collect_live already owns the cancellation grace period.
+                    # Kill this nested session before its owner is escalated,
+                    # including descendants of an exited failing command.
+                    process._signal_group(signal.SIGKILL)
+            finally:
+                process.finish()
+    finally:
+        ended = time.monotonic_ns()
+        ended_unix = time.time_ns()
+        Path(timing).write_text(json.dumps({
+            "clock_id": clock, "start_ns": started, "end_ns": ended,
+            "start_unix_ns": started_unix, "end_unix_ns": ended_unix,
+            "exit_status": status, "synchronized_source_window": False,
+        }) + "\n")
+raise SystemExit(status if status >= 0 else 128 - status)
+PY
+}
+
+wait_capture_requests() {
+  local index pid status=0 request_status
+  if [[ ${#CAPTURE_PIDS[@]} -eq 0 ]]; then return; fi
+  for index in "${!CAPTURE_PIDS[@]}"; do
+    pid="${CAPTURE_PIDS[$index]}"
+    if wait "$pid"; then
+      :
+    else
+      request_status=$?
+      if [[ "$status" == 0 ]]; then status="$request_status"; fi
+    fi
+    unset "CAPTURE_PIDS[$index]"
+  done
+  CAPTURE_PIDS=()
+  return "$status"
+}
+
+stop_capture_requests() {
+  local pid
+  if [[ ${#CAPTURE_PIDS[@]} -eq 0 ]]; then return; fi
+  for pid in "${CAPTURE_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  wait_capture_requests || true
 }
 
 write_heal_status_summary() {
@@ -328,26 +450,16 @@ write_heal_status_summary() {
 capture_background_heal_status_sample() {
   local index="$1"
   local ts="$2"
-  local summary_file="$3"
   local endpoint label heal_status_file
-  local heal_status_files=()
+  HEAL_STATUS_FILES=()
 
   while IFS= read -r endpoint; do
     label="$(endpoint_label "$endpoint")"
     heal_status_file="$OUT_DIR/heal/background-heal-status.${label}.${index}.${ts}.json"
-    AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
-    AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
-    AWS_DEFAULT_REGION="$REGION" \
-    "$AWSCURL_BIN" \
-      --service s3 \
-      --region "$REGION" \
-      --request POST \
-      "$(background_heal_status_url "$endpoint")" \
-      | "$JQ_BIN" . >"$heal_status_file"
-    heal_status_files+=("$heal_status_file")
+    capture_http_request POST "$(background_heal_status_url "$endpoint")" "$heal_status_file" &
+    CAPTURE_PIDS+=("$!")
+    HEAL_STATUS_FILES+=("$heal_status_file")
   done < <(background_heal_status_endpoints)
-
-  write_heal_status_summary "$summary_file" "${heal_status_files[@]}"
 }
 
 capture_distributed_metrics_sample() {
@@ -368,15 +480,8 @@ capture_distributed_metrics_sample() {
 
     label="$(endpoint_label "$endpoint")"
     metrics_file="$OUT_DIR/metrics/admin-metrics.${label}.${index}.${ts}.ndjson"
-    AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
-    AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
-    AWS_DEFAULT_REGION="$REGION" \
-    "$AWSCURL_BIN" \
-      --service s3 \
-      --region "$REGION" \
-      --request GET \
-      "$(metrics_url "$endpoint")" \
-      >"$metrics_file"
+    capture_http_request GET "$(metrics_url "$endpoint")" "$metrics_file" &
+    CAPTURE_PIDS+=("$!")
   done
 }
 
@@ -386,17 +491,12 @@ capture_status_sample() {
   local status_file="$OUT_DIR/status/scanner-status.${index}.${ts}.json"
   local heal_summary_file="$OUT_DIR/heal/background-heal-summary.${index}.${ts}.json"
 
-  AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
-  AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
-  AWS_DEFAULT_REGION="$REGION" \
-  "$AWSCURL_BIN" \
-    --service s3 \
-    --region "$REGION" \
-    --request GET \
-    "$(scanner_status_url)" \
-    | "$JQ_BIN" . >"$status_file"
-
-  capture_background_heal_status_sample "$index" "$ts" "$heal_summary_file"
+  capture_http_request GET "$(scanner_status_url)" "$status_file" &
+  CAPTURE_PIDS+=("$!")
+  capture_background_heal_status_sample "$index" "$ts"
+  capture_distributed_metrics_sample "$index" "$ts"
+  wait_capture_requests
+  write_heal_status_summary "$heal_summary_file" "${HEAL_STATUS_FILES[@]}"
 
   "$JQ_BIN" -r --arg ts "$ts" --slurpfile heal_status "$heal_summary_file" '
     ($heal_status[0] // {}) as $heal |
@@ -429,7 +529,6 @@ capture_status_sample() {
     ] | @csv
   ' "$status_file" >>"$SUMMARY_CSV"
 
-  capture_distributed_metrics_sample "$index" "$ts"
 }
 
 capture_status_series() {
@@ -475,6 +574,7 @@ Interval seconds: $INTERVAL_SECS
 - Summary CSV: scanner-summary.csv
 - Usage freshness summary: current/last usage saves, dirty bucket state, last usage save result, and scanner life_time_ops.
 - Run metadata: run-metadata.env
+- HTTP request timing: requests/*.timing.json (one client clock; actual request intervals, not synchronized server metric windows).
 
 ## Review Checklist
 
@@ -494,6 +594,7 @@ main() {
   require_cmd "$MC_BIN"
   require_cmd "$AWSCURL_BIN"
   require_cmd "$JQ_BIN"
+  CAPTURE_CLOCK_ID=$("$SCRIPT_DIR/python_bin.sh" -c 'import uuid; print(uuid.uuid4())')
   setup_output
 
   local started_at
@@ -501,9 +602,12 @@ main() {
 
   write_metadata "$started_at"
   capture_config_snapshots
+  trap 'harness_exit_status=$?; stop_capture_requests; finalize_host_telemetry "$harness_exit_status" || true; exit "$harness_exit_status"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   start_host_telemetry
   capture_status_series
-  wait_host_telemetry
+  finalize_host_telemetry
   write_report
 
   echo "Scanner validation artifacts written to $OUT_DIR"

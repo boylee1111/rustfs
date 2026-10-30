@@ -979,6 +979,30 @@ async fn test_namespace_lock_distributed_retries_transient_acquire_timeout() {
     drop(guard);
 }
 
+#[tokio::test(start_paused = true)]
+async fn test_namespace_lock_retries_when_backoff_exceeds_remaining_budget() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let flaky_clients = managers
+        .iter()
+        .map(|manager| Arc::new(FlakyAcquireClient::new(manager.clone(), 1)))
+        .collect::<Vec<_>>();
+    let clients = flaky_clients
+        .iter()
+        .map(|client| client.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+    let lock = NamespaceLock::with_clients("short-retry-budget".to_string(), clients);
+    let resource = create_test_object_key("bucket", "short-retry-budget");
+
+    // The first jittered backoff is at least 187 ms, but a second attempt can
+    // still succeed within this budget once the transient failure has cleared.
+    let guard = lock
+        .get_write_lock(resource, "owner", Duration::from_millis(180))
+        .await
+        .expect("a backoff longer than the remaining budget must not discard the remaining attempt");
+    assert!(flaky_clients.iter().any(|client| client.acquire_attempts() >= 2));
+    drop(guard);
+}
+
 #[tokio::test]
 async fn test_namespace_lock_distributed_waits_full_timeout_for_late_release() {
     let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
@@ -1136,10 +1160,16 @@ async fn test_namespace_lock_distributed_contention_quorum_miss_times_out() {
     let lock = NamespaceLock::with_clients("contention-timeout".to_string(), clients);
     let resource = create_test_object_key("bucket", "object-contention-timeout");
 
-    let err = lock
-        .get_write_lock(resource, "owner-a", Duration::from_millis(40))
+    let timeout = Duration::from_millis(40);
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(Duration::from_secs(2), lock.get_write_lock(resource, "owner-a", timeout))
         .await
+        .expect("contended acquisition must remain bounded")
         .expect_err("ordinary contention should exhaust acquire timeout");
+    assert!(
+        started.elapsed() >= timeout,
+        "a contended acquisition must not return before its configured deadline"
+    );
 
     let err_str = err.to_string().to_lowercase();
     assert!(err_str.contains("timeout"), "expected timeout after contention retries, got: {err}");
@@ -1255,6 +1285,59 @@ async fn test_namespace_lock_distributed_even_node_read_write_quorum_split() {
         err_str.contains("quorum") || err_str.contains("not reached"),
         "expected quorum error, got: {err}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_namespace_lock_read_quorum_is_independent_of_slow_voter_order() {
+    let fast_positions = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
+    for positions in fast_positions {
+        let clients: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|index| {
+                let inner = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+                if positions.contains(&index) {
+                    inner as Arc<dyn LockClient>
+                } else {
+                    Arc::new(DelayedClient {
+                        inner,
+                        delay: Duration::from_secs(3),
+                    }) as Arc<dyn LockClient>
+                }
+            })
+            .collect();
+        let lock = NamespaceLock::with_clients("read-quorum-order".to_string(), clients);
+        let resource = create_test_object_key("bucket", "slow-voters");
+        let result =
+            tokio::time::timeout(Duration::from_millis(900), lock.get_read_lock(resource, "owner", Duration::from_secs(5))).await;
+        let mut guard = result
+            .expect("healthy read quorum must be contacted before the first attempt expires")
+            .expect("two healthy voters must suffice in every ordering");
+        assert!(guard.release(), "the admitted quorum must release");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_namespace_lock_write_quorum_reaches_voters_after_a_silent_prefix() {
+    let clients: Vec<Arc<dyn LockClient>> = (0..8)
+        .map(|index| {
+            let inner = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+            if index >= 3 {
+                inner as Arc<dyn LockClient>
+            } else {
+                Arc::new(DelayedClient {
+                    inner,
+                    delay: Duration::from_secs(3),
+                }) as Arc<dyn LockClient>
+            }
+        })
+        .collect();
+    let lock = NamespaceLock::with_clients("write-quorum-order".to_string(), clients);
+    let resource = create_test_object_key("bucket", "slow-voters");
+    let result =
+        tokio::time::timeout(Duration::from_millis(900), lock.get_write_lock(resource, "owner", Duration::from_secs(5))).await;
+    let mut guard = result
+        .expect("healthy write quorum must be contacted within the first attempt")
+        .expect("five healthy voters must suffice");
+    assert!(guard.release());
 }
 
 #[tokio::test]

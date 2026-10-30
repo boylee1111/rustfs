@@ -13,19 +13,21 @@
 // limitations under the License.
 
 use super::{
-    Arc, Bytes, DiskError, DiskStore, ErasureCache, Error, FileInfo, GetCodecStreamingFallbackReason, GetObjectFileInfo,
-    GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration, GetObjectMetadataCacheKey, GetObjectReadPolicy, HashAlgorithm,
-    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET,
-    ReadOptions, Result, SetDisks, StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine,
-    build_inline_bitrot_readers_from_refs, collect_inline_data_shard_fileinfos_by_index, debug, error,
-    get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
-    is_codec_streaming_multipart_enabled, is_multipart_reader_setup_prefetch_enabled, object_fits_single_block,
-    reduce_read_quorum_errs, to_object_err, try_read_inline_data_shards_direct, warn,
+    Arc, Bytes, DiskError, DiskOption, DiskStore, Endpoint, ErasureCache, Error, FileInfo, GetCodecStreamingFallbackReason,
+    GetObjectFileInfo, GetObjectMetadataCacheCapability, GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration,
+    GetObjectMetadataCacheKey, GetObjectMetadataCacheLookupKey, GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE,
+    LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks,
+    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine, build_inline_bitrot_readers_from_refs,
+    collect_inline_data_shard_fileinfos_by_index, debug, error, get_codec_streaming_metrics_path,
+    get_codec_streaming_multipart_max_parts, get_object_read_policy, is_codec_streaming_multipart_enabled,
+    is_multipart_reader_setup_prefetch_enabled, object_fits_single_block, reduce_read_quorum_errs, to_object_err,
+    try_read_inline_data_shards_direct, warn,
 };
 use crate::diagnostics::get::{
     GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
     GET_METADATA_CACHE_DECISION_MISS, GET_METADATA_CACHE_DECISION_REJECT, GET_METADATA_CACHE_DECISION_SKIP,
-    GET_METADATA_CACHE_REASON_DATA_MOVEMENT, GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE,
+    GET_METADATA_CACHE_REASON_BODY_LAYOUT_REQUIRED, GET_METADATA_CACHE_REASON_DATA_MOVEMENT,
+    GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE,
     GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS, GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
     GET_METADATA_CACHE_REASON_META_BUCKET, GET_METADATA_CACHE_REASON_NO_LOCK, GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
     GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_CHECKSUMS, GET_METADATA_CACHE_REASON_PART_NUMBER,
@@ -38,11 +40,12 @@ use crate::diagnostics::get::{
     get_stage_timer_if_enabled, mark_get_object_downstream_closed, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
-use crate::disk::DiskAPI;
+use crate::disk::{DiskAPI, new_disk};
 use crate::io_support::bitrot::{BitrotReaderStageMetrics, DeferredReaderStripeHandle, object_mmap_read_enabled};
 use crate::set_disk::coding;
 use crate::set_disk::runtime_sources;
-use crate::set_disk::shard_source::ShardReadCost;
+use crate::set_disk::shard_source::{ShardReadCost, ShardReadRepair};
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
     future::Future,
     io::IoSlice,
@@ -112,7 +115,28 @@ use super::GetCodecStreamingObjectClass;
 use super::GetCodecStreamingRollout;
 #[cfg(test)]
 use super::classify_get_codec_streaming_object_class;
-use super::core::io_primitives::*;
+use super::core::io_primitives::{
+    BitrotReaderSetup, BitrotReaderSetupAttribution, BitrotReaderSetupMode, DeferredReaderReopener, EVENT_SET_DISK_READ,
+    GetCodecStreamingReaderBuildOutcome, MetadataCacheLookup, ObjectBitrotReader, ReadRepairAdmissionSubmitter,
+    ReadRepairHealSubmission, SLOW_OBJECT_READ_LOG_THRESHOLD, codec_streaming_reader_setup_fallback_reason,
+    create_bitrot_readers_until_quorum_with_preference, create_data_block_bitrot_readers, resolved_read_repair_version_id,
+    send_read_repair_heal_request, shard_read_costs_for_disks, submit_read_repair_heal, submit_read_repair_heal_with_submitter,
+};
+#[cfg(test)]
+use super::core::io_primitives::{
+    ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP,
+    MultipartCodecStreamingReader, ReadRepairAdmissionFuture, ReadRepairAdmissionOutcome, collect_read_multiple_results,
+    collect_read_parts_results, create_bitrot_readers_until_quorum, create_bitrot_readers_until_quorum_all_shards,
+    release_read_repair_heal_reservation, reserve_read_repair_heal, resolve_read_part_from_responses, shard_read_cost_for_disk,
+    shard_read_cost_for_endpoint,
+};
+#[cfg(test)]
+use super::core::metadata_quorum::{MetadataEarlyStopDecision, MetadataQuorumAccumulator};
+#[cfg(test)]
+use super::core::metadata_read::{
+    MetadataFanoutDiagnostics, MetadataFanoutObservation, metadata_early_stop_permitted, should_allow_metadata_early_stop,
+};
+use super::core::metadata_read::{late_materialization_candidate_is_safe, non_inline_data_read_early_stop_allowed};
 #[cfg(test)]
 use super::get_codec_streaming_config_cached_core;
 #[cfg(test)]
@@ -184,6 +208,16 @@ use tokio::time::timeout;
 #[cfg(test)]
 use uuid::Uuid;
 
+fn metadata_quorum_outcome(error: &StorageError) -> &'static str {
+    if error.is_not_found() {
+        "not_found"
+    } else if error.is_quorum_error() {
+        "not_reached"
+    } else {
+        "unavailable"
+    }
+}
+
 pub(super) struct GetObjectDownstreamWriter<W> {
     inner: W,
 }
@@ -224,7 +258,191 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for GetObjectDownstreamWriter<W> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetadataReadPurpose {
+    FullLayout,
+    GetObjectReader,
+}
+
+/// Upper bound on exact-version reads a latest read spends looking past
+/// dangling versions before it keeps the read-quorum error; each read is one
+/// metadata fan-out.
+const MAX_DANGLING_LATEST_VERSIONS: usize = 8;
+
+/// How a metadata read-quorum failure is reported when the replies prove the
+/// object or version dangling. Only the object read entry points
+/// (`get_object_info`, `get_object_reader` and prepared GET metadata) report
+/// it as not found; read-before-write callers of `get_object_fileinfo*` keep
+/// the quorum error so fences and delete recovery never treat a torn write as
+/// an absent key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DanglingRead {
+    KeepQuorumError,
+    /// Metadata updates of the latest version keep the quorum error but, like
+    /// object reads, look past newer versions proven dangling
+    /// (`read_latest_past_dangling_versions`).
+    SkipDanglingVersions,
+    ReportNotFound,
+}
+
+/// Read-only form of MinIO's GET-path dangling check: once
+/// `totalResp == setDriveCount`, `getObjectFileInfo` calls `deleteIfDangling`
+/// and a dangling verdict replaces the read-quorum error with
+/// `errFileNotFound` or `errFileVersionNotFound`.
+///
+/// Each deliberate difference keeps the quorum error instead:
+/// - nothing is deleted; heal owns cleanup and its recent-write grace window;
+/// - MinIO counts an offline drive as a response and lets `isObjectDangling`
+///   reject it, while here every slot must hold valid metadata or a not-found
+///   reply, so an offline drive, a timeout, an unanswered slot, or a corrupt or
+///   unusable xl.meta stays uncertain;
+/// - the valid replies must be one metadata generation and not a remote
+///   (transitioned) version, the candidates heal's `dangling_delete_safety`
+///   also refuses to delete.
+fn dangling_read_not_found(
+    bucket: &str,
+    version_id: &str,
+    parts_metadata: &[FileInfo],
+    errs: &[Option<DiskError>],
+    fanout_complete: bool,
+) -> Option<DiskError> {
+    if !fanout_complete || crate::bucket::utils::is_meta_bucketname(bucket) {
+        return None;
+    }
+    let mut generation = None;
+    for (metadata, err) in parts_metadata.iter().zip(errs) {
+        match err {
+            Some(DiskError::FileNotFound | DiskError::FileVersionNotFound) => {}
+            Some(_) => return None,
+            None => {
+                if !super::file_info_is_valid_for_metadata(metadata) || metadata.is_remote() {
+                    return None;
+                }
+                let identity = SetDisks::file_info_quorum_hash(metadata);
+                if *generation.get_or_insert(identity) != identity {
+                    return None;
+                }
+            }
+        }
+    }
+    let (_, dangling) = super::is_object_dangling(parts_metadata, errs, &std::collections::HashMap::new());
+    dangling.then_some(if version_id.is_empty() {
+        DiskError::FileNotFound
+    } else {
+        DiskError::FileVersionNotFound
+    })
+}
+
 impl SetDisks {
+    /// A startup quorum can leave remote slots unregistered even after their
+    /// peers become ready. Refresh those slots before taking the GET metadata
+    /// snapshot, without waiting for the periodic reconnect loop.
+    pub(crate) async fn get_disks_for_data_read(&self) -> Vec<Option<DiskStore>> {
+        let disks = self.get_disks_internal().await;
+        if !disks
+            .iter()
+            .enumerate()
+            .any(|(index, disk)| disk.is_none() && self.set_endpoints.get(index).is_some_and(|endpoint| !endpoint.is_local))
+        {
+            return disks;
+        }
+
+        let timeout = crate::disk::disk_store::get_drive_active_check_timeout();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| tokio::time::sleep(timeout).deadline());
+        let mut recovered = 0;
+        let timed_out = tokio::time::timeout_at(deadline, async {
+            // Lock order: read_reconnect -> disks. Only this bounded probe sweep
+            // holds read_reconnect across I/O; disks guards never cross I/O.
+            let mut last_attempt = self.read_reconnect.lock().await;
+            if last_attempt.is_some_and(|at| at.elapsed() < crate::disk::health_state::get_drive_returning_probe_interval()) {
+                return false;
+            }
+            let current = self.get_disks_internal().await;
+            // Timeout polls its inner future before its timer. Lock/snapshot
+            // waits must not admit a new probe after the request budget expires.
+            if tokio::time::Instant::now() >= deadline {
+                return true;
+            }
+            // Start the cooldown when this sweep ends, including cancellation,
+            // before releasing the singleflight lock to waiting readers.
+            rustfs_common::defer! {
+                *last_attempt = Some(tokio::time::Instant::now());
+            }
+            let mut probes = self
+                .set_endpoints
+                .iter()
+                .enumerate()
+                .filter(|(index, endpoint)| !endpoint.is_local && current.get(*index).is_some_and(Option::is_none))
+                .map(|(index, endpoint)| async move { (index, self.probe_missing_read_disk(index, endpoint).await) })
+                .collect::<FuturesUnordered<_>>();
+            while let Some((index, result)) = probes.next().await {
+                let Ok(disk) = result else {
+                    continue;
+                };
+                let mut slots = self.disks.write().await;
+                // A background reconnect may have published a handle while the
+                // format probe was pending. Never replace or close its handle.
+                if let Some(slot) = slots.get_mut(index).filter(|slot| slot.is_none()) {
+                    disk.enable_health_check();
+                    *slot = Some(disk);
+                    recovered += 1;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(true);
+        debug!(
+            event = EVENT_SET_DISK_READ,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            state = "missing_read_disks_probed",
+            pool_index = self.pool_index,
+            set_index = self.set_index,
+            recovered_disks = recovered,
+            timed_out,
+            "Missing GET disk slots probed"
+        );
+        self.get_disks_internal().await
+    }
+
+    async fn probe_missing_read_disk(&self, index: usize, endpoint: &Endpoint) -> Result<DiskStore> {
+        if endpoint.is_local
+            || usize::try_from(endpoint.pool_idx).ok() != Some(self.pool_index)
+            || usize::try_from(endpoint.set_idx).ok() != Some(self.set_index)
+            || usize::try_from(endpoint.disk_idx).ok() != Some(index)
+        {
+            return Err(Error::CorruptedFormat);
+        }
+        // An unregistered probe must not leave a health monitor running after
+        // failure/cancellation. Only an identity-validated published handle gets
+        // monitoring. No replacement formatting or healing is initiated here.
+        let probe = new_disk(
+            endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await?;
+        let format = super::load_format_erasure(&probe, false).await?;
+        if self.find_disk_index(&format)? != (self.set_index, index) {
+            return Err(Error::CorruptedFormat);
+        }
+        let disk = new_disk(
+            endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+        )
+        .await?;
+        disk.set_disk_id(Some(format.erasure.this)).await?;
+        Ok(disk)
+    }
+
     async fn get_object_metadata_cache_bypass_reason(
         &self,
         bucket: &str,
@@ -261,7 +479,7 @@ impl SetDisks {
         let Some(generation) = self.get_object_metadata_cache_generation(bucket, object) else {
             return MetadataCacheLookup::Miss;
         };
-        let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+        let key = GetObjectMetadataCacheLookupKey::new(bucket, object, generation);
         // moka handles TTL expiry automatically; no is_fresh() check needed
         let Some(entry) = self.get_object_metadata_cache.get(&key).await else {
             return MetadataCacheLookup::Miss;
@@ -278,17 +496,43 @@ impl SetDisks {
         }
     }
 
+    #[cfg(test)]
     async fn cache_get_object_fileinfo(
         &self,
         identity: (&str, &str),
         generation: Option<GetObjectMetadataCacheGeneration>,
-        fi: &FileInfo,
+        selected: (&FileInfo, GetObjectMetadataCacheCapability),
         parts_metadata: &[FileInfo],
         online_disks: &[Option<DiskStore>],
         read_quorum: usize,
     ) {
+        let (fi, capability) = selected;
+        let _ = self
+            .cache_get_object_fileinfo_owned(
+                identity,
+                generation,
+                (fi.clone(), capability, None),
+                parts_metadata.to_vec(),
+                online_disks.to_vec(),
+                read_quorum,
+            )
+            .await;
+    }
+
+    async fn cache_get_object_fileinfo_owned(
+        &self,
+        identity: (&str, &str),
+        generation: Option<GetObjectMetadataCacheGeneration>,
+        selected: (FileInfo, GetObjectMetadataCacheCapability, Option<Bytes>),
+        parts_metadata: Vec<FileInfo>,
+        online_disks: Vec<Option<DiskStore>>,
+        read_quorum: usize,
+    ) -> GetObjectFileInfo {
+        let (fi, capability, verified_inline_body) = selected;
         if fi.deleted || !fi.has_valid_erasure_geometry() {
-            return;
+            let mut snapshot = GetObjectFileInfo::owned(fi, parts_metadata, online_disks);
+            snapshot.set_verified_inline_body(verified_inline_body);
+            return snapshot;
         }
         let (bucket, object) = identity;
 
@@ -299,19 +543,24 @@ impl SetDisks {
                 GET_METADATA_CACHE_DECISION_REJECT,
                 GET_METADATA_CACHE_REASON_STALE_PUBLICATION,
             );
-            return;
+            let mut snapshot = GetObjectFileInfo::owned(fi, parts_metadata, online_disks);
+            snapshot.set_verified_inline_body(verified_inline_body);
+            return snapshot;
         };
 
         let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
         let entry = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
-            fi: fi.clone(),
-            parts_metadata: parts_metadata.to_vec(),
-            online_disks: online_disks.to_vec(),
+            fi,
+            parts_metadata,
+            online_disks,
             read_quorum,
+            capability,
+            verified_inline_body,
         });
-        self.insert_get_object_metadata_cache_entry_after_insert(key, generation, entry, || {})
+        self.insert_get_object_metadata_cache_entry_after_insert(key, generation, Arc::clone(&entry), || {})
             .await;
+        GetObjectFileInfo::owned_published(entry)
     }
 
     async fn insert_get_object_metadata_cache_entry_after_insert(
@@ -321,7 +570,25 @@ impl SetDisks {
         entry: Arc<GetObjectMetadataCacheEntry>,
         after_insert: impl FnOnce(),
     ) {
-        self.get_object_metadata_cache.insert(key.clone(), entry).await;
+        // Every publisher shares Moka's per-key compute lock. A partial snapshot
+        // cannot downgrade a full layout or extend its original TTL.
+        self.get_object_metadata_cache
+            .entry(key.clone())
+            .and_compute_with(|current| {
+                std::future::ready(
+                    if !self.is_get_object_metadata_cache_generation_current(generation)
+                        || (entry.capability != GetObjectMetadataCacheCapability::Full
+                            && current
+                                .as_ref()
+                                .is_some_and(|existing| existing.value().capability == GetObjectMetadataCacheCapability::Full))
+                    {
+                        moka::ops::compute::Op::Nop
+                    } else {
+                        moka::ops::compute::Op::Put(entry)
+                    },
+                )
+            })
+            .await;
         after_insert();
         if self.is_get_object_metadata_cache_generation_current(generation) {
             return;
@@ -350,6 +617,10 @@ impl SetDisks {
         let object: Arc<str> = Arc::from(object);
         let version_id: Arc<str> = Arc::from(version_id);
         let opts = *opts;
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let api_operation = rustfs_io_metrics::get_stage_metrics_enabled()
+            .then(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context)
+            .flatten();
 
         let processor = runtime_sources::batch_processors().read_processor();
         let tasks: Vec<_> = disks
@@ -361,8 +632,28 @@ impl SetDisks {
                     let object = object.clone();
                     let version_id = version_id.clone();
                     let task_opts = opts;
+                    #[cfg(feature = "diagnostic-read-version-caller")]
+                    #[allow(clippy::redundant_locals)]
+                    let api_operation = api_operation;
 
-                    async move { disk.read_version(&bucket, &bucket, &object, &version_id, &task_opts).await }
+                    async move {
+                        let read_version =
+                            async move { disk.read_version(&bucket, &bucket, &object, &version_id, &task_opts).await };
+                        #[cfg(feature = "diagnostic-read-version-caller")]
+                        let read_version = crate::cluster::rpc::runtime_sources::with_read_version_request_caller_if_absent(
+                            rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::SetDiskRead,
+                            read_version,
+                        );
+                        #[cfg(feature = "diagnostic-read-version-caller")]
+                        if let Some(api_operation) = api_operation {
+                            rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(Some(api_operation), read_version)
+                                .await
+                        } else {
+                            read_version.await
+                        }
+                        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+                        read_version.await
+                    }
                 })
             })
             .collect();
@@ -383,8 +674,40 @@ impl SetDisks {
         read_data: bool,
         caller_allows_early_stop: bool,
     ) -> Result<GetObjectFileInfo> {
-        self.get_object_fileinfo_gated_inner(bucket, object, opts, read_data, caller_allows_early_stop, false)
-            .await
+        self.get_object_fileinfo_gated_inner(
+            bucket,
+            object,
+            opts,
+            read_data,
+            caller_allows_early_stop,
+            MetadataReadPurpose::FullLayout,
+            DanglingRead::KeepQuorumError,
+        )
+        .await
+    }
+
+    /// `get_object_fileinfo` for `get_object_info` and prepared GET metadata:
+    /// a provably dangling object or version reads as not found.
+    #[tracing::instrument(level = "debug", skip(self))]
+    #[hotpath::measure(impl_type = "SetDisks")]
+    pub(super) async fn get_object_fileinfo_for_object_read(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        read_data: bool,
+        caller_allows_early_stop: bool,
+    ) -> Result<GetObjectFileInfo> {
+        self.get_object_fileinfo_gated_inner(
+            bucket,
+            object,
+            opts,
+            read_data,
+            caller_allows_early_stop,
+            MetadataReadPurpose::FullLayout,
+            DanglingRead::ReportNotFound,
+        )
+        .await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -397,23 +720,23 @@ impl SetDisks {
         read_data: bool,
         caller_allows_early_stop: bool,
     ) -> Result<GetObjectFileInfo> {
-        let allow_read_version_coalescing = !crate::bucket::utils::is_meta_bucketname(bucket)
-            && crate::runtime::global::get_metadata_read_version_coalescing_service_ready();
         self.get_object_fileinfo_gated_inner(
             bucket,
             object,
             opts,
             read_data,
             caller_allows_early_stop,
-            allow_read_version_coalescing,
+            MetadataReadPurpose::GetObjectReader,
+            DanglingRead::ReportNotFound,
         )
         .await
     }
 
     /// Like `get_object_fileinfo`, but `allow_early_stop=false` forces the full
-    /// quorum fanout. Read-before-write callers (object tagging) must use this:
-    /// the returned online-disk set is the write target, and the early-stop
-    /// subset would fail write quorum (backlog#872 regression fix).
+    /// quorum fanout. Read-before-write callers must use this or
+    /// `get_object_fileinfo_for_metadata_update`: the returned online-disk set
+    /// is the write target, and the early-stop subset would fail write quorum
+    /// (backlog#872 regression fix).
     #[tracing::instrument(level = "debug", skip(self))]
     pub(in crate::set_disk) async fn get_object_fileinfo_gated(
         &self,
@@ -423,8 +746,74 @@ impl SetDisks {
         read_data: bool,
         allow_early_stop: bool,
     ) -> Result<GetObjectFileInfo> {
-        self.get_object_fileinfo_gated_inner(bucket, object, opts, read_data, allow_early_stop, false)
-            .await
+        self.get_object_fileinfo_gated_inner(
+            bucket,
+            object,
+            opts,
+            read_data,
+            allow_early_stop,
+            MetadataReadPurpose::FullLayout,
+            DanglingRead::KeepQuorumError,
+        )
+        .await
+    }
+
+    /// The full-fanout read behind a metadata update such as object tagging.
+    /// A latest read whose newest versions never committed resolves to the
+    /// version a latest GET serves, while a dangling key keeps the quorum
+    /// error. The returned online disks are the write target.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(in crate::set_disk) async fn get_object_fileinfo_for_metadata_update(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<GetObjectFileInfo> {
+        self.get_object_fileinfo_gated_inner(
+            bucket,
+            object,
+            opts,
+            false,
+            false,
+            MetadataReadPurpose::FullLayout,
+            DanglingRead::SkipDanglingVersions,
+        )
+        .await
+    }
+
+    /// Recovers a failed latest selection in read-before-write callers that
+    /// read and select metadata themselves (`put_object_metadata` and the
+    /// CopyObject source) the way a latest GET does. `None` keeps the caller's
+    /// error: a failure other than read quorum, an explicit version, the
+    /// system bucket's commit-proof rule, or a walk that finds no readable
+    /// version or cannot read every drive. The selected metadata keeps its
+    /// part checksums because a version-only copy carries them into the new
+    /// version.
+    pub(in crate::set_disk) async fn select_latest_past_dangling_versions(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        read_data: bool,
+        disks: &[Option<DiskStore>],
+        err: &DiskError,
+    ) -> Option<GetObjectFileInfo> {
+        if *err != DiskError::ErasureReadQuorum || opts.version_id.is_some() || crate::bucket::utils::is_meta_bucketname(bucket) {
+            return None;
+        }
+        let opts = ObjectOptions {
+            include_part_checksums: true,
+            ..opts.clone()
+        };
+        Box::pin(self.read_latest_past_dangling_versions(
+            bucket,
+            object,
+            &opts,
+            read_data,
+            MetadataReadPurpose::FullLayout,
+            disks,
+        ))
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -435,9 +824,15 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
         allow_early_stop: bool,
-        allow_read_version_coalescing: bool,
+        purpose: MetadataReadPurpose,
+        dangling_read: DanglingRead,
     ) -> Result<GetObjectFileInfo> {
         let vid = opts.version_id.clone().unwrap_or_default();
+        let metadata_metrics_path = if crate::bucket::utils::is_meta_bucketname(bucket) {
+            GET_OBJECT_PATH_INTERNAL_META
+        } else {
+            GET_OBJECT_PATH_LEGACY_DUPLEX
+        };
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
         let metadata_cache_lookup_start = get_stage_timer_if_enabled(stage_metrics_enabled);
@@ -451,7 +846,19 @@ impl SetDisks {
             );
         } else if vid.is_empty() {
             match self.lookup_cached_get_object_fileinfo(bucket, object).await {
-                MetadataCacheLookup::Hit(cached) => {
+                MetadataCacheLookup::Hit(cached)
+                    if cached.capability == GetObjectMetadataCacheCapability::Full
+                        || (cached.capability == GetObjectMetadataCacheCapability::QuorumSelected
+                            && read_data
+                            && allow_early_stop)
+                        || (purpose == MetadataReadPurpose::GetObjectReader
+                            && cached.capability == GetObjectMetadataCacheCapability::ConditionOnly
+                            && allow_early_stop
+                            && crate::object_api::get_object_read_condition_is_terminal(
+                                crate::object_api::GetObjectReadMetadata::from_file_info(bucket, object, &cached.fi),
+                            )) =>
+                {
+                    rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, "reached");
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
                         GET_OBJECT_PATH_SET_DISK,
                         GET_METADATA_CACHE_DECISION_HIT,
@@ -462,7 +869,24 @@ impl SetDisks {
                         GET_STAGE_METADATA_CACHE_LOOKUP,
                         metadata_cache_lookup_start,
                     );
-                    return Ok(GetObjectFileInfo::shared(cached));
+                    let snapshot = if cached.capability == GetObjectMetadataCacheCapability::QuorumSelected
+                        && non_inline_data_read_early_stop_allowed(read_data, bucket, object)
+                        && late_materialization_candidate_is_safe(&cached.fi)
+                    {
+                        GetObjectFileInfo::shared_with_late_metadata_refresh(cached)
+                    } else {
+                        GetObjectFileInfo::shared(cached)
+                    };
+                    return Ok(snapshot);
+                }
+                MetadataCacheLookup::Hit(_) => {
+                    // Keep the conditional entry for other requests; this read
+                    // needs a body or a complete mutation target set.
+                    rustfs_io_metrics::record_get_object_metadata_cache_decision(
+                        GET_OBJECT_PATH_SET_DISK,
+                        GET_METADATA_CACHE_DECISION_REJECT,
+                        GET_METADATA_CACHE_REASON_BODY_LAYOUT_REQUIRED,
+                    );
                 }
                 MetadataCacheLookup::Miss => {
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
@@ -490,60 +914,93 @@ impl SetDisks {
             .then(|| self.get_object_metadata_cache_generation(bucket, object))
             .flatten();
 
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
+        let disks = if read_data && !crate::bucket::utils::is_meta_bucketname(bucket) {
+            self.get_disks_for_data_read().await
+        } else {
+            self.get_disks_internal().await
+        };
 
         // Early-stop for safe metadata reads is handled inside
-        // read_all_fileinfo_observed (see read_all_fileinfo_early_stop in
-        // core/io_primitives.rs); unsafe requests and callers that opt out
+        // read_metadata_observed (see read_all_fileinfo_early_stop in
+        // core/metadata_read.rs); unsafe requests and callers that opt out
         // (allow_early_stop=false) fall back to full-wait.
-        let (mut parts_metadata, errs, metadata_fanout_diagnostics) = if allow_read_version_coalescing {
-            Self::read_all_fileinfo_observed_for_get_object(
-                &disks,
-                "",
-                bucket,
-                object,
-                vid.as_str(),
-                read_data,
-                opts.incl_free_versions,
-                allow_early_stop,
-                self.default_parity_count,
-            )
-            .await?
-        } else {
-            Self::read_all_fileinfo_observed(
-                &disks,
-                "",
-                bucket,
-                object,
-                vid.as_str(),
-                read_data,
-                false,
-                opts.incl_free_versions,
-                allow_early_stop,
-                self.default_parity_count,
-            )
-            .await?
+        let allow_read_version_coalescing = purpose == MetadataReadPurpose::GetObjectReader
+            && !crate::bucket::utils::is_meta_bucketname(bucket)
+            && crate::runtime::global::get_metadata_read_version_coalescing_service_ready();
+        let metadata_read = async {
+            if allow_read_version_coalescing {
+                Self::read_metadata_for_get_object(
+                    &disks,
+                    "",
+                    bucket,
+                    object,
+                    vid.as_str(),
+                    read_data,
+                    opts.incl_free_versions,
+                    allow_early_stop,
+                    self.default_parity_count,
+                )
+                .await
+            } else {
+                Self::read_metadata_observed(
+                    &disks,
+                    "",
+                    bucket,
+                    object,
+                    vid.as_str(),
+                    read_data,
+                    false,
+                    opts.incl_free_versions,
+                    allow_early_stop,
+                    self.default_parity_count,
+                )
+                .await
+            }
         };
-        let metadata_metrics_path = if crate::bucket::utils::is_meta_bucketname(bucket) {
-            GET_OBJECT_PATH_INTERNAL_META
-        } else {
-            GET_OBJECT_PATH_LEGACY_DUPLEX
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let metadata_read_result = crate::cluster::rpc::runtime_sources::with_read_version_caller_and_entry_if_absent(
+            rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::Object,
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ObjectRead,
+            metadata_read,
+        )
+        .await;
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+        let metadata_read_result = metadata_read.await;
+        let mut metadata_read = match metadata_read_result {
+            Ok(metadata_read) => metadata_read,
+            Err(err) => {
+                let err = StorageError::from(err);
+                rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, metadata_quorum_outcome(&err));
+                return Err(err);
+            }
         };
+        let metadata_fanout_complete = metadata_read.is_complete();
+        let condition_stopped = metadata_read.condition_stopped;
+        let verified_inline_body = metadata_read.verified_inline_body.take();
+        let (mut parts_metadata, errs, metadata_fanout_diagnostics) = metadata_read.into_legacy();
         metadata_fanout_diagnostics.record(metadata_metrics_path);
-        let metadata_fanout_complete = metadata_fanout_diagnostics.total_responses() >= disks.len();
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
         let metadata_resolve_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        // Like MinIO, check for a dangling object after either metadata quorum
+        // reduction fails; only a read-quorum failure is reclassified.
+        let dangling_not_found = |err: &DiskError| {
+            if dangling_read == DanglingRead::ReportNotFound && *err == DiskError::ErasureReadQuorum {
+                dangling_read_not_found(bucket, &vid, &parts_metadata, &errs, metadata_fanout_complete)
+            } else {
+                None
+            }
+        };
         let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
-            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))
+            .map_err(|err| dangling_not_found(&err).unwrap_or(err))
+            .map_err(|err| to_object_err(err.into(), vec![bucket, object, &vid]))
         {
             Ok(v) => v,
             Err(e) => {
+                rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, metadata_quorum_outcome(&e));
                 // error!("Self::object_quorum_from_meta: {:?}, bucket: {}, object: {}", &e, bucket, object);
                 record_get_stage_duration_if_enabled(
                     GET_OBJECT_PATH_SET_DISK,
@@ -558,17 +1015,50 @@ impl SetDisks {
         let write_quorum = usize::try_from(write_quorum)
             .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+            if let Some(not_found) = dangling_not_found(&err) {
+                rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, "not_found");
+                record_get_stage_duration_if_enabled(
+                    GET_OBJECT_PATH_SET_DISK,
+                    GET_STAGE_METADATA_RESOLVE,
+                    metadata_resolve_stage_start,
+                );
+                return Err(to_object_err(not_found.into(), vec![bucket, object, &vid]));
+            }
+            rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, "not_reached");
             error!("reduce_read_quorum_errs: {:?}, bucket: {}, object: {}", &err, bucket, object);
             record_get_stage_duration_if_enabled(
                 GET_OBJECT_PATH_SET_DISK,
                 GET_STAGE_METADATA_RESOLVE,
                 metadata_resolve_stage_start,
             );
-            return Err(to_object_err(err.into(), vec![bucket, object]));
+            return Err(to_object_err(err.into(), vec![bucket, object, &vid]));
         }
 
-        let (op_online_disks, mut fi, fileinfo_selection_quorum) =
-            Self::select_valid_fileinfo(&disks, &parts_metadata, &errs, vid.as_str(), read_quorum, write_quorum)?;
+        let (op_online_disks, mut fi) =
+            match Self::select_fileinfo_for_read(bucket, &disks, &parts_metadata, &errs, vid.as_str(), read_quorum, write_quorum)
+            {
+                Ok(selection) => selection,
+                Err(err) => {
+                    if err == DiskError::ErasureReadQuorum
+                        && vid.is_empty()
+                        && dangling_read != DanglingRead::KeepQuorumError
+                        && metadata_fanout_complete
+                        && !crate::bucket::utils::is_meta_bucketname(bucket)
+                        && let Some(snapshot) =
+                            Box::pin(self.read_latest_past_dangling_versions(bucket, object, opts, read_data, purpose, &disks))
+                                .await
+                    {
+                        rustfs_io_metrics::record_get_object_metadata_quorum_result(metadata_metrics_path, "reached");
+                        return Ok(snapshot);
+                    }
+                    let err = StorageError::from(err);
+                    rustfs_io_metrics::record_get_object_metadata_quorum_result(
+                        metadata_metrics_path,
+                        metadata_quorum_outcome(&err),
+                    );
+                    return Err(err);
+                }
+            };
         let include_part_checksums =
             opts.include_part_checksums || opts.part_number.is_some() || opts.data_movement || opts.raw_data_movement_read;
         if include_part_checksums {
@@ -578,8 +1068,12 @@ impl SetDisks {
                 rustfs_utils::http::remove_str(&mut metadata.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS);
             }
         }
-        metadata_fanout_diagnostics.record_quorum_candidate_latency(metadata_metrics_path, fileinfo_selection_quorum);
-        if errs.iter().any(|err| err.is_some()) {
+        metadata_fanout_diagnostics.record_quorum_candidate_latency(metadata_metrics_path, read_quorum);
+        let needs_late_metadata_fanout = !metadata_fanout_complete
+            && allow_early_stop
+            && non_inline_data_read_early_stop_allowed(read_data, bucket, object)
+            && late_materialization_candidate_is_safe(&fi);
+        let mut snapshot = if !opts.suppress_read_repair && errs.iter().any(|err| err.is_some()) {
             let version_id = resolved_read_repair_version_id(&fi, opts.version_id.as_deref());
             submit_read_repair_heal(
                 &fi.volume,
@@ -591,60 +1085,235 @@ impl SetDisks {
                 "metadata_read_error",
             )
             .await;
-        } else if use_metadata_cache && metadata_fanout_complete {
+            let mut snapshot = GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks);
+            snapshot.set_verified_inline_body(verified_inline_body);
+            snapshot
+        } else if use_metadata_cache
+            && (metadata_fanout_complete
+                || condition_stopped
+                || (read_data
+                    && allow_early_stop
+                    && metadata_fanout_diagnostics.valid_responses() >= read_quorum
+                    && errs.iter().all(Option::is_none)
+                    && op_online_disks.iter().filter(|disk| disk.is_some()).count() >= read_quorum))
+        {
             #[cfg(test)]
             metadata_cache_tests::wait_before_metadata_cache_publish(bucket, object).await;
-            self.cache_get_object_fileinfo(
+            self.cache_get_object_fileinfo_owned(
                 (bucket, object),
                 metadata_cache_generation,
-                &fi,
-                &parts_metadata,
-                &op_online_disks,
-                read_quorum,
-            )
-            .await;
-        }
-        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_METADATA_RESOLVE, metadata_resolve_stage_start);
-        // debug!("get_object_fileinfo pick fi {:?}", &fi);
-
-        // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();
-
-        if !metadata_fanout_complete
-            && allow_early_stop
-            && non_inline_data_read_early_stop_allowed(read_data, bucket, object)
-            && late_materialization_candidate_is_safe(&fi)
-        {
-            Ok(GetObjectFileInfo::owned_with_late_metadata_fanout(
-                fi,
+                (
+                    fi,
+                    if metadata_fanout_complete {
+                        GetObjectMetadataCacheCapability::Full
+                    } else if condition_stopped {
+                        GetObjectMetadataCacheCapability::ConditionOnly
+                    } else {
+                        GetObjectMetadataCacheCapability::QuorumSelected
+                    },
+                    verified_inline_body,
+                ),
                 parts_metadata,
                 op_online_disks,
-                disks,
-            ))
+                read_quorum,
+            )
+            .await
         } else {
-            Ok(GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks))
+            let mut snapshot = GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks);
+            snapshot.set_verified_inline_body(verified_inline_body);
+            snapshot
+        };
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_METADATA_RESOLVE, metadata_resolve_stage_start);
+        if needs_late_metadata_fanout {
+            snapshot.set_late_metadata_fanout_disks(disks);
         }
+        snapshot.condition_stopped = condition_stopped;
+        Ok(snapshot)
     }
 
-    #[hotpath::measure(impl_type = "SetDisks")]
-    pub(super) async fn get_object_info_and_quorum(
+    /// A latest read whose split cannot reach read quorum may still have a
+    /// readable older version under newer versions that never committed;
+    /// MinIO resolves this in `pickLatestQuorumFilesInfo`. With every drive
+    /// answering, try versions newest first through exact-version reads and
+    /// serve the readable one with the newest selected modification time. A
+    /// version whose exact read proves it dangling (the NoSuchVersion an
+    /// explicit GET reports) is skipped and queued for heal, which owns its
+    /// cleanup; any other outcome keeps the read-quorum error.
+    async fn read_latest_past_dangling_versions(
         &self,
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
-    ) -> (ObjectInfo, usize, Option<StorageError>) {
+        read_data: bool,
+        purpose: MetadataReadPurpose,
+        disks: &[Option<DiskStore>],
+    ) -> Option<GetObjectFileInfo> {
+        let disk_object = rustfs_utils::path::encode_dir_object(object);
+        let (raw, errs) = Self::read_all_raw_file_info(disks, bucket, &disk_object, false).await;
+        if errs
+            .iter()
+            .any(|err| err.as_ref().is_some_and(|err| !matches!(err, DiskError::FileNotFound)))
+        {
+            return None;
+        }
+        // Stacks are newest first, so only each drive's first few headers can
+        // matter. Keep a version's newest modification time across drives: a
+        // rewritten null version can carry different times on different drives.
+        let mut newest = std::collections::HashMap::<Option<uuid::Uuid>, Option<time::OffsetDateTime>>::new();
+        let mut truncated = false;
+        let mut metadata = Vec::with_capacity(raw.len());
+        for raw in raw.into_iter().flatten() {
+            let mut meta = rustfs_filemeta::FileMeta::load(&raw.buf).ok()?;
+            let mut versions = meta
+                .versions
+                .iter()
+                .enumerate()
+                .filter(|(_, version)| !version.header.free_version());
+            let mut retained_end = 0;
+            for (index, version) in versions.by_ref().take(MAX_DANGLING_LATEST_VERSIONS) {
+                let mod_time = newest.entry(version.header.version_id).or_insert(version.header.mod_time);
+                *mod_time = (*mod_time).max(version.header.mod_time);
+                retained_end = index + 1;
+            }
+            truncated |= versions.next().is_some();
+            meta.versions.truncate(retained_end);
+            metadata.push(meta);
+        }
+        let mut candidates = newest.into_iter().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+        // Use the stored header for equal-time ordering: re-encoding a selected
+        // FileInfo can change legacy signatures or omit part-checksum metadata.
+        let selected_header = |snapshot: &GetObjectFileInfo| {
+            let mut selected = snapshot.fi().clone();
+            selected.data = None;
+            let version_id = selected.version_id.unwrap_or_else(uuid::Uuid::nil).to_string();
+            let include_part_checksums =
+                opts.include_part_checksums || opts.part_number.is_some() || opts.data_movement || opts.raw_data_movement_read;
+            metadata.iter().find_map(|meta| {
+                let version = meta
+                    .versions
+                    .iter()
+                    .filter(|version| !version.header.free_version())
+                    .take(MAX_DANGLING_LATEST_VERSIONS)
+                    .find(|version| {
+                        version.header.version_id.unwrap_or_else(uuid::Uuid::nil)
+                            == selected.version_id.unwrap_or_else(uuid::Uuid::nil)
+                            && version.header.mod_time == selected.mod_time
+                    })?;
+                let mut original = if include_part_checksums {
+                    meta.into_fileinfo(&selected.volume, &selected.name, &version_id, false, opts.incl_free_versions, true)
+                } else {
+                    meta.into_fileinfo_without_part_checksums(
+                        &selected.volume,
+                        &selected.name,
+                        &version_id,
+                        false,
+                        opts.incl_free_versions,
+                    )
+                }
+                .ok()?;
+                if !include_part_checksums {
+                    rustfs_utils::http::remove_str(&mut original.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS);
+                }
+                original.data = None;
+                original.is_latest = selected.is_latest;
+                original.successor_mod_time = selected.successor_mod_time;
+                original.num_versions = selected.num_versions;
+                (original == selected).then_some(version.header.clone())
+            })
+        };
+
+        let mut best: Option<(Option<time::OffsetDateTime>, GetObjectFileInfo)> = None;
+        let mut skipped = Vec::new();
+        let mut settled = false;
+        for (reads, (version_id, newest_mod_time)) in candidates.into_iter().enumerate() {
+            if best.as_ref().is_some_and(|(selected, _)| newest_mod_time < *selected) {
+                settled = true;
+                break;
+            }
+            if reads == MAX_DANGLING_LATEST_VERSIONS {
+                return None;
+            }
+            // The nil UUID addresses the null version slot at this layer.
+            let version_id = version_id.unwrap_or_else(uuid::Uuid::nil).to_string();
+            let exact = ObjectOptions {
+                version_id: Some(version_id.clone()),
+                ..opts.clone()
+            };
+            match Box::pin(self.get_object_fileinfo_gated_inner(
+                bucket,
+                object,
+                &exact,
+                read_data,
+                false,
+                purpose,
+                DanglingRead::ReportNotFound,
+            ))
+            .await
+            {
+                Ok(snapshot) => {
+                    let selected = snapshot.fi().mod_time;
+                    let replace = match best.as_ref() {
+                        Some((current, previous)) if selected == *current => {
+                            selected_header(&snapshot)?.sorts_before(&selected_header(previous)?)
+                        }
+                        Some((current, _)) => selected > *current,
+                        None => true,
+                    };
+                    if replace {
+                        best = Some((selected, snapshot));
+                    }
+                }
+                Err(StorageError::VersionNotFound(..)) => skipped.push(version_id),
+                Err(_) => return None,
+            }
+        }
+        // Headers past each drive's first few were not compared; only a walk
+        // that proved no remaining candidate can be newer may stop early.
+        if !settled && truncated {
+            return None;
+        }
+        let (_, mut snapshot) = best?;
+        snapshot.mark_selected_as_latest();
+        if !opts.suppress_read_repair {
+            for version_id in &skipped {
+                submit_read_repair_heal(
+                    bucket,
+                    object,
+                    Some(version_id),
+                    self.pool_index,
+                    self.set_index,
+                    None,
+                    "dangling_latest_version",
+                )
+                .await;
+            }
+        }
+        Some(snapshot)
+    }
+
+    #[hotpath::measure(impl_type = "SetDisks")]
+    pub(super) async fn get_object_info_fileinfo_and_quorum(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> (ObjectInfo, FileInfo, usize, Option<StorageError>) {
         let snapshot = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
             Ok(snapshot) => snapshot,
-            Err(e) => return (ObjectInfo::default(), 0, Some(e)),
+            Err(e) => return (ObjectInfo::default(), FileInfo::default(), 0, Some(e)),
         };
-        let fi = snapshot.fi();
+        let (fi, _, _) = snapshot.into_owned();
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
-        let oi = ObjectInfo::from_file_info(fi, bucket, object, opts.versioned || opts.version_suspended);
+        let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
 
         if !fi.version_purge_status().is_empty() && opts.version_id.is_some() {
             return (
                 oi,
+                fi,
                 write_quorum,
                 Some(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object])),
             );
@@ -652,20 +1321,26 @@ impl SetDisks {
 
         if fi.deleted {
             if opts.incl_free_versions && fi.tier_free_version() && opts.version_id.is_some() {
-                return (oi, write_quorum, None);
+                return (oi, fi, write_quorum, None);
             }
             return if opts.version_id.is_none() || opts.delete_marker {
-                (oi, write_quorum, Some(to_object_err(StorageError::FileNotFound, vec![bucket, object])))
+                (
+                    oi,
+                    fi,
+                    write_quorum,
+                    Some(to_object_err(StorageError::FileNotFound, vec![bucket, object])),
+                )
             } else {
                 (
                     oi,
+                    fi,
                     write_quorum,
                     Some(to_object_err(StorageError::MethodNotAllowed, vec![bucket, object])),
                 )
             };
         }
 
-        (oi, write_quorum, None)
+        (oi, fi, write_quorum, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -725,6 +1400,15 @@ impl SetDisks {
                 skip_verify_bitrot,
             )
             .await?;
+            if let Some(expected) = part.integrity.as_ref() {
+                use crate::io_support::shard_integrity::{PartProofReader, ShardVerifier};
+                let proof = PartProofReader::new(expected.clone(), files, disks, bucket, object)?;
+                for (index, reader) in readers.iter_mut().enumerate() {
+                    if let Some(reader) = reader {
+                        reader.set_integrity(ShardVerifier::new(Arc::clone(&proof), index, 0, None)?)?;
+                    }
+                }
+            }
             let reader_setup_elapsed = reader_setup_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
             rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -736,6 +1420,8 @@ impl SetDisks {
             );
 
             let decode_stage_start = Instant::now();
+            #[cfg(test)]
+            crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
             let body = try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await;
             let decode_elapsed = decode_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
@@ -777,6 +1463,7 @@ impl SetDisks {
             erasure.data_shards,
         )
         .await;
+        reader_setup.bind_integrity(part.integrity.as_ref(), &files, &disks, bucket, object, 0)?;
         let reader_setup_elapsed = reader_setup_stage_start.elapsed();
         rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
         rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -792,6 +1479,8 @@ impl SetDisks {
         }
 
         let decode_stage_start = Instant::now();
+        #[cfg(test)]
+        crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
         let body =
             try_read_inline_data_shards_direct(&mut reader_setup.readers, erasure.data_shards, read_length, object_size).await;
         let decode_elapsed = decode_stage_start.elapsed();
@@ -831,6 +1520,7 @@ impl SetDisks {
         set_index: usize,
         pool_index: usize,
         skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
         prefer_data_blocks_first_reader_setup: bool,
         require_reconstruction_surplus: bool,
         metrics_path: &'static str,
@@ -978,6 +1668,7 @@ impl SetDisks {
 
             let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(&disks));
             let sync_spec = PartReaderSetupSpec {
+                integrity: fi.parts[current_part].integrity.clone(),
                 part_number,
                 read_offset,
                 read_length,
@@ -1032,6 +1723,7 @@ impl SetDisks {
                 let next_size = fi.parts[next_part].size;
                 let next_length = next_size.min(remaining_after_current);
                 let spec = PartReaderSetupSpec {
+                    integrity: fi.parts[next_part].integrity.clone(),
                     part_number: next_number,
                     read_offset: 0,
                     read_length: erasure.shard_file_offset(0, next_length, next_size),
@@ -1126,7 +1818,10 @@ impl SetDisks {
                         "Create bitrot reader failed read quorum"
                     );
                     record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
-                    return Err(to_object_err(read_err.into(), vec![bucket, object]));
+                    // The metadata selected this object, but the part cannot
+                    // be reconstructed. A dominant disk I/O/not-found error
+                    // must not erase the object's read-quorum failure.
+                    return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
                 }
                 let reason = GetObjectFailureReason::ReadQuorum;
                 error!(
@@ -1151,7 +1846,7 @@ impl SetDisks {
                     "Create bitrot reader did not have enough disks"
                 );
                 record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
-                return Err(Error::other(format!("not enough disks to read: {:?}", reader_setup.errors)));
+                return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
             }
 
             // Check if we have missing shards even though we can read successfully
@@ -1173,7 +1868,7 @@ impl SetDisks {
                 "Shard availability check"
             );
 
-            if missing_shards > 0 && available_shards >= erasure.data_shards {
+            if !suppress_read_repair && missing_shards > 0 && available_shards >= erasure.data_shards {
                 // We have missing shards but enough to read - trigger background heal
                 debug!(
                     bucket,
@@ -1207,34 +1902,26 @@ impl SetDisks {
             let readers = reader_setup.readers;
             let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
             let deferred_reopeners = reader_setup.deferred_reopeners;
-            let (written, err, exact_quorum) = if require_reconstruction_surplus {
-                erasure
-                    .decode_with_stripe_handles_and_reopeners_with_diagnostics(
-                        writer,
-                        readers,
-                        part_offset,
-                        part_length,
-                        part_size,
-                        read_costs,
-                        deferred_stripe_handles,
-                        deferred_reopeners,
-                    )
-                    .await
-            } else {
-                let (written, err) = erasure
-                    .decode_with_stripe_handles_and_reopeners(
-                        writer,
-                        readers,
-                        part_offset,
-                        part_length,
-                        part_size,
-                        read_costs,
-                        deferred_stripe_handles,
-                        deferred_reopeners,
-                    )
-                    .await;
-                (written, err, false)
-            };
+            #[cfg(test)]
+            crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
+            let coding::decode::DecodeOutcome {
+                written,
+                error: err,
+                exact_quorum,
+                repair,
+            } = erasure
+                .decode_with_stripe_handles_and_reopeners_with_diagnostics(
+                    writer,
+                    readers,
+                    part_offset,
+                    part_length,
+                    part_size,
+                    read_costs,
+                    deferred_stripe_handles,
+                    deferred_reopeners,
+                )
+                .await;
+            let mut repair_needed = repair.needed(!unattempted_data_shards);
             let decode_elapsed = decode_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
             rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -1244,7 +1931,7 @@ impl SetDisks {
                 metrics_size_bucket,
                 decode_elapsed.as_secs_f64(),
             );
-            if exact_quorum && err.is_none() {
+            if require_reconstruction_surplus && exact_quorum && err.is_none() {
                 return Err(Error::other("two-phase read completed with exact reconstruction quorum"));
             }
             if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD && err.is_none() {
@@ -1283,33 +1970,7 @@ impl SetDisks {
                     let should_enqueue_heal = matches!(de_err, DiskError::FileCorrupt)
                         || (matches!(de_err, DiskError::FileNotFound) && !unattempted_data_shards);
                     if should_enqueue_heal {
-                        debug!(
-                            bucket,
-                            object,
-                            part_number,
-                            error = ?de_err,
-                            "Recoverable decode error triggered read repair"
-                        );
-                        let version_id = fi.version_id.as_ref().map(ToString::to_string);
-                        // Single-flight (backlog#1894 axis A): the durable
-                        // MRF intent (Urgent ECDecode across restarts, HS-01)
-                        // is bound to the read-repair reservation, so only the
-                        // first sighting within the dedup TTL books a journal
-                        // record instead of one per retried read.
-                        submit_read_repair_heal_with_submitter(
-                            ReadRepairHealSubmission {
-                                bucket,
-                                object,
-                                version_id: version_id.as_deref(),
-                                pool_index,
-                                set_index,
-                                part_number: Some(part_number),
-                                reason: "decode_error",
-                                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, fi.version_id)),
-                            },
-                            send_read_repair_heal_request,
-                        )
-                        .await;
+                        repair_needed = true;
                         has_err = false;
                     }
                 }
@@ -1348,6 +2009,12 @@ impl SetDisks {
                     record_get_object_pipeline_failure(GET_STAGE_DECODE, reason);
                     return Err(de_err.into());
                 }
+            }
+
+            if !suppress_read_repair && written == part_length && repair_needed {
+                DecodeReadRepairContext::new(bucket, object, fi.version_id, pool_index, set_index, part_number, false)
+                    .submit()
+                    .await;
             }
 
             // debug!("ec decode {} written size {}", part_number, n);
@@ -1391,6 +2058,7 @@ impl SetDisks {
         set_index: usize,
         pool_index: usize,
         skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
@@ -1405,6 +2073,7 @@ impl SetDisks {
             set_index,
             pool_index,
             skip_verify_bitrot,
+            suppress_read_repair,
             metrics_object_class,
             metrics_size_bucket,
             prefer_data_blocks_first_reader_setup,
@@ -1430,6 +2099,7 @@ impl SetDisks {
         set_index: usize,
         pool_index: usize,
         skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
@@ -1444,6 +2114,7 @@ impl SetDisks {
             set_index,
             pool_index,
             skip_verify_bitrot,
+            suppress_read_repair,
             metrics_object_class,
             metrics_size_bucket,
             prefer_data_blocks_first_reader_setup,
@@ -1462,9 +2133,10 @@ impl SetDisks {
         fi: &FileInfo,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
-        _set_index: usize,
-        _pool_index: usize,
+        set_index: usize,
+        pool_index: usize,
         skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
@@ -1483,6 +2155,8 @@ impl SetDisks {
                 bucket,
                 object,
                 fi,
+                pool_index,
+                set_index,
                 &files,
                 &disks,
                 &erasure,
@@ -1491,6 +2165,7 @@ impl SetDisks {
                 part_length,
                 part.size,
                 skip_verify_bitrot,
+                suppress_read_repair,
                 metrics_object_class,
                 metrics_size_bucket,
                 prefer_data_blocks_first_reader_setup,
@@ -1537,6 +2212,8 @@ impl SetDisks {
             bucket,
             object,
             fi,
+            pool_index,
+            set_index,
             &files,
             &disks,
             &erasure,
@@ -1545,6 +2222,7 @@ impl SetDisks {
             first_part.size,
             first_part.size,
             skip_verify_bitrot,
+            suppress_read_repair,
             metrics_object_class,
             metrics_size_bucket,
             false,
@@ -1569,10 +2247,13 @@ impl SetDisks {
             bucket: bucket.to_owned(),
             object: object.to_owned(),
             fi: fi.clone(),
+            pool_index,
+            set_index,
             files,
             disks,
             erasure,
             skip_verify_bitrot,
+            suppress_read_repair,
             metrics_object_class,
             metrics_size_bucket,
             metrics_path,
@@ -1585,6 +2266,8 @@ impl SetDisks {
                     &ctx.bucket,
                     &ctx.object,
                     &ctx.fi,
+                    ctx.pool_index,
+                    ctx.set_index,
                     &ctx.files,
                     &ctx.disks,
                     &ctx.erasure,
@@ -1593,6 +2276,7 @@ impl SetDisks {
                     part_size,
                     part_size,
                     ctx.skip_verify_bitrot,
+                    ctx.suppress_read_repair,
                     ctx.metrics_object_class,
                     ctx.metrics_size_bucket,
                     false,
@@ -1619,6 +2303,8 @@ impl SetDisks {
         bucket: &str,
         object: &str,
         fi: &FileInfo,
+        pool_index: usize,
+        set_index: usize,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
         erasure: &coding::Erasure,
@@ -1627,6 +2313,7 @@ impl SetDisks {
         part_length: usize,
         part_size: usize,
         skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
@@ -1657,7 +2344,7 @@ impl SetDisks {
         });
         let reader_setup_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(disks));
-        let reader_setup = create_bitrot_readers_until_quorum_with_preference(
+        let mut reader_setup = create_bitrot_readers_until_quorum_with_preference(
             files,
             disks,
             bucket,
@@ -1681,6 +2368,12 @@ impl SetDisks {
             }),
         )
         .await;
+        let expected = fi
+            .parts
+            .iter()
+            .find(|part| part.number == part_number)
+            .and_then(|part| part.integrity.as_ref());
+        reader_setup.bind_integrity(expected, files, disks, bucket, object, part_offset / erasure.block_size)?;
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_SETUP, reader_setup_stage_start);
 
         let available_shards = reader_setup.available_shards();
@@ -1688,10 +2381,10 @@ impl SetDisks {
             if let Some(read_err) = reduce_read_quorum_errs(&reader_setup.errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
                 let reason = classify_disk_error(&read_err);
                 record_get_object_pipeline_failure_for_path(metrics_path, GET_STAGE_READER_SETUP, reason);
-                return Err(to_object_err(read_err.into(), vec![bucket, object]));
+                return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
             }
             record_get_object_pipeline_failure_for_path(metrics_path, GET_STAGE_READER_SETUP, GetObjectFailureReason::ReadQuorum);
-            return Err(Error::other(format!("not enough disks to read: {:?}", reader_setup.errors)));
+            return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
         }
 
         let missing_shards = reader_setup.completed_failed_shards();
@@ -1712,6 +2405,7 @@ impl SetDisks {
                     state = "codec_streaming_mid_stream_legacy_fallback",
                     "Codec streaming later part degraded in place to legacy per-part decode"
                 );
+                let allow_missing = reader_setup.data_shards_attempted(erasure.data_shards);
                 let reader = build_legacy_per_part_fallback_reader(
                     erasure.clone(),
                     reader_setup.readers,
@@ -1721,12 +2415,26 @@ impl SetDisks {
                     part_offset,
                     part_length,
                     part_size,
+                    Some((
+                        DecodeReadRepairContext::new(
+                            bucket,
+                            object,
+                            fi.version_id,
+                            pool_index,
+                            set_index,
+                            part_number,
+                            suppress_read_repair,
+                        ),
+                        allow_missing,
+                    )),
                 );
                 return Ok(GetCodecStreamingReaderBuildOutcome::Reader(reader));
             }
             return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason));
         }
 
+        let allow_missing = reader_setup.data_shards_attempted(erasure.data_shards);
+        let repair = Arc::new(ShardReadRepair::default());
         let readers = reader_setup.readers;
         let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
         let deferred_reopeners = reader_setup.deferred_reopeners;
@@ -1749,7 +2457,10 @@ impl SetDisks {
             )
         }
         .with_deferred_parity_handles(deferred_stripe_handles)
-        .with_deferred_parity_reopeners(deferred_reopeners);
+        .with_deferred_parity_reopeners(deferred_reopeners)
+        .with_repair_evidence(Arc::clone(&repair));
+        #[cfg(test)]
+        crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
         let reader = if single_inflight {
             coding::decode_reader::ErasureDecodeReader::new_single_inflight_with_metrics_path(
@@ -1761,18 +2472,146 @@ impl SetDisks {
         } else {
             coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?
         };
-        if single_inflight {
-            Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(reader)))
+        let inner: Box<dyn AsyncRead + Unpin + Send + Sync> = if single_inflight {
+            Box::new(reader)
         } else {
-            Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
-                coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
-            )))
+            Box::new(coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(
+                reader,
+                metrics_path,
+            ))
+        };
+        Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(RepairReportingReader {
+            inner,
+            evidence: repair,
+            remaining: part_length,
+            allow_missing,
+            context: Some(DecodeReadRepairContext::new(
+                bucket,
+                object,
+                fi.version_id,
+                pool_index,
+                set_index,
+                part_number,
+                suppress_read_repair,
+            )),
+        })))
+    }
+}
+
+struct DecodeReadRepairContext {
+    bucket: String,
+    object: String,
+    version_id: Option<uuid::Uuid>,
+    pool_index: usize,
+    set_index: usize,
+    part_number: usize,
+    submitter: ReadRepairAdmissionSubmitter,
+    suppress_read_repair: bool,
+}
+
+impl DecodeReadRepairContext {
+    fn new(
+        bucket: &str,
+        object: &str,
+        version_id: Option<uuid::Uuid>,
+        pool_index: usize,
+        set_index: usize,
+        part_number: usize,
+        suppress_read_repair: bool,
+    ) -> Self {
+        Self {
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            version_id,
+            pool_index,
+            set_index,
+            part_number,
+            submitter: send_read_repair_heal_request,
+            suppress_read_repair,
         }
+    }
+
+    async fn submit(self) {
+        if self.suppress_read_repair {
+            return;
+        }
+        let Self {
+            bucket,
+            object,
+            version_id,
+            pool_index,
+            set_index,
+            part_number,
+            submitter,
+            suppress_read_repair: _,
+        } = self;
+        debug!(
+            event = EVENT_SET_DISK_READ,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            state = "decode_repair_observed",
+            bucket,
+            object,
+            version_id = ?version_id,
+            part_number,
+            pool_index,
+            set_index,
+            "Recovered shard damage triggered read repair"
+        );
+        let version = version_id.map(|value| value.to_string());
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: &bucket,
+                object: &object,
+                version_id: version.as_deref(),
+                pool_index,
+                set_index,
+                part_number: Some(part_number),
+                reason: "decode_error",
+                mrf_intent: Some((rustfs_common::mrf_channel::MrfKind::DecodeFailure, version_id)),
+            },
+            submitter,
+        )
+        .await;
+    }
+}
+
+/// Report observed damage only after the requested part has reconstructed and
+/// reached the caller. Read errors and a client dropping a partial body are not
+/// successful repair admissions.
+struct RepairReportingReader {
+    inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    evidence: Arc<ShardReadRepair>,
+    remaining: usize,
+    allow_missing: bool,
+    context: Option<DecodeReadRepairContext>,
+}
+
+impl AsyncRead for RepairReportingReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        match &result {
+            Poll::Ready(Ok(())) => {
+                this.remaining = this.remaining.saturating_sub(buf.filled().len() - before);
+                if this.remaining == 0
+                    && let Some(context) = this.context.take()
+                    && this.evidence.needed(this.allow_missing)
+                {
+                    tokio::spawn(context.submit());
+                }
+            }
+            Poll::Ready(Err(_)) => this.context = None,
+            Poll::Pending => {}
+        }
+        result
     }
 }
 
 /// Per-part parameters for a multipart bitrot reader setup.
 struct PartReaderSetupSpec {
+    integrity: Option<rustfs_filemeta::shard_integrity::PartIntegrity>,
     part_number: usize,
     read_offset: usize,
     read_length: usize,
@@ -1845,7 +2684,7 @@ impl SetDisks {
         expected: &LateMetadataIdentity,
         metrics_path: &'static str,
     ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
-        let (mut parts_metadata, errs, diagnostics) = SetDisks::read_all_fileinfo_observed(
+        let metadata_read = SetDisks::read_metadata_observed(
             fallback_disks,
             "",
             bucket,
@@ -1858,6 +2697,7 @@ impl SetDisks {
             expected.parity_blocks,
         )
         .await?;
+        let (mut parts_metadata, errs, diagnostics) = metadata_read.into_legacy();
         diagnostics.record(metrics_path);
 
         let (read_quorum, write_quorum) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, expected.parity_blocks)
@@ -1870,8 +2710,8 @@ impl SetDisks {
             return Err(to_object_err(err.into(), vec![bucket, object]));
         }
 
-        let (mut online_disks, full_fi, _) =
-            SetDisks::select_valid_fileinfo(fallback_disks, &parts_metadata, &errs, "", read_quorum, write_quorum)?;
+        let (mut online_disks, full_fi) =
+            SetDisks::select_fileinfo_for_read(bucket, fallback_disks, &parts_metadata, &errs, "", read_quorum, write_quorum)?;
         if !late_metadata_read_identity_matches(expected, &full_fi) {
             return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
         }
@@ -1914,7 +2754,7 @@ async fn setup_multipart_part_readers(
     metrics_size_bucket: &'static str,
 ) -> (BitrotReaderSetup, Duration) {
     let started = Instant::now();
-    let setup = create_bitrot_readers_until_quorum_with_preference(
+    let mut setup = create_bitrot_readers_until_quorum_with_preference(
         files,
         disks,
         bucket,
@@ -1938,6 +2778,13 @@ async fn setup_multipart_part_readers(
         }),
     )
     .await;
+    if setup
+        .bind_integrity(spec.integrity.as_ref(), files, disks, bucket, object, spec.read_offset / shard_size)
+        .is_err()
+    {
+        setup = BitrotReaderSetup::new(disks.len());
+        setup.errors.fill(Some(DiskError::FileCorrupt));
+    }
     (setup, started.elapsed())
 }
 
@@ -1973,10 +2820,13 @@ struct LazyCodecPartContext {
     bucket: String,
     object: String,
     fi: FileInfo,
+    pool_index: usize,
+    set_index: usize,
     files: Vec<FileInfo>,
     disks: Vec<Option<DiskStore>>,
     erasure: Arc<coding::Erasure>,
     skip_verify_bitrot: bool,
+    suppress_read_repair: bool,
     metrics_object_class: &'static str,
     metrics_size_bucket: &'static str,
     metrics_path: &'static str,
@@ -2128,12 +2978,13 @@ fn build_legacy_per_part_fallback_reader(
     part_offset: usize,
     part_length: usize,
     part_size: usize,
+    read_repair: Option<(DecodeReadRepairContext, bool)>,
 ) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
     let buffer = adaptive_duplex_buffer_size(part_size as i64);
     let (read_half, mut write_half) = tokio::io::duplex(buffer);
     let decode = tokio::spawn(async move {
-        let (_written, err) = erasure
-            .decode_with_stripe_handles_and_reopeners(
+        let outcome = erasure
+            .decode_with_stripe_handles_and_reopeners_with_diagnostics(
                 &mut write_half,
                 readers,
                 part_offset,
@@ -2144,6 +2995,26 @@ fn build_legacy_per_part_fallback_reader(
                 deferred_reopeners,
             )
             .await;
+        let allow_missing = read_repair.as_ref().is_some_and(|(_, allow_missing)| *allow_missing);
+        let err = match outcome.error {
+            Some(error) if outcome.written == part_length => {
+                let error = DiskError::from(error);
+                if matches!(error, DiskError::FileCorrupt) || (allow_missing && matches!(error, DiskError::FileNotFound)) {
+                    outcome.repair.observe(&[Some(error)]);
+                    None
+                } else {
+                    Some(error.into())
+                }
+            }
+            error => error,
+        };
+        if err.is_none()
+            && outcome.written == part_length
+            && outcome.repair.needed(allow_missing)
+            && let Some((context, _)) = read_repair
+        {
+            context.submit().await;
+        }
         // Dropping `write_half` on return signals EOF to the reader half.
         err
     });
@@ -2209,6 +3080,10 @@ impl Drop for LegacyPerPartDecodeReader {
 }
 
 fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOptions, read_data: bool) -> Option<&'static str> {
+    #[cfg(feature = "test-util")]
+    if super::conditional_read_bench::cache_bypass_applies(bucket) {
+        return Some("benchmark");
+    }
     if !read_data {
         return Some(GET_METADATA_CACHE_REASON_NOT_READ_DATA);
     }
@@ -2255,7 +3130,9 @@ fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOpti
 #[cfg(test)]
 mod metadata_cache_tests {
     use super::*;
+    use crate::set_disk::core::io_primitives::disk_call_counters;
     use rustfs_heal_contracts::heal_channel::HealAdmissionDropReason;
+    use rustfs_utils::path::object_name_disk_identity;
     use serial_test::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
@@ -2482,6 +3359,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "small",
@@ -2514,6 +3392,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "small",
@@ -2536,6 +3415,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             false,
@@ -2562,6 +3442,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "small",
@@ -2584,6 +3465,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             false,
@@ -2626,6 +3508,7 @@ mod metadata_cache_tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "empty",
@@ -2657,6 +3540,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             false,
@@ -2776,7 +3660,7 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
-    async fn get_object_info_and_quorum_maps_delete_marker_and_purge_states() {
+    async fn get_object_info_fileinfo_and_quorum_maps_delete_marker_and_purge_states() {
         let bucket = "get-object-info-marker-bucket";
         let (_dir, disk) = new_read_version_test_disk(bucket).await;
         let set = SetDisks::new(
@@ -2803,8 +3687,8 @@ mod metadata_cache_tests {
         disk.write_metadata(bucket, bucket, "latest-delete-marker", latest_marker)
             .await
             .expect("latest marker metadata should be written");
-        let (_, _, latest_err) = set
-            .get_object_info_and_quorum(bucket, "latest-delete-marker", &ObjectOptions::default())
+        let (_, _, _, latest_err) = set
+            .get_object_info_fileinfo_and_quorum(bucket, "latest-delete-marker", &ObjectOptions::default())
             .await;
         assert!(
             matches!(latest_err, Some(StorageError::ObjectNotFound(_, _))),
@@ -2823,8 +3707,8 @@ mod metadata_cache_tests {
         disk.write_metadata(bucket, bucket, "version-delete-marker", version_marker)
             .await
             .expect("version marker metadata should be written");
-        let (_, _, version_err) = set
-            .get_object_info_and_quorum(
+        let (_, _, _, version_err) = set
+            .get_object_info_fileinfo_and_quorum(
                 bucket,
                 "version-delete-marker",
                 &ObjectOptions {
@@ -2957,6 +3841,74 @@ mod metadata_cache_tests {
             get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
             Some(GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ)
         );
+    }
+
+    #[test]
+    fn missing_metadata_read_repair_is_suppressed_only_for_read_only_requests() {
+        use crate::object_api::{PutObjReader, ShardIntegrityWriteMode, WriteCompletion};
+        use crate::storage_api_contracts::object::ObjectIO;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+                let bucket = format!("read-only-{}", Uuid::new_v4());
+                let object = "missing-metadata";
+                for disk in set.disks.read().await.iter().flatten() {
+                    disk.make_volume(&bucket).await.expect("bucket volume");
+                }
+                let written = set
+                    .put_object(
+                        &bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![7; 1024]),
+                        &ObjectOptions {
+                            shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("fully committed fixture");
+                let missing = dirs[0].path().join(&bucket).join(object).join("xl.meta");
+                tokio::fs::remove_file(&missing).await.expect("remove one metadata replica");
+
+                // Intercept the production submitter at its dedup admission boundary.
+                // This avoids initializing the process-global heal channel or allowing
+                // a background worker to repair the physical fault under test.
+                let version = written.version_id.map(|id| id.to_string());
+                let reservation = reserve_read_repair_heal(&bucket, object, version.as_deref(), 0, 0)
+                    .await
+                    .expect("unique object reservation");
+                for (suppress_read_repair, submissions) in [(true, 0), (false, 1), (true, 1)] {
+                    set.get_object_fileinfo(
+                        &bucket,
+                        object,
+                        &ObjectOptions {
+                            include_part_checksums: true,
+                            suppress_read_repair,
+                            ..Default::default()
+                        },
+                        false,
+                        false,
+                    )
+                    .await
+                    .expect("remaining metadata replicas retain read quorum");
+                    assert_eq!(
+                        recorder.counter_value("rustfs_heal_read_repair_dedup_total", &[("reason", "duplicate")]),
+                        submissions,
+                        "only ordinary reads must reach read-repair admission"
+                    );
+                    assert!(!missing.exists(), "the read-only probe must not restore metadata");
+                }
+                release_read_repair_heal_reservation(&reservation).await;
+            });
+        });
     }
 
     #[tokio::test]
@@ -3118,8 +4070,15 @@ mod metadata_cache_tests {
         let online_disks = Vec::new();
 
         let generation = set.get_object_metadata_cache_generation("bucket", "object");
-        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, &parts_metadata, &online_disks, 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            &parts_metadata,
+            &online_disks,
+            0,
+        )
+        .await;
 
         let cached = set
             .cached_get_object_fileinfo("bucket", "object")
@@ -3138,8 +4097,15 @@ mod metadata_cache_tests {
         let parts_metadata = vec![fi.clone()];
         let online_disks = Vec::new();
         let generation = set.get_object_metadata_cache_generation("bucket", "object");
-        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, &parts_metadata, &online_disks, 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            &parts_metadata,
+            &online_disks,
+            0,
+        )
+        .await;
         let cached = set
             .cached_get_object_fileinfo("bucket", "object")
             .await
@@ -3157,14 +4123,259 @@ mod metadata_cache_tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn metadata_cache_real_get_and_range_preserve_body_across_read_modes() {
+        use crate::object_api::{PutObjReader, WriteCompletion};
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+        use crate::storage_api_contracts::object::ObjectIO;
+        use crate::storage_api_contracts::range::HTTPRangeSpec;
+        use http::HeaderMap;
+        use tokio::io::AsyncReadExt;
+
+        for size in [4097, 1024 * 1024 + 321] {
+            for early_stop in [false, true] {
+                for offline in [false, true] {
+                    let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                    let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+                    let bucket = "metadata-cache-real-body";
+                    let object = format!("body-{size}-{early_stop}-{offline}");
+                    let body = (0..size)
+                        .map(|index| u8::try_from(index % 251).expect("bounded fixture byte"))
+                        .collect::<Vec<_>>();
+                    set.make_bucket(bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create real bucket");
+                    set.put_object(
+                        bucket,
+                        &object,
+                        &mut PutObjReader::from_vec(body.clone()),
+                        &ObjectOptions {
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("commit all real shards before reading");
+                    if offline {
+                        set.disks.write().await[0] = None;
+                    }
+                    let opts = ObjectOptions {
+                        suppress_read_repair: true,
+                        ..Default::default()
+                    };
+                    assert!(
+                        set.get_object_metadata_cache_bypass_reason(bucket, &opts, true)
+                            .await
+                            .is_none()
+                    );
+                    temp_env::async_with_vars(
+                        [
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some(if early_stop { "true" } else { "false" })),
+                            (
+                                "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE",
+                                Some(if early_stop { "true" } else { "false" }),
+                            ),
+                            (
+                                "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT",
+                                Some(if early_stop { "true" } else { "false" }),
+                            ),
+                        ],
+                        async {
+                            let calls = disk_call_counters::observe(&object);
+                            for range in [
+                                None,
+                                Some(HTTPRangeSpec {
+                                    is_suffix_length: false,
+                                    start: 17,
+                                    end: 103,
+                                }),
+                            ] {
+                                set.invalidate_get_object_metadata_cache(bucket, &object).await;
+                                assert!(
+                                    set.cached_get_object_fileinfo(bucket, &object).await.is_none(),
+                                    "miss fixture must be uncached"
+                                );
+                                let expected = if range.is_some() { &body[17..104] } else { body.as_slice() };
+                                let before_miss = calls.total(disk_call_counters::KIND_READ_VERSION);
+                                let mut miss = set
+                                    .get_object_reader(bucket, &object, range.clone(), HeaderMap::new(), &opts)
+                                    .await
+                                    .expect("real miss reader");
+                                assert_eq!(miss.object_info.size, i64::try_from(body.len()).expect("fixture object size"));
+                                let mut miss_body = Vec::new();
+                                miss.stream.read_to_end(&mut miss_body).await.expect("stream real cache miss");
+                                assert_eq!(miss_body, expected);
+                                assert!(
+                                    calls.total(disk_call_counters::KIND_READ_VERSION) > before_miss,
+                                    "miss must issue disk metadata reads"
+                                );
+
+                                // Partial early-stop snapshots cannot be cached. Warm through the
+                                // existing full-wait read, retaining its normal publication rules.
+                                set.get_object_fileinfo_gated(bucket, &object, &opts, true, false)
+                                    .await
+                                    .expect("complete metadata snapshot");
+                                let cached = set
+                                    .cached_get_object_fileinfo(bucket, &object)
+                                    .await
+                                    .expect("real complete snapshot published");
+                                assert!(cached.read_quorum > 0);
+                                assert_eq!(
+                                    cached.fi.inline_data(),
+                                    size == 4097,
+                                    "the real disk fixture must reach the intended storage shape"
+                                );
+                                assert!(cached.online_disks.iter().filter(|disk| disk.is_some()).count() >= cached.read_quorum);
+                                assert_eq!(cached.online_disks.len(), 4, "snapshot must retain every disk slot");
+                                assert_eq!(
+                                    cached.online_disks.iter().flatten().count(),
+                                    if offline { 3 } else { 4 },
+                                    "snapshot must include every available disk rather than only the first quorum"
+                                );
+                                let before_hit = calls.total(disk_call_counters::KIND_READ_VERSION);
+                                let snapshot = set
+                                    .get_object_fileinfo_gated(bucket, &object, &opts, true, false)
+                                    .await
+                                    .expect("real metadata cache hit");
+                                assert!(
+                                    snapshot.shared_entry().is_some_and(|entry| Arc::ptr_eq(entry, &cached)),
+                                    "hit must share the published disk snapshot"
+                                );
+                                let mut hit = set
+                                    .get_object_reader(bucket, &object, range, HeaderMap::new(), &opts)
+                                    .await
+                                    .expect("real hit reader");
+                                assert_eq!(hit.object_info.size, miss.object_info.size);
+                                let mut hit_body = Vec::new();
+                                hit.stream.read_to_end(&mut hit_body).await.expect("stream real cache hit");
+                                assert_eq!(hit_body.len(), expected.len());
+                                assert_eq!(hit_body, miss_body);
+                                assert_eq!(
+                                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                                    before_hit,
+                                    "cached GET and Range must not refetch metadata"
+                                );
+                            }
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn late_metadata_refresh_rejects_changed_generation_and_mapped_shards() {
+        use crate::object_api::{PutObjReader, WriteCompletion};
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+        use crate::storage_api_contracts::object::ObjectIO;
+
+        let bucket = "late-metadata-identity";
+        let object = "late-metadata-identity-object";
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create real late-read bucket");
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(vec![7; 1024 * 1024 + 321]),
+            &ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("commit real metadata and all shard files before late refresh");
+        let disks = set.get_disks_internal().await;
+        let original = SetDisks::read_metadata_observed(&disks, "", bucket, object, "", true, false, false, false, 2)
+            .await
+            .expect("read original real disk metadata");
+        assert!(original.is_complete());
+        let (baseline, errors, _) = original.into_legacy();
+        assert!(errors.iter().all(Option::is_none), "original real shards must all be readable");
+        let (_, selected) = SetDisks::select_valid_fileinfo(&disks, &baseline, &errors, 2).expect("original metadata quorum");
+        assert!(!selected.inline_data(), "late fixture must retain real non-inline shard files");
+        let expected = LateMetadataIdentity::from_file_info(&selected);
+        let (_, _, original_online) =
+            SetDisks::refresh_late_metadata_fanout(&disks, bucket, object, &expected, GET_OBJECT_PATH_LEGACY_DUPLEX)
+                .await
+                .expect("matching late metadata remains usable");
+        assert_eq!(original_online.iter().flatten().count(), 4);
+
+        for changed_generation in [true, false] {
+            let changed_directory = uuid::Uuid::new_v4();
+            for (index, disk) in disks.iter().enumerate() {
+                let mut metadata = baseline[index].clone();
+                if changed_generation {
+                    metadata.data_dir = Some(changed_directory);
+                } else {
+                    metadata.erasure.index = metadata.erasure.index % 4 + 1;
+                }
+                assert!(
+                    metadata.validate_for_metadata_read().is_ok(),
+                    "mutated late metadata must remain decodable"
+                );
+                disk.as_ref()
+                    .expect("real disk slot")
+                    .write_metadata(bucket, bucket, object, metadata)
+                    .await
+                    .expect("persist late identity change");
+            }
+            let changed = SetDisks::read_metadata_observed(&disks, "", bucket, object, "", true, false, false, false, 2)
+                .await
+                .expect("read changed real disk metadata");
+            assert!(changed.is_complete(), "late fixture must reach complete metadata observation");
+            let (metadata, errors, _) = changed.into_legacy();
+            let (online, selected) = SetDisks::select_valid_fileinfo(&disks, &metadata, &errors, 2)
+                .expect("changed metadata still reaches selection quorum");
+            assert_eq!(online.iter().flatten().count(), 4, "the late identity guard must decide this failure");
+            if changed_generation {
+                assert_ne!(SetDisks::file_info_quorum_hash(&selected), expected.quorum_hash);
+            } else {
+                assert_eq!(SetDisks::file_info_quorum_hash(&selected), expected.quorum_hash);
+                assert!(
+                    metadata
+                        .iter()
+                        .enumerate()
+                        .all(|(index, item)| expected.distribution[index] != item.erasure.index)
+                );
+            }
+            let calls = disk_call_counters::observe(object);
+            let result =
+                SetDisks::refresh_late_metadata_fanout(&disks, bucket, object, &expected, GET_OBJECT_PATH_LEGACY_DUPLEX).await;
+            assert_eq!(
+                calls.total(disk_call_counters::KIND_READ_VERSION),
+                4,
+                "late refresh must read all real disk slots before rejection"
+            );
+            assert!(
+                matches!(result, Err(Error::InsufficientReadQuorum(ref failed_bucket, ref failed_object))
+                    if failed_bucket == bucket && failed_object == object),
+                "changed late identity cannot yield usable shards (changed_generation={changed_generation})"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn get_object_metadata_cache_rejects_deleted_and_invalid_fileinfo() {
         let set = new_metadata_cache_test_set().await;
 
         let mut deleted = valid_test_fileinfo("deleted-object");
         deleted.deleted = true;
         let generation = set.get_object_metadata_cache_generation("bucket", "deleted-object");
-        set.cache_get_object_fileinfo(("bucket", "deleted-object"), generation, &deleted, &[deleted.clone()], &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "deleted-object"),
+            generation,
+            (&deleted, GetObjectMetadataCacheCapability::Full),
+            &[deleted.clone()],
+            &[],
+            0,
+        )
+        .await;
         assert!(
             set.cached_get_object_fileinfo("bucket", "deleted-object").await.is_none(),
             "deleted metadata must not be cached"
@@ -3172,8 +4383,15 @@ mod metadata_cache_tests {
 
         let invalid = FileInfo::default();
         let generation = set.get_object_metadata_cache_generation("bucket", "invalid-object");
-        set.cache_get_object_fileinfo(("bucket", "invalid-object"), generation, &invalid, std::slice::from_ref(&invalid), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "invalid-object"),
+            generation,
+            (&invalid, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&invalid),
+            &[],
+            0,
+        )
+        .await;
         assert!(
             set.cached_get_object_fileinfo("bucket", "invalid-object").await.is_none(),
             "invalid metadata must not be cached"
@@ -3195,10 +4413,12 @@ mod metadata_cache_tests {
                 ),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
+                    capability: GetObjectMetadataCacheCapability::Full,
                     fi: fi.clone(),
                     parts_metadata: vec![fi],
                     online_disks: vec![None],
                     read_quorum: 1,
+                    verified_inline_body: None,
                 }),
             )
             .await;
@@ -3215,8 +4435,15 @@ mod metadata_cache_tests {
         let fi = valid_test_fileinfo("object");
 
         let generation = set.get_object_metadata_cache_generation("bucket", "object");
-        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
 
         assert!(
             set.cached_get_object_fileinfo("bucket", "object").await.is_some(),
@@ -3241,8 +4468,15 @@ mod metadata_cache_tests {
             .get_object_metadata_cache_generation("bucket", "object")
             .expect("metadata cache generation should be active");
         let retired_key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
-        set.cache_get_object_fileinfo(("bucket", "object"), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            Some(generation),
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
         set.get_object_metadata_cache.run_pending_tasks().await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_some());
         assert_eq!(set.get_object_metadata_cache.entry_count(), 1);
@@ -3256,8 +4490,65 @@ mod metadata_cache_tests {
         assert_eq!(set.get_object_metadata_cache.entry_count(), 0);
     }
 
+    async fn cache_valid_test_fileinfo(set: &SetDisks, object: &str) {
+        let fi = valid_test_fileinfo(object);
+        let generation = set.get_object_metadata_cache_generation("bucket", object);
+        set.cache_get_object_fileinfo(
+            ("bucket", object),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
+        assert!(set.cached_get_object_fileinfo("bucket", object).await.is_some());
+    }
+
+    #[cfg(not(windows))]
     #[tokio::test]
-    #[serial(metadata_cache_publish_barrier)]
+    async fn metadata_cache_keeps_backslash_and_slash_keys_distinct_off_windows() {
+        assert_eq!(object_name_disk_identity("a\\b"), "a\\b");
+        let set = new_metadata_cache_test_set().await;
+        cache_valid_test_fileinfo(&set, "a/b").await;
+        cache_valid_test_fileinfo(&set, "a\\b").await;
+
+        set.invalidate_get_object_metadata_cache("bucket", "a\\b").await;
+
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a/b").await.is_some(),
+            "off Windows `a\\b` is a different object and must not retire `a/b`"
+        );
+        assert!(set.cached_get_object_fileinfo("bucket", "a\\b").await.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_metadata_cache_shares_backslash_and_slash_spellings() {
+        assert_eq!(object_name_disk_identity("a\\b"), "a/b");
+        let set = new_metadata_cache_test_set().await;
+        cache_valid_test_fileinfo(&set, "a/b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a\\b").await.is_some(),
+            "both spellings address the same xl.meta and must share one cache entry"
+        );
+
+        set.invalidate_get_object_metadata_cache("bucket", "a\\b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a/b").await.is_none(),
+            "a mutation through `a\\b` must retire metadata cached for `a/b`"
+        );
+
+        cache_valid_test_fileinfo(&set, "a\\b").await;
+        set.invalidate_get_object_metadata_cache("bucket", "a/b").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "a\\b").await.is_none(),
+            "a mutation through `a/b` must retire metadata cached for `a\\b`"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(metadata_cache_early_stop)]
     async fn metadata_cache_production_fanout_cannot_publish_after_invalidation() {
         // Isolated context: an ambient DistErasure window (another test's
         // SetupTypeGuard) would bypass metadata-cache publication entirely
@@ -3311,14 +4602,1067 @@ mod metadata_cache_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(metadata_cache_early_stop)]
+    async fn metadata_cache_publishes_quorum_selected_early_stop_result() {
+        use tokio::io::AsyncReadExt;
+
+        let isolated_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        isolated_ctx
+            .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
+            .await;
+        let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, isolated_ctx).await;
+        let bucket = "metadata-cache-early-stop";
+        let object = "objects/repeated-key";
+        let disks = set.disks.read().await.clone();
+        for disk in disks.iter().flatten() {
+            disk.make_volume(bucket)
+                .await
+                .expect("test bucket should be created on each disk");
+        }
+        let expected_body = vec![0x5a; 1024 * 1024];
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(expected_body.clone()),
+            &ObjectOptions::default(),
+        )
+        .await
+        .expect("test object should be written before enabling the slow-tail fault");
+
+        let calls = disk_call_counters::observe(object);
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("false")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS", Some("500")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS", Some("3")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET", Some(bucket)),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX", Some("objects/")),
+            ],
+            async {
+                let first = tokio::time::timeout(
+                    Duration::from_millis(400),
+                    set.get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, true),
+                )
+                .await
+                .expect("first metadata read should stop before the delayed peer")
+                .expect("read quorum should provide valid object metadata");
+                assert!(first.owned.is_some(), "the first lookup should resolve through disk metadata");
+                assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 4);
+                assert_eq!(calls.total(disk_call_counters::KIND_METADATA_SLOWTAIL_FAULT), 1);
+
+                let second = set
+                    .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, true)
+                    .await
+                    .expect("second lookup should use the quorum-published metadata cache entry");
+                assert!(second.shared_entry().is_some(), "the repeated GET should hit the published cache entry");
+                assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 4);
+
+                let cached = second.shared_entry().expect("second lookup should share cached metadata");
+                assert_eq!(cached.fi.name, object);
+                let cached_online_count = cached.online_disks.iter().filter(|disk| disk.is_some()).count();
+                assert_eq!(cached_online_count, 3, "the warm cache should contain three of four disks");
+                assert_eq!(cached.capability, GetObjectMetadataCacheCapability::QuorumSelected);
+
+                let data_dir = cached
+                    .fi
+                    .data_dir
+                    .expect("quorum cache retains the object data directory")
+                    .to_string();
+                let selected_disk_indices = cached
+                    .online_disks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, disk)| disk.as_ref().map(|_| index))
+                    .take(2)
+                    .collect::<Vec<_>>();
+                assert_eq!(selected_disk_indices.len(), 2, "the warmed cache should name enough selected shards");
+                for index in selected_disk_indices {
+                    tokio::fs::remove_file(dirs[index].path().join(bucket).join(object).join(&data_dir).join("part.1"))
+                        .await
+                        .expect("simulate loss of two cached selected shards");
+                }
+
+                let mut reader = set
+                    .get_object_reader(bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("a cached partial layout must recover through omitted disks");
+                let mut body = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut body)
+                    .await
+                    .expect("the GET should decode after refreshing the omitted disks");
+                assert_eq!(body, expected_body, "recovered body must be byte-exact");
+            },
+        )
+        .await;
+
+        let full_layout = set
+            .get_object_fileinfo_gated(bucket, object, &ObjectOptions::default(), false, false)
+            .await
+            .expect("read-before-write consumers must fetch a complete layout");
+        assert!(
+            full_layout.shared_entry().is_none(),
+            "a quorum-selected partial layout cannot satisfy mutation consumers"
+        );
+        assert!(
+            calls.total(disk_call_counters::KIND_READ_VERSION) > 4,
+            "mutation consumers must independently fan out after a quorum-only cache hit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(metadata_cache_early_stop)]
+    async fn metadata_cache_early_stop_publication_is_fenced_by_invalidation() {
+        let isolated_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        isolated_ctx
+            .update_erasure_type(crate::layout::endpoints::SetupType::Erasure)
+            .await;
+        let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, isolated_ctx).await;
+        let bucket = "metadata-cache-early-stop-fence";
+        let object = "objects/repeated-key";
+        let disks = set.disks.read().await.clone();
+        for disk in disks.iter().flatten() {
+            disk.make_volume(bucket)
+                .await
+                .expect("test bucket should be created on each disk");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(vec![0x5a; 1024 * 1024]),
+            &ObjectOptions::default(),
+        )
+        .await
+        .expect("test object should be written before enabling the slow-tail fault");
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("false")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS", Some("500")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS", Some("3")),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET", Some(bucket)),
+                ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX", Some("objects/")),
+            ],
+            async {
+                let barrier = MetadataCachePublishBarrier::install(bucket, object);
+                let stale_generation = set
+                    .get_object_metadata_cache_generation(bucket, object)
+                    .expect("metadata cache generation should be active");
+                let reader_set = Arc::clone(&set);
+                let read = tokio::spawn(async move {
+                    reader_set
+                        .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, true)
+                        .await
+                });
+                barrier.wait_until_paused().await;
+                set.invalidate_get_object_metadata_cache(bucket, object).await;
+                barrier.release();
+
+                let snapshot = read
+                    .await
+                    .expect("early-stop metadata read should not panic")
+                    .expect("read quorum should resolve the selected FileInfo");
+                assert!(snapshot.owned.is_some());
+                assert!(
+                    set.get_object_metadata_cache
+                        .get(&GetObjectMetadataCacheKey::new(bucket, object, stale_generation))
+                        .await
+                        .is_none(),
+                    "early-stop publication must not retain an entry under the retired generation"
+                );
+                assert!(
+                    set.cached_get_object_fileinfo(bucket, object).await.is_none(),
+                    "invalidation must reject the quorum-selected early-stop publication"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(metadata_cache_publish_barrier, body_cache_hook)]
+    async fn conditional_inline_hedge_caches_only_terminal_metadata() {
+        use crate::object_api::{GetObjectReadCondition, GetObjectReadMetadata, WriteCompletion, with_get_object_read_condition};
+        use crate::set_disk::core::io_primitives::{disk_call_counters, rename_fanout_barrier};
+        use crate::set_disk::core::metadata_read::bounded_metadata_fanout_order;
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+        use http::HeaderMap;
+        use tokio::io::AsyncReadExt;
+
+        struct MatchingEtag {
+            bucket: &'static str,
+            object: &'static str,
+            etag: String,
+            reached: Notify,
+        }
+        impl GetObjectReadCondition for MatchingEtag {
+            fn is_terminal(&self, metadata: GetObjectReadMetadata<'_>) -> bool {
+                let matched = metadata.bucket == self.bucket
+                    && metadata.object == self.object
+                    && !metadata.delete_marker
+                    && metadata.etag == Some(self.etag.as_str());
+                if matched {
+                    // Observe the real metadata decision without changing its result.
+                    self.reached.notify_one();
+                }
+                matched
+            }
+        }
+
+        temp_env::async_with_vars(
+            [
+                (super::super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (super::super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("true")),
+            ],
+            async {
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+                let (_dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+                let bucket = "conditional-inline-cache-hedge";
+                let object = "conditional-inline-cache-hedge.bin";
+                let payload: Vec<_> = (0..4096)
+                    .map(|index| u8::try_from(index % 251).expect("pattern byte"))
+                    .collect();
+                set.make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("real bucket");
+                let info = set
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(payload.clone()),
+                        &ObjectOptions {
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("commit all four real inline shards");
+                let etag = info.etag.expect("committed ETag");
+                let opts = ObjectOptions::default();
+                // This metadata-only inspection bypasses publication and discovers the actual layout.
+                let snapshot = set
+                    .get_object_fileinfo(bucket, object, &opts, false, false)
+                    .await
+                    .expect("actual metadata");
+                let distribution = snapshot.fi().erasure.distribution.clone();
+                assert_eq!(snapshot.fi().erasure.data_blocks, 2);
+                assert_eq!(snapshot.fi().erasure.parity_blocks, 2);
+                assert!(snapshot.fi().inline_data());
+                let d1 = distribution.iter().position(|block| *block == 1).expect("D1");
+                let d2 = distribution.iter().position(|block| *block == 2).expect("D2");
+                let order = bounded_metadata_fanout_order(bucket, object, 4, 2);
+                // Parity slots retain disk order, not their erasure block-number order.
+                let p1 = order[2];
+                let p2 = order[3];
+                assert_eq!(&order[..2], &[d1, d2]);
+                assert!(distribution[p1] > 2 && distribution[p2] > 2);
+                drop(snapshot);
+                assert!(set.cached_get_object_fileinfo(bucket, object).await.is_none(), "cold real object");
+                assert!(
+                    set.get_object_metadata_cache_bypass_reason(bucket, &opts, true)
+                        .await
+                        .is_none()
+                );
+
+                let calls = disk_call_counters::observe(object);
+                let data = rename_fanout_barrier::arm(object, d2, rename_fanout_barrier::PHASE_READ_VERSION);
+                let parity = rename_fanout_barrier::arm(object, p2, rename_fanout_barrier::PHASE_READ_VERSION);
+                let condition = Arc::new(MatchingEtag {
+                    bucket,
+                    object,
+                    etag: etag.clone(),
+                    reached: Notify::new(),
+                });
+                let reader_set = Arc::clone(&set);
+                let reader_condition = Arc::clone(&condition);
+                let mut read = tokio::spawn(async move {
+                    with_get_object_read_condition(
+                        reader_condition,
+                        reader_set.get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default()),
+                    )
+                    .await
+                });
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                let completed = tokio::select! {
+                    _ = data.wait_until_paused_before(deadline) => {
+                        parity.wait_until_paused_before(deadline).await;
+                        assert!(data.is_paused(), "D2 is still unavailable when the spare P2 is scheduled");
+                        assert_eq!(calls.for_disk(disk_call_counters::KIND_READ_VERSION, d1), 1);
+                        assert_eq!(calls.for_disk(disk_call_counters::KIND_READ_VERSION, p1), 1);
+                        parity.release();
+                        tokio::time::timeout_at(deadline, condition.reached.notified()).await
+                            .expect("actual matching decision on the first three completed responses");
+                        // The 304 must finish while D2 remains blocked; waiting
+                        // for all four disks would hide the cache starvation.
+                        let result = tokio::time::timeout_at(deadline, &mut read).await.expect("conditional reader deadline");
+                        data.release();
+                        result
+                    }
+                    _ = &mut read => panic!("cold read must cross the real hedge barriers"),
+                };
+                let mut reader = completed.expect("reader task").expect("conditional metadata reader");
+                assert_eq!(reader.object_info.etag.as_deref(), Some(etag.as_str()));
+                let mut forbidden_body = Vec::new();
+                assert!(
+                    reader.stream.read_to_end(&mut forbidden_body).await.is_err(),
+                    "terminal read is not a successful body"
+                );
+                assert!(forbidden_body.is_empty());
+                drop(reader);
+                assert_eq!(calls.total(disk_call_counters::KIND_INLINE_SHARD_OPEN), 0);
+                assert_eq!(calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN), 0);
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_BODY_DECODE),
+                    0,
+                    "304 metadata setup never verifies or decodes a body"
+                );
+                drop(data);
+                drop(parity);
+                let cached = set
+                    .cached_get_object_fileinfo(bucket, object)
+                    .await
+                    .expect("a terminal quorum must remain reusable for another condition");
+                assert_eq!(cached.capability, GetObjectMetadataCacheCapability::ConditionOnly);
+                assert_eq!(cached.online_disks.iter().flatten().count(), 3);
+                assert_eq!(
+                    cached
+                        .parts_metadata
+                        .iter()
+                        .filter(|metadata| !metadata.name.is_empty())
+                        .count(),
+                    3
+                );
+
+                let before = calls.total(disk_call_counters::KIND_READ_VERSION);
+                let mut hit = with_get_object_read_condition(
+                    Arc::new(MatchingEtag {
+                        bucket,
+                        object,
+                        etag: etag.clone(),
+                        reached: Notify::new(),
+                    }),
+                    set.get_object_reader(bucket, object, None, HeaderMap::new(), &opts),
+                )
+                .await
+                .expect("warm conditional metadata");
+                assert!(hit.stream.read_to_end(&mut Vec::new()).await.is_err());
+                drop(hit);
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                    before,
+                    "warm conditions reuse metadata without fanout"
+                );
+                let mut ordinary = set
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("ordinary warm GET");
+                let mut actual = Vec::new();
+                ordinary.stream.read_to_end(&mut actual).await.expect("ordinary body");
+                assert_eq!(actual, payload);
+                assert!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION) > before,
+                    "conditional cached layout cannot supply an ordinary body"
+                );
+                assert!(
+                    calls.total(disk_call_counters::KIND_INLINE_SHARD_OPEN) > 0,
+                    "same source counter sees the ordinary positive control"
+                );
+                assert!(
+                    calls.total(disk_call_counters::KIND_BODY_DECODE) > 0,
+                    "same decoder counter sees the ordinary positive control"
+                );
+
+                // Restore the proven conditional quorum for each nonterminal
+                // consumer, so an earlier ordinary read cannot mask a leak.
+                for range in [
+                    None,
+                    Some(HTTPRangeSpec {
+                        is_suffix_length: false,
+                        start: 1,
+                        end: 16,
+                    }),
+                ] {
+                    set.invalidate_get_object_metadata_cache(bucket, object).await;
+                    set.cache_get_object_fileinfo(
+                        (bucket, object),
+                        set.get_object_metadata_cache_generation(bucket, object),
+                        (&cached.fi, GetObjectMetadataCacheCapability::ConditionOnly),
+                        &cached.parts_metadata,
+                        &cached.online_disks,
+                        cached.read_quorum,
+                    )
+                    .await;
+                    let before = calls.total(disk_call_counters::KIND_READ_VERSION);
+                    let mut reader = with_get_object_read_condition(
+                        Arc::new(MatchingEtag {
+                            bucket,
+                            object,
+                            etag: "different-etag".to_owned(),
+                            reached: Notify::new(),
+                        }),
+                        set.get_object_reader(bucket, object, range.clone(), HeaderMap::new(), &opts),
+                    )
+                    .await
+                    .expect("nonterminal condition must read its own body layout");
+                    let mut actual = Vec::new();
+                    reader
+                        .stream
+                        .read_to_end(&mut actual)
+                        .await
+                        .expect("complete nonterminal body");
+                    assert_eq!(
+                        actual.as_slice(),
+                        if range.is_some() {
+                            &payload[1..17]
+                        } else {
+                            payload.as_slice()
+                        }
+                    );
+                    assert!(calls.total(disk_call_counters::KIND_READ_VERSION) > before);
+                }
+
+                set.invalidate_get_object_metadata_cache(bucket, object).await;
+                set.cache_get_object_fileinfo(
+                    (bucket, object),
+                    set.get_object_metadata_cache_generation(bucket, object),
+                    (&cached.fi, GetObjectMetadataCacheCapability::ConditionOnly),
+                    &cached.parts_metadata,
+                    &cached.online_disks,
+                    cached.read_quorum,
+                )
+                .await;
+                let before = calls.total(disk_call_counters::KIND_READ_VERSION);
+                let full = with_get_object_read_condition(
+                    Arc::new(MatchingEtag {
+                        bucket,
+                        object,
+                        etag,
+                        reached: Notify::new(),
+                    }),
+                    set.get_object_fileinfo_gated(bucket, object, &opts, true, false),
+                )
+                .await
+                .expect("full-layout caller under a matching condition");
+                assert!(calls.total(disk_call_counters::KIND_READ_VERSION) > before);
+                assert_eq!(full.online_disks().iter().flatten().count(), 4);
+                assert_eq!(
+                    set.cached_get_object_fileinfo(bucket, object)
+                        .await
+                        .expect("complete publication")
+                        .capability,
+                    GetObjectMetadataCacheCapability::Full
+                );
+            },
+        )
+        .await;
+    }
+
+    fn cache_capability_race_entry(
+        object: &str,
+        capability: GetObjectMetadataCacheCapability,
+        etag: &str,
+    ) -> Arc<GetObjectMetadataCacheEntry> {
+        let mut fi = valid_test_fileinfo(object);
+        fi.metadata.insert("etag".to_string(), etag.to_string());
+        Arc::new(GetObjectMetadataCacheEntry {
+            created_at: Instant::now(),
+            parts_metadata: vec![fi.clone()],
+            fi,
+            online_disks: Vec::new(),
+            read_quorum: 0,
+            capability,
+            verified_inline_body: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_capability_publication_preserves_full_in_both_orders() {
+        use GetObjectMetadataCacheCapability::{ConditionOnly, Full};
+
+        for capabilities in [[Full, ConditionOnly], [ConditionOnly, Full]] {
+            let set = new_metadata_cache_test_set().await;
+            let generation = set
+                .get_object_metadata_cache_generation("bucket", "object")
+                .expect("active cache generation");
+            let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+            let full = cache_capability_race_entry("object", Full, "full-layout");
+            let partial = cache_capability_race_entry("object", ConditionOnly, "partial-layout");
+            for capability in capabilities {
+                let incoming = if capability == Full { &full } else { &partial };
+                set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, Arc::clone(incoming), || {})
+                    .await;
+            }
+            let cached = set.get_object_metadata_cache.get(&key).await.expect("published cache entry");
+            assert_eq!(cached.capability, Full);
+            assert!(Arc::ptr_eq(&cached, &full), "the complete layout must survive either publication order");
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_capability_publisher_waits_for_real_compute_in_both_orders() {
+        use GetObjectMetadataCacheCapability::{ConditionOnly, Full};
+        use moka::ops::compute::Op;
+
+        for held_capability in [Full, ConditionOnly] {
+            let set = new_metadata_cache_test_set().await;
+            let generation = set
+                .get_object_metadata_cache_generation("bucket", "object")
+                .expect("active cache generation");
+            let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+            let full = cache_capability_race_entry("object", Full, "full-layout");
+            let partial = cache_capability_race_entry("object", ConditionOnly, "partial-layout");
+            let (held_entry, incoming) = if held_capability == Full {
+                (Arc::clone(&full), Arc::clone(&partial))
+            } else {
+                (Arc::clone(&partial), Arc::clone(&full))
+            };
+            let release = Arc::new(Notify::new());
+            let holder_release = Arc::clone(&release);
+            // Hold the actual Moka compute waiter across an await. Polling the
+            // production publisher below proves it queues before any cache write.
+            let mut holder = Box::pin(
+                set.get_object_metadata_cache
+                    .entry(key.clone())
+                    .and_compute_with(|current| async move {
+                        assert!(current.is_none(), "the holder must see an empty key");
+                        holder_release.notified().await;
+                        Op::Put(held_entry)
+                    }),
+            );
+            assert!(futures::poll!(holder.as_mut()).is_pending());
+            let hook_calls = AtomicUsize::new(0);
+            let mut publisher =
+                Box::pin(
+                    set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, incoming, || {
+                        hook_calls.fetch_add(1, Ordering::AcqRel);
+                    }),
+                );
+            assert!(
+                futures::poll!(publisher.as_mut()).is_pending(),
+                "all production publishers must share Moka's compute waiter"
+            );
+            assert!(
+                set.get_object_metadata_cache.get(&key).await.is_none(),
+                "a plain insert must not bypass the holder and expose an entry"
+            );
+            assert_eq!(hook_calls.load(Ordering::Acquire), 0);
+            release.notify_one();
+            holder.await;
+            publisher.await;
+            assert_eq!(hook_calls.load(Ordering::Acquire), 1);
+            let cached = set.get_object_metadata_cache.get(&key).await.expect("published cache entry");
+            assert_eq!(cached.capability, Full);
+            assert!(Arc::ptr_eq(&cached, &full), "a queued conditional publisher must not downgrade Full");
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_waiting_stale_compute_cannot_touch_new_generation() {
+        use GetObjectMetadataCacheCapability::{ConditionOnly, Full};
+        use moka::ops::compute::Op;
+
+        let set = new_metadata_cache_test_set().await;
+        let old_generation = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("active old generation");
+        let old_key = GetObjectMetadataCacheKey::new("bucket", "object", old_generation);
+        let release = Arc::new(Notify::new());
+        let holder_release = Arc::clone(&release);
+        let mut holder = Box::pin(
+            set.get_object_metadata_cache
+                .entry(old_key.clone())
+                .and_compute_with(|current| async move {
+                    assert!(current.is_none());
+                    holder_release.notified().await;
+                    Op::Nop
+                }),
+        );
+        assert!(futures::poll!(holder.as_mut()).is_pending());
+        let hook_calls = AtomicUsize::new(0);
+        let old_partial = cache_capability_race_entry("object", ConditionOnly, "retired-layout");
+        let mut old_publisher = Box::pin(set.insert_get_object_metadata_cache_entry_after_insert(
+            old_key.clone(),
+            old_generation,
+            old_partial,
+            || {
+                hook_calls.fetch_add(1, Ordering::AcqRel);
+            },
+        ));
+        assert!(futures::poll!(old_publisher.as_mut()).is_pending());
+        assert_eq!(hook_calls.load(Ordering::Acquire), 0);
+
+        set.invalidate_get_object_metadata_cache("bucket", "object").await;
+        let new_generation = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("active new generation");
+        assert_eq!(new_generation.value, old_generation.value + 1);
+        let new_key = GetObjectMetadataCacheKey::new("bucket", "object", new_generation);
+        assert_ne!(old_key, new_key);
+        let new_full = cache_capability_race_entry("object", Full, "current-layout");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            set.insert_get_object_metadata_cache_entry_after_insert(
+                new_key.clone(),
+                new_generation,
+                Arc::clone(&new_full),
+                || {},
+            ),
+        )
+        .await
+        .expect("a retired-generation waiter must not block the new key");
+        release.notify_one();
+        holder.await;
+        old_publisher.await;
+        assert_eq!(hook_calls.load(Ordering::Acquire), 1, "a stale Nop still runs the post-compute hook");
+        assert!(set.get_object_metadata_cache.get(&old_key).await.is_none());
+        let cached = set
+            .get_object_metadata_cache
+            .get(&new_key)
+            .await
+            .expect("new generation must survive");
+        assert!(
+            Arc::ptr_eq(&cached, &new_full),
+            "old publication and its cleanup must not replace or remove the new key"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_put_and_nop_hooks_recheck_generation_exactly_once() {
+        use GetObjectMetadataCacheCapability::{ConditionOnly, Full};
+
+        for incoming_capability in [Full, ConditionOnly] {
+            let set = new_metadata_cache_test_set().await;
+            let generation = set
+                .get_object_metadata_cache_generation("bucket", "object")
+                .expect("active cache generation");
+            let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+            let existing = cache_capability_race_entry("object", Full, "existing-full");
+            set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, existing, || {})
+                .await;
+            let incoming = cache_capability_race_entry("object", incoming_capability, "incoming");
+            let hook_calls = AtomicUsize::new(0);
+            set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, incoming, || {
+                assert_eq!(hook_calls.fetch_add(1, Ordering::AcqRel), 0, "hook must run once");
+                // The existing production seam invalidates after either a Put or
+                // Full-preserving Nop; both must still perform the final fence read.
+                set.get_object_metadata_cache_generations[generation.index].fetch_add(1, Ordering::AcqRel);
+            })
+            .await;
+            assert_eq!(hook_calls.load(Ordering::Acquire), 1);
+            assert!(
+                set.get_object_metadata_cache.get(&key).await.is_none(),
+                "post-compute generation change must withdraw the retired key for both Put and Nop"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_cache_conditional_nop_preserves_actual_moka_expiration() {
+        use GetObjectMetadataCacheCapability::{ConditionOnly, Full};
+
+        let set = new_metadata_cache_test_set().await;
+        let generation = set
+            .get_object_metadata_cache_generation("bucket", "object")
+            .expect("active cache generation");
+        let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
+        let full = cache_capability_race_entry("object", Full, "original-full");
+        set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, Arc::clone(&full), || {})
+            .await;
+        let original_insert_finished = Instant::now();
+
+        // Moka uses its own real clock, so Tokio paused-time advancement would not
+        // establish this property. Use the actual configured TTL and expiry reads.
+        tokio::time::sleep(GET_OBJECT_METADATA_CACHE_TTL * 3 / 4).await;
+        assert!(
+            set.get_object_metadata_cache.get(&key).await.is_some(),
+            "the retained entry must be live immediately before the Nop"
+        );
+        let partial = cache_capability_race_entry("object", ConditionOnly, "partial-layout");
+        set.insert_get_object_metadata_cache_entry_after_insert(key.clone(), generation, partial, || {})
+            .await;
+        let retained = set.get_object_metadata_cache.get(&key).await.expect("Full must remain live");
+        assert!(Arc::ptr_eq(&retained, &full));
+
+        // A distinct fresh Put is the positive control for the renewed deadline.
+        let fresh_generation = set
+            .get_object_metadata_cache_generation("bucket", "fresh-object")
+            .expect("active positive-control generation");
+        let fresh_key = GetObjectMetadataCacheKey::new("bucket", "fresh-object", fresh_generation);
+        let fresh = cache_capability_race_entry("fresh-object", Full, "fresh-full");
+        set.insert_get_object_metadata_cache_entry_after_insert(fresh_key.clone(), fresh_generation, fresh, || {})
+            .await;
+        let renewed_insert_finished = Instant::now();
+        let original_expired_by = original_insert_finished + GET_OBJECT_METADATA_CACHE_TTL + Duration::from_millis(200);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(original_expired_by)).await;
+        assert!(
+            renewed_insert_finished.elapsed() < GET_OBJECT_METADATA_CACHE_TTL,
+            "the measurement must end before a renewed TTL could expire"
+        );
+        assert!(
+            set.get_object_metadata_cache.get(&fresh_key).await.is_some(),
+            "a genuinely fresh Put must still be live at the same observation time"
+        );
+        assert!(
+            set.get_object_metadata_cache.get(&key).await.is_none(),
+            "Nop must preserve Moka's original expiration, not merely the entry's created_at"
+        );
+    }
+
+    struct CacheBoundaryCondition {
+        bucket: &'static str,
+        object: &'static str,
+        etag: String,
+        calls: AtomicUsize,
+        terminal_calls: usize,
+    }
+
+    impl crate::object_api::GetObjectReadCondition for CacheBoundaryCondition {
+        fn is_terminal(&self, metadata: crate::object_api::GetObjectReadMetadata<'_>) -> bool {
+            if metadata.bucket != self.bucket
+                || metadata.object != self.object
+                || metadata.delete_marker
+                || metadata.etag != Some(self.etag.as_str())
+            {
+                return false;
+            }
+            self.calls.fetch_add(1, Ordering::AcqRel) < self.terminal_calls
+        }
+    }
+
+    async fn condition_only_cache_boundary_fixture(
+        bucket: &'static str,
+        object: &'static str,
+    ) -> (Vec<tempfile::TempDir>, Arc<SetDisks>, Arc<GetObjectMetadataCacheEntry>) {
+        use crate::object_api::WriteCompletion;
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+        let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(4, 2, ctx).await;
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("real bucket");
+        let committed = set
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![17; 4096]),
+                &ObjectOptions {
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit all four shards");
+        let full = set
+            .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+            .await
+            .expect("complete real metadata");
+        assert_eq!(full.online_disks().iter().flatten().count(), 4);
+        let mut metadata = full.parts_metadata().to_vec();
+        let mut disks = full.online_disks().to_vec();
+        let omitted = metadata
+            .iter()
+            .position(|fi| fi.erasure.index == 2)
+            .expect("actual second data disk");
+        metadata[omitted] = FileInfo::default();
+        disks[omitted] = None;
+        // This seam prepares a real, independently validated D1/P1/P2 quorum.
+        // The hedge test separately exercises its production publication timing.
+        let errs: Vec<Option<DiskError>> = (0..4).map(|_| None).collect();
+        let (online_disks, fi) = SetDisks::select_valid_fileinfo(&disks, &metadata, &errs, 2)
+            .expect("three real members satisfy latest-generation selection");
+        assert_eq!(online_disks.iter().flatten().count(), 3);
+        assert_eq!(fi.metadata.get("etag"), committed.etag.as_ref());
+        set.invalidate_get_object_metadata_cache(bucket, object).await;
+        set.cache_get_object_fileinfo(
+            (bucket, object),
+            set.get_object_metadata_cache_generation(bucket, object),
+            (&fi, GetObjectMetadataCacheCapability::ConditionOnly),
+            &metadata,
+            &online_disks,
+            2,
+        )
+        .await;
+        let cached = set
+            .cached_get_object_fileinfo(bucket, object)
+            .await
+            .expect("prepared conditional quorum");
+        assert_eq!(cached.capability, GetObjectMetadataCacheCapability::ConditionOnly);
+        (dirs, set, cached)
+    }
+
+    #[tokio::test]
+    #[serial(metadata_cache_publish_barrier, body_cache_hook)]
+    async fn condition_only_cache_final_predicate_flip_fails_before_body() {
+        use crate::object_api::with_get_object_read_condition;
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+
+        let bucket = "conditional-cache-final-flip";
+        let object = "conditional-cache-final-flip.bin";
+        let (_dirs, set, cached) = condition_only_cache_boundary_fixture(bucket, object).await;
+        let condition = Arc::new(CacheBoundaryCondition {
+            bucket,
+            object,
+            etag: cached.fi.metadata["etag"].clone(),
+            calls: AtomicUsize::new(0),
+            // Deliberately violate purity to attack the final fail-closed guard.
+            terminal_calls: 1,
+        });
+        let calls = disk_call_counters::observe(object);
+        let result = with_get_object_read_condition(
+            condition.clone(),
+            set.get_object_reader(bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default()),
+        )
+        .await;
+        let err = result
+            .err()
+            .expect("a partial snapshot cannot become a body reader after predicate flip");
+        assert!(
+            err.to_string()
+                .contains("conditional metadata snapshot no longer satisfies the read condition")
+        );
+        assert_eq!(condition.calls.load(Ordering::Acquire), 2, "lookup and final selected-FI check both ran");
+        for kind in [
+            disk_call_counters::KIND_READ_VERSION,
+            disk_call_counters::KIND_INLINE_SHARD_OPEN,
+            disk_call_counters::KIND_DISK_SHARD_OPEN,
+            disk_call_counters::KIND_BODY_DECODE,
+        ] {
+            assert_eq!(calls.total(kind), 0, "rejected cached snapshot cannot materialize any body");
+        }
+    }
+
+    #[tokio::test]
+    #[serial(metadata_cache_publish_barrier, body_cache_hook)]
+    async fn condition_only_cache_scope_and_full_layout_boundaries() {
+        use crate::object_api::with_get_object_read_condition;
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+
+        let bucket = "conditional-cache-scope-boundary";
+        let object = "conditional-cache-scope-boundary.bin";
+        let (_dirs, set, cached) = condition_only_cache_boundary_fixture(bucket, object).await;
+        for mode in 0..3 {
+            set.invalidate_get_object_metadata_cache(bucket, object).await;
+            set.cache_get_object_fileinfo(
+                (bucket, object),
+                set.get_object_metadata_cache_generation(bucket, object),
+                (&cached.fi, GetObjectMetadataCacheCapability::ConditionOnly),
+                &cached.parts_metadata,
+                &cached.online_disks,
+                cached.read_quorum,
+            )
+            .await;
+            let condition = Arc::new(CacheBoundaryCondition {
+                bucket,
+                object,
+                etag: cached.fi.metadata["etag"].clone(),
+                calls: AtomicUsize::new(0),
+                terminal_calls: usize::MAX,
+            });
+            let calls = disk_call_counters::observe(object);
+            let snapshot = with_get_object_read_condition(condition.clone(), async {
+                assert!(crate::object_api::get_object_read_condition_is_active());
+                match mode {
+                    0 => {
+                        let producer_set = set.clone();
+                        tokio::spawn(Box::pin(async move {
+                            assert!(
+                                !crate::object_api::get_object_read_condition_is_active(),
+                                "spawned producers inherit no caller condition"
+                            );
+                            producer_set
+                                .get_object_fileinfo_for_get_object_reader(bucket, object, &ObjectOptions::default(), true, true)
+                                .await
+                        }))
+                        .await
+                        .expect("producer task")
+                        .expect("producer reads its own layout")
+                    }
+                    1 => set
+                        .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+                        .await
+                        .expect("generic complete-layout consumer"),
+                    _ => set
+                        .get_object_fileinfo_for_get_object_reader(
+                            bucket,
+                            object,
+                            &ObjectOptions {
+                                no_lock: true,
+                                metadata_cache_safe: false,
+                                ..Default::default()
+                            },
+                            true,
+                            true,
+                        )
+                        .await
+                        .expect("unprotected NoLock reads bypass even a terminal cached condition"),
+                }
+            })
+            .await;
+            assert!(snapshot.shared.is_none(), "mode {mode} cannot consume a conditional cached layout");
+            assert!(
+                calls.total(disk_call_counters::KIND_READ_VERSION) > 0,
+                "mode {mode} must independently read metadata"
+            );
+            if mode < 2 {
+                assert!(!snapshot.condition_stopped);
+                assert_eq!(condition.calls.load(Ordering::Acquire), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn condition_only_cache_rejects_invalid_deleted_and_insufficient_quorum() {
+        let set = new_metadata_cache_test_set().await;
+        let mut deleted = valid_test_fileinfo("conditional-deleted");
+        deleted.deleted = true;
+        let invalid = FileInfo::default();
+        for (object, fi) in [("conditional-deleted", deleted), ("conditional-invalid", invalid)] {
+            set.cache_get_object_fileinfo(
+                ("bucket", object),
+                set.get_object_metadata_cache_generation("bucket", object),
+                (&fi, GetObjectMetadataCacheCapability::ConditionOnly),
+                std::slice::from_ref(&fi),
+                &[],
+                0,
+            )
+            .await;
+            assert!(matches!(
+                set.lookup_cached_get_object_fileinfo("bucket", object).await,
+                MetadataCacheLookup::Miss
+            ));
+        }
+        for object in ["conditional-deleted", "conditional-invalid"] {
+            let condition = Arc::new(CacheBoundaryCondition {
+                bucket: "bucket",
+                object,
+                etag: "etag-1".to_owned(),
+                calls: AtomicUsize::new(0),
+                terminal_calls: usize::MAX,
+            });
+            let result = crate::object_api::with_get_object_read_condition(
+                condition.clone(),
+                set.get_object_fileinfo_for_get_object_reader("bucket", object, &ObjectOptions::default(), true, true),
+            )
+            .await;
+            assert!(result.is_err(), "invalid or deleted cache metadata cannot terminate the read");
+            assert_eq!(condition.calls.load(Ordering::Acquire), 0);
+        }
+        let object = "conditional-insufficient";
+        let fi = valid_test_fileinfo(object);
+        let generation = set
+            .get_object_metadata_cache_generation("bucket", object)
+            .expect("generation");
+        set.get_object_metadata_cache
+            .insert(
+                GetObjectMetadataCacheKey::new("bucket", object, generation),
+                Arc::new(GetObjectMetadataCacheEntry {
+                    created_at: Instant::now(),
+                    capability: GetObjectMetadataCacheCapability::ConditionOnly,
+                    fi: fi.clone(),
+                    parts_metadata: vec![fi],
+                    online_disks: vec![None],
+                    read_quorum: 1,
+                    verified_inline_body: None,
+                }),
+            )
+            .await;
+        assert!(matches!(
+            set.lookup_cached_get_object_fileinfo("bucket", object).await,
+            MetadataCacheLookup::RejectedInsufficientQuorum
+        ));
+        // With no disks, a rejected entry must produce an actual metadata error,
+        // even when a caller's predicate would accept the poisoned cached ETag.
+        let condition = Arc::new(CacheBoundaryCondition {
+            bucket: "bucket",
+            object,
+            etag: "etag-1".to_owned(),
+            calls: AtomicUsize::new(0),
+            terminal_calls: usize::MAX,
+        });
+        let result = crate::object_api::with_get_object_read_condition(
+            condition.clone(),
+            set.get_object_fileinfo_for_get_object_reader("bucket", object, &ObjectOptions::default(), true, true),
+        )
+        .await;
+        assert!(result.is_err(), "insufficient cached quorum cannot yield terminal metadata");
+        assert_eq!(condition.calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    #[serial(metadata_cache_publish_barrier, body_cache_hook)]
+    async fn condition_only_cache_generation_rechecked_after_lookup() {
+        let bucket = "conditional-cache-generation-boundary";
+        let object = "conditional-cache-generation-boundary.bin";
+        let (_dirs, set, _) = condition_only_cache_boundary_fixture(bucket, object).await;
+        let generation = set
+            .get_object_metadata_cache_generation(bucket, object)
+            .expect("current generation");
+        let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+        let condition = Arc::new(CacheBoundaryCondition {
+            bucket,
+            object,
+            etag: set
+                .cached_get_object_fileinfo(bucket, object)
+                .await
+                .expect("cached quorum")
+                .fi
+                .metadata["etag"]
+                .clone(),
+            calls: AtomicUsize::new(0),
+            terminal_calls: usize::MAX,
+        });
+        let lookup = crate::object_api::with_get_object_read_condition(condition.clone(), async {
+            set.lookup_cached_get_object_fileinfo_after_get(bucket, object, || {
+                set.get_object_metadata_cache_generations[generation.index].fetch_add(1, Ordering::AcqRel);
+            })
+            .await
+        })
+        .await;
+        assert!(
+            matches!(lookup, MetadataCacheLookup::Miss),
+            "a concurrent invalidation rejects old conditional metadata"
+        );
+        assert!(
+            set.get_object_metadata_cache.get(&key).await.is_none(),
+            "retired partial entry is withdrawn"
+        );
+        assert_eq!(
+            condition.calls.load(Ordering::Acquire),
+            0,
+            "generation validation precedes conditional use"
+        );
+        assert!(matches!(
+            set.lookup_cached_get_object_fileinfo(bucket, object).await,
+            MetadataCacheLookup::Miss
+        ));
+    }
+
     #[tokio::test]
     async fn metadata_cache_lookup_rechecks_generation_after_get() {
         let set = new_metadata_cache_test_set().await;
         let fi = valid_test_fileinfo("object");
         let generation = set.get_object_metadata_cache_generation("bucket", "object");
         let generation_index = generation.expect("metadata cache generation should be active").index;
-        set.cache_get_object_fileinfo(("bucket", "object"), generation, &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
 
         let lookup = set
             .lookup_cached_get_object_fileinfo_after_get("bucket", "object", || {
@@ -3343,10 +5687,12 @@ mod metadata_cache_tests {
         let key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
         let entry = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
+            capability: GetObjectMetadataCacheCapability::Full,
             fi: fi.clone(),
             parts_metadata: vec![fi],
             online_disks: Vec::new(),
             read_quorum: 0,
+            verified_inline_body: None,
         });
 
         set.insert_get_object_metadata_cache_entry_after_insert(key, generation, entry, || {
@@ -3382,8 +5728,15 @@ mod metadata_cache_tests {
 
         assert_eq!(first.value, initial.value + 1);
         assert_eq!(second.value, first.value + 1);
-        set.cache_get_object_fileinfo(("bucket", "object"), Some(first), &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            Some(first),
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
     }
 
@@ -3422,10 +5775,24 @@ mod metadata_cache_tests {
         let first_generation = first.get_object_metadata_cache_generation("bucket", "object");
         let second_generation = second.get_object_metadata_cache_generation("bucket", "object");
         first
-            .cache_get_object_fileinfo(("bucket", "object"), first_generation, &fi, std::slice::from_ref(&fi), &[], 0)
+            .cache_get_object_fileinfo(
+                ("bucket", "object"),
+                first_generation,
+                (&fi, GetObjectMetadataCacheCapability::Full),
+                std::slice::from_ref(&fi),
+                &[],
+                0,
+            )
             .await;
         second
-            .cache_get_object_fileinfo(("bucket", "object"), second_generation, &fi, std::slice::from_ref(&fi), &[], 0)
+            .cache_get_object_fileinfo(
+                ("bucket", "object"),
+                second_generation,
+                (&fi, GetObjectMetadataCacheCapability::Full),
+                std::slice::from_ref(&fi),
+                &[],
+                0,
+            )
             .await;
 
         first.invalidate_get_object_metadata_cache("bucket", "object").await;
@@ -3442,21 +5809,26 @@ mod metadata_cache_tests {
             .get_object_metadata_cache_generation("bucket-a", "object-a")
             .expect("metadata cache generation should be active");
         let first_key = GetObjectMetadataCacheKey::new("bucket-a", "object-a", generation);
+        let first_lookup = GetObjectMetadataCacheLookupKey::new("bucket-a", "object-a", generation);
         let second_key = GetObjectMetadataCacheKey {
             bucket: Arc::from("bucket-b"),
             object: Arc::from("object-b"),
             generation: generation.value,
             hash: generation.hash,
         };
+        let second_lookup = GetObjectMetadataCacheLookupKey::new("bucket-b", "object-b", generation);
+        let unrelated_lookup = GetObjectMetadataCacheLookupKey::new("bucket-c", "object-c", generation);
         let first_fi = valid_test_fileinfo("object-a");
         let second_fi = valid_test_fileinfo("object-b");
         let entry = |fi: FileInfo| {
             Arc::new(GetObjectMetadataCacheEntry {
                 created_at: Instant::now(),
+                capability: GetObjectMetadataCacheCapability::Full,
                 parts_metadata: vec![fi.clone()],
                 fi,
                 online_disks: Vec::new(),
                 read_quorum: 0,
+                verified_inline_body: None,
             })
         };
 
@@ -3467,7 +5839,7 @@ mod metadata_cache_tests {
 
         assert_eq!(
             set.get_object_metadata_cache
-                .get(&first_key)
+                .get(&first_lookup)
                 .await
                 .expect("first colliding entry should remain addressable")
                 .fi
@@ -3476,13 +5848,14 @@ mod metadata_cache_tests {
         );
         assert_eq!(
             set.get_object_metadata_cache
-                .get(&second_key)
+                .get(&second_lookup)
                 .await
                 .expect("second colliding entry should remain addressable")
                 .fi
                 .name,
             "object-b"
         );
+        assert!(set.get_object_metadata_cache.get(&unrelated_lookup).await.is_none());
     }
 
     #[tokio::test]
@@ -3500,8 +5873,15 @@ mod metadata_cache_tests {
         set.invalidate_get_object_metadata_cache("bucket", "object").await;
 
         assert_eq!(set.get_object_metadata_cache_generation("bucket", "object"), None);
-        set.cache_get_object_fileinfo(("bucket", "object"), last_generation, &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            last_generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
         set.invalidate_get_object_metadata_cache("bucket", "object").await;
         assert_eq!(
@@ -3519,8 +5899,15 @@ mod metadata_cache_tests {
 
         set.invalidate_all_get_object_metadata_cache();
 
-        set.cache_get_object_fileinfo(("bucket", "object"), stale_generation, &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            stale_generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
         assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_none());
     }
 
@@ -3534,8 +5921,15 @@ mod metadata_cache_tests {
                 .get_object_metadata_cache_generation("bucket", object)
                 .expect("metadata cache generation should be active");
             retired_keys.push(GetObjectMetadataCacheKey::new("bucket", object, generation));
-            set.cache_get_object_fileinfo(("bucket", object), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
-                .await;
+            set.cache_get_object_fileinfo(
+                ("bucket", object),
+                Some(generation),
+                (&fi, GetObjectMetadataCacheCapability::Full),
+                std::slice::from_ref(&fi),
+                &[],
+                0,
+            )
+            .await;
         }
         set.get_object_metadata_cache.run_pending_tasks().await;
         assert_eq!(set.get_object_metadata_cache.entry_count(), 3);
@@ -3560,8 +5954,15 @@ mod metadata_cache_tests {
             .get_object_metadata_cache_generation("bucket", "object")
             .expect("metadata cache generation should be active");
         let retired_key = GetObjectMetadataCacheKey::new("bucket", "object", generation);
-        set.cache_get_object_fileinfo(("bucket", "object"), Some(generation), &fi, std::slice::from_ref(&fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "object"),
+            Some(generation),
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fi),
+            &[],
+            0,
+        )
+        .await;
         for fence in set.get_object_metadata_cache_generations.iter() {
             fence.store(u64::MAX, Ordering::Release);
         }
@@ -3588,8 +5989,15 @@ mod metadata_cache_tests {
         let fresh_fi = valid_test_fileinfo("fresh-object");
 
         let generation = set.get_object_metadata_cache_generation("bucket", "fresh-object");
-        set.cache_get_object_fileinfo(("bucket", "fresh-object"), generation, &fresh_fi, std::slice::from_ref(&fresh_fi), &[], 0)
-            .await;
+        set.cache_get_object_fileinfo(
+            ("bucket", "fresh-object"),
+            generation,
+            (&fresh_fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&fresh_fi),
+            &[],
+            0,
+        )
+        .await;
 
         assert!(
             set.cached_get_object_fileinfo("bucket", "fresh-object").await.is_some(),
@@ -3612,6 +6020,24 @@ mod tests {
 
     const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
     const CODEC_STREAMING_TEST_OBJECT: &str = "object";
+    static CAPTURED_READ_REPAIR_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn metadata_quorum_outcome_uses_bounded_error_categories() {
+        assert_eq!(metadata_quorum_outcome(&StorageError::ErasureReadQuorum), "not_reached");
+        assert_eq!(metadata_quorum_outcome(&StorageError::FileNotFound), "not_found");
+        assert_eq!(
+            metadata_quorum_outcome(&StorageError::Io(std::io::Error::other("disk unavailable"))),
+            "unavailable"
+        );
+    }
+
+    fn capture_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
+        CAPTURED_READ_REPAIR_CALLS.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async { ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted) })
+    }
 
     #[test]
     #[serial]
@@ -4058,16 +6484,17 @@ mod tests {
         let parts_metadata = vec![first.clone(), second, third, FileInfo::default()];
         let errs = vec![None, None, None, None];
 
-        let (read_quorum, write_quorum) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 2)
+        let (read_quorum, _) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 2)
             .expect("partial early-stop metadata should preserve read quorum");
         let read_quorum = usize::try_from(read_quorum).expect("read quorum should be non-negative");
-        let write_quorum = usize::try_from(write_quorum).expect("write quorum should be non-negative");
-        let selection_quorum = SetDisks::latest_fileinfo_selection_quorum("", &parts_metadata, &errs, read_quorum, write_quorum);
+        let (_, latest) = SetDisks::select_valid_fileinfo(&vec![None; parts_metadata.len()], &parts_metadata, &errs, read_quorum)
+            .expect("partial early-stop metadata should select the candidate");
         let selected = SetDisks::pick_valid_fileinfo(&parts_metadata, None, Some("etag-1".to_string()), read_quorum)
             .expect("partial early-stop metadata should preserve selected FileInfo");
 
         assert_eq!(read_quorum, 2);
-        assert_eq!(selection_quorum, 3);
+        assert_eq!(latest.name, first.name);
+        assert_eq!(latest.get_etag(), first.get_etag());
         assert_eq!(selected.name, first.name);
         assert_eq!(selected.get_etag(), first.get_etag());
     }
@@ -4618,6 +7045,7 @@ mod tests {
             0,
             0,
             false,
+            false,
             "test-object-class",
             "test-size-bucket",
             false,
@@ -4641,6 +7069,7 @@ mod tests {
             0,
             0,
             false,
+            false,
             "test-object-class",
             "test-size-bucket",
             false,
@@ -4661,6 +7090,7 @@ mod tests {
                 &[],
                 0,
                 0,
+                false,
                 false,
                 "test-object-class",
                 "test-size-bucket",
@@ -4686,6 +7116,7 @@ mod tests {
                 &[],
                 0,
                 0,
+                false,
                 false,
                 "test-object-class",
                 "test-size-bucket",
@@ -4715,6 +7146,7 @@ mod tests {
                     &[],
                     0,
                     0,
+                    false,
                     false,
                     "test-object-class",
                     "test-size-bucket",
@@ -4770,6 +7202,7 @@ mod tests {
                     0,
                     0,
                     false,
+                    false,
                     "test-object-class",
                     "test-size-bucket",
                     false,
@@ -4824,6 +7257,7 @@ mod tests {
                 0,
                 0,
                 false,
+                false,
                 "test-object-class",
                 "test-size-bucket",
                 false,
@@ -4868,6 +7302,7 @@ mod tests {
                 0,
                 0,
                 false,
+                false,
                 "plain_single_part",
                 "le_1mib",
                 false,
@@ -4911,6 +7346,7 @@ mod tests {
                 &disks,
                 0,
                 0,
+                false,
                 false,
                 "plain_single_part",
                 "le_1mib",
@@ -4974,6 +7410,7 @@ mod tests {
             0,
             0,
             false,
+            false,
             "plain_single_part",
             "le_1mib",
             false,
@@ -5022,6 +7459,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "test-object-class",
             "test-size-bucket",
@@ -5041,6 +7479,8 @@ mod tests {
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
             &fi,
+            0,
+            0,
             &[],
             &[],
             &erasure,
@@ -5048,6 +7488,7 @@ mod tests {
             0,
             9,
             8,
+            false,
             false,
             "test-object-class",
             "test-size-bucket",
@@ -5063,6 +7504,8 @@ mod tests {
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
             &fi,
+            0,
+            0,
             &[],
             &[],
             &erasure,
@@ -5070,6 +7513,7 @@ mod tests {
             0,
             8,
             8,
+            false,
             false,
             "test-object-class",
             "test-size-bucket",
@@ -5611,6 +8055,102 @@ mod tests {
         Ok(decoded)
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn codec_streaming_repair_evidence_requires_recovered_damage() {
+        for (corrupt, inconsistent, expected_calls) in [(false, false, 0), (true, false, 1), (true, true, 0)] {
+            CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+            let erasure = coding::Erasure::new(2, 2, 64);
+            let data: Vec<u8> = (0..64).collect();
+            let setup = setup_codec_data_blocks_first_encoded_bitrot_readers(
+                &erasure,
+                &data,
+                &[],
+                if corrupt { &[0] } else { &[] },
+                if inconsistent { &[2] } else { &[] },
+                HashAlgorithm::HighwayHash256,
+            )
+            .await;
+            let allow_missing = setup.data_shards_attempted(erasure.data_shards);
+            let evidence = Arc::new(ShardReadRepair::default());
+            let source = coding::decode::ParallelReader::new_with_metrics_path_and_reconstruction_verification(
+                setup.readers,
+                erasure.clone(),
+                0,
+                data.len(),
+                Some(GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE),
+            )
+            .with_deferred_parity_handles(setup.deferred_stripe_handles)
+            .with_repair_evidence(Arc::clone(&evidence));
+            let engine = CodecStreamingDecodeEngine::rustfs(&erasure).unwrap();
+            let inner = coding::decode_reader::ErasureDecodeReader::new_single_inflight_with_metrics_path(
+                source,
+                engine,
+                data.len(),
+                GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE,
+            )
+            .unwrap();
+            let mut context =
+                DecodeReadRepairContext::new(&Uuid::new_v4().to_string(), "object", Some(Uuid::new_v4()), 0, 0, 1, false);
+            context.submitter = capture_read_repair_submitter;
+            let mut reader = RepairReportingReader {
+                inner: Box::new(inner),
+                evidence: Arc::clone(&evidence),
+                remaining: data.len(),
+                allow_missing,
+                context: Some(context),
+            };
+            let mut decoded = Vec::new();
+            let result = reader.read_to_end(&mut decoded).await;
+            if inconsistent {
+                assert!(result.is_err(), "inconsistent reconstruction must still fail");
+            } else {
+                result.unwrap();
+                assert_eq!(decoded, data);
+            }
+            assert_eq!(evidence.needed(false), corrupt);
+            assert!(reader.context.is_none(), "terminal reads cannot report a second repair");
+            // The reporter detaches admission from response completion.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed), expected_calls);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repair_reporting_reader_does_not_report_partial_or_unattempted_missing_shards() {
+        CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+        for (partial, missing) in [(true, false), (false, true)] {
+            let evidence = Arc::new(ShardReadRepair::default());
+            evidence.observe(&[Some(if missing {
+                DiskError::FileNotFound
+            } else {
+                DiskError::FileCorrupt
+            })]);
+            let mut context = DecodeReadRepairContext::new(&Uuid::new_v4().to_string(), "object", None, 0, 0, 1, false);
+            context.submitter = capture_read_repair_submitter;
+            let mut reader = RepairReportingReader {
+                inner: Box::new(Cursor::new(vec![7; 16])),
+                evidence,
+                remaining: 16,
+                allow_missing: false,
+                context: Some(context),
+            };
+            if partial {
+                reader.read_exact(&mut [0; 1]).await.unwrap();
+            } else {
+                reader.read_to_end(&mut Vec::new()).await.unwrap();
+            }
+            drop(reader);
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed), 0);
+    }
+
     async fn codec_streaming_inline_files(erasure: &coding::Erasure, part_data: &[u8]) -> Vec<FileInfo> {
         let shards = erasure.encode_data(part_data).expect("test part should encode");
         let distribution = (1..=erasure.total_shard_count()).collect::<Vec<_>>();
@@ -5653,6 +8193,296 @@ mod tests {
                 .expect("external fixture shard should be written");
         }
         (data_dir, files)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn external_missing_shards_keep_typed_read_quorum() {
+        use tokio::io::AsyncReadExt;
+
+        let payload = vec![0x37; 256 * 1024];
+        for readable_shards in [1, 2, 4] {
+            let erasure = coding::Erasure::new(4, 2, 1024 * 1024);
+            let mut fi = codec_streaming_test_fileinfo(i64::try_from(payload.len()).expect("fixture size fits i64"), 1);
+            fi.erasure.data_blocks = erasure.data_shards;
+            fi.erasure.parity_blocks = erasure.parity_shards;
+            fi.erasure.block_size = erasure.block_size;
+            fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+            let (dirs, disks) = local_test_disks(erasure.total_shard_count(), CODEC_STREAMING_TEST_BUCKET).await;
+            let (data_dir, files) = codec_streaming_external_files(&erasure, &payload, &disks).await;
+            fi.data_dir = Some(data_dir);
+            for directory in dirs.iter().skip(readable_shards) {
+                tokio::fs::remove_file(
+                    directory
+                        .path()
+                        .join(CODEC_STREAMING_TEST_BUCKET)
+                        .join(CODEC_STREAMING_TEST_OBJECT)
+                        .join(data_dir.to_string())
+                        .join("part.1"),
+                )
+                .await
+                .expect("remove real part while retaining its selected metadata");
+            }
+
+            let mut output = Vec::new();
+            let legacy = SetDisks::get_object_with_fileinfo(
+                CODEC_STREAMING_TEST_BUCKET,
+                CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
+                0,
+                fi.size,
+                &mut output,
+                fi.clone(),
+                files.clone(),
+                &disks,
+                0,
+                0,
+                false,
+                true,
+                false,
+                false,
+                GET_OBJECT_PATH_LEGACY_DUPLEX,
+                "plain_single_part",
+                "le_1mib",
+            )
+            .await;
+            let streaming = SetDisks::get_object_mid_size_reader_with_fileinfo(
+                CODEC_STREAMING_TEST_BUCKET,
+                CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
+                &fi,
+                &files,
+                &disks,
+                0,
+                0,
+                false,
+                true,
+                "plain_single_part",
+                "le_1mib",
+                false,
+            )
+            .await;
+            if readable_shards < erasure.data_shards {
+                for error in [
+                    legacy.expect_err("legacy read must reject quorum minus one"),
+                    streaming.err().expect("streaming setup must reject quorum minus one"),
+                ] {
+                    assert_eq!(
+                        error,
+                        Error::InsufficientReadQuorum(
+                            CODEC_STREAMING_TEST_BUCKET.to_owned(),
+                            CODEC_STREAMING_TEST_OBJECT.to_owned(),
+                        )
+                    );
+                }
+                assert!(output.is_empty(), "quorum rejection must precede all response bytes");
+            } else {
+                legacy.expect("legacy reader retains reconstructable quorum");
+                assert_eq!(output, payload, "legacy read returns every original byte at quorum");
+                let GetCodecStreamingReaderBuildOutcome::Reader(mut reader) =
+                    streaming.expect("streaming quorum remains readable")
+                else {
+                    panic!("mid-size quorum must yield an actual reader");
+                };
+                let mut decoded = Vec::new();
+                reader
+                    .read_to_end(&mut decoded)
+                    .await
+                    .expect("streaming reader returns the complete body");
+                assert_eq!(decoded, payload, "streaming read returns every original byte at quorum");
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn payload_read_repair_is_suppressed_only_for_read_only_requests() {
+        use rustfs_common::mrf_channel::{MrfKind, init_mrf_channel, release_mrf_intent, set_mrf_delivery_enabled};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("read-repair test runtime");
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        // nextest isolates process-global channel owners in separate processes.
+        let mut receiver = init_mrf_channel().expect("first MRF channel initialization in this process");
+        set_mrf_delivery_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(temp_env::async_with_vars(
+                [(ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("true"))],
+                async {
+                    let part_data = b"abcdefgh";
+                    let erasure = coding::Erasure::new(4, 2, part_data.len());
+                    let (_dirs, disks) = local_test_disks(erasure.total_shard_count(), CODEC_STREAMING_TEST_BUCKET).await;
+                    // Local disks retain cleanup (and, on Linux, I/O metrics)
+                    // tasks for their lifetime. These same disks stay alive
+                    // throughout the matrix; only read/admission tasks are new.
+                    let idle_tasks = runtime.metrics().num_alive_tasks();
+                    for path in ["legacy", "codec", "mid-size", "mid-size-fallback", "lazy", "lazy-fallback"] {
+                        let multipart = path.starts_with("lazy");
+                        let fallback = path.ends_with("fallback");
+                        let part_count = if multipart { 2 } else { 1 };
+                        let expected = part_data.repeat(part_count);
+                        let mut fi = codec_streaming_test_fileinfo(
+                            i64::try_from(expected.len()).expect("fixture size fits i64"),
+                            part_count,
+                        );
+                        fi.erasure.block_size = erasure.block_size;
+                        fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+                        for part in &mut fi.parts {
+                            part.size = part_data.len();
+                            part.actual_size = i64::try_from(part_data.len()).expect("part size fits i64");
+                        }
+                        let mut files = codec_streaming_inline_files(&erasure, part_data).await;
+                        if multipart {
+                            let data_dir = Uuid::new_v4();
+                            fi.data_dir = Some(data_dir);
+                            for (index, file) in files.iter_mut().enumerate() {
+                                let shard = file.data.take().expect("encoded fixture shard");
+                                file.data_dir = Some(data_dir);
+                                for part in 1..=part_count {
+                                    // Only the lazy second part is damaged. Its missing
+                                    // shard forces the in-place fallback in that case.
+                                    if fallback && part == 2 && index == 0 {
+                                        continue;
+                                    }
+                                    let mut bytes = shard.to_vec();
+                                    if part == 2 && index == 1 {
+                                        *bytes.last_mut().expect("shard payload byte") ^= 1;
+                                    }
+                                    disks[index]
+                                        .as_ref()
+                                        .expect("fixture disk")
+                                        .write_all(
+                                            CODEC_STREAMING_TEST_BUCKET,
+                                            &format!("{CODEC_STREAMING_TEST_OBJECT}/{data_dir}/part.{part}"),
+                                            Bytes::from(bytes),
+                                        )
+                                        .await
+                                        .expect("write external fixture shard");
+                                }
+                            }
+                        } else {
+                            if fallback {
+                                files[0].data = None;
+                            }
+                            let mut bytes = files[1].data.take().expect("inline fixture shard").to_vec();
+                            *bytes.last_mut().expect("shard payload byte") ^= 1;
+                            files[1].data = Some(Bytes::from(bytes));
+                        }
+
+                        for suppress_read_repair in [true, false, true] {
+                            let version_id = Uuid::new_v4();
+                            fi.version_id = Some(version_id);
+                            let version = version_id.to_string();
+                            // Observe Heal admission without allowing a worker to
+                            // remove the fault. MRF ingress is independently observed.
+                            let reservation = reserve_read_repair_heal(
+                                CODEC_STREAMING_TEST_BUCKET,
+                                CODEC_STREAMING_TEST_OBJECT,
+                                Some(&version),
+                                0,
+                                0,
+                            )
+                            .await
+                            .expect("unique version reservation");
+                            let before =
+                                recorder.counter_value("rustfs_heal_read_repair_dedup_total", &[("reason", "duplicate")]);
+                            let mut body = Vec::new();
+                            if path == "legacy" {
+                                SetDisks::get_object_with_fileinfo(
+                                    CODEC_STREAMING_TEST_BUCKET,
+                                    CODEC_STREAMING_TEST_OBJECT,
+                                    Arc::new(ErasureCache::new()),
+                                    0,
+                                    fi.size,
+                                    &mut body,
+                                    fi.clone(),
+                                    files.clone(),
+                                    &disks,
+                                    0,
+                                    0,
+                                    false,
+                                    suppress_read_repair,
+                                    false,
+                                    false,
+                                    GET_OBJECT_PATH_SET_DISK,
+                                    "test-object-class",
+                                    "test-size-bucket",
+                                )
+                                .await
+                                .expect("legacy read must recover the complete body");
+                            } else {
+                                let outcome = if path.starts_with("mid-size") {
+                                    SetDisks::get_object_mid_size_reader_with_fileinfo(
+                                        CODEC_STREAMING_TEST_BUCKET,
+                                        CODEC_STREAMING_TEST_OBJECT,
+                                        Arc::new(ErasureCache::new()),
+                                        &fi,
+                                        &files,
+                                        &disks,
+                                        0,
+                                        0,
+                                        false,
+                                        suppress_read_repair,
+                                        "test-object-class",
+                                        "test-size-bucket",
+                                        false,
+                                    )
+                                    .await
+                                } else {
+                                    SetDisks::get_object_decode_reader_with_fileinfo(
+                                        CODEC_STREAMING_TEST_BUCKET,
+                                        CODEC_STREAMING_TEST_OBJECT,
+                                        Arc::new(ErasureCache::new()),
+                                        &fi,
+                                        &files,
+                                        &disks,
+                                        0,
+                                        0,
+                                        false,
+                                        suppress_read_repair,
+                                        "test-object-class",
+                                        "test-size-bucket",
+                                        false,
+                                    )
+                                    .await
+                                }
+                                .expect("streaming reader must retain read quorum");
+                                let GetCodecStreamingReaderBuildOutcome::Reader(mut reader) = outcome else {
+                                    panic!("{path} must construct a reader, including in-place fallback");
+                                };
+                                reader.read_to_end(&mut body).await.expect("complete recovered stream");
+                            }
+                            assert_eq!(body, expected, "{path}: suppression must not change recovered bytes");
+                            // Drive the current-thread runtime until all detached
+                            // admissions finish, instead of assuming a sleep/yield
+                            // was long enough to prove the absence of a submission.
+                            tokio::time::timeout(Duration::from_secs(5), async {
+                                while runtime.metrics().num_alive_tasks() != idle_tasks {
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .expect("all read/admission tasks must finish");
+                            let after = recorder.counter_value("rustfs_heal_read_repair_dedup_total", &[("reason", "duplicate")]);
+                            assert_eq!(after - before, u64::from(!suppress_read_repair), "{path}: Heal admission");
+                            if !suppress_read_repair {
+                                let intent = receiver.try_recv().expect("ordinary read must submit recovered-damage MRF");
+                                assert_eq!(&*intent.bucket, CODEC_STREAMING_TEST_BUCKET);
+                                assert_eq!(&*intent.object, CODEC_STREAMING_TEST_OBJECT);
+                                assert_eq!(intent.version_id, Some(version_id.into_bytes()));
+                                assert_eq!(intent.kind, MrfKind::DecodeFailure);
+                                release_mrf_intent(&intent);
+                            }
+                            assert!(receiver.try_recv().is_err(), "{path}: no suppressed or duplicate MRF ingress");
+                            release_read_repair_heal_reservation(&reservation).await;
+                        }
+                    }
+                },
+            ));
+        });
+        set_mrf_delivery_enabled(false);
     }
 
     #[tokio::test]
@@ -5761,6 +8591,47 @@ mod tests {
                 assert_eq!(&out[..n], b"cccc");
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bitrot_reader_setup_preserves_multistripe_hedge_reopeners() {
+        temp_env::async_with_vars([("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("false"))], async {
+            let files = vec![inline_reader_setup_fileinfo(Some(b"abcdefgh")); 4];
+            let disks = vec![None; files.len()];
+            let setup = create_bitrot_readers_until_quorum_with_preference(
+                &files,
+                &disks,
+                "bucket",
+                "object",
+                1,
+                0,
+                8,
+                4,
+                HashAlgorithm::None,
+                false,
+                false,
+                2,
+                2,
+                BitrotReaderSetupMode::ReadQuorum,
+                true,
+                None,
+                None,
+            )
+            .await;
+
+            assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
+            for (index, reopen) in setup.deferred_reopeners.iter().enumerate() {
+                let reopen = reopen
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("healthy shard {index} needs a reopener for a later stripe"));
+                let mut reader = reopen(1).expect("reopen the second stripe");
+                let mut bytes = [0; 4];
+                assert_eq!(reader.read(&mut bytes).await.expect("read reopened shard"), bytes.len());
+                assert_eq!(&bytes, b"efgh", "reopened shard must not return the previous stripe");
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -6062,6 +8933,7 @@ mod tests {
             0,
             data.len(),
             data.len(),
+            None,
         );
 
         let mut decoded = Vec::new();
@@ -6070,6 +8942,37 @@ mod tests {
             .await
             .expect("legacy per-part fallback reader should reconstruct the degraded part");
         assert_eq!(decoded, data, "reconstructed bytes must match the original part payload");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn legacy_per_part_fallback_preserves_repair_evidence() {
+        CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+        let erasure = coding::Erasure::new(2, 2, 64);
+        let data: Vec<u8> = (0..64).collect();
+        let setup =
+            setup_codec_data_blocks_first_encoded_bitrot_readers(&erasure, &data, &[], &[0], &[], HashAlgorithm::HighwayHash256)
+                .await;
+        let mut context = DecodeReadRepairContext::new(&Uuid::new_v4().to_string(), "object", None, 0, 0, 2, false);
+        context.submitter = capture_read_repair_submitter;
+        let mut reader = build_legacy_per_part_fallback_reader(
+            erasure,
+            setup.readers,
+            setup.deferred_stripe_handles,
+            Vec::new(),
+            None,
+            0,
+            data.len(),
+            data.len(),
+            Some((context, false)),
+        );
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, data);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed), 1);
     }
 
     // backlog#879: the whole multipart object must stream to completion when a
@@ -6113,6 +9016,7 @@ mod tests {
                     0,
                     part2_len,
                     part2_len,
+                    None,
                 );
                 Ok(GetCodecStreamingReaderBuildOutcome::Reader(reader))
             })
@@ -6154,6 +9058,7 @@ mod tests {
             0,
             data.len(),
             data.len(),
+            None,
         );
 
         let mut decoded = Vec::new();
@@ -7177,5 +10082,1003 @@ mod tests {
             .expect("quorum should still succeed");
         assert_eq!(responses.iter().filter(|item| item.is_some()).count(), 2);
         assert_eq!(errors.iter().filter(|item| item.is_none()).count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod dangling_read_tests {
+    //! GET and HEAD report a metadata read-quorum failure as not found only when
+    //! every drive answered and the surviving copies prove the object or version
+    //! dangling; any uncertainty keeps the read-quorum error (503 SlowDownRead).
+    use super::*;
+    use crate::disk::{DeleteOptions, STORAGE_FORMAT_FILE};
+    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+    use crate::storage_api_contracts::object::ObjectOperations;
+    use http::HeaderMap;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
+
+    /// EC 4+2: read quorum is four, so three surviving copies are below it
+    /// while still reaching the half-set probe.
+    const DRIVES: usize = 6;
+    const PARITY: usize = 2;
+
+    async fn dangling_test_set(bucket: &str) -> (Vec<TempDir>, Arc<SetDisks>) {
+        dangling_test_set_with(bucket, DRIVES, PARITY).await
+    }
+
+    async fn dangling_test_set_with(bucket: &str, drives: usize, parity: usize) -> (Vec<TempDir>, Arc<SetDisks>) {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+        let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(drives, parity, ctx).await;
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("test bucket should be created on every drive");
+        (dirs, set)
+    }
+
+    async fn put(set: &SetDisks, bucket: &str, object: &str, body: &[u8], versioned: bool) -> ObjectInfo {
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(body.to_vec()),
+            &ObjectOptions {
+                versioned,
+                // Wait for every drive so tests that edit one drive's metadata
+                // do not race the PUT's background tail writes.
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed object should commit on every drive")
+    }
+
+    fn object_dir(dirs: &[TempDir], disk: usize, bucket: &str, object: &str) -> PathBuf {
+        dirs[disk].path().join(bucket).join(object)
+    }
+
+    async fn remove_object_from(dirs: &[TempDir], bucket: &str, object: &str, disks: &[usize]) {
+        for &disk in disks {
+            tokio::fs::remove_dir_all(object_dir(dirs, disk, bucket, object))
+                .await
+                .expect("object directory should be removable to model a drive that never received the write");
+        }
+    }
+
+    /// Drops `version_id` from `disks`, modelling drives a failed PUT never
+    /// reached while the older versions below it stay intact.
+    async fn drop_version_from(set: &SetDisks, bucket: &str, object: &str, version_id: Uuid, disks: std::ops::Range<usize>) {
+        let all = set.disks.read().await.clone();
+        for disk in &all[disks] {
+            let disk = disk.as_ref().expect("every drive should be online");
+            let mut remove = FileInfo {
+                volume: bucket.to_string(),
+                name: object.to_string(),
+                version_id: Some(version_id),
+                ..Default::default()
+            };
+            remove.set_skip_tier_free_version();
+            disk.delete_version(bucket, object, remove, false, DeleteOptions::default())
+                .await
+                .expect("dropping the version should model a drive that never received it");
+        }
+    }
+
+    fn read_opts(version_id: Option<&str>) -> ObjectOptions {
+        ObjectOptions {
+            version_id: version_id.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    async fn head(set: &SetDisks, bucket: &str, object: &str, version_id: Option<&str>) -> Result<ObjectInfo> {
+        set.get_object_info(bucket, object, &read_opts(version_id)).await
+    }
+
+    async fn get(set: &SetDisks, bucket: &str, object: &str, version_id: Option<&str>) -> Result<Vec<u8>> {
+        let mut reader = set
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &read_opts(version_id))
+            .await?;
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("an opened object should stream its body");
+        Ok(body)
+    }
+
+    fn is_read_quorum_error(err: &StorageError) -> bool {
+        matches!(err, StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))
+    }
+
+    async fn assert_get_and_head_keep_read_quorum_error(set: &SetDisks, bucket: &str, object: &str, case: &str) {
+        let Err(err) = head(set, bucket, object, None).await else {
+            panic!("{case}: HEAD must not serve an object below read quorum");
+        };
+        assert!(is_read_quorum_error(&err), "{case}: HEAD must keep the read-quorum error: {err:?}");
+        let Err(err) = get(set, bucket, object, None).await else {
+            panic!("{case}: GET must not serve an object below read quorum");
+        };
+        assert!(is_read_quorum_error(&err), "{case}: GET must keep the read-quorum error: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn dangling_object_reads_as_not_found_on_get_and_head() {
+        let bucket = "dangling-read-unversioned";
+        let object = "torn/object";
+        let (dirs, set) = dangling_test_set(bucket).await;
+        put(&set, bucket, object, b"torn write payload", false).await;
+        // Three copies stay below read quorum four; the other drives answer FileNotFound.
+        remove_object_from(&dirs, bucket, object, &[3, 4, 5]).await;
+
+        let is_not_found = |err: &StorageError| matches!(err, StorageError::ObjectNotFound(b, o) if b == bucket && o == object);
+        let Err(err) = head(&set, bucket, object, None).await else {
+            panic!("HEAD must not serve a dangling object");
+        };
+        assert!(is_not_found(&err), "HEAD of a dangling object must be NoSuchKey: {err:?}");
+        let Err(err) = get(&set, bucket, object, None).await else {
+            panic!("GET must not serve a dangling object");
+        };
+        assert!(is_not_found(&err), "GET of a dangling object must be NoSuchKey: {err:?}");
+        let Err(err) = set
+            .prepare_get_object_metadata(bucket, object, &ObjectOptions::default())
+            .await
+        else {
+            panic!("prepared GET metadata must not resolve a dangling object");
+        };
+        assert!(is_not_found(&err), "prepared GET metadata must be NoSuchKey: {err:?}");
+
+        // Read-before-write callers keep the quorum error so fences and delete
+        // recovery never treat a torn write as an absent key.
+        let Err(err) = set
+            .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+            .await
+        else {
+            panic!("internal metadata reads must not resolve a dangling object");
+        };
+        assert!(is_read_quorum_error(&err), "internal metadata reads keep the quorum error: {err:?}");
+
+        // The classification is read-only; heal owns dangling cleanup.
+        for disk in 0..3 {
+            assert!(
+                object_dir(&dirs, disk, bucket, object).join(STORAGE_FORMAT_FILE).exists(),
+                "GET/HEAD must not delete the surviving copy on drive {disk}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dangling_classification_requires_every_drive_to_answer() {
+        let bucket = "dangling-read-offline";
+        let object = "torn/object";
+        let (dirs, set) = dangling_test_set(bucket).await;
+        let payload = b"offline drive may hold the fourth copy";
+        put(&set, bucket, object, payload, false).await;
+        remove_object_from(&dirs, bucket, object, &[3, 4]).await;
+        let offline = set.disks.write().await[5].take().expect("drive five should start online");
+
+        assert_get_and_head_keep_read_quorum_error(&set, bucket, object, "one drive offline").await;
+
+        // The offline drive held a copy: once it answers, read quorum is met.
+        set.disks.write().await[5] = Some(offline);
+        let body = get(&set, bucket, object, None)
+            .await
+            .expect("four copies satisfy read quorum once the drive returns");
+        assert_eq!(body, payload);
+    }
+
+    #[tokio::test]
+    async fn dangling_version_reads_as_no_such_version_while_other_versions_stay_readable() {
+        let bucket = "dangling-read-versioned";
+        let object = "torn/versioned";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let v1 = put(&set, bucket, object, b"version one", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        let v2 = put(&set, bucket, object, b"version two", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        let disks = set.disks.read().await.clone();
+        for disk in disks.iter().skip(3) {
+            let disk = disk.as_ref().expect("every drive should be online");
+            let mut remove = FileInfo {
+                volume: bucket.to_string(),
+                name: object.to_string(),
+                version_id: Some(v2),
+                ..Default::default()
+            };
+            remove.set_skip_tier_free_version();
+            disk.delete_version(bucket, object, remove, false, DeleteOptions::default())
+                .await
+                .expect("dropping version two should model a drive that never received it");
+            assert!(matches!(
+                disk.read_version("", bucket, object, &v2.to_string(), &ReadOptions::default())
+                    .await,
+                Err(DiskError::FileVersionNotFound | DiskError::FileNotFound)
+            ));
+        }
+
+        let v1 = v1.to_string();
+        let v2 = v2.to_string();
+        let is_no_such_version =
+            |err: &StorageError| matches!(err, StorageError::VersionNotFound(b, o, v) if b == bucket && o == object && v == &v2);
+        let Err(err) = head(&set, bucket, object, Some(&v2)).await else {
+            panic!("HEAD must not serve a dangling version");
+        };
+        assert!(is_no_such_version(&err), "HEAD of a dangling version must be NoSuchVersion: {err:?}");
+        let Err(err) = get(&set, bucket, object, Some(&v2)).await else {
+            panic!("GET must not serve a dangling version");
+        };
+        assert!(is_no_such_version(&err), "GET of a dangling version must be NoSuchVersion: {err:?}");
+
+        assert_eq!(
+            get(&set, bucket, object, Some(&v1))
+                .await
+                .expect("the committed version must stay readable"),
+            b"version one"
+        );
+        head(&set, bucket, object, Some(&v1))
+            .await
+            .expect("HEAD of the committed version must succeed");
+        // The latest read sees version two on three drives and version one on
+        // the rest. Version two's exact read proves it dangling, so the latest
+        // read serves version one, the newest version an exact read can serve.
+        let latest = head(&set, bucket, object, None)
+            .await
+            .expect("the latest read must serve the newest readable version");
+        assert_eq!(latest.version_id.map(|id| id.to_string()).as_deref(), Some(v1.as_str()));
+        assert_eq!(get(&set, bucket, object, None).await.expect("latest GET"), b"version one");
+    }
+
+    #[tokio::test]
+    async fn latest_read_skips_dangling_versions_above_a_committed_version() {
+        // EC 12+4: a failed PUT that left version two on 5..=11 drives keeps
+        // version one, present in every stack, below its read quorum of twelve
+        // when only the top of each stack is read. Up to seven copies the
+        // listing quorum already shows version one; from eight it lists the
+        // dangling version two.
+        let bucket = "dangling-latest-12-4";
+        let (_dirs, set) = dangling_test_set_with(bucket, 16, 4).await;
+        for copies in 5..=11 {
+            let object = format!("torn/latest-{copies:02}");
+            let v1 = put(&set, bucket, &object, b"committed version", true)
+                .await
+                .version_id
+                .expect("versioned PUT should assign a version id");
+            let v2 = put(&set, bucket, &object, b"failed overwrite", true)
+                .await
+                .version_id
+                .expect("versioned PUT should assign a version id");
+            drop_version_from(&set, bucket, &object, v2, copies..16).await;
+
+            let context = format!("version two on {copies} of 16 drives");
+            let latest = head(&set, bucket, &object, None)
+                .await
+                .unwrap_or_else(|err| panic!("{context}: HEAD must serve version one: {err:?}"));
+            assert_eq!(latest.version_id, Some(v1), "{context}");
+            assert!(latest.is_latest, "{context}: the served version is the latest one");
+            assert_eq!(
+                get(&set, bucket, &object, None)
+                    .await
+                    .unwrap_or_else(|err| panic!("{context}: GET must serve version one: {err:?}")),
+                b"committed version",
+                "{context}"
+            );
+            let Err(err) = head(&set, bucket, &object, Some(&v2.to_string())).await else {
+                panic!("{context}: the dangling version must not be served");
+            };
+            assert!(matches!(err, StorageError::VersionNotFound(..)), "{context}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_read_keeps_quorum_error_when_the_newest_version_is_uncertain() {
+        // Version two is on every drive, but a torn metadata update left two
+        // identities at one modification time, three copies each. Its exact
+        // read fails with a quorum error rather than NoSuchVersion, so the
+        // walk must not fall through to version one.
+        let bucket = "dangling-latest-uncertain";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        put(&set, bucket, object, b"version one", true).await;
+        let v2 = put(&set, bucket, object, b"version two", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id")
+            .to_string();
+        let disks = set.disks.read().await.clone();
+        for disk in disks.iter().take(3) {
+            let disk = disk.as_ref().expect("every drive should be online");
+            let mut fi = disk
+                .read_version("", bucket, object, &v2, &ReadOptions::default())
+                .await
+                .expect("version two should be on every drive");
+            fi.metadata.insert("x-amz-meta-torn".to_string(), "half-applied".to_string());
+            disk.update_metadata(bucket, object, fi, &crate::disk::UpdateMetadataOpts::default())
+                .await
+                .expect("a half-applied metadata update should be stored");
+        }
+
+        assert_get_and_head_keep_read_quorum_error(&set, bucket, object, "torn metadata update on version two").await;
+    }
+
+    #[tokio::test]
+    async fn latest_read_serves_a_committed_null_version_below_a_dangling_version() {
+        // A null version written while versioning was suspended sits between
+        // version one and a dangling version three. The walk reaches the null
+        // slot through the nil UUID and serves it, not version one.
+        let bucket = "dangling-latest-null";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let v1 = put(&set, bucket, object, b"version one", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(b"null version".to_vec()),
+            &ObjectOptions {
+                version_suspended: true,
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a suspended-versioning PUT should commit the null version");
+        let v3 = put(&set, bucket, object, b"version three", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        drop_version_from(&set, bucket, object, v3, 3..DRIVES).await;
+
+        let latest = head(&set, bucket, object, None)
+            .await
+            .expect("the committed null version must be served");
+        assert_ne!(latest.version_id, Some(v1));
+        assert_ne!(latest.version_id, Some(v3));
+        assert!(latest.is_latest);
+        assert_eq!(get(&set, bucket, object, None).await.expect("latest GET"), b"null version");
+    }
+
+    #[tokio::test]
+    async fn latest_read_orders_versions_by_their_newest_modification_time() {
+        // Drive 0 missed the suspended-versioning rewrite of the null version,
+        // so its null copy predates version one while every other drive holds
+        // the committed rewrite. Ordering by the first drive's time would try
+        // version one before the null version and serve it.
+        let bucket = "dangling-latest-order";
+        let object = "torn/latest";
+        let (dirs, set) = dangling_test_set(bucket).await;
+        let suspended = ObjectOptions {
+            version_suspended: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(b"stale null".to_vec()), &suspended)
+            .await
+            .expect("the first null version should commit");
+        let v1 = put(&set, bucket, object, b"version one", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        let drive_zero = object_dir(&dirs, 0, bucket, object).join(STORAGE_FORMAT_FILE);
+        let stale = tokio::fs::read(&drive_zero)
+            .await
+            .expect("drive zero metadata should be readable");
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(b"committed null".to_vec()), &suspended)
+            .await
+            .expect("the null rewrite should commit");
+        tokio::fs::write(&drive_zero, stale)
+            .await
+            .expect("drive zero should keep the pre-rewrite stack");
+        let v5 = put(&set, bucket, object, b"version five", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        drop_version_from(&set, bucket, object, v5, 3..DRIVES).await;
+
+        let latest = head(&set, bucket, object, None)
+            .await
+            .expect("the committed null rewrite must be served");
+        assert_ne!(latest.version_id, Some(v1));
+        assert_eq!(get(&set, bucket, object, None).await.expect("latest GET"), b"committed null");
+    }
+
+    #[tokio::test]
+    async fn latest_read_preserves_object_before_equal_time_marker() {
+        let bucket = "dangling-latest-equal-time-marker";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let same_time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed source mtime");
+        for suspended in [false, true] {
+            let object = if suspended {
+                "torn/equal-time-null"
+            } else {
+                "torn/equal-time-versioned"
+            };
+            let object_id = if suspended { Uuid::nil() } else { Uuid::from_u128(2) };
+            set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(b"committed object".to_vec()),
+                &ObjectOptions {
+                    versioned: !suspended,
+                    version_suspended: suspended,
+                    replication_request: true,
+                    version_id: Some(object_id.to_string()),
+                    mod_time: Some(same_time),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit object version");
+            set.delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(Uuid::from_u128(1).to_string()),
+                    mod_time: Some(same_time),
+                    data_movement: true,
+                    delete_marker: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recreate source delete marker during data movement");
+            let expected = head(&set, bucket, object, None)
+                .await
+                .expect("canonical latest before dangling write");
+            assert_eq!(expected.version_id, (!suspended).then_some(object_id));
+            assert!(!expected.delete_marker, "canonical header order prefers object to equal-time marker");
+            assert_eq!(get(&set, bucket, object, None).await.expect("canonical GET"), b"committed object");
+            let dangling_id = Uuid::from_u128(3);
+            set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(b"failed newer version".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    replication_request: true,
+                    version_id: Some(dangling_id.to_string()),
+                    mod_time: Some(same_time + time::Duration::seconds(1)),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit newer version before modeling failed rollback");
+            drop_version_from(&set, bucket, object, dangling_id, 3..DRIVES).await;
+            let actual = head(&set, bucket, object, None)
+                .await
+                .expect("latest HEAD past dangling version");
+            let actual_get = get(&set, bucket, object, None).await;
+            assert_eq!(
+                actual.version_id, expected.version_id,
+                "{object}: unreadable newer version must preserve canonical equal-time latest; GET result: {actual_get:?}"
+            );
+            assert!(
+                !actual.delete_marker,
+                "{object}: fallback must preserve the object before its equal-time marker"
+            );
+            assert_eq!(actual_get.expect("latest GET"), b"committed object");
+
+            let checksum_opts = ObjectOptions {
+                include_part_checksums: true,
+                ..Default::default()
+            };
+            let checksum_head = set
+                .get_object_info(bucket, object, &checksum_opts)
+                .await
+                .expect("latest HEAD with part checksums");
+            assert_eq!(checksum_head.version_id, expected.version_id, "{object}: checksum HEAD version");
+            assert!(!checksum_head.delete_marker, "{object}: checksum HEAD must return the object");
+            let mut checksum_reader = set
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &checksum_opts)
+                .await
+                .expect("latest GET with part checksums");
+            let mut checksum_body = Vec::new();
+            checksum_reader
+                .stream
+                .read_to_end(&mut checksum_body)
+                .await
+                .expect("checksum GET should stream the committed bytes");
+            assert_eq!(checksum_body, b"committed object", "{object}: checksum GET bytes");
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_read_past_dangling_versions_requires_every_drive_to_answer() {
+        let bucket = "dangling-latest-offline";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        put(&set, bucket, object, b"version one", true).await;
+        let v2 = put(&set, bucket, object, b"version two", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        drop_version_from(&set, bucket, object, v2, 3..DRIVES).await;
+        // The offline drive may hold the copy that makes version two readable.
+        let offline = set.disks.write().await[5].take().expect("drive five should start online");
+
+        assert_get_and_head_keep_read_quorum_error(&set, bucket, object, "one drive offline").await;
+
+        set.disks.write().await[5] = Some(offline);
+        let latest = head(&set, bucket, object, None)
+            .await
+            .expect("with every drive answering the dangling version is skipped");
+        assert_ne!(latest.version_id, Some(v2));
+    }
+
+    /// Version one on every drive under a version two that a failed PUT left
+    /// on drives `0..3`, below the read quorum of four.
+    async fn put_committed_below_dangling(set: &SetDisks, bucket: &str, object: &str) -> (Uuid, Uuid) {
+        let v1 = put(set, bucket, object, b"version one", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        let v2 = put(set, bucket, object, b"version two", true)
+            .await
+            .version_id
+            .expect("versioned PUT should assign a version id");
+        drop_version_from(set, bucket, object, v2, 3..DRIVES).await;
+        (v1, v2)
+    }
+
+    /// Each drive's copy of `version_id`, or `None` where the drive lacks it.
+    async fn version_metadata(
+        set: &SetDisks,
+        bucket: &str,
+        object: &str,
+        version_id: Uuid,
+    ) -> Vec<Option<HashMap<String, String>>> {
+        let disks = set.disks.read().await.clone();
+        let mut copies = Vec::with_capacity(disks.len());
+        for disk in &disks {
+            let disk = disk.as_ref().expect("every drive should be online");
+            copies.push(
+                disk.read_version("", bucket, object, &version_id.to_string(), &ReadOptions::default())
+                    .await
+                    .ok()
+                    .map(|fi| fi.metadata),
+            );
+        }
+        copies
+    }
+
+    #[tokio::test]
+    async fn latest_tagging_skips_dangling_versions_above_a_committed_version() {
+        let bucket = "dangling-latest-tagging";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let (v1, v2) = put_committed_below_dangling(&set, bucket, object).await;
+        let tag_of = |metadata: &Option<HashMap<String, String>>| {
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(rustfs_utils::http::headers::AMZ_OBJECT_TAGGING).cloned())
+        };
+
+        let tagged = set
+            .put_object_tags(bucket, object, "stage=committed", &ObjectOptions::default())
+            .await
+            .expect("PutObjectTagging must update the version a latest GET serves");
+        assert_eq!(tagged.version_id, Some(v1));
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            assert_eq!(
+                tag_of(metadata).as_deref(),
+                Some("stage=committed"),
+                "drive {disk} must carry the tag on version one"
+            );
+        }
+        for (disk, metadata) in version_metadata(&set, bucket, object, v2).await.iter().enumerate() {
+            assert_eq!(tag_of(metadata), None, "drive {disk} must leave the dangling version untouched");
+        }
+        assert_eq!(*head(&set, bucket, object, None).await.expect("latest HEAD").user_tags, "stage=committed");
+
+        let untagged = set
+            .delete_object_tags(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("DeleteObjectTagging must update the version a latest GET serves");
+        assert_eq!(untagged.version_id, Some(v1));
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            assert_eq!(tag_of(metadata).as_deref(), Some(""), "drive {disk} must clear the tag on version one");
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_metadata_update_skips_dangling_versions_above_a_committed_version() {
+        let bucket = "dangling-latest-metadata";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let (v1, v2) = put_committed_below_dangling(&set, bucket, object).await;
+
+        let updated = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-probe".to_string(), "updated".to_string())])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a latest metadata update must target the version a latest GET serves");
+        assert_eq!(updated.version_id, Some(v1));
+        assert!(updated.is_latest, "the updated version is the latest one");
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            let metadata = metadata.as_ref().expect("version one is on every drive");
+            assert_eq!(metadata.get("x-amz-meta-probe").map(String::as_str), Some("updated"), "drive {disk}");
+        }
+        for (disk, metadata) in version_metadata(&set, bucket, object, v2).await.iter().enumerate() {
+            assert!(
+                metadata
+                    .as_ref()
+                    .is_none_or(|metadata| !metadata.contains_key("x-amz-meta-probe")),
+                "drive {disk} must leave the dangling version untouched"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_copy_source_skips_dangling_versions_above_a_committed_version() {
+        let bucket = "dangling-latest-copy";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+
+        // A metadata-only self-copy rewrites the latest version in place.
+        let object = "torn/in-place";
+        let (v1, _) = put_committed_below_dangling(&set, bucket, object).await;
+        let mut source = head(&set, bucket, object, None).await.expect("latest HEAD");
+        assert_eq!(source.version_id, Some(v1));
+        source.metadata_only = true;
+        source.user_defined = Arc::new(HashMap::from([("x-amz-meta-copied".to_string(), "in-place".to_string())]));
+        let copied = set
+            .copy_object(
+                bucket,
+                object,
+                bucket,
+                object,
+                &mut source,
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("a CopyObject source without a version id must resolve like a latest GET");
+        assert_eq!(copied.version_id, Some(v1));
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            let metadata = metadata.as_ref().expect("version one is on every drive");
+            assert_eq!(metadata.get("x-amz-meta-copied").map(String::as_str), Some("in-place"), "drive {disk}");
+        }
+
+        // A version-only self-copy commits a new version that shares the
+        // served version's data.
+        let object = "torn/new-version";
+        let (_, v2) = put_committed_below_dangling(&set, bucket, object).await;
+        let v3 = Uuid::new_v4();
+        let mut source = head(&set, bucket, object, None).await.expect("latest HEAD");
+        source.version_only = true;
+        let copied = set
+            .copy_object(
+                bucket,
+                object,
+                bucket,
+                object,
+                &mut source,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+                &ObjectOptions {
+                    version_id: Some(v3.to_string()),
+                    versioned: true,
+                    object_lock_config_snapshot: Some(Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a version-only CopyObject source without a version id must resolve like a latest GET");
+        assert_eq!(copied.version_id, Some(v3));
+        let latest = head(&set, bucket, object, None).await.expect("latest HEAD");
+        assert_eq!(latest.version_id, Some(v3));
+        assert_eq!(get(&set, bucket, object, None).await.expect("latest GET"), b"version one");
+        assert!(
+            version_metadata(&set, bucket, object, v2).await[..3]
+                .iter()
+                .all(Option::is_some),
+            "the copy must not remove the dangling version; heal owns its cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_metadata_update_past_dangling_versions_keeps_write_quorum() {
+        // EC 3+3: read quorum three, write quorum four. Version one reached
+        // three drives, so it is readable but below write quorum; versions two
+        // and three are dangling on two drives each. A latest read serves
+        // version one, and a metadata update of it is refused before writing.
+        let bucket = "dangling-latest-write-quorum";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set_with(bucket, 6, 3).await;
+        let mut versions = Vec::new();
+        for body in [b"version zero".as_slice(), b"version one", b"version two", b"version three"] {
+            versions.push(
+                put(&set, bucket, object, body, true)
+                    .await
+                    .version_id
+                    .expect("versioned PUT should assign a version id"),
+            );
+        }
+        let [_, v1, v2, v3] = versions[..] else {
+            unreachable!("four versions were written");
+        };
+        drop_version_from(&set, bucket, object, v1, 3..6).await;
+        drop_version_from(&set, bucket, object, v2, 2..6).await;
+        drop_version_from(&set, bucket, object, v3, 0..3).await;
+        drop_version_from(&set, bucket, object, v3, 5..6).await;
+
+        let latest = head(&set, bucket, object, None)
+            .await
+            .expect("version one is readable at read quorum");
+        assert_eq!(latest.version_id, Some(v1));
+
+        let is_write_quorum_error =
+            |err: &StorageError| matches!(err, StorageError::ErasureWriteQuorum | StorageError::InsufficientWriteQuorum(_, _));
+        let Err(err) = set
+            .put_object_tags(bucket, object, "stage=refused", &ObjectOptions::default())
+            .await
+        else {
+            panic!("tagging a version below write quorum must be refused");
+        };
+        assert!(is_write_quorum_error(&err), "tagging keeps the write-quorum error: {err:?}");
+        let Err(err) = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-probe".to_string(), "refused".to_string())])),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("a metadata update of a version below write quorum must be refused");
+        };
+        assert!(is_write_quorum_error(&err), "the metadata update keeps the write-quorum error: {err:?}");
+        let v4 = Uuid::new_v4();
+        let mut source = head(&set, bucket, object, None).await.expect("latest HEAD");
+        source.version_only = true;
+        let Err(err) = set
+            .copy_object(
+                bucket,
+                object,
+                bucket,
+                object,
+                &mut source,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+                &ObjectOptions {
+                    version_id: Some(v4.to_string()),
+                    versioned: true,
+                    object_lock_config_snapshot: Some(Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("a version-only copy of a version below write quorum must be refused");
+        };
+        assert!(is_write_quorum_error(&err), "the version-only copy keeps the write-quorum error: {err:?}");
+        assert!(
+            version_metadata(&set, bucket, object, v4).await.iter().all(Option::is_none),
+            "a refused version-only copy must not write the new version to any drive"
+        );
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            assert!(
+                metadata.as_ref().is_none_or(|metadata| {
+                    !metadata.contains_key(rustfs_utils::http::headers::AMZ_OBJECT_TAGGING)
+                        && !metadata.contains_key("x-amz-meta-probe")
+                }),
+                "drive {disk} must not be written by a refused update"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_status_writeback_never_walks_past_dangling_versions() {
+        // A replication terminal CAS stays side-effect free: it keeps the
+        // read-quorum error instead of resolving the latest version, so it
+        // neither queues heal for the dangling version nor writes version one.
+        let bucket = "dangling-latest-replication-cas";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let (v1, _) = put_committed_below_dangling(&set, bucket, object).await;
+
+        let Err(err) = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-probe".to_string(), "written".to_string())])),
+                    replication_status_writeback: Some(Box::new(crate::object_api::ReplicationStatusWritebackCondition {
+                        mode: crate::object_api::ReplicationStatusWritebackMode::ValidateOnly,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("a replication terminal CAS must not resolve past a dangling version");
+        };
+        assert!(is_read_quorum_error(&err), "the CAS keeps the read-quorum error: {err:?}");
+        for (disk, metadata) in version_metadata(&set, bucket, object, v1).await.iter().enumerate() {
+            let metadata = metadata.as_ref().expect("version one is on every drive");
+            assert!(!metadata.contains_key("x-amz-meta-probe"), "drive {disk} must not be written");
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_metadata_updates_past_dangling_versions_require_every_drive_to_answer() {
+        let bucket = "dangling-latest-update-offline";
+        let object = "torn/latest";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        put_committed_below_dangling(&set, bucket, object).await;
+        let offline = set.disks.write().await[5].take().expect("drive five should start online");
+
+        let Err(err) = set
+            .put_object_tags(bucket, object, "stage=uncertain", &ObjectOptions::default())
+            .await
+        else {
+            panic!("tagging must not resolve past a version an offline drive may commit");
+        };
+        assert!(is_read_quorum_error(&err), "tagging keeps the read-quorum error: {err:?}");
+        let Err(err) = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-probe".to_string(), "uncertain".to_string())])),
+                    ..Default::default()
+                },
+            )
+            .await
+        else {
+            panic!("a metadata update must not resolve past a version an offline drive may commit");
+        };
+        assert!(is_read_quorum_error(&err), "the metadata update keeps the read-quorum error: {err:?}");
+        set.disks.write().await[5] = Some(offline);
+    }
+
+    #[tokio::test]
+    async fn dangling_classification_keeps_quorum_error_for_corrupt_metadata() {
+        let bucket = "dangling-read-corrupt";
+        let object = "torn/object";
+        let (dirs, set) = dangling_test_set(bucket).await;
+        put(&set, bucket, object, b"corrupt copies are present, not absent", false).await;
+        for disk in 3..DRIVES {
+            tokio::fs::write(object_dir(&dirs, disk, bucket, object).join(STORAGE_FORMAT_FILE), b"corrupt metadata")
+                .await
+                .expect("xl.meta should be corruptible for the test");
+        }
+
+        assert_get_and_head_keep_read_quorum_error(&set, bucket, object, "corrupt xl.meta").await;
+    }
+
+    #[tokio::test]
+    async fn dangling_classification_keeps_quorum_error_for_two_generations() {
+        let bucket = "dangling-read-two-generations";
+        let object = "torn/object";
+        let (dirs, set) = dangling_test_set(bucket).await;
+        put(&set, bucket, object, b"first generation", false).await;
+        let mut first_generation = Vec::new();
+        for disk in 0..2 {
+            let path = object_dir(&dirs, disk, bucket, object).join(STORAGE_FORMAT_FILE);
+            let bytes = tokio::fs::read(&path)
+                .await
+                .expect("first generation xl.meta should be readable");
+            first_generation.push((path, bytes));
+        }
+        put(&set, bucket, object, b"second generation", false).await;
+        // First generation on two drives, second on one, three drives absent:
+        // each generation is below read quorum and neither proves the other absent.
+        for (path, bytes) in first_generation {
+            tokio::fs::write(&path, bytes)
+                .await
+                .expect("first generation xl.meta should be restorable");
+        }
+        remove_object_from(&dirs, bucket, object, &[3, 4, 5]).await;
+
+        assert_get_and_head_keep_read_quorum_error(&set, bucket, object, "two generations").await;
+    }
+
+    /// Writes `fi` as the only version on the first `copies` drives; the
+    /// remaining drives answer FileNotFound.
+    async fn write_metadata_copies(set: &SetDisks, bucket: &str, object: &str, fi: &FileInfo, copies: usize) {
+        let disks = set.disks.read().await.clone();
+        for (index, disk) in disks.iter().take(copies).enumerate() {
+            let mut copy = fi.clone();
+            copy.erasure.index = index + 1;
+            disk.as_ref()
+                .expect("every drive should be online")
+                .write_metadata(bucket, bucket, object, copy)
+                .await
+                .expect("hand-written metadata should be stored");
+        }
+    }
+
+    fn handwritten_version(bucket: &str, object: &str, data_blocks: usize, parity_blocks: usize) -> FileInfo {
+        let mut fi = FileInfo::new(object, data_blocks, parity_blocks);
+        fi.volume = bucket.to_string();
+        fi.name = object.to_string();
+        fi.size = 1;
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        fi.metadata.insert("etag".to_string(), "handwritten-etag".to_string());
+        fi.add_object_part(1, "part-etag".to_string(), 1, None, 1, None, None);
+        fi
+    }
+
+    #[tokio::test]
+    async fn dangling_zero_parity_version_reads_as_not_found() {
+        // An EC:0 version on a default EC:2 set passes the common-parity check
+        // with four of six copies (n/2 + 1), so its read fails at the later
+        // read-quorum reduction, which must classify it as well.
+        let bucket = "dangling-read-zero-parity";
+        let object = "torn/zero-parity";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        write_metadata_copies(&set, bucket, object, &handwritten_version(bucket, object, DRIVES, 0), 4).await;
+
+        let is_not_found = |err: &StorageError| matches!(err, StorageError::ObjectNotFound(b, o) if b == bucket && o == object);
+        let Err(err) = head(&set, bucket, object, None).await else {
+            panic!("HEAD must not serve a zero-parity object missing two shards");
+        };
+        assert!(is_not_found(&err), "HEAD of a dangling zero-parity object must be NoSuchKey: {err:?}");
+        let Err(err) = get(&set, bucket, object, None).await else {
+            panic!("GET must not serve a zero-parity object missing two shards");
+        };
+        assert!(is_not_found(&err), "GET of a dangling zero-parity object must be NoSuchKey: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn dangling_classification_keeps_quorum_error_for_remote_versions() {
+        // Local metadata is the only pointer to tiered data, and heal never
+        // deletes a remote candidate as dangling, so GET must not report it absent.
+        let bucket = "dangling-read-remote";
+        let object = "torn/transitioned";
+        let (_dirs, set) = dangling_test_set(bucket).await;
+        let mut fi = handwritten_version(bucket, object, DRIVES - PARITY, PARITY);
+        fi.transition_status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
+        fi.transition_tier = "WARM".to_string();
+        fi.transitioned_objname = "remote/torn/transitioned".to_string();
+        assert!(fi.is_remote(), "the fixture must be a remote version");
+        write_metadata_copies(&set, bucket, object, &fi, 3).await;
+
+        assert_get_and_head_keep_read_quorum_error(&set, bucket, object, "remote version").await;
+    }
+
+    #[tokio::test]
+    async fn dangling_classification_skips_the_meta_bucket() {
+        // Like MinIO, internal objects are never classified: their readers
+        // treat not-found as absent configuration.
+        let object = "config/dangling-read.json";
+        let (dirs, set) = dangling_test_set("dangling-read-meta").await;
+        put(&set, RUSTFS_META_BUCKET, object, b"internal config", false).await;
+        remove_object_from(&dirs, RUSTFS_META_BUCKET, object, &[3, 4, 5]).await;
+
+        assert_get_and_head_keep_read_quorum_error(&set, RUSTFS_META_BUCKET, object, "meta bucket").await;
     }
 }

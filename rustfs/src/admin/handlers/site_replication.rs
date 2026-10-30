@@ -15,7 +15,7 @@
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_deployment_id, current_federated_identity_service, current_iam_handle, current_object_store_handle, current_region,
+    current_deployment_id, current_iam_handle, current_object_store_handle, current_oidc_config_query, current_region,
     current_replication_pool_handle, current_replication_stats_handle, current_server_config, current_token_signing_key,
     object_store_from_req,
 };
@@ -169,6 +169,7 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
         "s3:PutObject",
         "s3:DeleteObject",
         "s3:DeleteObjectVersion",
+        "s3:ForceDeleteObject",
         "s3:ReplicateObject",
         "s3:ReplicateDelete",
         "s3:ReplicateTags",
@@ -189,6 +190,29 @@ fn site_replicator_service_account_policy() -> S3Result<Policy> {
 }"#,
     )
     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("parse site replicator policy failed: {e}")))
+}
+
+/// A replicated force-delete needs an explicit `s3:ForceDeleteObject` on the peer; `s3:*` does not grant it.
+/// Accounts created before the action was added to the policy lack it and must be refreshed in place.
+async fn site_replicator_policy_allows_force_delete(policy: Option<&Policy>) -> bool {
+    let Some(policy) = policy else {
+        return false;
+    };
+    let groups: Option<Vec<String>> = None;
+    let claims = HashMap::new();
+    let conditions = HashMap::new();
+    let args = rustfs_policy::policy::Args {
+        account: SITE_REPLICATOR_SERVICE_ACCOUNT,
+        groups: &groups,
+        action: Action::S3Action(rustfs_policy::policy::action::S3Action::ForceDeleteObjectAction),
+        conditions: &conditions,
+        is_owner: false,
+        claims: &claims,
+        deny_only: false,
+        bucket: "bucket",
+        object: "prefix/",
+    };
+    policy.is_allowed(&args).await
 }
 
 // Lock order: lifecycle -> bucket-mutation admission -> per-bucket mutation
@@ -813,6 +837,18 @@ fn apply_public_peer_edit_tls_presence(state: &SiteReplicationState, incoming: &
     }
     if !presence.has_ca_cert_pem() {
         incoming.ca_cert_pem = existing.ca_cert_pem.clone();
+    }
+}
+
+/// An edit that omits the name keeps the stored one. Filled before the edit
+/// is planned so the fan-out and the endpoint-refresh journal carry the name
+/// too: a receiver that infers it from the new endpoint would rename the site.
+fn fill_omitted_peer_edit_name(state: &SiteReplicationState, incoming: &mut PeerInfo) {
+    if !incoming.name.is_empty() || incoming.deployment_id.is_empty() {
+        return;
+    }
+    if let Some(existing) = state.peers.get(&incoming.deployment_id) {
+        incoming.name = existing.name.clone();
     }
 }
 
@@ -1642,10 +1678,39 @@ async fn reconcile_site_replicator_service_account() -> S3Result<()> {
         Ok(_) => {
             // Never rebuild on an unread parent: `unwrap_or_default` here would compare an
             // empty string against a real parent and repair a healthy account on every boot.
-            let Ok((credentials, _)) = iam_sys.get_service_account(access_key).await else {
+            let Ok((credentials, stored_policy)) = iam_sys.get_service_account(access_key).await else {
                 return Ok(());
             };
             if credentials.parent_user == parent_user {
+                if site_replicator_policy_allows_force_delete(stored_policy.as_ref()).await {
+                    return Ok(());
+                }
+
+                iam_sys
+                    .update_service_account(
+                        access_key,
+                        UpdateServiceAccountOpts {
+                            session_policy: Some(session_policy),
+                            secret_key: None,
+                            name: None,
+                            description: None,
+                            expiration: None,
+                            status: None,
+                            parent_user: None,
+                            allow_site_replicator_account: true,
+                        },
+                    )
+                    .await
+                    .map_err(ApiError::from)?;
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "service_account_repaired",
+                    reason = "outdated_policy",
+                    parent = %parent_user,
+                    "admin site replication state"
+                );
                 return Ok(());
             }
 
@@ -2032,8 +2097,8 @@ async fn bootstrap_existing_metadata_after_add(
 }
 
 /// The OpenID half of the IDP settings a site reports to its site-replication
-/// peers, built from the providers this site has configured (in
-/// `list_providers` order) and the site's own region.
+/// peers, built from the active OIDC configuration snapshot and the site's own
+/// region.
 fn open_id_settings(providers: Vec<(String, OpenIDProviderSettings)>, region: String) -> OpenIDSettings {
     // `region` qualifies the provider identities, not the site: a site
     // without OpenID must report the empty settings in every region, or the
@@ -2043,53 +2108,53 @@ fn open_id_settings(providers: Vec<(String, OpenIDProviderSettings)>, region: St
         return OpenIDSettings::default();
     }
 
+    let mut providers = providers;
+    let claim_provider_index = providers
+        .iter()
+        .position(|(provider_id, _)| provider_id == "default")
+        .unwrap_or_default();
+    let (_, claim_provider) = providers.remove(claim_provider_index);
     let mut settings = OpenIDSettings {
         enabled: true,
         region,
+        claim_provider,
         ..Default::default()
     };
 
     for (provider_id, provider_settings) in providers {
-        let claim_provider_unset = settings.claim_provider.client_id.is_empty()
-            && settings.claim_provider.claim_name.is_empty()
-            && settings.claim_provider.role_policy.is_empty()
-            && settings.claim_provider.hashed_client_secret.is_empty();
-
-        if provider_id == "default" || claim_provider_unset {
-            settings.claim_provider = provider_settings;
-        } else {
-            settings.roles.insert(provider_id, provider_settings);
-        }
+        settings.roles.insert(provider_id, provider_settings);
     }
 
     settings
 }
 
+fn open_id_settings_from_snapshot(snapshot: &rustfs_iam::oidc::OidcSiteReplicationSnapshot, region: String) -> OpenIDSettings {
+    let providers = snapshot
+        .providers()
+        .iter()
+        .map(|provider| {
+            (
+                provider.provider_id.clone(),
+                OpenIDProviderSettings {
+                    claim_name: provider.claim_name.clone(),
+                    claim_userinfo_enabled: false,
+                    role_policy: provider.role_policy.clone(),
+                    client_id: provider.client_id.clone(),
+                    hashed_client_secret: provider.hashed_client_secret.clone(),
+                },
+            )
+        })
+        .collect();
+
+    open_id_settings(providers, region)
+}
+
 fn local_idp_settings() -> IDPSettings {
     let mut settings = IDPSettings::default();
-    if let Some(federation) = current_federated_identity_service() {
-        // A listed provider whose config cannot be resolved contributes
-        // nothing to the peer comparison, so it is dropped here rather than
-        // inside the settings builder.
-        let providers = federation
-            .list_providers()
-            .into_iter()
-            .filter_map(|provider| {
-                let config = federation.get_provider_config(&provider.provider_id)?;
-                Some((
-                    provider.provider_id.clone(),
-                    OpenIDProviderSettings {
-                        claim_name: config.claim_name.clone(),
-                        claim_userinfo_enabled: false,
-                        role_policy: config.role_policy.clone(),
-                        client_id: config.client_id.clone(),
-                        hashed_client_secret: hash_client_secret(config.client_secret.as_deref()),
-                    },
-                ))
-            })
-            .collect();
-        settings.open_id = open_id_settings(providers, current_region().map(|region| region.to_string()).unwrap_or_default());
-    }
+    let region = current_region().map(|region| region.to_string()).unwrap_or_default();
+    settings.open_id = current_oidc_config_query()
+        .map(|query| open_id_settings_from_snapshot(&query.site_replication_snapshot(), region))
+        .unwrap_or_default();
 
     let (ldap, ldap_configs) = load_ldap_idp_settings();
     settings.ldap = ldap;
@@ -2971,6 +3036,7 @@ fn merge_add_sites(
 }
 
 fn update_peer(mut state: SiteReplicationState, incoming: PeerInfo, ilm_expiry_override: Option<bool>) -> SiteReplicationState {
+    let name_omitted = incoming.name.is_empty();
     let mut peer = normalize_peer_info(incoming);
     // An older sender may still hold a placeholder after this site has
     // learned the real ID. Do not let that delivery downgrade the identity.
@@ -2981,6 +3047,15 @@ fn update_peer(mut state: SiteReplicationState, incoming: PeerInfo, ilm_expiry_o
         })
     {
         peer.deployment_id = existing.deployment_id.clone();
+    }
+    // An edit that omits the name (e.g. `mc admin replicate update --endpoint`)
+    // changes the endpoint only. Keep the stored name instead of the one
+    // inferred from the new endpoint, or the site is renamed after its host.
+    if name_omitted
+        && let Some(existing) = state.peers.get(&peer.deployment_id)
+        && !existing.name.is_empty()
+    {
+        peer.name = existing.name.clone();
     }
     // Remove the placeholder before persistence normalizes duplicate
     // endpoints; otherwise map ordering can discard the real identity.
@@ -7358,32 +7433,36 @@ where
 {
     let store =
         current_object_store_handle().ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
-    with_config_object_write_lock(store, SITE_REPLICATION_JOIN_ADMISSION_LOCK_PATH.to_string(), move || async move {
-        let fresh = load_site_replication_state().await?;
-        let fresh_local_peer = local_peer_at_endpoint(local_endpoint.clone(), &fresh);
-        if join_request_is_superseded(&fresh, join_req.updated_at) {
-            let peer = fresh
-                .peers
-                .get(&fresh_local_peer.deployment_id)
-                .cloned()
-                .unwrap_or(fresh_local_peer);
-            return Ok(PeerJoinOutcome::Superseded(peer));
-        }
-
-        apply_iam(join_req.clone()).await?;
-
-        let incoming_updated_at = join_req.updated_at;
-        update_site_replication_state_when_changed(move |state| {
-            let local_peer = local_peer_at_endpoint(local_endpoint, state);
-            if join_request_is_superseded(state, incoming_updated_at) {
-                let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
-                return Ok(StateCommit::Unchanged(PeerJoinOutcome::Superseded(peer)));
+    with_config_object_write_lock(
+        store,
+        SITE_REPLICATION_JOIN_ADMISSION_LOCK_PATH.to_string(),
+        move |_write_guard| async move {
+            let fresh = load_site_replication_state().await?;
+            let fresh_local_peer = local_peer_at_endpoint(local_endpoint.clone(), &fresh);
+            if join_request_is_superseded(&fresh, join_req.updated_at) {
+                let peer = fresh
+                    .peers
+                    .get(&fresh_local_peer.deployment_id)
+                    .cloned()
+                    .unwrap_or(fresh_local_peer);
+                return Ok(PeerJoinOutcome::Superseded(peer));
             }
-            apply_peer_join(state, &local_peer, join_req, defer_sync_state_enable);
-            Ok(StateCommit::Changed(PeerJoinOutcome::Applied(Box::new(state.clone()), local_peer)))
-        })
-        .await
-    })
+
+            apply_iam(join_req.clone()).await?;
+
+            let incoming_updated_at = join_req.updated_at;
+            update_site_replication_state_when_changed(move |state| {
+                let local_peer = local_peer_at_endpoint(local_endpoint, state);
+                if join_request_is_superseded(state, incoming_updated_at) {
+                    let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
+                    return Ok(StateCommit::Unchanged(PeerJoinOutcome::Superseded(peer)));
+                }
+                apply_peer_join(state, &local_peer, join_req, defer_sync_state_enable);
+                Ok(StateCommit::Changed(PeerJoinOutcome::Applied(Box::new(state.clone()), local_peer)))
+            })
+            .await
+        },
+    )
     .await
     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("lock site replication join admission failed: {e}")))?
 }
@@ -7731,6 +7810,7 @@ impl Operation for SiteReplicationEditHandler {
         // must not run under the state-object lock.
         let current_state = load_site_replication_state().await?;
         apply_public_peer_edit_tls_presence(&current_state, &mut incoming, tls_presence);
+        fill_omitted_peer_edit_name(&current_state, &mut incoming);
         if !incoming.deployment_id.is_empty() || !incoming.endpoint.is_empty() || !incoming.name.is_empty() {
             validate_proposed_peer(&incoming)?;
         }
@@ -8878,6 +8958,8 @@ mod tests {
     }
 
     /// Publish a ready IAM app context so `apply_iam_item` gets past its IAM guard.
+    /// Tests using this real storage fixture keep the `durable_iam_state_` prefix so
+    /// nextest reserves capacity while their internal races retain production deadlines.
     async fn publish_ready_iam_context() {
         use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
         use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
@@ -9077,7 +9159,7 @@ mod tests {
     /// every gated item type.
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_applies_delayed_in_order_updates_through_the_receiver() {
+    async fn durable_iam_state_apply_iam_item_applies_delayed_in_order_updates_through_the_receiver() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let iam = current_iam_handle().expect("test IAM");
@@ -9158,7 +9240,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn apply_group_member_add_preserves_a_disabled_group_status() {
+    async fn durable_iam_state_apply_group_member_add_preserves_a_disabled_group_status() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let iam = current_iam_handle().expect("test IAM");
@@ -9193,7 +9275,7 @@ mod tests {
     /// membership-only guard above exists to prevent.
     #[tokio::test]
     #[serial]
-    async fn apply_group_snapshot_propagates_a_disabled_status_with_members() {
+    async fn durable_iam_state_apply_group_snapshot_propagates_a_disabled_status_with_members() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let iam = current_iam_handle().expect("test IAM");
@@ -9228,7 +9310,7 @@ mod tests {
     /// the write of one cannot interleave with the other's.
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_serializes_a_concurrent_older_grant_and_newer_revoke() {
+    async fn durable_iam_state_apply_iam_item_serializes_a_concurrent_older_grant_and_newer_revoke() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let t1 = OffsetDateTime::now_utc() - time::Duration::hours(2);
@@ -9267,7 +9349,7 @@ mod tests {
     /// applied the delete; a genuinely newer create still lands.
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_rejects_a_stale_recreate_after_a_replicated_delete() {
+    async fn durable_iam_state_apply_iam_item_rejects_a_stale_recreate_after_a_replicated_delete() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let iam = current_iam_handle().expect("test IAM");
@@ -9312,7 +9394,7 @@ mod tests {
     /// then switched off, and carries the source stamp.
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_creates_a_replicated_service_account_with_its_status() {
+    async fn durable_iam_state_apply_iam_item_creates_a_replicated_service_account_with_its_status() {
         publish_ready_iam_context().await;
         seed_two_peer_state_for_iam_apply().await;
         let iam = current_iam_handle().expect("test IAM");
@@ -9341,7 +9423,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_accepts_minio_sts_account_item_type() {
+    async fn durable_iam_state_apply_iam_item_accepts_minio_sts_account_item_type() {
         publish_ready_iam_context().await;
 
         // MinIO madmin-go sends `SRIAMItemSTSAcc = "sts-account"`. The bogus session token
@@ -9363,7 +9445,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn apply_iam_item_still_accepts_legacy_sts_credential_item_type() {
+    async fn durable_iam_state_apply_iam_item_still_accepts_legacy_sts_credential_item_type() {
         publish_ready_iam_context().await;
 
         // Older RustFS peers emit `sts-credential`; the alias stays accepted permanently
@@ -10607,6 +10689,31 @@ mod tests {
         assert!(!policy.is_allowed(&put_policy_args).await);
     }
 
+    // A replicated force-delete (Console folder delete, `x-rustfs-force-delete: true`) is rejected by the
+    // peer with AccessDenied unless the replication account names `s3:ForceDeleteObject` explicitly.
+    #[tokio::test]
+    async fn test_site_replicator_policy_allows_force_delete_replication() {
+        let policy = site_replicator_service_account_policy().expect("site replicator policy should parse");
+        assert!(site_replicator_policy_allows_force_delete(Some(&policy)).await);
+    }
+
+    // Accounts created before the action was added keep their stored policy until the reconciler refreshes it.
+    #[tokio::test]
+    async fn test_outdated_site_replicator_policy_is_not_treated_as_current() {
+        assert!(!site_replicator_policy_allows_force_delete(None).await);
+
+        let outdated: Policy = serde_json::from_value(serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion", "s3:ReplicateDelete", "s3:*"],
+                "Resource": ["arn:aws:s3:::*/*"]
+            }]
+        }))
+        .expect("outdated policy should parse");
+        assert!(!site_replicator_policy_allows_force_delete(Some(&outdated)).await);
+    }
+
     // The replication service account must be able to carry object-lock metadata to the peer.
     // Without these actions the peer answers AccessDenied for any replicated object that has
     // retention or a legal hold, so a WORM-protected object never reaches the replica at all,
@@ -11380,6 +11487,63 @@ mod tests {
         }
     }
 
+    fn oidc_snapshot_provider(id: &str, client_id: &str) -> rustfs_iam::oidc::SourcedOidcProviderConfig {
+        rustfs_iam::oidc::SourcedOidcProviderConfig {
+            config: rustfs_iam::oidc::OidcProviderConfig {
+                id: id.to_string(),
+                enabled: true,
+                config_url: format!("https://idp.example.com/{id}/.well-known/openid-configuration"),
+                issuer: None,
+                client_id: client_id.to_string(),
+                client_secret: Some("secret".to_string()),
+                scopes: vec!["openid".to_string()],
+                other_audiences: Vec::new(),
+                redirect_uri: None,
+                redirect_uri_dynamic: true,
+                claim_name: "groups".to_string(),
+                claim_prefix: String::new(),
+                role_policy: "readwrite".to_string(),
+                display_name: id.to_string(),
+                groups_claim: "groups".to_string(),
+                roles_claim: String::new(),
+                email_claim: "email".to_string(),
+                username_claim: "username".to_string(),
+                hide_from_ui: false,
+            },
+            source: rustfs_iam::oidc::OidcProviderConfigSource::Persisted,
+        }
+    }
+
+    fn ldap_settings_kvs() -> rustfs_config::server_config::KVS {
+        rustfs_config::server_config::KVS(vec![
+            rustfs_config::server_config::KV {
+                key: "enable".to_string(),
+                value: "on".to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_config::server_config::KV {
+                key: "user_dn_search_base_dn".to_string(),
+                value: "ou=people,dc=example,dc=com".to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_config::server_config::KV {
+                key: "user_dn_search_filter".to_string(),
+                value: "(uid=%s)".to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_config::server_config::KV {
+                key: "group_search_base_dn".to_string(),
+                value: "ou=groups,dc=example,dc=com".to_string(),
+                hidden_if_empty: false,
+            },
+            rustfs_config::server_config::KV {
+                key: "group_search_filter".to_string(),
+                value: "(&(objectclass=groupOfNames)(member=%s))".to_string(),
+                hidden_if_empty: false,
+            },
+        ])
+    }
+
     // rustfs#7003: the site region is per-site and must not reach the peer
     // IDP comparison while OpenID is unconfigured, or two sites in different
     // regions can never be paired even with an identical (empty) IDP config.
@@ -11404,6 +11568,124 @@ mod tests {
         assert!(settings.enabled);
         assert_eq!(settings.region, "eu-site-1");
         assert_eq!(settings.claim_provider.client_id, "client-a");
+    }
+
+    #[test]
+    fn test_open_id_settings_uses_first_named_provider_without_default() {
+        let settings = open_id_settings(
+            vec![
+                ("alpha".to_string(), openid_provider("client-a")),
+                ("corp".to_string(), openid_provider("client-b")),
+            ],
+            "eu-site-1".to_string(),
+        );
+
+        assert_eq!(settings.claim_provider.client_id, "client-a");
+        assert_eq!(settings.roles.get("corp").map(|provider| provider.client_id.as_str()), Some("client-b"));
+    }
+
+    #[test]
+    fn idp_settings_preserve_site_replication_wire_shape() {
+        let (ldap, ldap_configs) = ldap_settings_from_kvs(&ldap_settings_kvs());
+        let settings = IDPSettings {
+            ldap,
+            ldap_configs,
+            open_id: open_id_settings(
+                vec![
+                    ("default".to_string(), openid_provider("client-a")),
+                    ("corp".to_string(), openid_provider("client-b")),
+                ],
+                "eu-site-1".to_string(),
+            ),
+        };
+
+        assert_eq!(
+            serde_json::to_value(settings).expect("serialize IDP settings"),
+            serde_json::json!({
+                "LDAP": {
+                    "IsLDAPEnabled": true,
+                    "LDAPUserDNSearchBase": "ou=people,dc=example,dc=com",
+                    "LDAPUserDNSearchFilter": "(uid=%s)",
+                    "LDAPGroupSearchBase": "ou=groups,dc=example,dc=com",
+                    "LDAPGroupSearchFilter": "(&(objectclass=groupOfNames)(member=%s))",
+                },
+                "LDAPConfigs": {
+                    "Enabled": true,
+                    "Configs": {
+                        "default": {
+                            "UserDNSearchBase": "ou=people,dc=example,dc=com",
+                            "UserDNSearchFilter": "(uid=%s)",
+                            "GroupSearchBase": "ou=groups,dc=example,dc=com",
+                            "GroupSearchFilter": "(&(objectclass=groupOfNames)(member=%s))",
+                        }
+                    }
+                },
+                "OpenID": {
+                    "Enabled": true,
+                    "Region": "eu-site-1",
+                    "Roles": {
+                        "corp": {
+                            "ClaimName": "groups",
+                            "ClaimUserinfoEnabled": false,
+                            "RolePolicy": "readwrite",
+                            "ClientID": "client-b",
+                            "HashedClientSecret": "hashed",
+                        }
+                    },
+                    "ClaimProvider": {
+                        "ClaimName": "groups",
+                        "ClaimUserinfoEnabled": false,
+                        "RolePolicy": "readwrite",
+                        "ClientID": "client-a",
+                        "HashedClientSecret": "hashed",
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn oidc_config_snapshot_preserves_site_replication_settings() {
+        let snapshot = rustfs_iam::oidc::OidcSiteReplicationSnapshot::from_config_snapshot(
+            &rustfs_iam::oidc::OidcConfigSnapshot::new(vec![
+                oidc_snapshot_provider("corp", "client-b"),
+                oidc_snapshot_provider("default", "client-a"),
+            ]),
+        );
+
+        assert_eq!(
+            snapshot
+                .providers()
+                .iter()
+                .map(|provider| provider.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "corp"]
+        );
+
+        assert_eq!(
+            serde_json::to_value(open_id_settings_from_snapshot(&snapshot, "eu-site-1".to_string()))
+                .expect("serialize OpenID settings"),
+            serde_json::json!({
+                "Enabled": true,
+                "Region": "eu-site-1",
+                "Roles": {
+                    "corp": {
+                        "ClaimName": "groups",
+                        "ClaimUserinfoEnabled": false,
+                        "RolePolicy": "readwrite",
+                        "ClientID": "client-b",
+                        "HashedClientSecret": "K7gNU3sdo-OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols",
+                    }
+                },
+                "ClaimProvider": {
+                    "ClaimName": "groups",
+                    "ClaimUserinfoEnabled": false,
+                    "RolePolicy": "readwrite",
+                    "ClientID": "client-a",
+                    "HashedClientSecret": "K7gNU3sdo-OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols",
+                }
+            })
+        );
     }
 
     // A whole provider object present on one side only must not spill its
@@ -12934,6 +13216,97 @@ mod tests {
         let edited = edit_state(state, PeerInfo::default(), Some(true));
 
         assert!(edited.peers.values().all(|peer| peer.replicate_ilm_expiry));
+    }
+
+    fn endpoint_only_edit_fixture() -> (SiteReplicationState, PeerInfo, PeerInfo) {
+        let local = PeerInfo {
+            deployment_id: "local".to_string(),
+            ..peer("sr3-a", "https://site-a.example.com")
+        };
+        let edited = PeerInfo {
+            deployment_id: "edited".to_string(),
+            ..peer("sr3-c", "https://site-c.example.com")
+        };
+        let state = SiteReplicationState {
+            name: "sr3-a".to_string(),
+            peers: BTreeMap::from([("local".to_string(), local.clone()), ("edited".to_string(), edited)]),
+            ..Default::default()
+        };
+        // What `mc admin replicate update --deployment-id <ID> --endpoint <URL>`
+        // sends: the deployment ID and the new endpoint, no name.
+        let incoming = PeerInfo {
+            deployment_id: "edited".to_string(),
+            ..peer("", "https://moved-c.example.com")
+        };
+        (state, local, incoming)
+    }
+
+    #[test]
+    fn test_endpoint_only_edit_keeps_stored_peer_name_on_editing_site() {
+        let (state, _, incoming) = endpoint_only_edit_fixture();
+
+        let edited = edit_state(state, incoming, None);
+
+        let peer = &edited.peers["edited"];
+        assert_eq!(peer.name, "sr3-c");
+        assert_eq!(peer.endpoint, "https://moved-c.example.com");
+        assert_eq!(edited.name, "sr3-a");
+        assert_eq!(edited.peers.len(), 2);
+    }
+
+    #[test]
+    fn test_endpoint_only_edit_keeps_stored_peer_name_on_receivers() {
+        let (state, local, incoming) = endpoint_only_edit_fixture();
+
+        let updated = apply_internal_peer_edit(state, &local, incoming, None).expect("endpoint-only edit");
+
+        assert_eq!(updated.peers["edited"].name, "sr3-c");
+        assert_eq!(updated.peers["edited"].endpoint, "https://moved-c.example.com");
+        assert_eq!(updated.name, "sr3-a");
+    }
+
+    #[test]
+    fn test_endpoint_only_edit_keeps_name_on_the_edited_site_itself() {
+        let (mut state, _, incoming) = endpoint_only_edit_fixture();
+        state.name = "sr3-c".to_string();
+        let edited_local = PeerInfo {
+            deployment_id: "edited".to_string(),
+            ..peer("sr3-c", "https://moved-c.example.com")
+        };
+
+        let updated = apply_internal_peer_edit(state, &edited_local, incoming, None).expect("endpoint-only edit");
+
+        assert_eq!(updated.peers["edited"].name, "sr3-c");
+        assert_eq!(updated.name, "sr3-c");
+    }
+
+    #[test]
+    fn test_public_endpoint_only_edit_carries_stored_name_to_peers() {
+        let (state, _, mut incoming) = endpoint_only_edit_fixture();
+
+        fill_omitted_peer_edit_name(&state, &mut incoming);
+
+        assert_eq!(incoming.name, "sr3-c");
+        assert_eq!(normalize_peer_info(incoming).name, "sr3-c");
+    }
+
+    #[test]
+    fn test_peer_edit_name_rules_for_renames_and_unknown_peers() {
+        let (state, local, mut incoming) = endpoint_only_edit_fixture();
+        incoming.name = "renamed".to_string();
+        let renamed = apply_internal_peer_edit(state.clone(), &local, incoming, None).expect("rename");
+        assert_eq!(renamed.peers["edited"].name, "renamed");
+
+        // A peer this site does not know yet still gets its name inferred
+        // from the endpoint, as add and join have always done.
+        let mut unknown = PeerInfo {
+            deployment_id: "new".to_string(),
+            ..peer("", "http://new-site.example.com:9000")
+        };
+        fill_omitted_peer_edit_name(&state, &mut unknown);
+        assert!(unknown.name.is_empty());
+        let added = update_peer(state, unknown, None);
+        assert_eq!(added.peers["new"].name, "new-site.example.com");
     }
 
     #[test]
@@ -14488,33 +14861,7 @@ mod tests {
 
     #[test]
     fn test_ldap_settings_from_kvs_reads_minio_style_keys() {
-        let kvs = rustfs_config::server_config::KVS(vec![
-            rustfs_config::server_config::KV {
-                key: "enable".to_string(),
-                value: "on".to_string(),
-                hidden_if_empty: false,
-            },
-            rustfs_config::server_config::KV {
-                key: "user_dn_search_base_dn".to_string(),
-                value: "ou=people,dc=example,dc=com".to_string(),
-                hidden_if_empty: false,
-            },
-            rustfs_config::server_config::KV {
-                key: "user_dn_search_filter".to_string(),
-                value: "(uid=%s)".to_string(),
-                hidden_if_empty: false,
-            },
-            rustfs_config::server_config::KV {
-                key: "group_search_base_dn".to_string(),
-                value: "ou=groups,dc=example,dc=com".to_string(),
-                hidden_if_empty: false,
-            },
-            rustfs_config::server_config::KV {
-                key: "group_search_filter".to_string(),
-                value: "(&(objectclass=groupOfNames)(member=%s))".to_string(),
-                hidden_if_empty: false,
-            },
-        ]);
+        let kvs = ldap_settings_kvs();
 
         let (ldap, ldap_configs) = ldap_settings_from_kvs(&kvs);
 
@@ -15400,7 +15747,7 @@ mod tests {
     /// would delete the retry queue and every other field along with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn test_missed_pending_clear_must_not_rewrite_the_state_object() {
+    async fn durable_iam_state_test_missed_pending_clear_must_not_rewrite_the_state_object() {
         publish_ready_iam_context().await;
 
         // One peer, no pending records: exactly the shape the persist helper's clear
@@ -15461,7 +15808,7 @@ mod tests {
     /// write before A finishes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_peer_join_admission_serializes_iam_apply_against_a_newer_join() {
+    async fn durable_iam_state_test_peer_join_admission_serializes_iam_apply_against_a_newer_join() {
         publish_ready_iam_context().await;
 
         // Whole-second timestamps so the RFC3339 round trip through the state
@@ -15565,7 +15912,7 @@ mod tests {
     /// admission: the assertion on the empty IAM log turns red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_peer_join_admission_serializes_across_separate_nodes() {
+    async fn durable_iam_state_test_peer_join_admission_serializes_across_separate_nodes() {
         publish_ready_iam_context().await;
 
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).expect("truncate nanos");
@@ -15662,7 +16009,7 @@ mod tests {
     /// acked rotation is cleared in the same transaction that reports true.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn test_finalize_pending_rotation_three_way_contract() {
+    async fn durable_iam_state_test_finalize_pending_rotation_three_way_contract() {
         publish_ready_iam_context().await;
 
         let local_peer = PeerInfo {
@@ -15744,7 +16091,7 @@ mod tests {
     /// update.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_state_object_lock_serializes_writers_from_separate_nodes() {
+    async fn durable_iam_state_test_state_object_lock_serializes_writers_from_separate_nodes() {
         publish_ready_iam_context().await;
 
         let seed = SiteReplicationState {
@@ -15796,7 +16143,7 @@ mod tests {
     /// leave the receiver unable to tell which edit is newer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_peer_edit_generations_are_unique_across_nodes() {
+    async fn durable_iam_state_test_peer_edit_generations_are_unique_across_nodes() {
         publish_ready_iam_context().await;
         // A configured site: `persist_site_replication_state_no_lock` clears
         // the object once a site drops below two peers, and a cleared object
@@ -15847,7 +16194,7 @@ mod tests {
     /// accepts the restarted counter instead of fencing it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_recreated_state_object_allocates_over_the_previous_lifetimes_mark() {
+    async fn durable_iam_state_test_recreated_state_object_allocates_over_the_previous_lifetimes_mark() {
         publish_ready_iam_context().await;
         let seed = || SiteReplicationState {
             peers: ["site-a", "site-b"]
@@ -15912,7 +16259,7 @@ mod tests {
     /// (the red-light commit pinned the exact interleaving).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_retry_event_persist_must_not_wipe_concurrent_locked_rmw() {
+    async fn durable_iam_state_test_retry_event_persist_must_not_wipe_concurrent_locked_rmw() {
         publish_ready_iam_context().await;
 
         const ROUNDS: usize = 8;

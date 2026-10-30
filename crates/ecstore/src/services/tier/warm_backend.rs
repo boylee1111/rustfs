@@ -22,7 +22,7 @@ use crate::services::tier::warm_backend_gcs::WarmBackendGCS;
 use crate::services::tier::{
     tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_INVALID_CONFIG, ERR_TIER_TYPE_UNSUPPORTED},
     tier_config::{TierConfig, TierType},
-    tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR},
+    tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR},
     warm_backend_aliyun::WarmBackendAliyun,
     warm_backend_azure::WarmBackendAzure,
     warm_backend_huaweicloud::WarmBackendHuaweicloud,
@@ -40,7 +40,7 @@ use rustfs_s3_client::credentials::{Credentials, SignatureType, Static, Value};
 use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts, TransitionCore};
 use rustfs_s3_client::{
     admin_handler_utils::AdminError,
-    api_error_response::to_error_response,
+    api_error_response::{ErrorResponse, to_error_response},
     api_put_object::{AdvancedPutOptions, PutObjectOptions},
     transition_api::{ReadCloser, ReaderImpl},
 };
@@ -298,6 +298,11 @@ pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap
         }
     }
 
+    // x-minio-internal-* is reserved by MinIO and its derivatives; they reject
+    // any request carrying it with 400 InvalidArgument. The transition ids above
+    // are the only internal keys the remote needs, and they travel as x-amz-meta-*.
+    metadata.retain(|key, _| !rustfs_utils::http::is_internal_key(key));
+
     opts.user_metadata = metadata;
     opts
 }
@@ -322,11 +327,9 @@ pub(crate) struct S3CompatibleWarmBackendParams<'a> {
     /// and metrics stay attributable.
     pub provider_tag: &'a str,
     /// SSRF guard run against the parsed endpoint once it's known to have a
-    /// host. Almost every provider passes [`rustfs_utils::egress::validate_outbound_url`]
-    /// unchanged; RustFS passes its own wrapper that adds a debug-only,
-    /// env-gated loopback exception for its e2e tier tests (see
-    /// rustfs/rustfs#6773) — the shared constructor stays the single call
-    /// site either way, so no provider can silently end up unvalidated.
+    /// host. Cloud providers use [`rustfs_utils::egress::validate_outbound_url`];
+    /// MinIO allows private storage endpoints, and RustFS additionally wraps
+    /// that policy with its debug-only, env-gated loopback exception.
     pub validate_endpoint: fn(&url::Url) -> Result<(), rustfs_utils::egress::OutboundUrlError>,
 }
 
@@ -669,6 +672,17 @@ fn probe_cleanup_incomplete_error() -> AdminError {
     err
 }
 
+fn is_remote_tier_auth_rejection(err: &std::io::Error) -> bool {
+    let Some(response) = err.get_ref().and_then(|err| err.downcast_ref::<ErrorResponse>()) else {
+        return false;
+    };
+    matches!(response.status_code, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        || matches!(
+            response.code,
+            S3ErrorCode::AccessDenied | S3ErrorCode::InvalidAccessKeyId | S3ErrorCode::SignatureDoesNotMatch
+        )
+}
+
 async fn check_warm_backend_with_deadlines(
     w: Option<&WarmBackendImpl>,
     deadline: tokio::time::Instant,
@@ -689,6 +703,9 @@ async fn check_warm_backend_with_deadlines(
         tokio::time::timeout_at(deadline, w.put(&probe_object, ReaderImpl::Body(Bytes::from_static(b"RustFS")), 6)).await;
     let remote_version_id = match put_result {
         Ok(Ok(remote_version_id)) => remote_version_id,
+        Ok(Err(err)) if is_remote_tier_auth_rejection(&err) => {
+            return Err(ERR_TIER_INVALID_CREDENTIALS.clone());
+        }
         Ok(Err(_)) => {
             return Err(match compensate_uncertain_probe_put(w, &probe_object, cleanup_deadline).await {
                 Ok(()) => ERR_TIER_PERM_ERR.clone(),
@@ -1285,6 +1302,13 @@ mod tests {
         removed_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
+    struct AuthRejectingProbePutBackend {
+        status_code: StatusCode,
+        code: S3ErrorCode,
+        probes: Arc<AtomicUsize>,
+        removes: Arc<AtomicUsize>,
+    }
+
     #[derive(Clone, Copy)]
     enum ProbeBody {
         Exact,
@@ -1520,6 +1544,46 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl WarmBackend for AuthRejectingProbePutBackend {
+        async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
+            Err(std::io::Error::other(rustfs_s3_client::api_error_response::ErrorResponse {
+                status_code: self.status_code,
+                code: self.code.clone(),
+                message: "remote credentials rejected".to_string(),
+                ..Default::default()
+            }))
+        }
+
+        async fn put_with_meta(
+            &self,
+            object: &str,
+            r: ReaderImpl,
+            length: i64,
+            _meta: HashMap<String, String>,
+        ) -> Result<String, std::io::Error> {
+            self.put(object, r, length).await
+        }
+
+        async fn get(&self, _object: &str, _rv: &str, _opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+            Err(std::io::Error::other("GET must not run after an auth-rejected probe PUT"))
+        }
+
+        async fn remove(&self, _object: &str, _rv: &str) -> Result<(), std::io::Error> {
+            self.removes.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("remove must not run after a deterministic auth rejection"))
+        }
+
+        async fn probe_transition_candidate(&self, _object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("probe must not run after a deterministic auth rejection"))
+        }
+
+        async fn in_use(&self) -> Result<bool, std::io::Error> {
+            Ok(false)
+        }
+    }
+
     #[tokio::test]
     async fn check_warm_backend_validates_before_probe_io() {
         let validations = Arc::new(AtomicUsize::new(0));
@@ -1698,6 +1762,34 @@ mod tests {
         assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
         assert!(err.message.contains("cleanup is incomplete"));
         assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_reports_auth_rejected_probe_put_as_invalid_credentials() {
+        for (status_code, code) in [
+            (StatusCode::FORBIDDEN, S3ErrorCode::AccessDenied),
+            (StatusCode::UNAUTHORIZED, S3ErrorCode::Custom("".into())),
+            (StatusCode::OK, S3ErrorCode::InvalidAccessKeyId),
+            (StatusCode::OK, S3ErrorCode::SignatureDoesNotMatch),
+        ] {
+            let probes = Arc::new(AtomicUsize::new(0));
+            let removes = Arc::new(AtomicUsize::new(0));
+            let backend: WarmBackendImpl = Box::new(AuthRejectingProbePutBackend {
+                status_code,
+                code,
+                probes: probes.clone(),
+                removes: removes.clone(),
+            });
+
+            let err = check_warm_backend(Some(&backend))
+                .await
+                .expect_err("a deterministic remote-auth rejection should not become an uncertain probe error");
+
+            assert_eq!(err.code, ERR_TIER_INVALID_CREDENTIALS.code);
+            assert_eq!(err.status_code, StatusCode::BAD_REQUEST);
+            assert_eq!(probes.load(Ordering::SeqCst), 0);
+            assert_eq!(removes.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1914,11 +2006,8 @@ mod tests {
         assert_eq!(err.to_string(), "Invalid endpoint URL: missing host");
     }
 
-    /// Every migrated provider that uses `validate_outbound_url` directly (all
-    /// but RustFS, which injects its own debug-only, env-gated wrapper — see
-    /// rustfs/rustfs#6773) goes through this one construction path, so the
-    /// SSRF guard only needs to be pinned here rather than once per provider
-    /// file (see backlog#2040's migrate steps and rustfs/rustfs#6764).
+    /// Cloud providers retain the strict literal guard through the shared
+    /// constructor; self-hosted providers inject their own policy.
     #[tokio::test]
     async fn s3_compatible_backend_rejects_a_loopback_endpoint_before_any_network_setup() {
         let err = init_error(s3_compatible_params("https://127.0.0.1:9000"), "a loopback endpoint must be rejected").await;
@@ -2153,6 +2242,38 @@ mod tests {
                 rustfs_utils::http::metadata_compat::MINIO_INTERNAL_PREFIX
             )));
         }
+    }
+
+    #[test]
+    fn build_transition_put_options_drops_reserved_internal_headers() {
+        let transaction_suffix = rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TRANSACTION_ID;
+        let mut metadata = HashMap::new();
+        for suffix in [
+            rustfs_utils::http::SUFFIX_INLINE_DATA,
+            rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+            rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
+            transaction_suffix,
+        ] {
+            rustfs_utils::http::metadata_compat::insert_str(&mut metadata, suffix, "x".to_string());
+        }
+        metadata.insert("X-Minio-Internal-Compression".to_string(), "klauspost/compress/s2".to_string());
+        metadata.insert("x-amz-meta-foo".to_string(), "bar".to_string());
+        metadata.insert("name".to_string(), "object".to_string());
+
+        let opts = build_transition_put_options("COLD".to_string(), metadata);
+
+        let leaked: Vec<_> = opts
+            .user_metadata
+            .keys()
+            .filter(|key| rustfs_utils::http::is_internal_key(key))
+            .collect();
+        assert!(leaked.is_empty(), "reserved internal keys must not reach the remote: {leaked:?}");
+        assert_eq!(opts.user_metadata.get("x-amz-meta-foo").map(String::as_str), Some("bar"));
+        assert_eq!(opts.user_metadata.get("name").map(String::as_str), Some("object"));
+        assert!(opts.user_metadata.contains_key(&format!(
+            "x-amz-meta-{}",
+            rustfs_utils::http::metadata_compat::internal_key_rustfs(transaction_suffix)
+        )));
     }
 
     #[test]

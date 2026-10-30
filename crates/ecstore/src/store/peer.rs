@@ -18,6 +18,11 @@ use crate::disk::error::{DiskError, Result as DiskResult};
 use crate::disk::{DeleteOptions, Disk, RenameDataGuards, RenameDataResp};
 use crate::runtime::instance::{InstanceContext, NamespaceCommitGuard};
 use crate::runtime::sources as runtime_sources;
+use rustfs_io_metrics::{
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_ADMIT, PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOCAL_RENAME,
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOOKUP, PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_OVERHEAD,
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_TOTAL,
+};
 use tracing::{debug, error};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -80,6 +85,163 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    /// Resolve a quota lease against this request's captured storage instance.
+    pub async fn quota_mutation_fence_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        Ok(disk)
+    }
+
+    pub async fn write_local_metadata_at_incarnation(
+        self: &Arc<Self>,
+        disk_ref: &str,
+        target: (&str, &str),
+        fi: FileInfo,
+        expected: Uuid,
+    ) -> DiskResult<()> {
+        if crate::disk::remote_io_admission::active() {
+            local_disk_candidate(&self.ctx, disk_ref).await?;
+        }
+        let disk_ref = disk_ref.to_owned();
+        let path = target.1.to_owned();
+        self.run_bucket_heal_at_incarnation(target.0, expected, &Default::default(), move |store, volume, _| async move {
+            let (disk, id) = local_disk_candidate(&store.ctx, &disk_ref).await?;
+            let _owner = admit_local_disk(&store.ctx, &disk, id, true).await?;
+            disk.write_metadata("", &volume, &path, fi).await.map_err(Into::into)
+        })
+        .await
+        .map_err(|error| DiskError::other(error.to_string()))
+    }
+
+    pub async fn delete_local_path_at_incarnation(
+        self: &Arc<Self>,
+        disk_ref: &str,
+        target: (&str, &str),
+        opts: DeleteOptions,
+        expected: Uuid,
+    ) -> DiskResult<()> {
+        if crate::disk::remote_io_admission::active() {
+            local_disk_candidate(&self.ctx, disk_ref).await?;
+        }
+        let disk_ref = disk_ref.to_owned();
+        let path = target.1.to_owned();
+        self.run_bucket_heal_at_incarnation(target.0, expected, &Default::default(), move |store, volume, _| async move {
+            let (disk, id) = local_disk_candidate(&store.ctx, &disk_ref).await?;
+            let owner = admit_local_disk(&store.ctx, &disk, id, true).await?;
+            let scope = super::bucket_heal_scope(&volume).ok_or_else(|| StorageError::other("missing bucket heal scope"))?;
+            scope.check()?;
+            disk.delete_with_namespace_owner(&volume, &path, opts, Some(Arc::new((scope, owner))))
+                .await
+                .map_err(Into::into)
+        })
+        .await
+        .map_err(|error| DiskError::other(error.to_string()))
+    }
+
+    pub async fn delete_local_version_at_incarnation(
+        &self,
+        disk_ref: &str,
+        target: (&str, &str),
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+        expected: Uuid,
+    ) -> DiskResult<()> {
+        if expected.is_nil() || opts.undo_write || self.ctx.lock_manager().is_disabled() {
+            return Err(DiskError::other("invalid incarnation-bound heal deletion"));
+        }
+        if crate::disk::remote_io_admission::active() {
+            local_disk_candidate(&self.ctx, disk_ref).await?;
+        }
+        let fence = Arc::new(
+            self.acquire_bucket_incarnation_fence(target.0, expected)
+                .await
+                .map_err(|error| DiskError::other(error.to_string()))?,
+        );
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let owner = admit_local_disk(&self.ctx, &disk, id, true).await?;
+        if fence.is_lock_lost() {
+            return Err(DiskError::other("bucket heal incarnation fence was lost"));
+        }
+        disk.delete_version_with_namespace_owner(target.0, target.1, fi, force_del_marker, opts, Some(Arc::new((fence, owner))))
+            .await
+    }
+
+    /// Target-side admission for an incarnation-bound heal rename. The physical
+    /// namespace operations retain the lifecycle owner after RPC cancellation.
+    pub async fn rename_local_data_at_incarnation(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+        expected: Uuid,
+    ) -> DiskResult<RenameDataResp> {
+        if expected.is_nil() || self.ctx.lock_manager().is_disabled() {
+            return Err(DiskError::other(
+                "incarnation-bound rename requires namespace locking and a non-nil identity",
+            ));
+        }
+        let bucket = if destination.0 == RUSTFS_META_BUCKET {
+            super::heal::bucket_metadata_owner(destination.1).ok_or(DiskError::FileAccessDenied)?
+        } else {
+            destination.0
+        };
+        let guard = Arc::new(
+            self.acquire_bucket_incarnation_fence(bucket, expected)
+                .await
+                .map_err(|error| DiskError::other(error.to_string()))?,
+        );
+        if guard.is_lock_lost() {
+            return Err(DiskError::other("bucket heal incarnation fence was lost"));
+        }
+        let transaction = if destination.0 == RUSTFS_META_BUCKET {
+            // The receiver must retain the config fence after an RPC timeout.
+            // A delayed request must also reject a newer config in the same
+            // bucket incarnation before publishing its older repair payload.
+            let transaction = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket)
+                .await
+                .map_err(|error| DiskError::other(error.to_string()))?;
+            let (current, _) = self
+                .get_pool_info_for_delete_marker(
+                    destination.0,
+                    destination.1,
+                    &ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| DiskError::other(error.to_string()))?;
+            let current = current.object_info;
+            if transaction.is_lock_lost()
+                || guard.is_lock_lost()
+                || fi.mod_time.is_none()
+                || current.mod_time != fi.mod_time
+                || current.data_dir != fi.data_dir
+                || current.size != fi.size
+                || current.etag != fi.get_etag()
+            {
+                return Err(DiskError::FileAccessDenied);
+            }
+            Some(transaction)
+        } else {
+            None
+        };
+        rename_local_data_with_ctx(
+            &self.ctx,
+            disk_ref,
+            source,
+            fi,
+            destination,
+            RenameDataGuards {
+                external_guard: Some(Arc::new((guard, transaction))),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
     /// Execute on this instance's active local disk through the physical owner.
     pub async fn rename_local_data(
         &self,
@@ -90,11 +252,11 @@ impl ECStore {
         scanner_token: Option<Uuid>,
     ) -> DiskResult<RenameDataResp> {
         let external_guard: Option<Arc<dyn Send + Sync>> = if let Some(token) = scanner_token {
-            Some(Arc::new(
-                self.acquire_scanner_publication_lease_guard(token)
+            Some(
+                self.acquire_scanner_publication_lease_guard_for_rename(token, destination.0, destination.1)
                     .await
-                    .map_err(|err| DiskError::other(err.to_string()))?,
-            ))
+                    .map_err(|err| DiskError::other(err.to_string()))? as Arc<dyn Send + Sync>,
+            )
         } else {
             None
         };
@@ -113,6 +275,25 @@ impl ECStore {
         .await
     }
 
+    /// Recovery stays bound to this admitted instance even after RPC cancellation.
+    pub async fn recover_local_multipart_source(
+        &self,
+        disk_ref: &str,
+        request: crate::disk::multipart_source::MultipartSourceRequest,
+    ) -> DiskResult<crate::disk::multipart_source::MultipartSourceResponse> {
+        request.validate()?;
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let owner = admit_local_disk(&self.ctx, &disk, id, request.operation.is_mutation()).await?;
+        let Disk::Local(wrapper) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        wrapper
+            .get_disk()
+            .bind_multipart_proof_authority(&self.ctx.multipart_proof_verification_context())?;
+        let owner = owner.map(|owner| owner as Arc<dyn Send + Sync>);
+        wrapper.recover_multipart_source_with_namespace_owner(request, owner).await
+    }
+
     pub async fn undo_local_write(
         &self,
         disk_ref: &str,
@@ -128,7 +309,9 @@ impl ECStore {
 // The optional ID is a cold lookup to cache only after final admission.
 async fn local_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> DiskResult<(DiskStore, Option<Uuid>)> {
     let map = ctx.local_disk_map();
-    if let Some(disk) = map.read().await.get(disk_ref).and_then(Option::as_ref).cloned() {
+    let path_disk = map.read().await.get(disk_ref).and_then(Option::as_ref).cloned();
+    if let Some(disk) = path_disk {
+        admit_rpc_disk(&disk)?;
         return Ok((disk, None));
     }
     let disk_id = Uuid::parse_str(disk_ref).map_err(|_| DiskError::DiskNotFound)?;
@@ -137,10 +320,15 @@ async fn local_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> Dis
         let cached_disk = map.read().await.get(&path).and_then(Option::as_ref).cloned();
         if let Some(disk) = cached_disk
             && matches!(disk.as_ref(), Disk::Local(_))
-            && disk.get_disk_id().await? == Some(disk_id)
         {
-            return Ok((disk, None));
+            admit_rpc_disk(&disk)?;
+            if disk.get_disk_id().await? == Some(disk_id) {
+                return Ok((disk, None));
+            }
         }
+    }
+    if crate::disk::remote_io_admission::active() {
+        return Err(DiskError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)));
     }
     let disks: Vec<_> = map.read().await.values().filter_map(Clone::clone).collect();
     // Disk identity may perform format I/O. No registry guard spans this await.
@@ -150,6 +338,17 @@ async fn local_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> Dis
         }
     }
     Err(DiskError::DiskNotFound)
+}
+
+fn admit_rpc_disk(disk: &DiskStore) -> DiskResult<()> {
+    use crate::disk::remote_io_admission;
+    if remote_io_admission::active() {
+        let binding = disk
+            .physical_admission()
+            .ok_or_else(|| DiskError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)))?;
+        remote_io_admission::admit(&binding).map_err(DiskError::Io)?;
+    }
+    Ok(())
 }
 
 async fn admit_local_disk(
@@ -190,15 +389,46 @@ async fn rename_local_data_with_ctx(
     destination: (&str, &str),
     mut guards: RenameDataGuards,
 ) -> DiskResult<RenameDataResp> {
+    let handler_started = rustfs_io_metrics::put_stage_timer();
+    let lookup_started = rustfs_io_metrics::put_stage_timer();
     let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let lookup_ms = lookup_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = lookup_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOOKUP, duration_ms);
+    }
     let mutates_namespace = !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0);
+    let admit_started = rustfs_io_metrics::put_stage_timer();
     let owner = admit_local_disk(ctx, &disk, disk_id, mutates_namespace).await?;
+    if source.0 == crate::disk::RUSTFS_META_MULTIPART_BUCKET {
+        let Disk::Local(wrapper) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        wrapper
+            .get_disk()
+            .bind_multipart_proof_authority(&ctx.multipart_proof_verification_context())?;
+    }
+    let admit_ms = admit_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = admit_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_ADMIT, duration_ms);
+    }
     guards.namespace_owner = owner.as_ref().map(|owner| owner.clone() as Arc<dyn Send + Sync>);
+    let local_rename_started = rustfs_io_metrics::put_stage_timer();
     let result = disk
         .rename_data_borrowed_with_fence_observed(source.0, source.1, fi, destination.0, destination.1, guards)
         .await
         .result;
+    let local_rename_ms = local_rename_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = local_rename_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOCAL_RENAME, duration_ms);
+    }
     drop(owner);
+    if let Some(handler_started) = handler_started {
+        let handler_ms = handler_started.elapsed().as_secs_f64() * 1000.0;
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_TOTAL, handler_ms);
+        let child_ms = lookup_ms.unwrap_or(0.0) + admit_ms.unwrap_or(0.0) + local_rename_ms.unwrap_or(0.0);
+        let overhead_ms = (handler_ms - child_ms).max(0.0);
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_OVERHEAD, overhead_ms);
+    }
     result
 }
 
@@ -278,6 +508,18 @@ pub async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
     }
 
     None
+}
+
+/// Resolve and admit an authenticated RPC's target before its storage locks.
+/// Unknown UUID mappings defer background work instead of probing unrelated disks.
+pub async fn find_local_disk_by_ref_for_rpc(disk_ref: &str) -> DiskResult<Option<DiskStore>> {
+    use crate::disk::remote_io_admission;
+
+    if !remote_io_admission::active() {
+        return Ok(find_local_disk_by_ref(disk_ref).await);
+    }
+    let (disk, _) = local_disk_candidate(&crate::runtime::global::current_ctx(), disk_ref).await?;
+    Ok(Some(disk))
 }
 
 pub async fn all_local_disk_path() -> Vec<String> {
@@ -641,6 +883,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_background_target_lookup_defers_before_io_and_reuses_multi_phase_admission() {
+        use crate::disk::{RemoteBackgroundIo, with_remote_background_io};
+        use rustfs_concurrency::adaptive::{
+            AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure,
+        };
+        use std::num::NonZeroU16;
+
+        let ctx = Arc::new(InstanceContext::new());
+        let root = tempfile::tempdir().expect("target directory");
+        let id = Uuid::new_v4();
+        let disk = target_disk(&ctx, root.path(), id).await;
+        disk.make_volume("bucket").await.expect("fixture volume");
+        let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 0);
+        disk.physical_admission()
+            .expect("local binding")
+            .set_test_capacity(vec![gate.clone()])
+            .expect("physical device");
+        let node = NodeAdmission::new(NonZeroU16::MIN);
+        node.update(
+            &mut FeedbackController::new(),
+            Some(FeedbackObservation {
+                generation: 1,
+                max_concurrency: 1,
+                pressure: ResourcePressure::Unknown,
+                completed_units: None,
+            }),
+        );
+        let path = disk.endpoint().to_string();
+        with_remote_background_io(Some(RemoteBackgroundIo::new(node.clone())), async {
+            assert!(
+                matches!(disk.read_all("bucket", "object").await,
+                Err(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "no implicit target admission"
+            );
+            assert!(
+                matches!(local_disk_candidate(&ctx, &path).await,
+                Err(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "closed receiver capacity"
+            );
+            gate.set_limit(1);
+            assert!(
+                matches!(local_disk_candidate(&ctx, &id.to_string()).await,
+                Err(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "cold UUID cannot probe unrelated disks"
+            );
+            assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
+            let (selected, _) = local_disk_candidate(&ctx, &path).await.expect("select known local path");
+            assert!(Arc::ptr_eq(&selected, &disk));
+            for body in [b"first phase".as_slice(), b"second phase".as_slice()] {
+                disk.write_all("bucket", "object", bytes::Bytes::copy_from_slice(body))
+                    .await
+                    .expect("write phase");
+                let (again, _) = local_disk_candidate(&ctx, &path)
+                    .await
+                    .expect("repeat target resolution at capacity one");
+                assert_eq!(again.read_all("bucket", "object").await.expect("read phase").as_ref(), body);
+                assert_eq!([node.snapshot().active, gate.snapshot().active], [1, 1]);
+            }
+        })
+        .await;
+        assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
+        assert_eq!([node.completed(), gate.completed()], [Some(1), Some(1)]);
+        assert!(record_local_disk_id_if_active(&ctx, &disk, id).await);
+        let replacement = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
+        replacement
+            .physical_admission()
+            .expect("replacement binding")
+            .set_test_capacity(vec![gate.clone()])
+            .expect("replacement device");
+        with_remote_background_io(Some(RemoteBackgroundIo::new(node.clone())), async {
+            assert!(
+                matches!(local_disk_candidate(&ctx, &id.to_string()).await,
+                Err(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "stale UUID must not resolve replacement data"
+            );
+        })
+        .await;
+        assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
+        assert_eq!(
+            [node.completed(), gate.completed()],
+            [Some(1), Some(1)],
+            "identity checks alone are not work completion"
+        );
+    }
+
+    #[tokio::test]
     async fn target_uuid_cache_cannot_admit_a_different_format_at_the_same_path() {
         let ctx = Arc::new(InstanceContext::new());
         let root = tempfile::tempdir().expect("root");
@@ -741,12 +1069,110 @@ mod tests {
             let ctx = Arc::new(InstanceContext::new());
             let root = tempfile::tempdir().expect("root");
             let disk = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
-            let fi = target_file_info("destination", Uuid::new_v4(), b"internal-CAS-body");
-            seed_target(&disk, volume, "staged", fi.clone()).await;
-            BootstrapLocalTarget::new(ctx.clone())
-                .rename_local_data(&disk.endpoint().to_string(), (volume, "staged"), &fi, (volume, "destination"), None)
+            let body = b"internal-CAS-body";
+            let mut fi = target_file_info("destination", Uuid::new_v4(), body);
+            let source = if volume == crate::disk::RUSTFS_META_MULTIPART_BUCKET {
+                // MPI remains a valid internal bootstrap volume, but its source
+                // must obey the real initial-head and part-generation protocol.
+                let authority = ctx
+                    .bind_multipart_proof_topology(&single_local_disk_pools(root.path()))
+                    .expect("complete actual local bootstrap topology");
+                crate::disk::multipart_source::bind_multipart_proof_snapshot(&[Some(disk.clone())], &authority)
+                    .expect("bootstrap MPI handle belongs to this instance");
+                tokio::fs::create_dir_all(root.path().join(volume))
+                    .await
+                    .expect("MPI fixture volume");
+                let hash = rustfs_utils::crypto::hex_sha256(format!("{volume}/destination").as_bytes(), str::to_owned);
+                let path = format!("{hash}/{}x{}", Uuid::new_v4(), fi.mod_time.unwrap().unix_timestamp_nanos());
+                let original_dir = Uuid::new_v4();
+                let mut initial = FileInfo::new("destination", 1, 0);
+                initial.erasure.index = 1;
+                initial.version_id = fi.version_id;
+                initial.mod_time = fi.mod_time;
+                initial.data_dir = Some(original_dir);
+                initial.fresh = true;
+                crate::disk::multipart_source::mark_native_source(&mut initial);
+                rustfs_utils::http::insert_str(&mut initial.metadata, "multipart-bucket", volume.to_string());
+                rustfs_utils::http::insert_str(&mut initial.metadata, "multipart-object", "destination".to_string());
+                disk.write_metadata(volume, volume, &path, initial)
+                    .await
+                    .expect("publish the unique real MPI initial head");
+                let mut completed = disk
+                    .read_version(
+                        volume,
+                        volume,
+                        &path,
+                        &fi.version_id.unwrap().to_string(),
+                        &crate::disk::ReadOptions::default(),
+                    )
+                    .await
+                    .expect("capture the persisted initial source");
+                let condition = crate::disk::multipart_source::capture_source_condition(
+                    volume,
+                    "destination",
+                    &path,
+                    &completed,
+                    Uuid::new_v4(),
+                )
+                .expect("capture the actual native source condition");
+                completed.size = body.len() as i64;
+                completed.add_object_part(
+                    1,
+                    "bootstrap-part".to_string(),
+                    body.len(),
+                    completed.mod_time,
+                    body.len() as i64,
+                    None,
+                    None,
+                );
+                let data_path = format!("{path}/{original_dir}/part.1");
+                disk.write_all(volume, &data_path, bytes::Bytes::from_static(body))
+                    .await
+                    .expect("stage the actual MPI part");
+                disk.write_all(
+                    volume,
+                    &format!("{data_path}.meta"),
+                    completed.parts[0]
+                        .marshal_msg()
+                        .expect("encode native selected part generation")
+                        .into(),
+                )
+                .await
+                .expect("stage the actual native part metadata");
+                completed.data_dir = Some(Uuid::new_v4());
+                rustfs_utils::http::remove_str(&mut completed.metadata, "multipart-bucket");
+                rustfs_utils::http::remove_str(&mut completed.metadata, "multipart-object");
+                crate::disk::multipart_source::strip_native_controls(&mut completed.metadata);
+                condition
+                    .attach(&mut completed)
+                    .expect("attach native publication precondition");
+                fi = completed;
+                path
+            } else {
+                seed_target(&disk, volume, "staged", fi.clone()).await;
+                "staged".to_string()
+            };
+            let response = BootstrapLocalTarget::new(ctx.clone())
+                .rename_local_data(&disk.endpoint().to_string(), (volume, &source), &fi, (volume, "destination"), None)
                 .await
                 .expect("legitimate bootstrap metadata write");
+            if volume == crate::disk::RUSTFS_META_MULTIPART_BUCKET {
+                response
+                    .multipart_source
+                    .as_ref()
+                    .expect("real native MPI publication proof")
+                    .verify_with_authority(&ctx.multipart_proof_verification_context())
+                    .expect("native bootstrap proof must verify");
+                assert!(
+                    !root
+                        .path()
+                        .join(volume)
+                        .join(&source)
+                        .join(crate::disk::STORAGE_FORMAT_FILE)
+                        .exists(),
+                    "native MPI publication must consume the canonical source head"
+                );
+            }
             let read = disk
                 .read_version(
                     volume,
@@ -760,7 +1186,62 @@ mod tests {
                 )
                 .await
                 .expect("read bootstrap result");
-            assert_eq!(read.data, fi.data);
+            if volume == crate::disk::RUSTFS_META_MULTIPART_BUCKET {
+                assert!(!read.inline_data(), "native MPI metadata must not carry an inline marker");
+                // read_data may prefetch a small legacy-shaped part. Inspect
+                // the raw persisted map rather than mistaking that cache for inline storage.
+                let raw = disk
+                    .read_all(volume, "destination/xl.meta")
+                    .await
+                    .expect("read actual committed xl.meta");
+                let metadata = rustfs_filemeta::FileMeta::load(&raw).expect("decode actual committed metadata");
+                assert_eq!(metadata.versions.len(), 1, "bootstrap MPI must publish exactly one version");
+                assert_eq!(metadata.data.entries().expect("validate the actual inline map"), 0);
+                assert!(
+                    metadata
+                        .data
+                        .find(&fi.version_id.expect("version").to_string())
+                        .expect("inspect this version's inline key")
+                        .is_none(),
+                    "the committed version must have no inline payload"
+                );
+                let persisted = rustfs_filemeta::get_file_info(
+                    &raw,
+                    volume,
+                    "destination",
+                    &fi.version_id.expect("version").to_string(),
+                    rustfs_filemeta::FileInfoOpts {
+                        data: true,
+                        include_free_versions: false,
+                        include_part_checksums: true,
+                    },
+                )
+                .expect("decode FI directly without legacy part read-ahead");
+                assert!(
+                    !persisted.inline_data() && persisted.data.is_none(),
+                    "raw metadata must remain parts-backed"
+                );
+                assert_eq!(persisted.data_dir, fi.data_dir);
+                if let Some(prefetched) = &read.data {
+                    assert_eq!(
+                        prefetched.as_ref(),
+                        body,
+                        "compatibility read-ahead must contain the complete physical part bytes"
+                    );
+                }
+                assert_eq!(read.size, body.len() as i64);
+                assert_eq!(read.data_dir, fi.data_dir);
+                let committed_part = format!("destination/{}/part.1", fi.data_dir.unwrap());
+                assert_eq!(
+                    disk.read_all(volume, &committed_part)
+                        .await
+                        .expect("read committed native part bytes")
+                        .as_ref(),
+                    body
+                );
+            } else {
+                assert_eq!(read.data, fi.data);
+            }
             assert_eq!(ctx.namespace_commit_generation(), 0);
             assert!(!ctx.namespace_commits_pending());
         }
@@ -949,15 +1430,20 @@ mod tests {
         .await
         .expect("bounded physical entry");
         drop(rename);
-        assert!(store.scanner_data_usage_publication_blocked().await);
+        assert!(
+            !store.scanner_data_usage_publication_blocked().await,
+            "a pending namespace commit is not a local publication barrier"
+        );
         assert!(ctx.namespace_commits_pending());
         assert!(!sibling.namespace_commits_pending());
-        assert!(
+        // The pending physical rename owns the namespace commit, which is
+        // ordinary namespace activity and no longer fences another scanner
+        // admission on the same token.
+        drop(
             store
-                .rename_local_data(&disk_ref, ("target-bucket", "staged"), &fi, ("target-bucket", "another"), Some(token))
+                .acquire_scanner_publication_lease_guard(token)
                 .await
-                .is_err(),
-            "real pending rename blocks another scanner publication"
+                .expect("a pending ordinary rename does not fence another scanner admission"),
         );
         assert!(store.release_scanner_publication_lease(token).await, "remove registered token");
         let gate = ctx.data_movement_operation_gate();
@@ -1051,7 +1537,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_namespace_commit_rejects_stale_scanner_target_admission() {
+    async fn observational_lease_renames_only_the_observed_usage_object() {
+        let ctx = Arc::new(InstanceContext::new());
+        let root = tempfile::tempdir().expect("target root");
+        let disk = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
+        let store = super::super::tests::build_store_with_ctx(ctx.clone());
+        let disk_ref = disk.endpoint().to_string();
+        let volume = crate::disk::RUSTFS_META_BUCKET;
+        let observed_path = format!(
+            "{}/{}",
+            crate::disk::BUCKET_META_PREFIX,
+            rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME
+        );
+        let source_path = format!("{}/.staged-observation", crate::disk::BUCKET_META_PREFIX);
+        let fi = target_file_info(&observed_path, Uuid::new_v4(), b"non-authoritative");
+        seed_target(&disk, volume, &source_path, fi.clone()).await;
+
+        let pending = ctx.begin_namespace_commit();
+        let (token, generation) = store
+            .acquire_scanner_publication_lease_with_purpose(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL, true)
+            .await
+            .expect("observational lease should permit a pending namespace commit");
+        let error = store
+            .rename_local_data(&disk_ref, (volume, &source_path), &fi, (volume, "buckets/.usage.v2.json"), Some(token))
+            .await
+            .expect_err("observational token must not authorize the authoritative usage path");
+        assert!(error.to_string().contains("observed usage publication"));
+        assert!(root.path().join(volume).join(&source_path).join("xl.meta").exists());
+
+        store
+            .rename_local_data(&disk_ref, (volume, &source_path), &fi, (volume, &observed_path), Some(token))
+            .await
+            .expect("observational token may rename only the observed usage key");
+        assert!(
+            store
+                .validate_scanner_publication_lease_with_purpose(token, generation, true)
+                .await
+                .is_ok(),
+            "namespace commits do not invalidate the movement-only observation lease"
+        );
+        let wrong_purpose = store
+            .validate_scanner_publication_lease_with_purpose(token, generation, false)
+            .await
+            .expect_err("the same token must not validate as authoritative");
+        assert!(wrong_purpose.to_string().contains("purpose"));
+        drop(pending);
+        assert!(store.release_scanner_publication_lease(token).await);
+        let observed = disk
+            .read_version(
+                volume,
+                volume,
+                &observed_path,
+                &fi.version_id.expect("fixture version").to_string(),
+                &crate::disk::ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("observed metadata should be present");
+        assert_eq!(observed.data.as_deref(), Some(&b"non-authoritative"[..]));
+    }
+
+    #[tokio::test]
+    async fn completed_namespace_commit_keeps_scanner_target_admission() {
         use futures::FutureExt;
         use std::time::{Duration, Instant};
         use tokio::time::timeout;
@@ -1262,21 +1811,21 @@ mod tests {
         assert_eq!(final_state, (false, namespace_completed, movement_before, operation_epoch_before));
         assert_eq!(user_latest.data, user_new.data);
         assert_eq!(user_latest.version_id, user_new.version_id);
+        // An ordinary commit that completed after the lease was granted is
+        // namespace activity the scanner certifies per bucket; it is not a
+        // reason to withhold the scanner-owned metadata rename.
         assert!(
-            stale_validate.is_err() && target_rename.is_err(),
-            "completed namespace commit must reject both stale admissions: validate={stale_validate:?}, target={:?}, metadata_changed={metadata_changed}",
+            stale_validate.is_ok() && target_rename.is_ok(),
+            "a completed ordinary commit must keep both admissions: validate={stale_validate:?}, target={:?}, metadata_changed={metadata_changed}",
             target_rename.as_ref().map(|_| ()),
         );
-        assert_eq!(metadata_after, metadata_before, "stale target must not rewrite metadata");
-        assert_eq!(metadata_latest.data, metadata_old.data, "latest metadata body must remain the old one");
-        assert_eq!(
-            metadata_latest.version_id, metadata_old.version_id,
-            "latest metadata version must remain the old one"
-        );
+        assert!(metadata_changed, "the admitted target publishes the staged metadata");
+        assert!(latest_is_staged, "latest metadata must be the published one");
+        assert_ne!(metadata_latest.data, metadata_old.data);
     }
 
     #[tokio::test]
-    async fn renewed_namespace_lease_allows_real_metadata_publication() {
+    async fn scanner_lease_allows_real_metadata_publication_after_an_ordinary_write() {
         use futures::FutureExt;
         use std::time::Duration;
         use tokio::time::timeout;
@@ -1342,16 +1891,18 @@ mod tests {
                 .expect("latest ordinary committed object");
             assert_eq!(user_latest.version_id, user_new.version_id);
             assert_eq!(user_latest.data, user_new.data);
-            assert!(
-                store
-                    .validate_scanner_publication_lease(old_token, movement_generation)
-                    .await
-                    .is_err()
-            );
+            store
+                .validate_scanner_publication_lease(old_token, movement_generation)
+                .await
+                .expect("an ordinary write after the grant does not stale the lease");
             assert_eq!(
                 ctx.scanner_publication_lease_generations(old_token).await,
-                Some((movement_generation, namespace_generation)),
-                "rejection must not refresh or discard the old lease"
+                Some((
+                    movement_generation,
+                    Some(namespace_generation),
+                    crate::runtime::instance::ScannerPublicationLeasePurpose::Authoritative,
+                )),
+                "validation must not refresh or discard the lease"
             );
             let (fresh_token, fresh_generation) = store
                 .acquire_scanner_publication_lease(movement_generation, ttl)
@@ -1461,7 +2012,9 @@ mod tests {
     #[serial_test::serial]
     async fn target_ordinary_timeout_keeps_its_physical_namespace_owner() {
         use crate::disk::os::prepared_publication_test_hooks as hooks;
-        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1"))], async {
+        // Allow real fixture I/O to finish under load. Expire the operation
+        // with virtual time only after its physical publication is paused.
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
             let ctx = Arc::new(InstanceContext::new());
             let store = super::super::tests::build_store_with_ctx(ctx.clone());
             let root = tempfile::tempdir().expect("root");
@@ -1495,7 +2048,7 @@ mod tests {
             .await
             .expect("bounded entry");
             tokio::time::pause();
-            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
             tokio::time::resume();
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut rename)
                 .await

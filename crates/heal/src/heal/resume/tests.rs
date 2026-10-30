@@ -16,7 +16,9 @@ use super::checkpoint::CURRENT_CHECKPOINT_SCHEMA;
 use super::replacement::ReplacementCompletionProof;
 use super::*;
 
-async fn schema_test_disk() -> (tempfile::TempDir, DiskStore) {
+mod checkpoint_diagnostics;
+
+pub(super) async fn schema_test_disk() -> (tempfile::TempDir, DiskStore) {
     use super::super::{DiskOption, Endpoint, new_disk};
 
     let temp_dir = tempfile::TempDir::new().expect("create schema test directory");
@@ -85,6 +87,154 @@ fn replacement_intent_binds_a_generation_before_format() {
     );
 }
 
+fn replacement_candidate_state(task_id: &str) -> ResumeState {
+    ResumeState::replacement_intent(
+        task_id.to_string(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket-a".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+}
+
+#[test]
+fn replacement_recovery_merges_same_generation_replicas() {
+    let task_id = Uuid::new_v4().to_string();
+    let mut stale = replacement_candidate_state(&task_id);
+    stale.replacement_revision = 4;
+    let mut current = None;
+    merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(stale, "http://survivor-a/recovery", false).expect("valid candidate"),
+    )
+    .expect("first candidate should be admitted");
+
+    let mut latest = replacement_candidate_state(&task_id);
+    latest.replacement_revision = 5;
+    latest.processed_objects = 7;
+    latest.dangling_delete_retry_not_before = Some(4_000_000_000);
+    merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(latest, "http://survivor-b/recovery", true).expect("valid candidate"),
+    )
+    .expect("same generation replica should be merged");
+
+    let selected = current.expect("a canonical candidate should remain");
+    assert_eq!(selected.state.replacement_revision, 5);
+    assert_eq!(selected.state.processed_objects, 7);
+    assert_eq!(selected.state.dangling_delete_retry_not_before, Some(4_000_000_000));
+    assert_eq!(selected.anchor, "http://survivor-b/recovery");
+}
+
+#[test]
+fn replacement_recovery_rejects_ambiguous_equal_revision_copies() {
+    let task_id = Uuid::new_v4().to_string();
+    let mut left = replacement_candidate_state(&task_id);
+    left.replacement_revision = 2;
+    let mut right = left.clone();
+    right.processed_objects = 1;
+    let mut current = None;
+    merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(left, "survivor-a", false).expect("valid candidate"),
+    )
+    .expect("first candidate should be admitted");
+    let error = merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(right, "survivor-b", false).expect("valid candidate"),
+    )
+    .expect_err("equal revisions with divergent progress must remain a typed conflict");
+    assert!(matches!(error, Error::ReplacementGenerationConflict { .. }));
+}
+
+#[test]
+fn replacement_recovery_rejects_divergent_grace_deadlines_at_the_same_revision() {
+    let task_id = Uuid::new_v4().to_string();
+    let left = replacement_candidate_state(&task_id);
+    let mut right = left.clone();
+    right.dangling_delete_retry_not_before = Some(4_000_000_000);
+    let mut current = Some(ReplacementRecoveryCandidate::new(left, "survivor-a", true).expect("valid candidate"));
+    let error = merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(right, "survivor-b", false).expect("valid deferred candidate"),
+    )
+    .expect_err("different deadlines at the same revision must remain a conflict");
+    assert!(matches!(error, Error::ReplacementGenerationConflict { .. }));
+}
+
+#[test]
+fn replacement_recovery_rejects_different_generation_binding() {
+    let task_id = Uuid::new_v4().to_string();
+    let first = replacement_candidate_state(&task_id);
+    let mut second = first.clone();
+    second.replacement_targets = vec!["replacement-b".to_string()];
+    second.replacement_target_identities[0].endpoint = "replacement-b".to_string();
+    let mut current = None;
+    merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(first, "survivor-a", true).expect("valid candidate"),
+    )
+    .expect("first candidate should be admitted");
+    let error = merge_replacement_recovery_candidate(
+        &mut current,
+        ReplacementRecoveryCandidate::new(second, "survivor-b", true).expect("candidate shape is still valid"),
+    )
+    .expect_err("different target slots must not be merged");
+    assert!(matches!(error, Error::ReplacementGenerationConflict { .. }));
+}
+
+#[test]
+fn exhausted_replacement_is_probeable_without_losing_failed_progress() {
+    let task_id = Uuid::new_v4().to_string();
+    let mut state = replacement_candidate_state(&task_id);
+    state.replacement_phase = ReplacementPhase::Rebuilding;
+    state.retry_count = state.max_retries;
+    state.skipped_objects = 24;
+    assert!(replacement_retry_is_exhausted_active(&state));
+
+    state.failed_objects = 1;
+    assert!(replacement_retry_is_exhausted_active(&state));
+}
+
+#[test]
+fn exhausted_legacy_transient_skip_is_rearmed_only_once() {
+    let task_id = Uuid::new_v4().to_string();
+    let mut state = replacement_candidate_state(&task_id);
+    state.replacement_phase = ReplacementPhase::Rebuilding;
+    state.retry_count = state.max_retries;
+    state.error_message = Some(
+        "Transient heal skip: Replacement erasure set heal incomplete: 0 bucket(s) failed, 0 object(s) failed, 24 object(s) skipped; retry scheduled"
+            .to_string(),
+    );
+    state.replacement_legacy_retry_compatibility_done = false;
+    assert!(replacement_retry_is_legacy_transient_skip(&state));
+
+    state.replacement_legacy_retry_compatibility_done = true;
+    assert!(!replacement_retry_is_legacy_transient_skip(&state));
+}
+
+#[test]
+fn readiness_aware_retry_marker_defaults_old_schema_seven_intents_to_legacy() {
+    let task_id = Uuid::new_v4().to_string();
+    let current = replacement_candidate_state(&task_id);
+    assert!(current.replacement_legacy_retry_compatibility_done);
+
+    let mut encoded = serde_json::to_value(current).expect("serialize current replacement intent");
+    encoded
+        .as_object_mut()
+        .expect("replacement intent is a JSON object")
+        .remove("replacement_legacy_retry_compatibility_done");
+    let legacy: ResumeState = serde_json::from_value(encoded).expect("deserialize prior schema-seven replacement intent");
+
+    assert!(!legacy.replacement_legacy_retry_compatibility_done);
+}
+
 #[tokio::test]
 async fn replacement_terminal_phases_are_durable() {
     use super::super::{DiskOption, Endpoint, new_disk};
@@ -122,6 +272,7 @@ async fn replacement_terminal_phases_are_durable() {
     )
     .await
     .expect("replacement intent should persist");
+    manager.state.write().await.dangling_delete_retry_not_before = Some(4_000_000_000);
     manager
         .mark_replacement_completed_and_verified()
         .await
@@ -134,6 +285,7 @@ async fn replacement_terminal_phases_are_durable() {
         .await;
     assert!(verified.completed);
     assert_eq!(verified.replacement_phase, ReplacementPhase::Verified);
+    assert_eq!(verified.dangling_delete_retry_not_before, None);
 
     let resumed = ResumeManager::new_replacement_intent(
         disk.clone(),
@@ -394,6 +546,7 @@ async fn torn_intent_recovery_cas_preserves_a_concurrent_valid_binding() {
             }],
         ))),
         throttle: Mutex::new(PersistThrottle::new()),
+        persistence_lock: tokio::sync::Mutex::new(()),
         state_file: ResumeStateFile::ReplacementIntent,
     };
     let error = match loser.publish_new_replacement_intent(Some(expected)).await {
@@ -1415,6 +1568,410 @@ fn reset_for_retry_clears_progress_but_keeps_retry_budget() {
     assert_eq!(state.retry_count, 1, "retry budget must be preserved");
 }
 
+#[tokio::test]
+async fn dangling_delete_deferral_survives_restart_without_spending_retry_budget() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new(
+        disk.clone(),
+        task_id.clone(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+    )
+    .await
+    .expect("create resume state for dangling-delete deferral");
+    {
+        let mut state = manager.state.write().await;
+        state.processed_objects = 9;
+        state.skipped_objects = 4;
+        state.retry_count = 2;
+        state.resume_cursor = Some("unfinished-page".to_string());
+    }
+    let deadline = 4_000_000_000;
+    manager
+        .defer_retry_until_dangling_delete_ready(deadline)
+        .await
+        .expect("persist dangling-delete deferral");
+
+    let resumed = ResumeManager::load_from_disk(disk, &task_id)
+        .await
+        .expect("reload dangling-delete deferral after restart");
+    let state = resumed.get_state().await;
+    assert_eq!(state.retry_count, 2, "grace waits must preserve the failure retry budget");
+    assert_eq!(state.dangling_delete_retry_not_before, Some(deadline));
+    assert_eq!(state.processed_objects, 0);
+    assert_eq!(state.skipped_objects, 0);
+    assert!(state.resume_cursor.is_none());
+    assert!(!state.completed);
+
+    assert!(resumed.schedule_retry().await.expect("schedule an ordinary failure retry"));
+    let state = resumed.get_state().await;
+    assert_eq!(state.retry_count, 3);
+    assert_eq!(state.dangling_delete_retry_not_before, None);
+}
+
+#[tokio::test]
+async fn replacement_dangling_delete_failure_preserves_budget_and_does_not_rearm_exhaustion() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let initial = replacement_candidate_state(&task_id);
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id.clone(),
+        initial.set_disk_id,
+        initial.replacement_buckets,
+        initial.replacement_targets,
+        initial.replacement_target_identities,
+    )
+    .await
+    .expect("persist replacement intent for grace failure");
+    {
+        let mut state = manager.state.write().await;
+        state.replacement_phase = ReplacementPhase::Rebuilding;
+        state.retry_count = 1;
+    }
+    manager.save_state_strict().await.expect("persist initial retry count");
+    let deferred = Error::DanglingDeleteDeferred {
+        retry_not_before: 4_000_000_000,
+    };
+    manager
+        .record_replacement_failure(&deferred, 99)
+        .await
+        .expect("persist grace failure without a task-level retry increment");
+    let reloaded = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+        .await
+        .expect("reload replacement grace failure");
+    let state = reloaded.get_state().await;
+    assert_eq!(state.retry_count, 1);
+    assert_eq!(state.dangling_delete_retry_not_before, Some(4_000_000_000));
+    assert_eq!(state.replacement_phase, ReplacementPhase::Rebuilding);
+    {
+        let mut state = reloaded.state.write().await;
+        state.retry_count = state.max_retries;
+        state.dangling_delete_retry_not_before = None;
+    }
+    reloaded.save_state_strict().await.expect("persist exhausted retry budget");
+    assert!(matches!(
+        reloaded.record_replacement_failure(&deferred, 99).await,
+        Err(Error::ReplacementRetryBudgetExhausted)
+    ));
+    let exhausted = ResumeManager::load_replacement_intent(disk, &task_id)
+        .await
+        .expect("reload unchanged exhausted intent")
+        .get_state()
+        .await;
+    assert_eq!(exhausted.retry_count, exhausted.max_retries);
+    assert_eq!(exhausted.dangling_delete_retry_not_before, None);
+    assert!(matches!(
+        reloaded.defer_retry_until_dangling_delete_ready(4_000_000_000).await,
+        Err(Error::ReplacementRetryBudgetExhausted)
+    ));
+}
+
+#[tokio::test]
+async fn old_signed_checkpoint_accepts_missing_dangling_delete_fields() {
+    use sha2::{Digest, Sha256};
+
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let mut checkpoint = ResumeCheckpoint::new(task_id.clone());
+    checkpoint.current_object_index = 1;
+    checkpoint.successful_objects = 1;
+    checkpoint.processed_objects.insert("bucket/object:v1".to_string());
+    let mut wire = serde_json::to_value(&checkpoint).expect("serialize old checkpoint fixture");
+    let fields = wire.as_object_mut().expect("checkpoint should be an object");
+    fields.remove("dangling_delete_grace_objects");
+    fields.remove("dangling_delete_retry_not_before");
+    let unsigned = serde_json::to_vec(&wire).expect("serialize old unsigned checkpoint fixture");
+    wire["integrity_digest"] = serde_json::json!(base64_simd::STANDARD.encode_to_string(Sha256::digest(&unsigned)));
+    let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &checkpoint_path,
+        serde_json::to_vec(&wire)
+            .expect("serialize old signed checkpoint fixture")
+            .into(),
+    )
+    .await
+    .expect("persist old signed checkpoint fixture");
+
+    let restored = CheckpointManager::load_from_disk(disk.clone(), &task_id)
+        .await
+        .expect("old signed checkpoints must preserve their original digest")
+        .get_checkpoint()
+        .await;
+    assert_eq!(restored.current_object_index, 1);
+    assert_eq!(restored.successful_objects, 1);
+    assert_eq!(restored.dangling_delete_grace_objects, 0);
+    assert_eq!(restored.dangling_delete_retry_not_before, None);
+    assert!(!CheckpointManager::is_blocked(&disk, &task_id).await);
+}
+
+#[tokio::test]
+async fn checkpoint_grace_classification_survives_page_commit_and_restart() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let checkpoint = CheckpointManager::new(disk.clone(), task_id.clone())
+        .await
+        .expect("create checkpoint for grace outcomes");
+    for (object, deadline, skipped) in [
+        ("bucket/a:v1", 4_000_000_000, 1),
+        ("bucket/b:v1", 4_000_000_100, 2),
+        ("bucket/b:v1", 4_000_000_200, 2),
+    ] {
+        checkpoint
+            .record_object_outcome(CheckpointObjectOutcomeRecord {
+                object: object.to_string(),
+                outcome: CheckpointObjectOutcome::DeferredDanglingDelete {
+                    retry_not_before: deadline,
+                },
+                successful: 0,
+                failed: 0,
+                skipped,
+                bytes: 0,
+                skipped_new_versions: 0,
+                skipped_ilm_expired: 0,
+                counter_unknown: false,
+            })
+            .await
+            .expect("record grace outcome atomically with object counters");
+    }
+    checkpoint
+        .advance_page(0, 2)
+        .await
+        .expect("flush page containing grace outcomes");
+    checkpoint
+        .prune_completed_page()
+        .await
+        .expect("prune page identities after cursor commit");
+
+    let restored = CheckpointManager::load_from_disk(disk.clone(), &task_id)
+        .await
+        .expect("reload grace page after restart");
+    let snapshot = restored.get_checkpoint().await;
+    assert_eq!(snapshot.skipped_object_count, 2);
+    assert_eq!(
+        snapshot.dangling_delete_grace_objects, 2,
+        "duplicate page outcomes must not increase grace count"
+    );
+    assert_eq!(snapshot.dangling_delete_retry_not_before, Some(4_000_000_100));
+    assert!(snapshot.skipped_objects.is_empty(), "classification must outlive page identity pruning");
+
+    restored.reset_for_retry().await.expect("reset checkpoint for grace recheck");
+    let reset = CheckpointManager::load_from_disk(disk, &task_id)
+        .await
+        .expect("reload checkpoint after reset")
+        .get_checkpoint()
+        .await;
+    assert_eq!(reset.dangling_delete_grace_objects, 0);
+    assert_eq!(reset.dangling_delete_retry_not_before, None);
+    assert_eq!(reset.skipped_object_count, 0);
+    assert_eq!(reset.current_object_index, 0);
+}
+
+#[test]
+fn old_schema_seven_resume_defaults_dangling_delete_deadline() {
+    let task_id = ResumeUtils::generate_task_id();
+    let mut wire = serde_json::to_value(replacement_candidate_state(&task_id)).expect("serialize replacement intent");
+    wire.as_object_mut()
+        .expect("replacement intent should be an object")
+        .remove("dangling_delete_retry_not_before");
+    let restored: ResumeState = serde_json::from_value(wire).expect("decode old schema-seven intent");
+    assert_eq!(restored.schema_version, 7);
+    assert_eq!(restored.dangling_delete_retry_not_before, None);
+    assert!(restored.replacement_legacy_retry_compatibility_done);
+}
+
+#[tokio::test]
+async fn persisted_dangling_delete_deadlines_reject_unrepresentable_values() {
+    use sha2::{Digest, Sha256};
+
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let mut state = ResumeState::new(
+        task_id.clone(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+    );
+    state.dangling_delete_retry_not_before = Some(u64::MAX);
+    let state_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &state_path,
+        serde_json::to_vec(&state)
+            .expect("serialize malformed deadline fixture")
+            .into(),
+    )
+    .await
+    .expect("write resume state with an unrepresentable deadline");
+    let resume_error = match ResumeManager::load_from_disk(disk.clone(), &task_id).await {
+        Ok(_) => panic!("an unrepresentable deadline must not become a durable wait"),
+        Err(error) => error,
+    };
+    assert!(matches!(resume_error, Error::TaskExecutionFailed { message } if message.contains("grace deadline")));
+
+    let mut checkpoint = ResumeCheckpoint::new(task_id.clone());
+    checkpoint.dangling_delete_grace_objects = 1;
+    checkpoint.skipped_object_count = 1;
+    checkpoint.dangling_delete_retry_not_before = Some(u64::MAX);
+    let mut wire = serde_json::to_value(checkpoint).expect("serialize malformed checkpoint deadline");
+    let unsigned = serde_json::to_vec(&wire).expect("serialize unsigned malformed checkpoint");
+    wire["integrity_digest"] = serde_json::json!(base64_simd::STANDARD.encode_to_string(Sha256::digest(&unsigned)));
+    let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &checkpoint_path,
+        serde_json::to_vec(&wire)
+            .expect("serialize signed malformed checkpoint")
+            .into(),
+    )
+    .await
+    .expect("write signed checkpoint with an unrepresentable deadline");
+    let checkpoint_error = match CheckpointManager::load_from_disk(disk.clone(), &task_id).await {
+        Ok(_) => panic!("an unrepresentable checkpoint deadline must not become a durable wait"),
+        Err(error) => error,
+    };
+    assert!(matches!(checkpoint_error, Error::InvalidCheckpoint(message) if message.contains("grace deadline")));
+    assert!(CheckpointManager::is_blocked(&disk, &task_id).await);
+}
+
+#[tokio::test]
+async fn replacement_readiness_deferral_rewinds_progress_without_spending_budget() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("replacement intent should persist");
+    {
+        let mut state = manager.state.write().await;
+        state.replacement_phase = ReplacementPhase::Rebuilding;
+        state.processed_objects = 9;
+        state.skipped_objects = 4;
+        state.retry_count = 2;
+        state.dangling_delete_retry_not_before = Some(4_000_000_000);
+    }
+    manager
+        .save_state_strict()
+        .await
+        .expect("progress should persist before deferral");
+
+    manager
+        .defer_retry_until_target_ready()
+        .await
+        .expect("readiness deferral should persist without incrementing retry count");
+    let state = ResumeManager::load_replacement_intent(disk, &task_id)
+        .await
+        .expect("deferred intent should remain loadable")
+        .get_state()
+        .await;
+    assert_eq!(state.retry_count, 2, "readiness deferral must not spend the in-budget counter");
+    assert_eq!(state.processed_objects, 0);
+    assert_eq!(state.skipped_objects, 0);
+    assert_eq!(state.replacement_phase, ReplacementPhase::Rebuilding);
+    assert!(!state.completed);
+    assert!(state.replacement_retry_waiting_for_target);
+    assert_eq!(state.dangling_delete_retry_not_before, None);
+    assert_eq!(state.error_message.as_deref(), Some(REPLACEMENT_TARGET_READINESS_DEFERRED));
+}
+
+#[tokio::test]
+async fn exhausted_replacement_deferral_reserves_one_bounded_retry() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("replacement intent should persist");
+    {
+        let mut state = manager.state.write().await;
+        state.replacement_phase = ReplacementPhase::Rebuilding;
+        state.retry_count = state.max_retries;
+    }
+    manager.save_state_strict().await.expect("exhausted state should persist");
+
+    manager
+        .defer_retry_until_target_ready()
+        .await
+        .expect("compatibility deferral should persist");
+    manager
+        .record_replacement_failure(&Error::ReplacementTargetNotReady("target is restarting".to_string()), 99)
+        .await
+        .expect("task-level persistence must preserve a readiness deferral");
+    let state = ResumeManager::load_replacement_intent(disk, &task_id)
+        .await
+        .expect("deferred intent should remain loadable")
+        .get_state()
+        .await;
+    assert_eq!(state.retry_count, state.max_retries.saturating_sub(1));
+    assert!(state.replacement_legacy_retry_compatibility_done);
+    assert!(state.replacement_retry_waiting_for_target);
+}
+
+#[tokio::test]
+async fn replacement_target_not_ready_failure_does_not_consume_budget() {
+    let (_temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("replacement intent should persist");
+    {
+        let mut state = manager.state.write().await;
+        state.replacement_phase = ReplacementPhase::Rebuilding;
+        state.retry_count = 1;
+    }
+    manager.save_state_strict().await.expect("active state should persist");
+
+    manager
+        .record_replacement_failure(&Error::ReplacementTargetNotReady("target is restarting".to_string()), 99)
+        .await
+        .expect("target readiness should be persisted as a deferral");
+    let state = ResumeManager::load_replacement_intent(disk, &task_id)
+        .await
+        .expect("deferred intent should remain loadable")
+        .get_state()
+        .await;
+    assert_eq!(state.retry_count, 1);
+    assert!(state.replacement_retry_waiting_for_target);
+    assert_eq!(state.error_message.as_deref(), Some(REPLACEMENT_TARGET_READINESS_DEFERRED));
+}
+
 #[test]
 fn can_retry_is_bounded_by_max_retries() {
     let mut state = ResumeState::new("t".to_string(), "erasure_set".to_string(), "pool_0_set_0".to_string(), vec![]);
@@ -1603,6 +2160,152 @@ async fn test_resumestate_schema_v0_discarded_on_load() {
 }
 
 #[tokio::test]
+async fn historical_null_progress_is_replayed_after_upgrade() {
+    use sha2::{Digest, Sha256};
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let mut state = ResumeState::new(
+        task_id.clone(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        vec!["pending-bucket".to_string()],
+    );
+    state.schema_version = 5;
+    state.resume_cursor = Some("dw1:old-page".to_string());
+    state.completed_buckets = vec!["completed-bucket".to_string()];
+    state.processed_objects = 5;
+    state.successful_objects = 5;
+    state.completed = true;
+    let state_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_STATE_FILE}");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &state_path,
+        serde_json::to_vec(&state).expect("serialize schema 5").into(),
+    )
+    .await
+    .expect("persist old resume state");
+
+    let mut checkpoint = ResumeCheckpoint::new(task_id.clone());
+    checkpoint.schema_version = 6;
+    checkpoint.current_bucket_index = 1;
+    checkpoint.current_object_index = 5;
+    checkpoint.processed_objects.insert(compose_key("versions/object.bin", None));
+    checkpoint.successful_objects = 5;
+    // Schema 6 used a digest over the canonical JSON with a null digest field.
+    let mut wire = serde_json::to_value(&checkpoint).expect("serialize schema 6");
+    let unsigned = serde_json::to_vec(&wire).expect("serialize unsigned schema 6");
+    wire["integrity_digest"] = serde_json::json!(base64_simd::STANDARD.encode_to_string(Sha256::digest(&unsigned)));
+    let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &checkpoint_path,
+        serde_json::to_vec(&wire).expect("serialize signed schema 6").into(),
+    )
+    .await
+    .expect("persist old checkpoint");
+
+    let restored = ResumeManager::load_from_disk(disk.clone(), &task_id)
+        .await
+        .expect("load old resume state")
+        .get_state()
+        .await;
+    assert_eq!(restored.schema_version, CURRENT_RESUME_SCHEMA);
+    assert_eq!(restored.resume_cursor, None);
+    assert_eq!(restored.processed_objects, 0);
+    assert_eq!(restored.successful_objects, 0);
+    assert!(!restored.completed);
+    assert!(restored.completed_buckets.is_empty());
+    assert_eq!(
+        restored.pending_buckets,
+        ["completed-bucket", "pending-bucket"],
+        "formerly completed buckets must be rescanned too"
+    );
+    let restored = CheckpointManager::load_from_disk(disk, &task_id)
+        .await
+        .expect("load old signed checkpoint")
+        .get_checkpoint()
+        .await;
+    assert_eq!(restored.schema_version, CURRENT_CHECKPOINT_SCHEMA);
+    assert!(
+        restored.processed_objects.is_empty(),
+        "ambiguous null coverage cannot survive the upgrade"
+    );
+    assert_eq!(restored.current_bucket_index, 0);
+    assert_eq!(restored.current_object_index, 0);
+    assert_eq!(restored.successful_objects, 0);
+    temp_dir.close().expect("remove upgrade fixture");
+}
+
+#[tokio::test]
+async fn legacy_replacement_null_coverage_cannot_reuse_a_completion_proof() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("persist replacement intent");
+    manager
+        .mark_replacement_completed_and_verified()
+        .await
+        .expect("persist the old completion proof");
+    let proof_path = replacement_completion_proof_path(&task_id);
+    let proof_path = proof_path.to_str().expect("proof path must be UTF-8");
+    let proof_before = disk
+        .read_all(RUSTFS_META_BUCKET, proof_path)
+        .await
+        .expect("read completion proof");
+    let intent_path = ResumeStateFile::ReplacementIntent.path(&task_id);
+    let intent_path = intent_path.to_str().expect("intent path must be UTF-8");
+    for phase in [
+        ReplacementPhase::Intent,
+        ReplacementPhase::Rebuilding,
+        ReplacementPhase::Verified,
+        ReplacementPhase::CleanupPending,
+    ] {
+        let mut legacy = manager.get_state().await;
+        legacy.schema_version = 5;
+        legacy.replacement_phase = phase;
+        legacy.completed = matches!(phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending);
+        let bytes = serde_json::to_vec(&legacy).expect("serialize old replacement state");
+        disk.write_all(RUSTFS_META_BUCKET, intent_path, bytes.clone().into())
+            .await
+            .expect("write old replacement state");
+        let error = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+            .await
+            .err()
+            .expect("legacy replacement coverage must require explicit recovery");
+        assert!(
+            error.to_string().contains("legacy version coverage"),
+            "unexpected recovery error: {error}"
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, intent_path)
+                .await
+                .expect("retained intent")
+                .as_ref(),
+            bytes
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, proof_path).await.expect("retained proof"),
+            proof_before,
+            "an upgrade must not discard the ownership/completion fence"
+        );
+    }
+    temp_dir.close().expect("remove replacement upgrade fixture");
+}
+
+#[tokio::test]
 async fn test_checkpoint_schema_v5_discarded_on_load() {
     let (temp_dir, disk) = schema_test_disk().await;
 
@@ -1633,6 +2336,162 @@ async fn test_checkpoint_schema_v5_discarded_on_load() {
     assert!(checkpoint.failed_objects.is_empty());
     assert!(checkpoint.skipped_objects.is_empty());
     temp_dir.close().expect("remove schema test directory");
+}
+
+// Keep these signed wire fixtures independent of today's struct and its defaults.
+const LEGACY_SIGNED_CHECKPOINTS: [&str; 3] = [
+    r#"{"schema_version":5,"task_id":"00000000-0000-4000-8000-000000000002","checkpoint_time":1700000000,"current_bucket_index":2,"current_object_index":500,"processed_objects":["a","b"],"failed_objects":["c"],"skipped_objects":["d"],"integrity_digest":"/AZPOA1TZttBQ0ieKM0QBVMDnr5s2YWZqb+3rmg+vds="}"#,
+    r#"{"schema_version":6,"task_id":"00000000-0000-4000-8000-000000000002","checkpoint_time":1700000000,"current_bucket_index":2,"current_object_index":500,"processed_objects":["a","b"],"failed_objects":["c"],"skipped_objects":["d"],"integrity_digest":"4IBOlSw4ln91DXRnVZD0D7qDt+DKSp205Y6eFwNpm80="}"#,
+    r#"{"schema_version":6,"task_id":"00000000-0000-4000-8000-000000000002","checkpoint_time":1700000000,"current_bucket_index":2,"current_object_index":500,"processed_objects":["a","b"],"failed_objects":["c"],"skipped_objects":["d"],"integrity_digest":"mkGdi8fQRM6f1yS9NIyf+O8F9FRL4/pBXL79CD/il7k="}"#,
+];
+
+#[tokio::test]
+async fn signed_legacy_checkpoint_verifies_before_schema_upgrade() {
+    for legacy in LEGACY_SIGNED_CHECKPOINTS {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = "00000000-0000-4000-8000-000000000002";
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        disk.write_all(RUSTFS_META_BUCKET, &path, legacy.as_bytes().to_vec().into())
+            .await
+            .expect("write signed legacy checkpoint");
+
+        assert!(
+            CheckpointManager::is_resumable(&disk, task_id)
+                .await
+                .expect("discovery must accept an intact signed legacy checkpoint")
+        );
+        let manager = CheckpointManager::load_from_disk(disk.clone(), task_id)
+            .await
+            .expect("verify the original signed fields before filling defaults");
+        let checkpoint = manager.get_checkpoint().await;
+        assert_eq!(checkpoint.schema_version, CURRENT_CHECKPOINT_SCHEMA);
+        assert_eq!(checkpoint.current_bucket_index, 0);
+        assert_eq!(checkpoint.current_object_index, 0);
+        assert!(checkpoint.processed_objects.is_empty());
+        assert!(checkpoint.failed_objects.is_empty());
+        assert!(checkpoint.skipped_objects.is_empty());
+        assert_eq!(checkpoint.successful_objects, 0);
+        assert_eq!(checkpoint.failed_object_count, 0);
+        assert_eq!(checkpoint.skipped_object_count, 0);
+        assert!(!checkpoint.baseline_known);
+        assert!(!CheckpointManager::is_blocked(&disk, task_id).await);
+
+        manager
+            .update_position(1, 3)
+            .await
+            .expect("save upgraded checkpoint with CAS");
+        let restored = CheckpointManager::load_from_disk(disk, task_id)
+            .await
+            .expect("reload upgraded checkpoint")
+            .get_checkpoint()
+            .await;
+        assert_eq!(restored.current_bucket_index, 1);
+        assert_eq!(restored.current_object_index, 3);
+        temp_dir.close().expect("remove signed legacy checkpoint fixture");
+    }
+}
+
+#[tokio::test]
+async fn signed_legacy_checkpoint_rejects_tampering() {
+    for legacy in LEGACY_SIGNED_CHECKPOINTS {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = "00000000-0000-4000-8000-000000000002";
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        let tampered = legacy.replace("\"current_object_index\":500", "\"current_object_index\":501");
+        disk.write_all(RUSTFS_META_BUCKET, &path, tampered.as_bytes().to_vec().into())
+            .await
+            .expect("write modified signed legacy checkpoint");
+
+        assert!(matches!(
+            CheckpointManager::load_from_disk(disk.clone(), task_id).await,
+            Err(Error::InvalidCheckpoint(message)) if message.contains("digest does not match")
+        ));
+        assert!(CheckpointManager::is_blocked(&disk, task_id).await);
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &path)
+                .await
+                .expect("invalid snapshot must remain available"),
+            tampered.as_bytes()
+        );
+        temp_dir.close().expect("remove modified legacy checkpoint fixture");
+    }
+}
+
+#[tokio::test]
+async fn signed_checkpoint_rejects_duplicate_fields() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = "00000000-0000-4000-8000-000000000002";
+    let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    let duplicate = LEGACY_SIGNED_CHECKPOINTS[2].replace(
+        "\"current_object_index\":500",
+        "\"current_object_index\":501,\"current_object_index\":500",
+    );
+    disk.write_all(RUSTFS_META_BUCKET, &path, duplicate.as_bytes().to_vec().into())
+        .await
+        .expect("write checkpoint with conflicting duplicate fields");
+
+    assert!(matches!(
+        CheckpointManager::load_from_disk(disk.clone(), task_id).await,
+        Err(Error::TaskExecutionFailed { message }) if message.contains("duplicate field")
+    ));
+    assert!(CheckpointManager::is_blocked(&disk, task_id).await);
+    temp_dir.close().expect("remove duplicate field checkpoint fixture");
+}
+
+#[tokio::test]
+async fn checkpoint_writer_preserves_base_reader_canonicalization() {
+    use sha2::{Digest, Sha256};
+
+    for admin in [false, true] {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let manager = CheckpointManager::new(disk.clone(), task_id.clone())
+            .await
+            .expect("create rollback-compatible checkpoint");
+        if admin {
+            manager
+                .set_admin(AdminErasureCheckpoint {
+                    set_disk_id: "pool_0_set_0".to_string(),
+                    options: Default::default(),
+                    buckets: [("bucket".to_string(), Some(uuid::Uuid::new_v4()))].into(),
+                    outcome: Default::default(),
+                    completed: false,
+                })
+                .await
+                .expect("save nested administrator checkpoint");
+        }
+        manager.add_processed_object("b".to_string()).await.expect("record object b");
+        manager.add_processed_object("a".to_string()).await.expect("record object a");
+        manager.update_position(2, 9).await.expect("flush rollback fixture");
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        let bytes = disk
+            .read_all(RUSTFS_META_BUCKET, &path)
+            .await
+            .expect("read real writer output");
+        let mut wire: serde_json::Value = serde_json::from_slice(&bytes).expect("decode writer output");
+        wire.sort_all_objects();
+        assert_eq!(
+            bytes.as_ref(),
+            serde_json::to_vec(&wire).expect("encode recursively sorted payload"),
+            "persisted keys must have the production base writer's order, including nested admin fields"
+        );
+        let signature = wire["integrity_digest"].take();
+        let unsigned = serde_json::to_vec(&wire).expect("encode base reader signing representation");
+        assert_eq!(
+            signature,
+            base64_simd::STANDARD.encode_to_string(Sha256::digest(&unsigned)),
+            "the production base reader must accept this writer's signature"
+        );
+        let restored = CheckpointManager::load_from_disk(disk, &task_id)
+            .await
+            .expect("same-version control must also load")
+            .get_checkpoint()
+            .await;
+        assert_eq!(restored.current_bucket_index, 2);
+        assert_eq!(restored.current_object_index, 9);
+        assert_eq!(restored.admin.is_some(), admin);
+        temp_dir.close().expect("remove rollback canonicalization fixture");
+    }
 }
 
 #[tokio::test]
@@ -2066,34 +2925,38 @@ async fn checkpoint_cleanup_leaves_no_task_specific_lock_artifact() {
 }
 
 #[tokio::test]
-async fn an_empty_blocked_marker_still_blocks_resume_selection() {
+async fn an_empty_blocked_marker_over_a_missing_snapshot_is_cleared_by_revalidation() {
+    // A legacy marker is due immediately. With no snapshot left to isolate,
+    // a fresh scan is the safe continuation, so the marker is cleared.
     let (temp_dir, disk) = schema_test_disk().await;
     let task_id = ResumeUtils::generate_task_id();
-    let manager = CheckpointManager::new(disk.clone(), task_id.clone())
-        .await
-        .expect("create checkpoint manager");
     let blocked_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_BLOCKED_FILE}");
     disk.write_all(RUSTFS_META_BUCKET, &blocked_path, EcstoreDiskBytes::new())
         .await
         .expect("write empty blocked marker fixture");
 
-    assert!(CheckpointManager::is_blocked(&disk, &task_id).await);
-    assert!(CheckpointManager::is_resumable(&disk, &task_id).await.is_err());
-    // Recovery requires replacing/cleaning the snapshot, then removing the
-    // marker; ordinary selector retries are intentionally not an unlock path.
-    manager.cleanup().await.expect("clean blocked checkpoint");
     assert!(!CheckpointManager::is_blocked(&disk, &task_id).await);
+    assert!(disk.read_all(RUSTFS_META_BUCKET, &blocked_path).await.is_err());
+    assert!(
+        CheckpointManager::is_resumable(&disk, &task_id)
+            .await
+            .expect("no snapshot and no marker")
+    );
     temp_dir.close().expect("remove empty blocked marker test directory");
 }
 
 #[tokio::test]
-async fn resumable_selector_skips_healthy_tasks_with_blocked_markers() {
+async fn resumable_selector_revalidates_legacy_markers_per_task() {
+    // One task carries a legacy marker over an intact snapshot: it unblocks.
+    // The other carries a legacy marker over a corrupt snapshot: it stays
+    // blocked and keeps failing the selector, while its bytes are retained.
     let (temp_dir, disk) = schema_test_disk().await;
-    let tasks = [
-        (ResumeUtils::generate_task_id(), EcstoreDiskBytes::new()),
-        (ResumeUtils::generate_task_id(), EcstoreDiskBytes::from_static(b"blocked")),
-    ];
-    for (task_id, marker) in &tasks {
+    let healthy = ResumeUtils::generate_task_id();
+    let corrupt = ResumeUtils::generate_task_id();
+    for (task_id, marker) in [
+        (&healthy, EcstoreDiskBytes::new()),
+        (&corrupt, EcstoreDiskBytes::from_static(b"blocked")),
+    ] {
         ResumeManager::new(
             disk.clone(),
             task_id.clone(),
@@ -2102,28 +2965,35 @@ async fn resumable_selector_skips_healthy_tasks_with_blocked_markers() {
             vec!["bucket".to_string()],
         )
         .await
-        .expect("create healthy resume state");
+        .expect("create resume state");
         CheckpointManager::new(disk.clone(), task_id.clone())
             .await
-            .expect("create healthy checkpoint");
-        let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
-        let checkpoint_bytes = disk
-            .read_all(RUSTFS_META_BUCKET, &checkpoint_path)
-            .await
-            .expect("read healthy checkpoint before blocking");
+            .expect("create checkpoint");
         let marker_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_BLOCKED_FILE}");
-        disk.write_all(RUSTFS_META_BUCKET, &marker_path, marker.clone())
+        disk.write_all(RUSTFS_META_BUCKET, &marker_path, marker)
             .await
-            .expect("write blocked marker");
-
-        assert!(ResumeUtils::get_resumable_tasks(&disk).await.is_err());
-        assert_eq!(
-            disk.read_all(RUSTFS_META_BUCKET, &checkpoint_path)
-                .await
-                .expect("read healthy checkpoint after blocking"),
-            checkpoint_bytes
-        );
+            .expect("write legacy blocked marker");
     }
+    let corrupt_path = format!("{BUCKET_META_PREFIX}/{corrupt}_{RESUME_CHECKPOINT_FILE}");
+    disk.write_all(RUSTFS_META_BUCKET, &corrupt_path, b"{truncated".to_vec().into())
+        .await
+        .expect("corrupt one snapshot");
+
+    assert!(
+        CheckpointManager::is_resumable(&disk, &healthy)
+            .await
+            .expect("intact snapshot unblocks")
+    );
+    assert!(!CheckpointManager::is_blocked(&disk, &healthy).await);
+    assert!(CheckpointManager::is_resumable(&disk, &corrupt).await.is_err());
+    assert!(CheckpointManager::is_blocked(&disk, &corrupt).await);
+    assert!(ResumeUtils::get_resumable_tasks(&disk).await.is_err());
+    assert_eq!(
+        disk.read_all(RUSTFS_META_BUCKET, &corrupt_path)
+            .await
+            .expect("corrupt snapshot retained"),
+        b"{truncated".as_slice()
+    );
     temp_dir.close().expect("remove blocked selector test directory");
 }
 
@@ -2516,4 +3386,246 @@ async fn resume_state_rejects_filename_and_json_task_id_mismatch() {
         error,
         Error::TaskExecutionFailed { message } if message == "Resume checkpoint task id does not match filename"
     ));
+}
+
+async fn budget_fixture() -> (tempfile::TempDir, DiskStore, ResumeManager) {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id,
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("replacement intent should persist");
+    (temp_dir, disk, manager)
+}
+
+#[tokio::test]
+async fn preformat_failures_do_not_consume_the_rebuild_budget() {
+    // rustfs/rustfs#8565: a format fence rejection before `format.json`
+    // exists is not a rebuild attempt.
+    let (_temp_dir, disk, manager) = budget_fixture().await;
+    let task_id = manager.get_state().await.task_id;
+    for attempt in 1..=5 {
+        manager
+            .record_replacement_failure(&Error::Storage(crate::heal::EcstoreError::SlowDown), attempt)
+            .await
+            .expect("pre-format failure persists");
+    }
+    let state = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+        .await
+        .expect("reload")
+        .get_state()
+        .await;
+    assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
+    assert_eq!(state.retry_count, 0, "pre-format failures must not spend the rebuild budget");
+    assert!(
+        state
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("reduce your request rate"))
+    );
+    assert_ne!(
+        ReplacementRecoveryRecord::from_state(state.clone()).expect("record").state,
+        ReplacementRecoveryState::Unrecoverable
+    );
+
+    // Genuine rebuild failures after formatting still exhaust the budget.
+    manager
+        .mark_replacement_rebuilding(state.replacement_target_identities.clone())
+        .await
+        .expect("format admitted");
+    for attempt in 1..=state.max_retries {
+        manager
+            .record_replacement_failure(&Error::other("rebuild failed"), attempt)
+            .await
+            .expect("rebuild failure persists");
+    }
+    let exhausted = manager.get_state().await;
+    assert_eq!(exhausted.retry_count, exhausted.max_retries);
+    assert_eq!(
+        ReplacementRecoveryRecord::from_state(exhausted).expect("record").state,
+        ReplacementRecoveryState::Unrecoverable
+    );
+}
+
+#[tokio::test]
+async fn repeated_target_outages_never_consume_the_rebuild_budget() {
+    let (_temp_dir, _disk, manager) = budget_fixture().await;
+    let identities = manager.get_state().await.replacement_target_identities;
+    manager
+        .mark_replacement_rebuilding(identities)
+        .await
+        .expect("format admitted");
+    manager
+        .record_replacement_failure(&Error::other("one real failure"), 1)
+        .await
+        .expect("rebuild failure persists");
+    for attempt in 2..=11 {
+        manager
+            .record_replacement_failure(&Error::ReplacementTargetNotReady("target offline".to_string()), attempt)
+            .await
+            .expect("outage persists as a deferral");
+    }
+    let state = manager.get_state().await;
+    assert_eq!(state.retry_count, 1, "ten outages must leave the single real failure");
+    assert!(state.replacement_retry_waiting_for_target);
+    assert!(state.can_retry());
+}
+
+#[tokio::test]
+async fn replacement_retry_does_not_treat_error_text_as_target_readiness() {
+    let (_temp_dir, disk, manager) = budget_fixture().await;
+    let identities = manager.get_state().await.replacement_target_identities;
+    manager
+        .mark_replacement_rebuilding(identities)
+        .await
+        .expect("format admitted");
+    manager
+        .defer_retry_until_target_ready()
+        .await
+        .expect("target readiness deferral persists");
+    let failure = Error::transient_skip("object named target readiness deferred retry failed during rebuild");
+    manager
+        .record_replacement_failure(&failure, 2)
+        .await
+        .expect("rebuild failure persists");
+
+    let task_id = manager.get_state().await.task_id;
+    let state = ResumeManager::load_replacement_intent(disk, &task_id)
+        .await
+        .expect("failed intent remains loadable")
+        .get_state()
+        .await;
+    assert_eq!(state.retry_count, 2, "error text must not bypass the rebuild retry budget");
+    assert_eq!(state.error_message.as_deref(), Some(failure.to_string().as_str()));
+}
+
+fn blocked_marker_path(task_id: &str) -> String {
+    format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_BLOCKED_FILE}")
+}
+
+#[tokio::test]
+async fn blocked_checkpoint_is_unblocked_when_the_current_reader_accepts_it() {
+    // rustfs/rustfs#8645: an older binary blocked a checkpoint whose digest it
+    // could not verify. The compatible reader accepts it, so a revalidation
+    // must clear the legacy marker instead of blocking the task forever.
+    for legacy in LEGACY_SIGNED_CHECKPOINTS {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = "00000000-0000-4000-8000-000000000002";
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        disk.write_all(RUSTFS_META_BUCKET, &path, legacy.as_bytes().to_vec().into())
+            .await
+            .expect("write signed legacy checkpoint");
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            &blocked_marker_path(task_id),
+            EcstoreDiskBytes::from_static(b"blocked"),
+        )
+        .await
+        .expect("write legacy blocked marker");
+
+        assert!(
+            CheckpointManager::is_resumable(&disk, task_id)
+                .await
+                .expect("revalidation must accept the intact checkpoint")
+        );
+        assert!(!CheckpointManager::is_blocked(&disk, task_id).await, "revalidation clears the marker");
+        assert!(
+            disk.read_all(RUSTFS_META_BUCKET, &blocked_marker_path(task_id))
+                .await
+                .is_err(),
+            "the marker file is removed"
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("checkpoint retained"),
+            legacy.as_bytes()
+        );
+        temp_dir.close().expect("remove revalidation fixture");
+    }
+}
+
+#[tokio::test]
+async fn tampered_checkpoint_stays_blocked_after_revalidation() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = "00000000-0000-4000-8000-000000000002";
+    let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    let tampered = LEGACY_SIGNED_CHECKPOINTS[2].replace("\"current_object_index\":500", "\"current_object_index\":501");
+    disk.write_all(RUSTFS_META_BUCKET, &path, tampered.as_bytes().to_vec().into())
+        .await
+        .expect("write tampered checkpoint");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &blocked_marker_path(task_id),
+        EcstoreDiskBytes::from_static(b"blocked"),
+    )
+    .await
+    .expect("write legacy blocked marker");
+
+    assert!(CheckpointManager::is_resumable(&disk, task_id).await.is_err());
+    assert!(CheckpointManager::is_blocked(&disk, task_id).await);
+    let marker = disk
+        .read_all(RUSTFS_META_BUCKET, &blocked_marker_path(task_id))
+        .await
+        .expect("marker retained");
+    let marker: serde_json::Value = serde_json::from_slice(&marker).expect("revalidated marker is structured");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let revalidate_after = marker["revalidate_after"].as_u64().expect("next revalidation time");
+    assert!(revalidate_after > now + 3000, "revalidation is rescheduled about an hour later");
+    assert!(marker["reason"].as_str().is_some_and(|reason| reason.contains("digest")));
+
+    // Not due yet: the second call must not rewrite the marker.
+    assert!(CheckpointManager::is_resumable(&disk, task_id).await.is_err());
+    let unchanged = disk
+        .read_all(RUSTFS_META_BUCKET, &blocked_marker_path(task_id))
+        .await
+        .expect("marker retained");
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&unchanged).expect("marker JSON"), marker);
+    assert_eq!(
+        disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("checkpoint retained"),
+        tampered.as_bytes()
+    );
+    temp_dir.close().expect("remove tampered revalidation fixture");
+}
+
+#[tokio::test]
+async fn blocked_checkpoint_is_not_revalidated_before_its_schedule() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = "00000000-0000-4000-8000-000000000002";
+    let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    disk.write_all(RUSTFS_META_BUCKET, &path, LEGACY_SIGNED_CHECKPOINTS[2].as_bytes().to_vec().into())
+        .await
+        .expect("write intact checkpoint");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let marker = serde_json::json!({
+        "schema": 1,
+        "blocked_at": now,
+        "revalidate_after": now + 3600,
+        "reason": "digest mismatch observed by a previous reader",
+    });
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &blocked_marker_path(task_id),
+        serde_json::to_vec(&marker).expect("marker JSON").into(),
+    )
+    .await
+    .expect("write scheduled marker");
+
+    assert!(CheckpointManager::is_resumable(&disk, task_id).await.is_err());
+    assert!(CheckpointManager::is_blocked(&disk, task_id).await);
+    let retained = disk
+        .read_all(RUSTFS_META_BUCKET, &blocked_marker_path(task_id))
+        .await
+        .expect("marker retained");
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&retained).expect("marker JSON"), marker);
+    temp_dir.close().expect("remove scheduled revalidation fixture");
 }

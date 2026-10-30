@@ -58,8 +58,14 @@ impl ActionSet {
     }
 
     pub fn is_match(&self, action: &Action) -> bool {
+        self.is_match_for_effect(action, false)
+    }
+
+    /// `deny` lets a blanket `s3:*` cover force-delete actions so an explicit
+    /// Deny still wins. Allow matching stays name-only for those actions.
+    pub fn is_match_for_effect(&self, action: &Action, deny: bool) -> bool {
         for act in self.0.iter() {
-            if act.is_match(action) {
+            if act.is_match_for_effect(action, deny) {
                 return true;
             }
 
@@ -71,6 +77,22 @@ impl ActionSet {
         }
 
         false
+    }
+
+    /// Whether a statement with this `Action` list and `not_actions` as its
+    /// `NotAction` list covers `action`.
+    ///
+    /// `NotAction` always uses plain wildcard matching, so `NotAction: "s3:*"`
+    /// still excludes force-delete. An Allow grants force-delete only when its
+    /// `Action` list names it: an Allow built from `NotAction` alone never does.
+    pub fn statement_covers(&self, not_actions: &ActionSet, action: &Action, deny: bool) -> bool {
+        if not_actions.is_match_for_effect(action, true) {
+            return false;
+        }
+        if self.is_empty() {
+            return deny || !action_requires_explicit_grant(action);
+        }
+        self.is_match_for_effect(action, deny)
     }
 }
 
@@ -155,8 +177,26 @@ pub enum Action {
 
 impl Action {
     pub fn is_match(&self, action: &Action) -> bool {
+        self.is_match_for_effect(action, false)
+    }
+
+    pub fn is_match_for_effect(&self, action: &Action, deny: bool) -> bool {
+        // Force-delete bypasses emptiness and version checks. A blanket `s3:*`
+        // / `*` Allow (including canned consoleAdmin) must not confer it; the
+        // statement has to name `s3:ForceDeleteBucket` or `s3:ForceDeleteObject`.
+        // The same wildcard on a Deny still matches, so explicit deny wins.
+        if !deny && matches!(self, Action::S3Action(S3Action::AllActions)) && action_requires_explicit_grant(action) {
+            return false;
+        }
         wildcard::is_match::<&str, &str>(self.into(), action.into())
     }
+}
+
+fn action_requires_explicit_grant(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::S3Action(S3Action::ForceDeleteBucketAction | S3Action::ForceDeleteObjectAction)
+    )
 }
 
 impl From<&Action> for &str {
@@ -220,8 +260,14 @@ pub enum S3Action {
     CreateBucketAction,
     #[strum(serialize = "s3:DeleteBucket")]
     DeleteBucketAction,
+    /// DeleteBucket when `x-minio-force-delete` / `x-rustfs-force-delete` is set.
+    /// Not implied by `s3:*`; the action must be named on the statement.
     #[strum(serialize = "s3:ForceDeleteBucket")]
     ForceDeleteBucketAction,
+    /// Recursive DeleteObject selected by the same force-delete header.
+    /// Not implied by `s3:*`; the action must be named on the statement.
+    #[strum(serialize = "s3:ForceDeleteObject")]
+    ForceDeleteObjectAction,
     #[strum(serialize = "s3:DeleteBucketPolicy")]
     DeleteBucketPolicyAction,
     #[strum(serialize = "s3:DeleteBucketPublicAccessBlock")]
@@ -401,6 +447,10 @@ pub enum AdminAction {
     ServiceFreezeAdminAction,
     #[strum(serialize = "admin:ConfigUpdate")]
     ConfigUpdateAdminAction,
+    #[strum(serialize = "admin:TLSCertificatePublish")]
+    TLSCertificatePublishAdminAction,
+    #[strum(serialize = "admin:TLSCertificateStatus")]
+    TLSCertificateStatusAdminAction,
     #[strum(serialize = "admin:CreateUser")]
     CreateUserAdminAction,
     #[strum(serialize = "admin:DeleteUser")]
@@ -481,6 +531,9 @@ pub enum AdminAction {
     ImportBucketMetadataAction,
     #[strum(serialize = "admin:ExportBucketMetadata")]
     ExportBucketMetadataAction,
+    /// Reconcile metadata left after an operator removed all physical bucket volumes.
+    #[strum(serialize = "admin:RecoverOrphanedBucket")]
+    RecoverOrphanedBucketAction,
     #[strum(serialize = "admin:GetTableCatalog")]
     GetTableCatalogAction,
     #[strum(serialize = "admin:MigrateTableCatalog")]
@@ -503,6 +556,8 @@ pub enum AdminAction {
     SetTableAction,
     #[strum(serialize = "admin:CreateTable")]
     CreateTableAction,
+    #[strum(serialize = "admin:ClaimTableLocation")]
+    ClaimTableLocationAction,
     #[strum(serialize = "admin:RegisterTable")]
     RegisterTableAction,
     #[strum(serialize = "admin:CommitTable")]
@@ -513,6 +568,24 @@ pub enum AdminAction {
     GetTableLifecycleAction,
     #[strum(serialize = "admin:SetTableLifecycle")]
     SetTableLifecycleAction,
+    #[strum(serialize = "admin:CreatePluginDelegation")]
+    CreatePluginDelegationAction,
+    #[strum(serialize = "admin:IssuePluginAttempt")]
+    IssuePluginAttemptAction,
+    #[strum(serialize = "admin:SubmitPluginJob")]
+    SubmitPluginJobAction,
+    #[strum(serialize = "admin:GetPluginRun")]
+    GetPluginRunAction,
+    #[strum(serialize = "admin:CancelPluginRun")]
+    CancelPluginRunAction,
+    #[strum(serialize = "admin:ListPluginRuns")]
+    ListPluginRunsAction,
+    #[strum(serialize = "admin:ReplayPluginRun")]
+    ReplayPluginRunAction,
+    #[strum(serialize = "admin:GetPluginDelegation")]
+    GetPluginDelegationAction,
+    #[strum(serialize = "admin:RevokePluginDelegation")]
+    RevokePluginDelegationAction,
     #[strum(serialize = "admin:GetTableCredentials")]
     GetTableCredentialsAction,
     #[strum(serialize = "admin:RunTableMaintenance")]
@@ -558,6 +631,7 @@ impl AdminAction {
                 | AdminAction::GetTableAction
                 | AdminAction::SetTableAction
                 | AdminAction::CreateTableAction
+                | AdminAction::ClaimTableLocationAction
                 | AdminAction::RegisterTableAction
                 | AdminAction::CommitTableAction
                 | AdminAction::DeleteTableAction
@@ -597,6 +671,8 @@ impl AdminAction {
                 | AdminAction::ServiceStopAdminAction
                 | AdminAction::ServiceFreezeAdminAction
                 | AdminAction::ConfigUpdateAdminAction
+                | AdminAction::TLSCertificatePublishAdminAction
+                | AdminAction::TLSCertificateStatusAdminAction
                 | AdminAction::CreateUserAdminAction
                 | AdminAction::DeleteUserAdminAction
                 | AdminAction::ListUsersAdminAction
@@ -636,6 +712,7 @@ impl AdminAction {
                 | AdminAction::GetReplicationMetricsAction
                 | AdminAction::ImportBucketMetadataAction
                 | AdminAction::ExportBucketMetadataAction
+                | AdminAction::RecoverOrphanedBucketAction
                 | AdminAction::GetTableCatalogAction
                 | AdminAction::MigrateTableCatalogAction
                 | AdminAction::GetTableBucketAction
@@ -647,12 +724,22 @@ impl AdminAction {
                 | AdminAction::GetTableAction
                 | AdminAction::SetTableAction
                 | AdminAction::CreateTableAction
+                | AdminAction::ClaimTableLocationAction
                 | AdminAction::RegisterTableAction
                 | AdminAction::CommitTableAction
                 | AdminAction::DeleteTableAction
                 | AdminAction::GetTableLifecycleAction
                 | AdminAction::SetTableLifecycleAction
                 | AdminAction::GetTableCredentialsAction
+                | AdminAction::IssuePluginAttemptAction
+                | AdminAction::SubmitPluginJobAction
+                | AdminAction::GetPluginRunAction
+                | AdminAction::CancelPluginRunAction
+                | AdminAction::ListPluginRunsAction
+                | AdminAction::ReplayPluginRunAction
+                | AdminAction::GetPluginDelegationAction
+                | AdminAction::CreatePluginDelegationAction
+                | AdminAction::RevokePluginDelegationAction
                 | AdminAction::RunTableMaintenanceAction
                 | AdminAction::GetTableMetadataLocationAction
                 | AdminAction::SetTableMetadataLocationAction
@@ -731,6 +818,26 @@ pub enum KmsAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blanket_s3_wildcard_does_not_grant_force_delete() {
+        let wildcard = Action::try_from("s3:*").expect("s3:* parses");
+        let star = Action::try_from("*").expect("* parses as s3:*");
+        let force_bucket = Action::try_from("s3:ForceDeleteBucket").expect("force bucket action parses");
+        let force_object = Action::try_from("s3:ForceDeleteObject").expect("force object action parses");
+        let delete_object = Action::try_from("s3:DeleteObject").expect("delete object parses");
+
+        assert!(!wildcard.is_match(&force_bucket));
+        assert!(!wildcard.is_match(&force_object));
+        assert!(!star.is_match(&force_bucket));
+        assert!(!star.is_match(&force_object));
+        assert!(wildcard.is_match(&delete_object));
+        assert!(wildcard.is_match_for_effect(&force_bucket, true));
+        assert!(wildcard.is_match_for_effect(&force_object, true));
+        assert!(force_bucket.is_match(&force_bucket));
+        assert!(force_object.is_match(&force_object));
+        assert!(!force_bucket.is_match(&force_object));
+    }
 
     #[test]
     fn test_action_wildcard_parsing() {
@@ -834,6 +941,35 @@ mod tests {
     }
 
     #[test]
+    fn plugin_delegation_actions_are_explicit_and_unscoped() {
+        for (name, expected) in [
+            ("admin:GetPluginDelegation", AdminAction::GetPluginDelegationAction),
+            ("admin:CreatePluginDelegation", AdminAction::CreatePluginDelegationAction),
+            ("admin:RevokePluginDelegation", AdminAction::RevokePluginDelegationAction),
+            ("admin:SubmitPluginJob", AdminAction::SubmitPluginJobAction),
+            ("admin:GetPluginRun", AdminAction::GetPluginRunAction),
+            ("admin:CancelPluginRun", AdminAction::CancelPluginRunAction),
+            ("admin:ListPluginRuns", AdminAction::ListPluginRunsAction),
+            ("admin:ReplayPluginRun", AdminAction::ReplayPluginRunAction),
+        ] {
+            assert_eq!(AdminAction::try_from(name).unwrap(), expected);
+            assert!(expected.is_valid());
+            assert!(!expected.is_table_resource_scoped());
+        }
+        assert_eq!(
+            AdminAction::try_from("admin:IssuePluginAttempt").unwrap(),
+            AdminAction::IssuePluginAttemptAction
+        );
+        assert!(AdminAction::IssuePluginAttemptAction.is_valid());
+        assert!(AdminAction::SubmitPluginJobAction.is_valid());
+        assert!(AdminAction::GetPluginRunAction.is_valid());
+        assert!(AdminAction::CancelPluginRunAction.is_valid());
+        assert!(AdminAction::ListPluginRunsAction.is_valid());
+        assert!(AdminAction::ReplayPluginRunAction.is_valid());
+        assert!(AdminAction::try_from("admin:IssuePluginCredentials").is_err());
+    }
+
+    #[test]
     fn test_get_replication_metrics_admin_action_is_valid() {
         assert!(AdminAction::GetReplicationMetricsAction.is_valid());
     }
@@ -841,6 +977,14 @@ mod tests {
     #[test]
     fn test_get_metrics_admin_action_is_valid() {
         assert!(AdminAction::GetMetricsAction.is_valid());
+    }
+
+    #[test]
+    fn orphaned_bucket_recovery_admin_action_is_valid() {
+        let action = AdminAction::try_from("admin:RecoverOrphanedBucket").expect("parse recovery action");
+        assert_eq!(action, AdminAction::RecoverOrphanedBucketAction);
+        assert!(action.is_valid());
+        assert_eq!(<&str>::from(action), "admin:RecoverOrphanedBucket");
     }
 
     #[test]
@@ -861,6 +1005,34 @@ mod tests {
         assert!(all_admin.is_match(&Action::AdminAction(set_action)));
         assert!(all_admin.is_match(&Action::AdminAction(get_action)));
         assert!(!Action::AdminAction(get_action).is_match(&Action::AdminAction(set_action)));
+    }
+
+    #[test]
+    fn tls_certificate_actions_preserve_least_privilege() {
+        let publish = Action::try_from("admin:TLSCertificatePublish").expect("parse certificate publish action");
+        let status = Action::try_from("admin:TLSCertificateStatus").expect("parse certificate status action");
+        for (action, name) in [
+            (&publish, "admin:TLSCertificatePublish"),
+            (&status, "admin:TLSCertificateStatus"),
+        ] {
+            let Action::AdminAction(admin_action) = action else {
+                panic!("certificate policy must use an admin action");
+            };
+            assert!(admin_action.is_valid());
+            assert_eq!(serde_json::to_string(action).expect("serialize action"), format!("\"{name}\""));
+        }
+        assert!(!status.is_match(&publish));
+        assert!(!publish.is_match(&status));
+        let config = Action::AdminAction(AdminAction::ConfigUpdateAdminAction);
+        let server_info = Action::AdminAction(AdminAction::ServerInfoAdminAction);
+        assert!(!config.is_match(&publish));
+        assert!(!server_info.is_match(&publish));
+        let admin = Action::AdminAction(AdminAction::AllAdminActions);
+        assert!(admin.is_match(&publish));
+        assert!(admin.is_match(&status));
+        let s3 = Action::try_from("s3:*").expect("parse S3 wildcard");
+        assert!(!s3.is_match(&publish));
+        assert!(!s3.is_match(&status));
     }
 
     #[test]

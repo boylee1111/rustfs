@@ -8,6 +8,41 @@ collection:
 
 ## Operations
 
+- [Sampled local batch CPU diagnostics](operations/local-batch-cpu-diagnostics.md) — default-off request-correlated allocation and worker wall/CPU diagnosis.
+
+- [Retained MRF responsibilities](operations/mrf-responsibilities.md) — unknown bucket identities, bounded probes, and unreadable checkpoint recovery.
+- [Read-only BTF declaration inspection](operations/btf-prototype-inspection.md) — bounded prototypes and scalar member layouts, explicit void handling, and independent native references.
+
+- [Internode HTTP streaming transport](operations/internode-http-transport.md) — protocol selection, pooled connection isolation, and distributed read validation.
+
+- [Persisted config compatibility](operations/persisted-config-compatibility.md) — ignored MinIO settings, bounded diagnostics, alias retention, and safe resets.
+
+- [Table maintenance periodic queueing](operations/s3-tables-maintenance-scheduler.md) — opt-in scheduling, limits, worker handoff, and recovery.
+
+For PUT cleanup admission, blocking-pool isolation, and optional CPU affinity,
+see [PUT cleanup isolation](operations/put-cleanup-isolation.md).
+
+- [External certificate issuance and TLS rotation](operations/tls-certificate-rotation.md) — publication, native reload, trust separation and failure handling.
+
+- [Architecture guard troubleshooting](operations/architecture-guard-troubleshooting.md) — diagnose repository guard failures.
+- [Logging governance](operations/logging-governance.md) — broad event audits, migrations, and guardrail changes.
+
+- [Multipart upload memory diagnosis](operations/multipart-memory.md) — allocator attribution, Docker reproduction and sustained upload checks.
+
+For the logical per-operation io_uring read cap, see
+[io_uring read chunk size](operations/io-uring-read-chunks.md).
+
+For bounded local read-backend startup and cancellation, see
+[io_uring backend initialization](operations/io-uring-initialization.md).
+
+For legacy protection assessment and bounded protected copies, see [Object integrity inventory, audit, and migration](operations/shard-integrity-audit.md).
+
+For encrypted listing compatibility and older stored fingerprints, see
+[Encrypted object ETags](operations/encrypted-etags.md).
+
+For durable hard quota accounting, node-outage behavior, and fence protocol
+upgrades, see [Durable hard quotas](operations/durable-quota-reservation-v2.md).
+
 Operational runbooks live under [`operations/`](operations/). Replication
 operators should start with:
 
@@ -18,9 +53,39 @@ operators should start with:
 | [Replication object size limits](operations/replication-object-size-limits.md) | Multipart routing, large-object limits, and retry characteristics. |
 | [Replication outbound transport](operations/replication-outbound-transport.md) | Integrity headers, generic target behavior, and transport knobs. |
 
+For the erasure-coded cluster lifecycle (planning, parity and `EC:0`,
+expansion, rebalance, decommission, heal, drive replacement, restart
+recovery, and the `rc` CLI mapping), start with
+[Cluster and erasure-coding lifecycle operations](operations/cluster-lifecycle-operations.md).
+
+For concurrent bucket creation and deletion, see
+[Bucket operation admission](operations/bucket-operation-admission.md).
+
+For persisted administrator bucket tasks and bucket recreation, see
+[Bucket heal recovery](operations/bucket-heal-recovery.md).
+
+For interrupted object deletions and returning drives, see
+[Delete transaction recovery](operations/delete-transaction-recovery.md).
+
+For disk replacement across VM restarts and schema 5/6 maintenance migration,
+see [Replacement generation recovery](operations/replacement-generation-recovery.md).
+
+For historical GET timeouts during PUT or Heal, see
+[Object lock contention diagnostics](operations/object-lock-contention.md).
+
 Other runbooks remain grouped by filename in [`operations/`](operations/);
 architecture pages link to the relevant runbook where a cross-boundary
 procedure is required.
 
 For storage dashboards, see [Storage metrics and observer selection](operations/storage-metrics.md):
 drive ownership, snapshot freshness, counter queries, and rolling upgrades.
+
+For per-bucket capacity and object counts, see [Bucket usage metrics](operations/bucket-usage-metrics.md):
+OTLP export, cluster deduplication, accounting semantics, and scanner freshness.
+
+For optional shard commitments, see [Independent shard integrity rollout](operations/shard-integrity-rollout.md):
+activation, legacy repair results, multipart mode changes, and rollback limits.
+
+For crates.io publication of workspace crates, see
+[Workspace Cargo Publish](operations/cargo-publish-workspace.md): dependency
+ordering, dry-run, publish, and failure handling.

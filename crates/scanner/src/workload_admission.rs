@@ -12,9 +12,233 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
+use rustfs_concurrency::adaptive::permit_set::{AdaptivePermitSet, NodeResourcePermit};
+use rustfs_concurrency::adaptive::{NodeAdmission, NodePermit};
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshotProvider, WorkloadClass};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+
+use crate::ScannerError;
+use crate::storage_api::owner::{PhysicalDiskBinding, PhysicalDiskPlan, ecstore_with_background_resource_set};
+
+static SCANNER_NODE_ADMISSION: OnceLock<Arc<NodeAdmission>> = OnceLock::new();
+
+tokio::task_local! {
+    static SCANNER_NODE_REQUESTS: ScannerNodeRequestSender;
+    static SCANNER_PHYSICAL_DISK: Option<Arc<PhysicalDiskBinding>>;
+    static SCANNER_METADATA_UNITS: AdaptivePermitSet;
+    static SCANNER_NODE_OPERATION_CANCEL: CancellationToken;
+}
+
+/// Cancellation for the currently admitted scanner operation, when present.
+pub(crate) fn scanner_node_operation_cancellation() -> Option<CancellationToken> {
+    SCANNER_NODE_OPERATION_CANCEL.try_with(Clone::clone).ok()
+}
+
+pub(crate) struct ScannerNodeRequest {
+    pub(crate) owner: Arc<NodeAdmission>,
+    pub(crate) physical: Option<Arc<PhysicalDiskPlan>>,
+    pub(crate) respond: oneshot::Sender<Result<ScannerNodePermit, ScannerError>>,
+    pub(crate) cancel: CancellationToken,
+}
+
+pub(crate) enum ScannerNodePermit {
+    Node(NodePermit),
+    Physical {
+        permit: NodeResourcePermit,
+        plan: Arc<PhysicalDiskPlan>,
+    },
+}
+
+impl ScannerNodePermit {
+    pub(crate) fn complete(self) {
+        match self {
+            Self::Node(permit) => permit.complete(),
+            Self::Physical { permit, .. } => permit.complete(),
+        }
+    }
+}
+
+pub(crate) async fn with_scanner_physical_disk<F: std::future::Future>(
+    binding: Option<Arc<PhysicalDiskBinding>>,
+    operation: F,
+) -> F::Output {
+    SCANNER_PHYSICAL_DISK.scope(binding, operation).await
+}
+
+pub(crate) type ScannerNodeRequestSender = mpsc::Sender<ScannerNodeRequest>;
+pub(crate) type ScannerNodeRequestReceiver = mpsc::Receiver<ScannerNodeRequest>;
+
+/// One suspended operation per walk; disabled admission allocates no channel.
+pub(crate) fn scanner_node_request_channel() -> (Option<ScannerNodeRequestSender>, Option<ScannerNodeRequestReceiver>) {
+    if scanner_node_admission().is_none() {
+        return (None, None);
+    }
+    let (sender, receiver) = mpsc::channel(1);
+    (Some(sender), Some(receiver))
+}
+
+pub(crate) async fn with_scanner_node_requests<F: std::future::Future>(
+    sender: Option<ScannerNodeRequestSender>,
+    operation: F,
+) -> F::Output {
+    match sender {
+        Some(sender) => SCANNER_NODE_REQUESTS.scope(sender, operation).await,
+        None => operation.await,
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_SCANNER_NODE_ADMISSION: Arc<NodeAdmission>;
+    pub(crate) static TEST_SCANNER_AFTER_NODE_ACQUIRE: Arc<dyn Fn() + Send + Sync>;
+}
+
+/// Install the heal manager's node owner before starting scanner workers.
+/// Refuse replacement: existing scans must not outlive an independently renewed owner.
+pub fn set_scanner_node_admission(owner: Arc<NodeAdmission>) -> bool {
+    SCANNER_NODE_ADMISSION.set(owner).is_ok()
+}
+
+pub(crate) fn scanner_node_admission() -> Option<Arc<NodeAdmission>> {
+    #[cfg(test)]
+    if let Ok(owner) = TEST_SCANNER_NODE_ADMISSION.try_with(Arc::clone) {
+        return Some(owner);
+    }
+    SCANNER_NODE_ADMISSION.get().cloned()
+}
+
+/// Try the fast path first. A scoped coordinator releases the cache lease before
+/// joining the node queue and validates the cache before returning a permit.
+/// Uncoordinated callers defer instead of parking under an unknown lock.
+pub(crate) async fn run_scanner_node_operation<T, E>(
+    owner: Option<&Arc<NodeAdmission>>,
+    cancel: &CancellationToken,
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<Result<T, E>, ScannerError> {
+    run_scanner_operation(owner, cancel, operation, false).await
+}
+
+/// Metadata parsing may subsequently dispatch lifecycle work on other disks.
+/// Only its local metadata read inherits the scanner's physical resource set.
+pub(crate) async fn run_scanner_metadata_operation<T, E>(
+    owner: Option<&Arc<NodeAdmission>>,
+    cancel: &CancellationToken,
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<Result<T, E>, ScannerError> {
+    run_scanner_operation(owner, cancel, operation, true).await
+}
+
+pub(crate) async fn with_scanner_metadata_io<F: std::future::Future>(operation: F) -> F::Output {
+    match SCANNER_METADATA_UNITS.try_with(Clone::clone) {
+        Ok(units) => ecstore_with_background_resource_set(units, operation).await,
+        Err(_) => operation.await,
+    }
+}
+
+async fn run_scanner_operation<T, E>(
+    owner: Option<&Arc<NodeAdmission>>,
+    cancel: &CancellationToken,
+    operation: impl std::future::Future<Output = Result<T, E>>,
+    metadata: bool,
+) -> Result<Result<T, E>, ScannerError> {
+    let Some(owner) = owner else {
+        return Ok(operation.await);
+    };
+    let operation = SCANNER_NODE_OPERATION_CANCEL.scope(cancel.clone(), operation);
+    if cancel.is_cancelled() {
+        return Err(ScannerError::Other("Operation cancelled".to_string()));
+    }
+    let physical = SCANNER_PHYSICAL_DISK.try_with(|binding| binding.as_ref().and_then(|binding| binding.plan()));
+    let physical = match physical {
+        Ok(Some(plan)) => Some(plan),
+        Ok(None) => return Err(ScannerError::ResourceDeferred),
+        Err(_) => None,
+    };
+    let available = match &physical {
+        Some(plan) => plan.try_acquire(owner).map(|permit| ScannerNodePermit::Physical {
+            permit,
+            plan: plan.clone(),
+        }),
+        None => owner.try_acquire().map(ScannerNodePermit::Node),
+    };
+    let permit = match available {
+        Some(permit) => permit,
+        None => {
+            let sender = SCANNER_NODE_REQUESTS
+                .try_with(Clone::clone)
+                .map_err(|_| ScannerError::ResourceDeferred)?;
+            let acquire = async {
+                let (respond, response) = oneshot::channel();
+                sender
+                    .send(ScannerNodeRequest {
+                        owner: owner.clone(),
+                        physical,
+                        respond,
+                        cancel: cancel.clone(),
+                    })
+                    .await
+                    .map_err(|_| ScannerError::ResourceDeferred)?;
+                response.await.map_err(|_| ScannerError::ResourceDeferred)?
+            };
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ScannerError::Other("Operation cancelled".to_string())),
+                permit = acquire => permit?,
+            }
+        }
+    };
+    #[cfg(test)]
+    let _ = TEST_SCANNER_AFTER_NODE_ACQUIRE.try_with(|hook| hook());
+    // Native work retains only its captured physical leaves, never the node
+    // slot that cancellation returns below.
+    let native = match &permit {
+        ScannerNodePermit::Node(_) => None,
+        ScannerNodePermit::Physical { permit, plan } => {
+            if !plan.is_current() {
+                return Err(ScannerError::ResourceDeferred);
+            }
+            Some(
+                plan.capture_native(permit.resources())
+                    .map_err(|_| ScannerError::ResourceDeferred)?,
+            )
+        }
+    };
+    let operation = async move {
+        match native {
+            None => operation.await,
+            Some(native) if metadata => SCANNER_METADATA_UNITS.scope(native, operation).await,
+            Some(native) => ecstore_with_background_resource_set(native, operation).await,
+        }
+    };
+    let operation_started = AtomicBool::new(false);
+    tokio::pin!(operation);
+    let observed = std::future::poll_fn(|context| {
+        operation_started.store(true, Ordering::Relaxed);
+        std::future::Future::poll(operation.as_mut(), context)
+    });
+    tokio::pin!(observed);
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            // The node slot belongs to the waiter, not the native operation.
+            drop(permit);
+            if !operation_started.load(Ordering::Relaxed) {
+                return Err(ScannerError::Other("Operation cancelled".to_string()));
+            }
+            // Keep polling the started operation under its existing locks.
+            return Ok(observed.await);
+        }
+        result = &mut observed => result,
+    };
+    if result.is_ok() && !cancel.is_cancelled() {
+        permit.complete();
+    }
+    Ok(result)
+}
 
 type WorkloadSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
 

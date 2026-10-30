@@ -35,6 +35,166 @@ struct FileInfoIdentityGroup {
 }
 
 impl SetDisks {
+    /// Read one key's complete version stack without enumerating its parent.
+    pub(crate) async fn read_object_versions_for_lifecycle(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> disk::error::Result<Option<rustfs_filemeta::MetaCacheEntry>> {
+        let disks = self.get_disks_internal().await;
+        if disks.len() != self.set_drive_count || disks.is_empty() {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+        let disk_object = rustfs_utils::path::encode_dir_object(object);
+        let (mut raw, mut errors) = Self::read_all_raw_file_info(&disks, bucket, &disk_object, false).await;
+        for (metadata, error) in raw.iter_mut().zip(&mut errors) {
+            if metadata.as_ref().is_some_and(|metadata| metadata.buf.is_empty()) {
+                *metadata = None;
+                *error = Some(DiskError::FileCorrupt);
+            }
+        }
+        // An unavailable disk is not evidence that a version group is absent.
+        // Unlike a walk, an exact read must also decide the all-missing case.
+        if raw.iter().all(Option::is_none) {
+            return if errors.iter().all(|error| {
+                matches!(
+                    error,
+                    Some(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound)
+                )
+            }) {
+                Ok(None)
+            } else {
+                Err(DiskError::ErasureReadQuorum)
+            };
+        }
+        let entries = rustfs_filemeta::MetaCacheEntries(
+            raw.into_iter()
+                .map(|raw| {
+                    raw.map(|raw| rustfs_filemeta::MetaCacheEntry {
+                        name: object.to_owned(),
+                        metadata: raw.buf,
+                        cached: None,
+                        reusable: false,
+                    })
+                })
+                .collect(),
+        );
+        // Reuse the listing's per-version authority, including the object's
+        // actual erasure layout. Never turn unreadable/stale metadata into a
+        // singleton made from the preceding write's ObjectInfo.
+        Self::resolve_listed_versions(bucket, entries, &errors, self.set_drive_count, self.default_parity_count)?
+            .map(Some)
+            .ok_or(DiskError::ErasureReadQuorum)
+    }
+
+    /// Resolve each listed version using the same metadata authority as an exact read.
+    pub(crate) fn resolve_listed_versions(
+        bucket: &str,
+        entries: rustfs_filemeta::MetaCacheEntries,
+        read_errors: &[Option<DiskError>],
+        disk_count: usize,
+        default_parity: usize,
+    ) -> disk::error::Result<Option<rustfs_filemeta::MetaCacheEntry>> {
+        use rustfs_filemeta::{FileMeta, MetaCacheEntry};
+
+        if disk_count == 0 || entries.0.len() > disk_count || entries.0.len() != read_errors.len() {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+        let Some(first) = entries.0.iter().flatten().next() else {
+            return Ok(None);
+        };
+        let name = first.name.clone();
+        if first.is_dir() {
+            let quorum = if default_parity == 0 {
+                disk_count
+            } else {
+                disk_count.div_ceil(2)
+            };
+            let matches = entries
+                .0
+                .iter()
+                .flatten()
+                .filter(|entry| entry.is_dir() && entry.name == name)
+                .count();
+            return Ok((matches >= quorum).then(|| first.clone()));
+        }
+
+        let mut versions = HashMap::<Option<Uuid>, Vec<FileInfo>>::new();
+        let mut missing = vec![Some(DiskError::DiskNotFound); disk_count];
+        for (slot, (entry, error)) in entries.0.into_iter().zip(read_errors).enumerate() {
+            missing[slot] = error.clone().or(Some(DiskError::FileVersionNotFound));
+            let Some(entry) = entry else { continue };
+            if error.is_some() {
+                continue;
+            }
+            if entry.is_dir() || entry.name != name {
+                missing[slot] = Some(DiskError::FileCorrupt);
+                continue;
+            }
+            let decoded = match entry.file_info_versions_with_free_versions(bucket) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    missing[slot] = Some(error.into());
+                    continue;
+                }
+            };
+            let decoded = decoded.versions.into_iter().chain(decoded.free_versions).collect::<Vec<_>>();
+            let mut seen = HashSet::new();
+            if decoded
+                .iter()
+                .any(|info| !file_info_is_valid_for_metadata(info) || !seen.insert(info.version_id))
+            {
+                missing[slot] = Some(DiskError::FileCorrupt);
+                continue;
+            }
+            for info in decoded {
+                let version_id = info.version_id;
+                versions
+                    .entry(version_id)
+                    .or_insert_with(|| vec![FileInfo::default(); disk_count])[slot] = info;
+            }
+        }
+        let complete = missing.iter().all(|error| {
+            matches!(
+                error,
+                Some(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound)
+            )
+        });
+        let mut metadata = FileMeta::new();
+        for parts in versions.into_values() {
+            let errors = parts
+                .iter()
+                .zip(&missing)
+                .map(|(info, error)| {
+                    if file_info_is_valid_for_metadata(info) {
+                        None
+                    } else {
+                        error.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let read_quorum = match Self::object_quorum_from_meta(&parts, &errors, default_parity) {
+                Ok((quorum, _)) => usize::try_from(quorum).map_err(|_| DiskError::FileCorrupt)?,
+                Err(DiskError::FileNotFound | DiskError::FileVersionNotFound) if complete => continue,
+                Err(DiskError::FileNotFound | DiskError::FileVersionNotFound) => return Err(DiskError::ErasureReadQuorum),
+                Err(DiskError::ErasureReadQuorum) if complete => continue,
+                Err(error) => return Err(error),
+            };
+            let mod_time = Self::common_time(&Self::list_object_modtimes(&parts, &errors), read_quorum);
+            let selected = Self::pick_valid_fileinfo(&parts, mod_time, None, read_quorum)?;
+            metadata.add_version(selected)?;
+        }
+        if metadata.versions.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(MetaCacheEntry {
+            name,
+            metadata: metadata.marshal_msg()?,
+            cached: Some(metadata),
+            reusable: false,
+        }))
+    }
+
     pub(super) fn all_not_found_metadata(errs: &[Option<DiskError>]) -> bool {
         !errs.is_empty()
             && errs.iter().all(|err| match err {
@@ -115,6 +275,22 @@ impl SetDisks {
 
     pub(super) fn common_parity(parities: &[i32], default_parity_count: i32) -> i32 {
         let n = parities.len() as i32;
+        let mut valid_parities = parities.iter().copied().filter(|&p| p != -1);
+        let Some(first_parity) = valid_parities.next() else {
+            return -1;
+        };
+        let mut same_count = 1i32;
+        if valid_parities.all(|p| {
+            same_count += 1;
+            p == first_parity
+        }) {
+            let read_quorum = if default_parity_count > 0 && first_parity == 0 {
+                n / 2 + 1
+            } else {
+                n - first_parity
+            };
+            return if same_count >= read_quorum { first_parity } else { -1 };
+        }
 
         let mut occ_map: HashMap<i32, i32> = HashMap::new();
         for &p in parities {
@@ -173,6 +349,19 @@ impl SetDisks {
     }
 
     pub(super) fn common_time_and_occurrence(times: &[Option<OffsetDateTime>]) -> (Option<OffsetDateTime>, usize) {
+        let mut valid_times = times.iter().flatten().copied();
+        let Some(first_time) = valid_times.next() else {
+            return (None, 0);
+        };
+        let mut count = 1usize;
+        if valid_times.all(|t| {
+            count += 1;
+            t == first_time
+        }) && first_time.unix_timestamp_nanos() != 0
+        {
+            return (Some(first_time), count);
+        }
+
         let mut time_occurrence_map = HashMap::new();
 
         // Ignore the uuid sentinel and count the rest.
@@ -303,7 +492,13 @@ impl SetDisks {
         default_parity_count: usize,
     ) -> disk::error::Result<(i32, i32)> {
         if Self::all_not_found_metadata(errs) {
-            return Err(DiskError::FileNotFound);
+            // Preserve explicit-version absence from the disk replies before
+            // the object/API error boundary assigns the S3 error code.
+            return Err(if errs.iter().any(|err| matches!(err, Some(DiskError::FileVersionNotFound))) {
+                DiskError::FileVersionNotFound
+            } else {
+                DiskError::FileNotFound
+            });
         }
 
         let expected_rquorum = if default_parity_count == 0 {
@@ -433,6 +628,25 @@ impl SetDisks {
             return write_quorum;
         }
 
+        if let Some((first, _)) = parts_metadata
+            .iter()
+            .zip(errs.iter())
+            .find(|(meta, err)| err.is_none() && file_info_is_valid_for_metadata(meta))
+        {
+            let same_count = parts_metadata
+                .iter()
+                .zip(errs.iter())
+                .filter(|(meta, err)| {
+                    err.is_none()
+                        && file_info_is_valid_for_metadata(meta)
+                        && super::core::metadata_quorum::metadata_early_stop_candidate_matches(first, meta)
+                })
+                .count();
+            if same_count >= write_quorum {
+                return write_quorum;
+            }
+        }
+
         let mut identity_counts = HashMap::with_capacity(usable_metadata);
         for (meta, err) in parts_metadata.iter().zip(errs.iter()) {
             if err.is_some() || !file_info_is_valid_for_metadata(meta) {
@@ -451,14 +665,20 @@ impl SetDisks {
         read_quorum
     }
 
-    pub(super) fn select_valid_fileinfo(
+    /// The commit-proof rule kept for internal metadata in the system bucket.
+    /// Pool metadata's PREPARE/COMMIT recovery and identity epochs treat an
+    /// ordinary read as proof that a record committed: when enough copies
+    /// answer to prove write quorum, the latest version must hold it, and a
+    /// degraded read never serves a newer version below write quorum. A split
+    /// write therefore stays unreadable until native recovery resolves it.
+    fn select_committed_fileinfo(
         disks: &[Option<DiskStore>],
         parts_metadata: &[FileInfo],
         errs: &[Option<DiskError>],
         version_id: &str,
         read_quorum: usize,
         write_quorum: usize,
-    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo, usize)> {
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
         let selection_quorum =
             Self::latest_fileinfo_selection_quorum(version_id, parts_metadata, errs, read_quorum, write_quorum);
         let (usable_metadata, has_read_error) = Self::usable_fileinfo_count(parts_metadata, errs);
@@ -469,14 +689,71 @@ impl SetDisks {
             && usable_metadata >= write_quorum
             && selection_quorum == read_quorum
         {
-            let (online_disks, fi) = Self::pick_degraded_latest_fileinfo(disks, parts_metadata, errs, read_quorum, write_quorum)?;
-            return Ok((online_disks, fi, read_quorum));
+            return Self::pick_degraded_latest_fileinfo(disks, parts_metadata, errs, read_quorum, write_quorum);
         }
 
         let (online_disks, mod_time, etag) = Self::list_online_disks(disks, parts_metadata, errs, selection_quorum);
         let fi = Self::pick_valid_fileinfo(parts_metadata, mod_time, etag, selection_quorum)?;
 
-        Ok((online_disks, fi, selection_quorum))
+        Ok((online_disks, fi))
+    }
+
+    /// Select the version a read of `bucket` serves: S3 buckets use MinIO's
+    /// read-quorum rule (`select_valid_fileinfo`); the system bucket keeps the
+    /// commit-proof rule (`select_committed_fileinfo`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn select_fileinfo_for_read(
+        bucket: &str,
+        disks: &[Option<DiskStore>],
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        version_id: &str,
+        read_quorum: usize,
+        write_quorum: usize,
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
+        if crate::bucket::utils::is_meta_bucketname(bucket) {
+            Self::select_committed_fileinfo(disks, parts_metadata, errs, version_id, read_quorum, write_quorum)
+        } else {
+            Self::select_valid_fileinfo(disks, parts_metadata, errs, read_quorum)
+        }
+    }
+
+    /// Select the version an S3 read serves with MinIO's rule (`getObjectFileInfo`
+    /// -> `listOnlineDisks` -> `pickValidFileInfo`): the modification time
+    /// shared by the most copies wins when it reaches `read_quorum`, a tie
+    /// goes to the newer time, and one content identity at that time must
+    /// itself reach `read_quorum`. Heal picks the latest version the same
+    /// way, so a read returns the version heal converges the set to; a write
+    /// that failed after reaching exactly `read_quorum` copies is readable
+    /// instead of failing until heal runs, as listing already shows it.
+    ///
+    /// `read_quorum` follows the parity most copies agree on, which delete
+    /// markers and empty versions can lower below the selected version's own
+    /// data blocks; like MinIO's `getLatestFileInfo`, a version with local
+    /// shards also needs that many copies, or HEAD would report a version
+    /// GET cannot decode.
+    pub(super) fn select_valid_fileinfo(
+        disks: &[Option<DiskStore>],
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        read_quorum: usize,
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
+        let (online_disks, mod_time, etag) = Self::list_online_disks(disks, parts_metadata, errs, read_quorum);
+        let (fi, copies) = Self::find_file_info_in_quorum_counted(parts_metadata, &mod_time, &etag, read_quorum)?;
+        if !fi.deleted && !fi.is_remote() && fi.size > 0 && copies < fi.erasure.data_blocks {
+            // The shortcut counts byte-identical copies only; count every copy
+            // of the content identity before refusing the version.
+            let identity = Self::file_info_quorum_hash(&fi);
+            let copies = parts_metadata
+                .iter()
+                .filter(|meta| file_info_is_valid_for_metadata(meta) && Self::file_info_quorum_hash(meta) == identity)
+                .count();
+            if copies < fi.erasure.data_blocks {
+                return Err(DiskError::ErasureReadQuorum);
+            }
+        }
+
+        Ok((online_disks, fi))
     }
 
     pub(super) fn pick_valid_fileinfo(
@@ -489,6 +766,7 @@ impl SetDisks {
     }
 
     pub(crate) fn hydrate_selected_fileinfo_part_checksums(fi: &mut FileInfo) -> disk::error::Result<()> {
+        fi.hydrate_shard_integrity().map_err(DiskError::from)?;
         fi.hydrate_data_movement_part_checksums().map_err(DiskError::from)?;
         for part in &fi.parts {
             let Some(checksums) = part.checksums.as_ref() else {
@@ -810,9 +1088,53 @@ impl SetDisks {
         etag: &Option<String>,
         quorum: usize,
     ) -> disk::error::Result<FileInfo> {
+        Self::find_file_info_in_quorum_counted(metas, mod_time, etag, quorum).map(|(fi, _)| fi)
+    }
+
+    /// `find_file_info_in_quorum`, also returning how many copies carry the
+    /// selected content identity.
+    ///
+    /// Two identities can share the top count only in a data = parity set
+    /// split exactly in half at one modification time, such as a metadata
+    /// update that failed after reaching half the drives. The identity held
+    /// by the lowest-index disk wins, so every read and heal picks the same
+    /// side and a retried metadata write can repair the split.
+    fn find_file_info_in_quorum_counted(
+        metas: &[FileInfo],
+        mod_time: &Option<OffsetDateTime>,
+        etag: &Option<String>,
+        quorum: usize,
+    ) -> disk::error::Result<(FileInfo, usize)> {
         if quorum < 1 {
             warn!("find_file_info_in_quorum: quorum < 1");
             return Err(DiskError::ErasureReadQuorum);
+        }
+
+        let matches_time_or_etag = |meta: &FileInfo| {
+            mod_time == &meta.mod_time
+                || (mod_time.is_none() && etag.as_deref().is_some_and(|e| meta.get_etag().as_deref() == Some(e)))
+        };
+
+        if let Some(first) = metas
+            .iter()
+            .find(|meta| file_info_is_valid_for_metadata(meta) && matches_time_or_etag(meta))
+        {
+            let mut total_valid = 0usize;
+            let mut same_count = 0usize;
+            for meta in metas {
+                if !file_info_is_valid_for_metadata(meta) || !matches_time_or_etag(meta) {
+                    continue;
+                }
+                total_valid += 1;
+                if super::core::metadata_quorum::metadata_early_stop_candidate_matches(first, meta) {
+                    same_count += 1;
+                }
+            }
+            if same_count >= quorum && same_count > total_valid - same_count {
+                let mut fi = first.clone();
+                fi.is_latest = fi.successor_mod_time.is_none();
+                return Ok((fi, same_count));
+            }
         }
 
         let mut meta_hashes = vec![None; metas.len()];
@@ -864,15 +1186,12 @@ impl SetDisks {
             *count_map.entry(hash).or_insert(0) += 1;
         }
 
-        let mut max_val = None;
-        let mut max_count = 0;
-
-        for (&val, &count) in &count_map {
-            if count > max_count {
-                max_val = Some(val);
-                max_count = count;
-            }
-        }
+        let max_count = count_map.values().copied().max().unwrap_or(0);
+        let max_val = meta_hashes
+            .iter()
+            .flatten()
+            .find(|hash| count_map.get(*hash) == Some(&max_count))
+            .copied();
 
         if max_count < quorum {
             warn!(
@@ -913,17 +1232,24 @@ impl SetDisks {
         if found {
             let mut fi = found_fi.expect("operation should succeed");
 
-            for (val, &count) in &valid_obj_map {
-                if count >= quorum {
-                    fi.successor_mod_time = val.successor_mod_time;
-                    fi.num_versions = val.num_versions;
-                    fi.is_latest = val.successor_mod_time.is_none();
-
-                    break;
-                }
+            // Scan in disk order so that two version-stack shapes with equal
+            // counts resolve the same way on every read.
+            let quorum_props = metas
+                .iter()
+                .zip(meta_hashes.iter())
+                .filter(|(meta, hash)| hash.is_some() && **hash == max_val && file_info_is_valid_for_metadata(meta))
+                .map(|(meta, _)| ObjProps {
+                    successor_mod_time: meta.successor_mod_time,
+                    num_versions: meta.num_versions,
+                })
+                .find(|props| valid_obj_map.get(props).is_some_and(|&count| count >= quorum));
+            if let Some(props) = quorum_props {
+                fi.successor_mod_time = props.successor_mod_time;
+                fi.num_versions = props.num_versions;
+                fi.is_latest = props.successor_mod_time.is_none();
             }
 
-            return Ok(fi);
+            return Ok((fi, max_count));
         }
 
         warn!("find_file_info_in_quorum: fileinfo not found");

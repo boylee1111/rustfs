@@ -70,6 +70,9 @@ pub const SUFFIX_RESTORE_OPERATION_ID: &str = "restore-operation-id";
 pub const SUFFIX_RESTORE_WORKER_LOCK: &str = "restore-worker-lock";
 pub const RESTORE_WORKER_LOCK_PROTOCOL_V1: &str = "v1";
 pub const SUFFIX_BUCKET_INCARNATION_ID: &str = "bucket-incarnation-id";
+/// Upload ID of the multipart completion that published this object version.
+/// A retried CompleteMultipartUpload matches it after the staging directory is gone.
+pub const SUFFIX_MULTIPART_UPLOAD_ID: &str = "multipart-upload-id";
 pub const SUFFIX_OBJECT_TRANSACTION_EPOCH: &str = "object-transaction-epoch";
 /// Active rebalance run id mirrored onto `rebalance.bin` object metadata.
 pub const SUFFIX_REBALANCE_RUN_ID: &str = "rebalance-run-id";
@@ -113,11 +116,143 @@ pub const SUFFIX_ODM_SOURCE_VERSION_ID: &str = "odm-source-version-id";
 /// When the object was pulled from the source, RFC 3339.
 pub const SUFFIX_ODM_PULLED_AT: &str = "odm-pulled-at";
 
+#[derive(Clone, Copy)]
+struct AsciiCaseMaskU64 {
+    mask: u64,
+    lower: u64,
+}
+
+impl AsciiCaseMaskU64 {
+    const fn new(target: &[u8; 8]) -> Self {
+        let mut mask = [0u8; 8];
+        let mut lower = [0u8; 8];
+        let mut i = 0;
+        while i < 8 {
+            if target[i].is_ascii_alphabetic() {
+                mask[i] = 0x20;
+                lower[i] = target[i] | 0x20;
+            } else {
+                lower[i] = target[i];
+            }
+            i += 1;
+        }
+        Self {
+            mask: u64::from_ne_bytes(mask),
+            lower: u64::from_ne_bytes(lower),
+        }
+    }
+
+    #[inline(always)]
+    const fn matches(self, word: u64) -> bool {
+        (word | self.mask) == self.lower
+    }
+}
+
+const RUSTFS_PREFIX_W0: AsciiCaseMaskU64 = AsciiCaseMaskU64::new(b"x-rustfs");
+const RUSTFS_PREFIX_W1: AsciiCaseMaskU64 = AsciiCaseMaskU64::new(b"-interna");
+const MINIO_PREFIX_W0: AsciiCaseMaskU64 = AsciiCaseMaskU64::new(b"x-minio-");
+const MINIO_PREFIX_W1: AsciiCaseMaskU64 = AsciiCaseMaskU64::new(b"internal");
+
+#[inline(always)]
+fn read_u64_ne(bytes: &[u8], offset: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_ne_bytes(buf)
+}
+
+#[inline(always)]
+fn read_u32_ne(bytes: &[u8], offset: usize) -> u32 {
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_ne_bytes(buf)
+}
+
+#[inline(always)]
+fn starts_with_rustfs_internal_prefix(bytes: &[u8]) -> bool {
+    bytes.len() >= RUSTFS_INTERNAL_PREFIX.len()
+        && bytes[17] == b'-'
+        && (bytes[16] | 0x20) == b'l'
+        && RUSTFS_PREFIX_W0.matches(read_u64_ne(bytes, 0))
+        && RUSTFS_PREFIX_W1.matches(read_u64_ne(bytes, 8))
+}
+
+#[inline(always)]
+fn starts_with_minio_internal_prefix(bytes: &[u8]) -> bool {
+    bytes.len() >= MINIO_INTERNAL_PREFIX.len()
+        && bytes[16] == b'-'
+        && MINIO_PREFIX_W0.matches(read_u64_ne(bytes, 0))
+        && MINIO_PREFIX_W1.matches(read_u64_ne(bytes, 8))
+}
+
+#[inline(always)]
+const fn eq_u64_ignore_ascii_case(wa: u64, wb: u64) -> bool {
+    let diff = wa ^ wb;
+    if diff == 0 {
+        return true;
+    }
+    if (diff & !0x2020_2020_2020_2020) != 0 {
+        return false;
+    }
+    let l = (wa | 0x2020_2020_2020_2020) & 0x7f7f_7f7f_7f7f_7f7f;
+    let alpha_20 =
+        (((l.wrapping_add(0x1f1f_1f1f_1f1f_1f1f)) ^ (l.wrapping_add(0x0505_0505_0505_0505))) & !wa & 0x8080_8080_8080_8080) >> 2;
+    (diff & alpha_20) == diff
+}
+
+#[inline(always)]
+const fn eq_u32_ignore_ascii_case(wa: u32, wb: u32) -> bool {
+    let diff = wa ^ wb;
+    if diff == 0 {
+        return true;
+    }
+    if (diff & !0x2020_2020) != 0 {
+        return false;
+    }
+    let l = (wa | 0x2020_2020) & 0x7f7f_7f7f;
+    let alpha_20 = (((l.wrapping_add(0x1f1f_1f1f)) ^ (l.wrapping_add(0x0505_0505))) & !wa & 0x8080_8080) >> 2;
+    (diff & alpha_20) == diff
+}
+
+/// SWAR-accelerated ASCII case-insensitive byte-slice equality.
+/// Compares 8 bytes at a time using 64-bit word operations instead of scalar per-byte loops.
+#[inline]
+pub fn eq_slice_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    let len = a.len();
+    if len != b.len() {
+        return false;
+    }
+    if len >= 8 {
+        if !eq_u64_ignore_ascii_case(read_u64_ne(a, 0), read_u64_ne(b, 0)) {
+            return false;
+        }
+        let mut i = 8;
+        while i + 8 < len {
+            if !eq_u64_ignore_ascii_case(read_u64_ne(a, i), read_u64_ne(b, i)) {
+                return false;
+            }
+            i += 8;
+        }
+        return len == 8 || eq_u64_ignore_ascii_case(read_u64_ne(a, len - 8), read_u64_ne(b, len - 8));
+    }
+    if len >= 4 {
+        return eq_u32_ignore_ascii_case(read_u32_ne(a, 0), read_u32_ne(b, 0))
+            && (len == 4 || eq_u32_ignore_ascii_case(read_u32_ne(a, len - 4), read_u32_ne(b, len - 4)));
+    }
+    match (a, b) {
+        ([], []) => true,
+        ([a0], [b0]) => a0.eq_ignore_ascii_case(b0),
+        ([a0, a1], [b0, b1]) => a0.eq_ignore_ascii_case(b0) && a1.eq_ignore_ascii_case(b1),
+        ([a0, a1, a2], [b0, b1, b2]) => a0.eq_ignore_ascii_case(b0) && a1.eq_ignore_ascii_case(b1) && a2.eq_ignore_ascii_case(b2),
+        _ => false,
+    }
+}
+
 /// Case-insensitive (ASCII) check that `s` begins with `prefix`. Equivalent to
 /// `s.to_lowercase().starts_with(prefix)` when `prefix` is ASCII (as both internal prefixes are),
 /// but without allocating.
+#[inline]
 pub fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    s.len() >= prefix.len() && eq_slice_ignore_ascii_case(&s.as_bytes()[..prefix.len()], prefix.as_bytes())
 }
 
 /// Allocation-free equivalent of `key.to_lowercase() == format!("{prefix}{suffix}")`.
@@ -133,35 +268,32 @@ fn internal_key_eq(key: &str, prefix: &str, suffix: &str) -> bool {
         return false;
     }
     let (key_prefix, key_suffix) = key.split_at(prefix.len());
-    key_prefix.eq_ignore_ascii_case(prefix.as_bytes())
-        && key_suffix
-            .iter()
-            .zip(suffix.as_bytes())
-            .all(|(k, s)| k.to_ascii_lowercase() == *s)
+    eq_slice_ignore_ascii_case(key_prefix, prefix.as_bytes())
+        && eq_slice_ignore_ascii_case(key_suffix, suffix.as_bytes())
+        && !suffix.as_bytes().iter().any(u8::is_ascii_uppercase)
 }
 
 /// Returns true if the key is an internal metadata key (x-rustfs-internal-* or x-minio-internal-*)
 /// for xl.meta compatibility. Case-insensitive.
+#[inline]
 pub fn is_internal_key(key: &str) -> bool {
-    starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX) || starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX)
+    let bytes = key.as_bytes();
+    starts_with_rustfs_internal_prefix(bytes) || starts_with_minio_internal_prefix(bytes)
 }
 
 /// Returns true if the key matches the given suffix for either x-rustfs-internal-* or x-minio-internal-*.
+#[inline]
 pub fn has_internal_suffix(key: &str, suffix: &str) -> bool {
-    internal_key_eq(key, RUSTFS_INTERNAL_PREFIX, suffix) || internal_key_eq(key, MINIO_INTERNAL_PREFIX, suffix)
+    if !key.is_ascii() {
+        return internal_key_eq(key, RUSTFS_INTERNAL_PREFIX, suffix) || internal_key_eq(key, MINIO_INTERNAL_PREFIX, suffix);
+    }
+    matches_either_internal_key_ignore_ascii_case(key, suffix) && !suffix.as_bytes().iter().any(u8::is_ascii_uppercase)
 }
 
 /// Strips x-rustfs-internal- or x-minio-internal- prefix from key. Returns the suffix part.
 /// Case-insensitive. Returns None if key is not an internal key.
 pub fn strip_internal_prefix(key: &str) -> Option<String> {
-    let rest = if starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX) {
-        &key[RUSTFS_INTERNAL_PREFIX.len()..]
-    } else if starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX) {
-        &key[MINIO_INTERNAL_PREFIX.len()..]
-    } else {
-        return None;
-    };
-    Some(rest.to_lowercase())
+    strip_internal_prefix_preserving_case(key).map(str::to_lowercase)
 }
 
 /// Returns true if key is internal and its suffix part starts with the given suffix_prefix.
@@ -174,9 +306,9 @@ pub fn internal_key_starts_with(key: &str, suffix_prefix: &str) -> bool {
 /// returning the remainder (e.g. "arn1"). Returns None if key does not match.
 pub fn internal_key_strip_suffix_prefix(key: &str, suffix_prefix: &str) -> Option<String> {
     let rest = strip_internal_prefix_preserving_case(key)?;
-    rest.get(..suffix_prefix.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(suffix_prefix))
-        .then(|| rest[suffix_prefix.len()..].to_string())
+    (rest.len() >= suffix_prefix.len()
+        && eq_slice_ignore_ascii_case(&rest.as_bytes()[..suffix_prefix.len()], suffix_prefix.as_bytes()))
+    .then(|| rest[suffix_prefix.len()..].to_string())
 }
 
 fn both_keys(suffix: &str) -> (String, String) {
@@ -220,6 +352,20 @@ pub fn insert_str(map: &mut HashMap<String, String>, suffix: &str, value: String
     map.insert(k2, value);
 }
 
+#[inline]
+pub(super) fn matches_either_internal_key_ignore_ascii_case(key: &str, suffix: &str) -> bool {
+    let key_bytes = key.as_bytes();
+    let suffix_bytes = suffix.as_bytes();
+    let prefix_matched = if key_bytes.len() == RUSTFS_INTERNAL_PREFIX.len() + suffix_bytes.len() {
+        starts_with_rustfs_internal_prefix(key_bytes)
+    } else if key_bytes.len() == MINIO_INTERNAL_PREFIX.len() + suffix_bytes.len() {
+        starts_with_minio_internal_prefix(key_bytes)
+    } else {
+        return false;
+    };
+    prefix_matched && eq_slice_ignore_ascii_case(&key_bytes[key_bytes.len() - suffix_bytes.len()..], suffix_bytes)
+}
+
 pub fn get_str(map: &HashMap<String, String>, suffix: &str) -> Option<String> {
     if let Some(v) = with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.get(k1).cloned()) {
         return Some(v);
@@ -228,17 +374,15 @@ pub fn get_str(map: &HashMap<String, String>, suffix: &str) -> Option<String> {
         return Some(v);
     }
     // Rare fallback: case-insensitive scan for non-canonical key casing.
-    let (k1, k2) = both_keys(suffix);
     map.iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
+        .find(|(key, _)| matches_either_internal_key_ignore_ascii_case(key, suffix))
         .map(|(_, value)| value.clone())
 }
 
 fn get_consistent_value<'a, V: AsRef<[u8]>>(map: &'a HashMap<String, V>, suffix: &str) -> Option<&'a V> {
-    let (rustfs_key, minio_key) = both_keys(suffix);
     let mut value = None;
     for (key, candidate) in map {
-        if !key.eq_ignore_ascii_case(&rustfs_key) && !key.eq_ignore_ascii_case(&minio_key) {
+        if !matches_either_internal_key_ignore_ascii_case(key, suffix) {
             continue;
         }
         if candidate.as_ref().is_empty() || value.is_some_and(|current: &V| current.as_ref() != candidate.as_ref()) {
@@ -263,16 +407,14 @@ pub fn contains_key_str(map: &HashMap<String, String>, suffix: &str) -> bool {
     if with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.contains_key(k2)) {
         return true;
     }
-    let (k1, k2) = both_keys(suffix);
     map.keys()
-        .any(|key| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
+        .any(|key| matches_either_internal_key_ignore_ascii_case(key, suffix))
 }
 
 pub fn remove_str(map: &mut HashMap<String, String>, suffix: &str) {
     with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.remove(k1));
     with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.remove(k2));
-    let (k1, k2) = both_keys(suffix);
-    map.retain(|key, _| !key.eq_ignore_ascii_case(&k1) && !key.eq_ignore_ascii_case(&k2));
+    map.retain(|key, _| !matches_either_internal_key_ignore_ascii_case(key, suffix));
 }
 
 // === Vec<u8> type (meta_sys) ===
@@ -305,11 +447,15 @@ pub fn remove_bytes(map: &mut HashMap<String, Vec<u8>>, suffix: &str) {
 }
 
 /// Strips an internal metadata prefix while preserving the suffix casing.
+#[inline]
 pub fn strip_internal_prefix_preserving_case(key: &str) -> Option<&str> {
-    if starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX) {
-        key.get(RUSTFS_INTERNAL_PREFIX.len()..)
-    } else if starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX) {
-        key.get(MINIO_INTERNAL_PREFIX.len()..)
+    let bytes = key.as_bytes();
+    if starts_with_rustfs_internal_prefix(bytes) {
+        // The matched prefix is 18 ASCII bytes, so index 18 is always a UTF-8 char boundary.
+        Some(&key[RUSTFS_INTERNAL_PREFIX.len()..])
+    } else if starts_with_minio_internal_prefix(bytes) {
+        // The matched prefix is 17 ASCII bytes, so index 17 is always a UTF-8 char boundary.
+        Some(&key[MINIO_INTERNAL_PREFIX.len()..])
     } else {
         None
     }
@@ -342,7 +488,7 @@ fn internal_versions_by_arn(map: &HashMap<String, String>, arn_prefix: &str) -> 
         let Some(prefix) = suffix.get(..arn_prefix.len()) else {
             continue;
         };
-        if !prefix.eq_ignore_ascii_case(arn_prefix) {
+        if !eq_slice_ignore_ascii_case(prefix.as_bytes(), arn_prefix.as_bytes()) {
             continue;
         }
         let arn = &suffix[arn_prefix.len()..];
@@ -452,6 +598,16 @@ mod tests {
             format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_TRANSITION_TIER_DESTINATION_ID}"),
             "identity-b".to_string(),
         );
+        assert_eq!(get_consistent_str(&metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID), None);
+    }
+
+    #[test]
+    fn test_consistent_str_rejects_conflicting_mixed_case_aliases() {
+        let metadata = HashMap::from([
+            ("X-RustFS-Internal-transition-tier-destination-id".to_string(), "identity-a".to_string()),
+            ("X-Minio-Internal-Transition-Tier-Destination-Id".to_string(), "identity-b".to_string()),
+        ]);
+
         assert_eq!(get_consistent_str(&metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID), None);
     }
 
@@ -699,6 +855,49 @@ mod tests {
         remove_str(&mut metadata, SUFFIX_ODM_SOURCE);
         assert!(!contains_key_str(&metadata, SUFFIX_ODM_SOURCE));
         assert!(contains_key_str(&metadata, SUFFIX_ODM_SOURCE_ETAG));
+    }
+
+    #[test]
+    fn test_eq_slice_ignore_ascii_case_swar_exhaustive_and_boundaries() {
+        for ab in 0u8..=u8::MAX {
+            for bb in 0u8..=u8::MAX {
+                let expected = ab.eq_ignore_ascii_case(&bb);
+                let mut s8_a = [b'x'; 8];
+                let mut s8_b = [b'X'; 8];
+                s8_a[3] = ab;
+                s8_b[3] = bb;
+                assert_eq!(
+                    eq_slice_ignore_ascii_case(&s8_a, &s8_b),
+                    expected,
+                    "u64 SWAR mismatch for ({ab:#04x}, {bb:#04x})"
+                );
+
+                let mut s4_a = [b'a'; 4];
+                let mut s4_b = [b'A'; 4];
+                s4_a[2] = ab;
+                s4_b[2] = bb;
+                assert_eq!(
+                    eq_slice_ignore_ascii_case(&s4_a, &s4_b),
+                    expected,
+                    "u32 SWAR mismatch for ({ab:#04x}, {bb:#04x})"
+                );
+            }
+        }
+
+        for len in 0usize..=35 {
+            let lower: Vec<u8> = (0..len)
+                .map(|i| b'a' + u8::try_from(i % 26).expect("modulo fits in u8"))
+                .collect();
+            let upper: Vec<u8> = lower.iter().map(u8::to_ascii_uppercase).collect();
+            assert!(eq_slice_ignore_ascii_case(&lower, &upper));
+            for pos in 0..len {
+                let mut mutated = upper.clone();
+                mutated[pos] = b'@';
+                let mut other = lower.clone();
+                other[pos] = b'`';
+                assert!(!eq_slice_ignore_ascii_case(&mutated, &other), "len={len} pos={pos}");
+            }
+        }
     }
 
     #[test]

@@ -46,15 +46,10 @@ impl Clone for PoolObjInfo {
     }
 }
 
-pub(super) struct LatestObjectInfoCandidate {
-    pub(super) info: Option<ObjectInfo>,
-    pub(super) idx: usize,
-    pub(super) err: Option<Error>,
-}
-
-pub(super) struct RebalanceDeletePoolResult {
-    pub(super) pool_idx: usize,
-    pub(super) result: Result<ObjectInfo>,
+pub(in crate::store) struct LatestObjectInfoCandidate {
+    pub(in crate::store) info: Option<ObjectInfo>,
+    pub(in crate::store) idx: usize,
+    pub(in crate::store) err: Option<Error>,
 }
 
 pub(super) fn pool_lookup_not_found_error(bucket: &str, object: &str, opts: &ObjectOptions) -> Error {
@@ -71,53 +66,30 @@ pub(super) fn resolve_store_rebalance_pool_meta_reload_result<T>(result: Result<
     result.map_err(|err| Error::other(format!("store rebalance pool meta reload failed during {stage}: {err}")))
 }
 
-pub(super) fn resolve_rebalance_delete_from_all_pools_result(
-    result: Result<ObjectInfo>,
-    bucket: &str,
-    object: &str,
-) -> Result<ObjectInfo> {
-    result.map_err(|err| {
-        if matches!(&err, Error::PreconditionFailed | Error::PrefixAccessDenied(_, _)) {
-            err
-        } else {
-            Error::other(format!("failed to delete rebalance source object {bucket}/{object}: {err}"))
-        }
-    })
-}
-
 fn is_ignorable_rebalance_delete_error(err: &Error) -> bool {
     is_err_object_not_found(err) || is_err_version_not_found(err)
 }
 
-fn rebalance_delete_pool_error(pool_idx: usize, bucket: &str, object: &str, err: Error) -> Error {
-    if matches!(&err, Error::PreconditionFailed | Error::PrefixAccessDenied(_, _)) {
-        err
-    } else {
-        Error::other(format!("pool {pool_idx} delete failed for {bucket}/{object}: {err}"))
-    }
-}
-
 pub(super) fn resolve_rebalance_delete_from_all_pools_results(
-    results: Vec<RebalanceDeletePoolResult>,
+    results: Vec<Result<ObjectInfo>>,
     bucket: &str,
     object: &str,
 ) -> Result<ObjectInfo> {
     let mut deleted = None;
     let mut ignored_error = None;
 
-    for pool_result in results {
-        let pool_idx = pool_result.pool_idx;
-        match pool_result.result {
+    for result in results {
+        match result {
             Ok(info) => {
                 if deleted.is_none() {
                     deleted = Some(info);
                 }
             }
             Err(err) if is_ignorable_rebalance_delete_error(&err) => {
-                ignored_error = Some((pool_idx, err));
+                ignored_error = Some(err);
             }
             Err(err) => {
-                return Err(rebalance_delete_pool_error(pool_idx, bucket, object, err));
+                return Err(err);
             }
         }
     }
@@ -126,8 +98,8 @@ pub(super) fn resolve_rebalance_delete_from_all_pools_results(
         return Ok(info);
     }
 
-    if let Some((pool_idx, err)) = ignored_error {
-        return Err(rebalance_delete_pool_error(pool_idx, bucket, object, err));
+    if let Some(err) = ignored_error {
+        return Err(err);
     }
 
     Err(Error::other(format!(
@@ -214,21 +186,18 @@ fn same_user_defined_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
     }
 }
 
-/// Pool-specific erasure geometry and data-movement rewrites are intentionally
-/// excluded. The selected winner still carries the chosen pool's layout, while
-/// the remaining read-visible fields must agree before the pool index can
-/// provide a deterministic tie-break.
+/// Pool-specific erasure geometry, version history, and data-movement rewrites
+/// are intentionally excluded. A copied version can be the target's latest
+/// while the source still holds newer versions. The selected winner keeps its
+/// pool's layout; the version's read-visible identity must still agree.
 pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
     let same_read_surface = left.bucket == right.bucket
         && left.name == right.name
         && left.is_dir == right.is_dir
         && left.restore_ongoing == right.restore_ongoing
         && left.restore_expires == right.restore_expires
-        && left.is_latest == right.is_latest
         && left.content_type == right.content_type
         && left.content_encoding == right.content_encoding
-        && left.num_versions == right.num_versions
-        && left.successor_mod_time == right.successor_mod_time
         && left.inlined == right.inlined
         && left.metadata_only == right.metadata_only
         && left.version_only == right.version_only
@@ -237,6 +206,18 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
     if !same_read_surface {
         return false;
     }
+
+    // These describe the pool's version list, not the version itself. A
+    // partially moved entry keeps every version on its source and only some
+    // on its target, so copies of one version legitimately disagree here
+    // (rustfs/backlog#2873, defect F). A version id names one version, so an
+    // exact copy of an identified version needs no matching list. A tiered
+    // null copy identifies the same remote object; an ordinary null version
+    // keeps the full comparison.
+    let same_version_history = left.is_latest == right.is_latest
+        && left.num_versions == right.num_versions
+        && left.successor_mod_time == right.successor_mod_time;
+    let identified_version = left.version_id.is_some_and(|id| !id.is_nil());
 
     let exact_identity = left.storage_class == right.storage_class
         && left.mod_time == right.mod_time
@@ -257,8 +238,22 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
         && left.version_purge_status == right.version_purge_status
         && left.checksum == right.checksum;
 
-    if exact_identity {
+    let tiered_null_version = !identified_version
+        && !left.delete_marker
+        && !left.transitioned_object.free_version
+        && left.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE
+        && !left.transitioned_object.tier.is_empty()
+        && !left.transitioned_object.name.is_empty();
+    if exact_identity && (same_version_history || identified_version || tiered_null_version) {
         return true;
+    }
+
+    // A copied delete marker carries the target's bucket incarnation fence,
+    // which the source marker does not; data movement already treats that as
+    // the same marker.
+    if left.delete_marker && right.delete_marker {
+        return crate::store::object::is_equivalent_data_movement_delete_marker(left, right)
+            || crate::store::object::is_equivalent_data_movement_delete_marker(right, left);
     }
 
     let left_moved =
@@ -278,7 +273,13 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
 }
 
 pub(super) fn validate_prepared_pool_refetch_identity(expected: &ObjectInfo, refetched: &ObjectInfo) -> Result<()> {
-    if same_latest_object_info_identity(expected, refetched) {
+    // A refetch stays in the same pool, so its history must still match the
+    // snapshot even though cross-pool copies may have different inventories.
+    if expected.is_latest == refetched.is_latest
+        && expected.num_versions == refetched.num_versions
+        && expected.successor_mod_time == refetched.successor_mod_time
+        && same_latest_object_info_identity(expected, refetched)
+    {
         Ok(())
     } else {
         Err(Error::ErasureReadQuorum)
@@ -295,7 +296,7 @@ pub(super) fn resolve_latest_object_info_candidates(
     resolve_latest_object_info_candidates_with_pool_state(candidates, &[], bucket, object, opts)
 }
 
-pub(super) fn resolve_latest_object_info_candidates_with_pool_state(
+pub(in crate::store) fn resolve_latest_object_info_candidates_with_pool_state(
     candidates: Vec<LatestObjectInfoCandidate>,
     suspended_pools: &[bool],
     bucket: &str,
@@ -377,52 +378,84 @@ mod tests {
     }
 
     #[test]
-    fn rebalance_delete_result_preserves_precondition_failed() {
-        let err = resolve_rebalance_delete_from_all_pools_result(Err(Error::PreconditionFailed), "bucket", "object")
-            .expect_err("precondition failure should remain structured");
-
-        assert_eq!(err, Error::PreconditionFailed);
+    fn prepared_pool_refetch_identity_fails_closed_on_version_history_change() {
+        let expected = ObjectInfo {
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(10).expect("test timestamp should be valid")),
+            version_id: Some(uuid::Uuid::from_u128(1)),
+            etag: Some("etag-a".to_string()),
+            ..Default::default()
+        };
+        for refetched in [
+            ObjectInfo {
+                is_latest: !expected.is_latest,
+                ..expected.clone()
+            },
+            ObjectInfo {
+                num_versions: expected.num_versions + 1,
+                ..expected.clone()
+            },
+            ObjectInfo {
+                successor_mod_time: Some(OffsetDateTime::from_unix_timestamp(20).expect("successor timestamp should be valid")),
+                ..expected.clone()
+            },
+        ] {
+            let error = validate_prepared_pool_refetch_identity(&expected, &refetched)
+                .expect_err("a changed same-pool history must invalidate the prepared snapshot");
+            assert_eq!(error, Error::ErasureReadQuorum);
+        }
     }
 
     #[test]
-    fn rebalance_delete_result_preserves_prefix_access_denied() {
-        let err = resolve_rebalance_delete_from_all_pools_result(
-            Err(Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned())),
-            "bucket",
-            "object",
-        )
-        .expect_err("prefix access denial should remain structured");
-
-        assert_eq!(err, Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned()));
+    fn rebalance_delete_aggregation_preserves_typed_failures() {
+        for expected in [
+            Error::UnsupportedDisk,
+            Error::GuardedDeleteUnsupported,
+            Error::ErasureReadQuorum,
+            Error::ErasureWriteQuorum,
+            Error::SlowDown,
+            Error::PreconditionFailed,
+            Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned()),
+            Error::FileCorrupt,
+        ] {
+            for results in [
+                vec![Err(expected.clone())],
+                vec![Ok(ObjectInfo::default()), Err(expected.clone())],
+                vec![Err(expected.clone()), Ok(ObjectInfo::default())],
+                vec![
+                    Err(Error::ObjectNotFound("bucket".to_owned(), "object".to_owned())),
+                    Err(expected.clone()),
+                ],
+            ] {
+                let actual = resolve_rebalance_delete_from_all_pools_results(results, "bucket", "object")
+                    .expect_err("a pool failure must retain its S3 error classification");
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]
-    fn rebalance_delete_pool_result_preserves_precondition_failed() {
-        let err = resolve_rebalance_delete_from_all_pools_results(
-            vec![RebalanceDeletePoolResult {
-                pool_idx: 0,
-                result: Err(Error::PreconditionFailed),
-            }],
-            "bucket",
-            "object",
-        )
-        .expect_err("precondition failure should remain structured");
-
-        assert_eq!(err, Error::PreconditionFailed);
+    fn rebalance_delete_aggregation_preserves_missing_identity() {
+        for expected in [
+            Error::ObjectNotFound("bucket".to_owned(), "object".to_owned()),
+            Error::VersionNotFound("bucket".to_owned(), "object".to_owned(), "version".to_owned()),
+        ] {
+            let actual = resolve_rebalance_delete_from_all_pools_results(vec![Err(expected.clone())], "bucket", "object")
+                .expect_err("all-missing deletes must preserve their typed object or version identity");
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
-    fn rebalance_delete_pool_result_preserves_prefix_access_denied() {
-        let err = resolve_rebalance_delete_from_all_pools_results(
-            vec![RebalanceDeletePoolResult {
-                pool_idx: 0,
-                result: Err(Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned())),
-            }],
-            "bucket",
-            "object",
-        )
-        .expect_err("prefix access denial should remain structured");
-
-        assert_eq!(err, Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned()));
+    fn rebalance_delete_aggregation_rejects_no_attempted_pools() {
+        let error = resolve_rebalance_delete_from_all_pools_results(Vec::new(), "bucket", "object")
+            .expect_err("an empty attempt set cannot report a successful delete");
+        let Error::Io(error) = error else {
+            panic!("an empty attempt set must remain an internal error");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "failed to delete rebalance source object bucket/object: no pools were attempted"
+        );
     }
 }

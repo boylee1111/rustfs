@@ -79,6 +79,12 @@ pub(crate) mod config_test {
 }
 
 pub(crate) mod error {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_disk::error::Error as DiskError;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_disk::error_reduce::{
+        OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs,
+    };
     pub(crate) mod contract {
         pub(crate) use super::super::storage_contracts::error::StorageErrorCode;
 
@@ -128,9 +134,35 @@ pub(crate) mod kms {
 
 pub(crate) mod protocols {
     pub(crate) mod client {
-        pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
+        pub(crate) use crate::storage::storage_api::access_consumer::{MultipartStagingOperation, ReqInfo, authorize_request};
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::contract::object::ObjectIO;
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
         pub(crate) type FS = crate::storage::storage_api::FS;
         pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
+        #[cfg(all(test, any(feature = "webdav", feature = "sftp")))]
+        pub(crate) use s3s::S3ErrorCode;
+        #[cfg(test)]
+        pub(crate) use s3s::dto::ListObjectsV2Input;
+
+        /// WebDAV quota reporting surface (`session_capacity_view`): bucket
+        /// quota config, cached usage, and the console's erasure-aware usable
+        /// capacity, all read from caches/snapshots only.
+        #[cfg(feature = "webdav")]
+        pub(crate) mod capacity {
+            pub(crate) use super::super::super::storage_contracts::StorageAdminApi;
+            pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::get_quota_config;
+            pub(crate) use crate::storage::storage_api::ecstore_capacity::{
+                get_total_usable_capacity, get_total_usable_capacity_free,
+            };
+            pub(crate) use crate::storage::storage_api::ecstore_data_usage::{
+                get_bucket_usage_memory, lookup_degraded_bucket_usage_baseline,
+            };
+            pub(crate) use crate::storage::storage_api::ecstore_error::{Error as BucketConfigError, is_err_bucket_not_found};
+        }
     }
 }
 
@@ -150,9 +182,14 @@ pub(crate) mod server {
     }
 
     pub(crate) mod http {
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_disk::{
+            DiskAPI, DiskOption, new_disk, with_background_resource_unit,
+        };
         pub(crate) use crate::storage::storage_api::{
-            ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
-            tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap,
+            RemoteBackgroundIo, ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, rpc_background_admission,
+            tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
+            verify_tonic_rpc_signature_with_bootstrap, with_remote_background_io,
         };
 
         pub(crate) fn try_current_local_node_name() -> Option<String> {
@@ -162,7 +199,8 @@ pub(crate) mod server {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{
             Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, ScannerScopedDirtyUsageAckEntry,
-            gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers, verify_tonic_boot_epoch_response,
+            find_local_disk_by_ref, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
+            init_local_disks, verify_tonic_boot_epoch_response,
         };
 
         pub(crate) mod ecfs {
@@ -170,11 +208,17 @@ pub(crate) mod server {
         }
 
         pub(crate) mod metadata_route {
-            pub(crate) fn with_metadata_route<A>(admin: A, host: Option<s3s::host::MultiDomain>) -> impl s3s::route::S3Route
+            pub(crate) fn with_metadata_route<A>(
+                admin: A,
+                host: Option<s3s::host::MultiDomain>,
+                website_domains: Vec<String>,
+                website_scheme: &'static str,
+                server_ctx: std::sync::Arc<super::ServerContextSlot>,
+            ) -> impl s3s::route::S3Route
             where
                 A: s3s::route::S3Route,
             {
-                crate::app::metadata_route::with_metadata_route(admin, host)
+                crate::app::metadata_route::with_metadata_route(admin, host, website_domains, website_scheme, server_ctx)
             }
         }
 
@@ -184,6 +228,8 @@ pub(crate) mod server {
 
         pub(crate) mod rpc {
             pub(crate) use crate::storage::storage_api::rpc_consumer::InternodeRpcService;
+            #[cfg(test)]
+            pub(crate) use s3s::Body;
         }
 
         pub(crate) mod tonic_service {
@@ -202,6 +248,13 @@ pub(crate) mod server {
 
     pub(crate) mod layer {
         pub(crate) use crate::storage::storage_api::apply_cors_headers;
+
+        #[cfg(feature = "diagnostic-local-batch")]
+        pub(crate) mod batch_diagnostic {
+            #[cfg(test)]
+            pub(crate) use crate::storage::storage_api::ecstore_diagnostic::current_request_id;
+            pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{in_request_context, request_context};
+        }
 
         pub(crate) mod request_context {
             pub(crate) use crate::storage::storage_api::request_context_consumer::{
@@ -225,7 +278,9 @@ pub(crate) mod server {
         }
 
         pub(crate) use crate::storage::storage_api::ecstore_disk::DiskStore;
-        pub(crate) use crate::storage::storage_api::{Endpoint, EndpointServerPools, is_dist_erasure};
+        pub(crate) use crate::storage::storage_api::{
+            Endpoint, EndpointServerPools, PeerRestClient, get_global_notification_sys, is_dist_erasure,
+        };
 
         pub(crate) fn disk_endpoint_snapshot(disk: &DiskStore) -> Endpoint {
             crate::storage::storage_api::ecstore_disk::DiskAPI::endpoint(disk.as_ref())
@@ -242,6 +297,19 @@ pub(crate) mod server {
     }
 }
 
+/// Storage surface of the connect diagnostics module
+/// (`crate::connect::diagnostics`): disk info and admin API primitives used
+/// by the health-check observation path.
+pub(crate) mod connect {
+    pub(crate) mod contract {
+        pub(crate) mod admin {
+            pub(crate) use super::super::super::storage_contracts::{DiskSetSelector, StorageAdminApi};
+        }
+    }
+
+    pub(crate) use crate::storage::storage_api::{DiskInfoOptions, StorageDiskRpcExt};
+}
+
 /// Storage surface of the site-replication service module
 /// (`crate::site_replication`, backlog#1840): bucket metadata, bucket
 /// targets, replication-config primitives, and the config-object lock
@@ -252,6 +320,7 @@ pub(crate) mod site_replication {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{
         BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketMetadata,
     };
+    pub(crate) use crate::storage::storage_api::ecstore_object::WriteCommitGuard;
 
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::ecstore_bucket::replication::merge_incoming_replication_config;
@@ -304,9 +373,13 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod background {
+        #[cfg(any(target_os = "linux", test))]
+        pub(crate) use crate::storage::storage_api::BackgroundMemoryBudget;
         pub(crate) use crate::storage::storage_api::{
             BitrotSelfTestError, ECStore, bitrot_self_test, set_workload_admission_snapshot_provider,
         };
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        pub(crate) use crate::storage::storage_api::{PhysicalDiskSample, PhysicalDiskSampler};
     }
 
     pub(crate) mod bucket_metadata {
@@ -377,7 +450,7 @@ pub(crate) mod startup {
     pub(crate) mod shutdown {
         pub(crate) use crate::storage::storage_api::{
             mark_get_metadata_read_version_coalescing_service_ready, shutdown_background_monitors, shutdown_background_services,
-            store_compression_total_in_backend,
+            store_compression_total_in_backend, wait_for_detached_mutations,
         };
     }
 
@@ -401,11 +474,15 @@ pub(crate) mod workload {
     }
 
     pub(crate) mod concurrency {
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::concurrency_consumer::ConcurrencyManager;
         pub(crate) use crate::storage::storage_api::concurrency_consumer::get_concurrency_manager;
     }
 }
 
 pub(crate) mod table {
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
+    pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
     pub(crate) mod contract {
         pub(crate) mod http {
             pub(crate) use super::super::super::storage_contracts::HTTPPreconditions;

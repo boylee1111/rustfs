@@ -164,6 +164,7 @@ impl DefaultObjectUsecase {
             ..
         } = req.input.clone();
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &object).await?;
         validate_table_catalog_object_mutation(&bucket, &object).await?;
 
         // Typed S3 errors on every RestoreObject failure (backlog#2205): a
@@ -213,8 +214,8 @@ impl DefaultObjectUsecase {
         // `apply_bucket_generation_guard` deliberately tolerates a missing guard
         // (only the S3 access layer installs one), so this must not hard-require
         // it. Resolve the current generation instead, exactly as the copy path
-        // does. The fence is unaffected: the value is re-read from disk and
-        // compared below, before the restore is admitted.
+        // does. The fence is unaffected: the value is validated under the
+        // lifecycle fence below, before the restore is admitted.
         let restore_bucket_incarnation_id = match opts.expected_bucket_incarnation_id {
             Some(incarnation_id) => incarnation_id,
             None => {
@@ -246,10 +247,12 @@ impl DefaultObjectUsecase {
         // in-flight commit on the same object) is transient — answer 503
         // SlowDown so SDK clients back off and retry instead of treating it
         // as a hard failure.
-        let mut restore_bucket_lifecycle_guard = Some(acquire_copy_bucket_lifecycle_lock(store.as_ref(), &bucket).await?);
-        if store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)? != restore_bucket_incarnation_id {
-            return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
-        }
+        let mut restore_bucket_lifecycle_guard = Some(
+            store
+                .acquire_bucket_incarnation_fence(&bucket, restore_bucket_incarnation_id)
+                .await
+                .map_err(ApiError::from)?,
+        );
         let mut accept_guard = {
             let guard = store
                 .acquire_restore_accept_guard(&bucket, &object)
@@ -299,12 +302,12 @@ impl DefaultObjectUsecase {
                             S3Error::with_message(S3ErrorCode::RestoreAlreadyInProgress, "Object restore is already in progress.")
                         })?;
 
-                    restore_bucket_lifecycle_guard = Some(acquire_copy_bucket_lifecycle_lock(store.as_ref(), &bucket).await?);
-                    if store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?
-                        != restore_bucket_incarnation_id
-                    {
-                        return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
-                    }
+                    restore_bucket_lifecycle_guard = Some(
+                        store
+                            .acquire_bucket_incarnation_fence(&bucket, restore_bucket_incarnation_id)
+                            .await
+                            .map_err(ApiError::from)?,
+                    );
                     accept_guard = Some(
                         store
                             .acquire_restore_accept_guard(&bucket, &object)
@@ -398,7 +401,7 @@ impl DefaultObjectUsecase {
                 ..Default::default()
             };
             if let Some(guard) = restore_bucket_lifecycle_guard.as_ref() {
-                restore_dst_opts.add_bucket_lifecycle_lock_guard(guard);
+                guard.attach_to_object_options(&mut restore_dst_opts);
             }
             if let Some(guard) = accept_guard.as_ref() {
                 guard.add_namespace_lock_fence(&mut restore_dst_opts);
@@ -472,9 +475,11 @@ impl DefaultObjectUsecase {
         }
 
         let restore_worker_guard = restore_worker_guard.take();
+        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
         spawn_traced(async move {
             let _restore_worker_guard = restore_worker_guard;
-            let opts = ObjectOptions {
+            let _table_data_plane_publication_guards = table_data_plane_publication_guards;
+            let mut opts = ObjectOptions {
                 transition: TransitionOptions {
                     restore_request: rreq_clone,
                     restore_expiry,
@@ -487,6 +492,9 @@ impl DefaultObjectUsecase {
                 user_defined: restore_operation_metadata,
                 ..Default::default()
             };
+            if let Some(guards) = _table_data_plane_publication_guards.as_ref() {
+                guards.add_lock_loss_fences(&mut opts);
+            }
 
             if let Err(err) = store_clone
                 .restore_transitioned_object(&bucket_clone, &object_clone, &opts)

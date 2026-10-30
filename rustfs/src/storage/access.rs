@@ -16,22 +16,29 @@ use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{ECStore, PolicySys, ReplicationStatusType, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
 use crate::auth::{
-    AuthType, RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest,
-    VerifiedSigV4Request, check_key_valid_with_context, get_condition_values_with_client_info,
-    get_condition_values_with_query_and_client_info, get_request_auth_type_with_query, get_session_token,
-    parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
-    reject_unsigned_amz_headers_on_sigv4_request,
+    AuthType, OBJECT_CREATION_OPERATION_CONDITION, OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION,
+    RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest, VerifiedSigV4Request,
+    check_key_valid_with_context, get_condition_values_with_client_info, get_condition_values_with_query_and_client_info,
+    get_request_auth_type_with_query, get_session_token, parse_presigned_multipart_max_total_object_size,
+    parse_presigned_put_max_content_length, reject_unsigned_amz_headers_on_sigv4_request,
 };
-use crate::error::ApiError;
+use crate::error::{ApiError, normalize_read_quorum_error};
 use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
+use crate::storage::denial_audit::DenialAuditor;
+use crate::storage::helper::DenialScope;
 use crate::storage::request_context::RequestContext;
 use crate::storage::storage_api::contract::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT;
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
 use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use chacha20poly1305::{
+    ChaCha20Poly1305, KeyInit,
+    aead::{Aead, Payload},
+};
 use http::HeaderMap;
 use metrics::counter;
+use rand::Rng;
 use rustfs_iam::{
     error::Error as IamError,
     store::object::ObjectStore,
@@ -44,17 +51,27 @@ use rustfs_policy::policy::{
 };
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
     SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
-    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, force_delete_header, get_header,
 };
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::OnceLock;
+use time::OffsetDateTime;
 use url::{Url, form_urlencoded};
+
+fn iam_authorization_error(err: IamError) -> ApiError {
+    match err {
+        IamError::IAMActionNotAllowed => ApiError::access_denied(),
+        other => ApiError::from(other),
+    }
+}
 
 const EVENT_OBJECT_TAG_AUTHORIZATION: &str = "object_tag_authorization";
 const LOG_COMPONENT_ACCESS: &str = "storage_access";
@@ -76,6 +93,9 @@ pub(crate) struct ReqInfo {
     /// collection) so `authorize_request` logs those routine denials at `debug`
     /// instead of `warn` (issue #5740).
     pub suppress_denial_log: bool,
+    /// Set by callers that audit their denials in aggregate (DeleteObjects), so each per-key
+    /// denial is not audited on its own. The denial is still logged.
+    pub suppress_denial_audit: bool,
 }
 
 pub(crate) fn replication_request_authorized<T>(req: &S3Request<T>) -> bool {
@@ -111,9 +131,14 @@ pub(crate) fn recursive_force_delete_has_authenticated_caller(
     authenticated: bool,
     replica_request: bool,
 ) -> bool {
-    !get_header(headers, SUFFIX_FORCE_DELETE).is_some_and(|value| value.eq_ignore_ascii_case("true"))
-        || authenticated
-        || replica_request
+    match force_delete_header(headers) {
+        Ok(Some(true)) => authenticated || replica_request,
+        _ => true,
+    }
+}
+
+fn invalid_force_delete_header() -> S3Error {
+    S3Error::with_message(S3ErrorCode::InvalidRequest, "Invalid force-delete header value")
 }
 
 #[derive(Clone, Debug)]
@@ -122,11 +147,30 @@ pub(crate) struct PostObjectRequestMarker;
 #[derive(Clone, Debug)]
 struct InternalObjectAuthorization;
 
+/// Retain-until date the request asks to set. `authorization_conditions` turns it
+/// into `object-lock-remaining-retention-days`.
+#[derive(Clone, Debug)]
+struct RequestedObjectLockRetainUntil(OffsetDateTime);
+
+#[derive(Clone, Debug)]
+struct RequestedObjectLockRetention(ObjectLockRetention);
+
+/// These operations stage upload state without publishing an object. Keep this
+/// separate from the marker controlling multipart publication fences.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MultipartStagingOperation;
+
+impl MultipartStagingOperation {
+    fn for_operation(operation: &str) -> Option<Self> {
+        matches!(operation, "CreateMultipartUpload" | "UploadPart" | "UploadPartCopy").then_some(Self)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct StagedMultipartPartAuthorization;
 
 #[derive(Clone, Default)]
-struct TableDataPlanePublicationGuards {
+pub(crate) struct TableDataPlanePublicationGuards {
     state: Arc<parking_lot::Mutex<TableDataPlanePublicationState>>,
 }
 
@@ -134,8 +178,215 @@ struct TableDataPlanePublicationGuards {
 struct TableDataPlanePublicationState {
     keys: BTreeSet<(String, String)>,
     guards: Vec<Box<dyn Send>>,
+    lock_lost_signals: Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     resources: HashMap<(String, String), crate::table_catalog::TableDataPlaneResource>,
     missing_resources: BTreeSet<(String, String)>,
+}
+
+impl TableDataPlanePublicationGuards {
+    pub(crate) fn add_lock_loss_fences(&self, options: &mut ObjectOptions) {
+        let state = self.state.lock();
+        for signal in &state.lock_lost_signals {
+            options.add_namespace_lock_lost_signal(Arc::clone(signal));
+        }
+    }
+}
+
+pub(crate) const TABLE_DATA_PLANE_LIST_CURSOR_PREFIX: &str = "rustfs-table-list:v1:";
+const TABLE_DATA_PLANE_LIST_CURSOR_VERSION: u8 = 1;
+const TABLE_DATA_PLANE_LIST_CURSOR_KEY_CONTEXT: &[u8] = b"rustfs-table-list-cursor-key:v1";
+const TABLE_DATA_PLANE_LIST_CURSOR_MAX_ENCODED_LEN: usize = 16 * 1024;
+
+fn table_data_plane_list_internal_error(message: impl Into<String>) -> S3Error {
+    S3Error::with_message(S3ErrorCode::InternalError, message.into())
+}
+
+#[derive(Clone)]
+struct TableDataPlaneListResource {
+    resource: crate::table_catalog::TableDataPlaneResource,
+    allowed: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct TableDataPlaneListAccess {
+    bucket: String,
+    principal_fingerprint: String,
+    snapshot_fingerprint: String,
+    cursor_key: [u8; 32],
+    resources: Vec<TableDataPlaneListResource>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableDataPlaneListCursor {
+    version: u8,
+    bucket: String,
+    principal_fingerprint: String,
+    snapshot_fingerprint: String,
+    operation: String,
+    prefix: String,
+    delimiter: Option<String>,
+    max_keys: usize,
+    marker: Option<String>,
+    version_marker: Option<String>,
+    common_prefix: Option<String>,
+}
+
+pub(crate) struct TableDataPlaneListCursorPosition {
+    pub(crate) marker: Option<String>,
+    pub(crate) version_marker: Option<String>,
+    pub(crate) common_prefix: Option<String>,
+}
+
+impl TableDataPlaneListCursor {
+    pub(crate) fn marker(&self) -> Option<&str> {
+        self.marker.as_deref()
+    }
+
+    pub(crate) fn version_marker(&self) -> Option<&str> {
+        self.version_marker.as_deref()
+    }
+
+    pub(crate) fn common_prefix(&self) -> Option<&str> {
+        self.common_prefix.as_deref()
+    }
+}
+
+impl TableDataPlaneListAccess {
+    #[cfg(test)]
+    pub(crate) fn test_listing_fixture(bucket: &str) -> Self {
+        let resource = |table: &str, prefix: &str, allowed| TableDataPlaneListResource {
+            resource: crate::table_catalog::TableDataPlaneResource {
+                table_bucket: bucket.to_owned(),
+                namespace: "test".to_owned(),
+                table: table.to_owned(),
+                table_id: table.to_owned(),
+                warehouse_object_prefix: prefix.to_owned(),
+            },
+            allowed,
+        };
+        Self {
+            bucket: bucket.to_owned(),
+            principal_fingerprint: "principal".to_owned(),
+            snapshot_fingerprint: "snapshot".to_owned(),
+            cursor_key: [0x42; 32],
+            resources: vec![
+                resource("table-id", "tables/table-id/", true),
+                resource("denied-id", "tables/zz-denied/", false),
+            ],
+        }
+    }
+
+    pub(crate) fn allows_object(&self, object: &str) -> bool {
+        if crate::table_catalog::is_reserved_table_object_key(object) {
+            return false;
+        }
+        self.resources
+            .iter()
+            .find(|entry| object.starts_with(&entry.resource.warehouse_object_prefix))
+            .is_none_or(|entry| entry.allowed)
+    }
+
+    pub(crate) fn encode_cursor(
+        &self,
+        operation: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: usize,
+        position: TableDataPlaneListCursorPosition,
+    ) -> S3Result<String> {
+        let cursor = TableDataPlaneListCursor {
+            version: TABLE_DATA_PLANE_LIST_CURSOR_VERSION,
+            bucket: self.bucket.clone(),
+            principal_fingerprint: self.principal_fingerprint.clone(),
+            snapshot_fingerprint: self.snapshot_fingerprint.clone(),
+            operation: operation.to_string(),
+            prefix: prefix.to_string(),
+            delimiter: delimiter.map(str::to_string),
+            max_keys,
+            marker: position.marker,
+            version_marker: position.version_marker,
+            common_prefix: position.common_prefix,
+        };
+        let plaintext = serde_json::to_vec(&cursor).map_err(|err| {
+            table_data_plane_list_internal_error(format!("failed to encode protected table list cursor: {err}"))
+        })?;
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.cursor_key)
+            .map_err(|_| table_data_plane_list_internal_error("failed to initialize protected table list cursor cipher"))?;
+        let mut nonce_bytes = [0u8; 12];
+        rand::rng().fill_bytes(&mut nonce_bytes);
+        let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: &plaintext,
+                    aad: TABLE_DATA_PLANE_LIST_CURSOR_PREFIX.as_bytes(),
+                },
+            )
+            .map_err(|_| table_data_plane_list_internal_error("failed to seal protected table list cursor"))?;
+        let mut token = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
+        token.extend_from_slice(&nonce_bytes);
+        token.extend_from_slice(&ciphertext);
+        Ok(format!(
+            "{}{}",
+            TABLE_DATA_PLANE_LIST_CURSOR_PREFIX,
+            base64_simd::URL_SAFE_NO_PAD.encode_to_string(token)
+        ))
+    }
+
+    pub(crate) fn decode_cursor(
+        &self,
+        operation: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: usize,
+        token: &str,
+    ) -> S3Result<TableDataPlaneListCursor> {
+        if token.len() > TABLE_DATA_PLANE_LIST_CURSOR_MAX_ENCODED_LEN {
+            return Err(invalid_table_data_plane_list_cursor());
+        }
+        let encoded = token
+            .strip_prefix(TABLE_DATA_PLANE_LIST_CURSOR_PREFIX)
+            .ok_or_else(invalid_table_data_plane_list_cursor)?;
+        let sealed = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(encoded.as_bytes())
+            .map_err(|_| invalid_table_data_plane_list_cursor())?;
+        let (nonce_bytes, ciphertext) = sealed
+            .split_at_checked(12)
+            .filter(|(_, ciphertext)| ciphertext.len() >= 16)
+            .ok_or_else(invalid_table_data_plane_list_cursor)?;
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.cursor_key)
+            .map_err(|_| table_data_plane_list_internal_error("failed to initialize protected table list cursor cipher"))?;
+        let nonce = chacha20poly1305::Nonce::try_from(nonce_bytes).map_err(|_| invalid_table_data_plane_list_cursor())?;
+        let plaintext = cipher
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: TABLE_DATA_PLANE_LIST_CURSOR_PREFIX.as_bytes(),
+                },
+            )
+            .map_err(|_| invalid_table_data_plane_list_cursor())?;
+        let cursor: TableDataPlaneListCursor =
+            serde_json::from_slice(&plaintext).map_err(|_| invalid_table_data_plane_list_cursor())?;
+        if cursor.version != TABLE_DATA_PLANE_LIST_CURSOR_VERSION
+            || cursor.bucket != self.bucket
+            || cursor.principal_fingerprint != self.principal_fingerprint
+            || cursor.snapshot_fingerprint != self.snapshot_fingerprint
+            || cursor.operation != operation
+            || cursor.prefix != prefix
+            || cursor.delimiter.as_deref() != delimiter
+            || cursor.max_keys != max_keys
+        {
+            return Err(invalid_table_data_plane_list_cursor());
+        }
+        Ok(cursor)
+    }
+}
+
+fn invalid_table_data_plane_list_cursor() -> S3Error {
+    S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid table listing continuation token".to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -215,38 +466,43 @@ struct CopySourceBucketGenerationGuard {
 }
 
 #[cfg(test)]
-type RestoreAuthorizationTestHook = (String, tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
+type ObjectGenerationTestHook = (String, tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
 
 #[cfg(test)]
-static RESTORE_AUTHORIZATION_TEST_HOOK: OnceLock<std::sync::Mutex<Option<RestoreAuthorizationTestHook>>> = OnceLock::new();
+static OBJECT_GENERATION_TEST_HOOK: OnceLock<std::sync::Mutex<Option<ObjectGenerationTestHook>>> = OnceLock::new();
 
 #[cfg(test)]
-fn install_restore_authorization_test_hook(
-    bucket: String,
-    authorized: tokio::sync::oneshot::Sender<()>,
-    resume: tokio::sync::oneshot::Receiver<()>,
-) {
-    *RESTORE_AUTHORIZATION_TEST_HOOK
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .expect("restore authorization test hook lock should not be poisoned") = Some((bucket, authorized, resume));
+tokio::task_local! {
+    static PUT_GENERATION_READ_QUORUM_FAILURE: ();
 }
 
 #[cfg(test)]
-async fn wait_for_restore_authorization_test_hook(bucket: &str) {
+fn install_object_generation_test_hook(
+    bucket: String,
+    loaded: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+) {
+    *OBJECT_GENERATION_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("object generation test hook lock should not be poisoned") = Some((bucket, loaded, resume));
+}
+
+#[cfg(test)]
+async fn wait_for_object_generation_test_hook(bucket: &str) {
     let hook = {
-        let mut slot = RESTORE_AUTHORIZATION_TEST_HOOK
+        let mut slot = OBJECT_GENERATION_TEST_HOOK
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
-            .expect("restore authorization test hook lock should not be poisoned");
+            .expect("object generation test hook lock should not be poisoned");
         if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
             slot.take()
         } else {
             None
         }
     };
-    if let Some((_bucket, authorized, resume)) = hook {
-        let _ = authorized.send(());
+    if let Some((_bucket, loaded, resume)) = hook {
+        let _ = loaded.send(());
         let _ = resume.await;
     }
 }
@@ -384,13 +640,23 @@ pub(crate) fn apply_bucket_generation_guard<T>(req: &S3Request<T>, bucket: &str,
         if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
             return Err(s3_error!(InternalError, "bucket generation guard is missing"));
         }
+        if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
+            publication_guards.add_lock_loss_fences(opts);
+        }
         return Ok(());
     };
     if guard.bucket != bucket {
         return Err(s3_error!(InternalError, "bucket generation guard does not match request bucket"));
     }
     opts.expected_bucket_incarnation_id = Some(guard.incarnation_id);
+    if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
+        publication_guards.add_lock_loss_fences(opts);
+    }
     Ok(())
+}
+
+pub(crate) fn retained_table_data_plane_publication_guards<T>(req: &S3Request<T>) -> Option<TableDataPlanePublicationGuards> {
+    req.extensions.get::<TableDataPlanePublicationGuards>().cloned()
 }
 
 pub(crate) fn apply_copy_source_bucket_generation_guard<T>(
@@ -402,6 +668,9 @@ pub(crate) fn apply_copy_source_bucket_generation_guard<T>(
         if req.extensions.get::<std::sync::Arc<ServerContextSlot>>().is_some() {
             return Err(s3_error!(InternalError, "copy source bucket generation guard is missing"));
         }
+        if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
+            publication_guards.add_lock_loss_fences(opts);
+        }
         return Ok(());
     };
     if guard.bucket != bucket {
@@ -411,6 +680,9 @@ pub(crate) fn apply_copy_source_bucket_generation_guard<T>(
         ));
     }
     opts.expected_bucket_incarnation_id = Some(guard.incarnation_id);
+    if let Some(publication_guards) = req.extensions.get::<TableDataPlanePublicationGuards>() {
+        publication_guards.add_lock_loss_fences(opts);
+    }
     Ok(())
 }
 
@@ -648,7 +920,7 @@ fn authorization_conditions<T>(
     req: &S3Request<T>,
     cred: &rustfs_credentials::Credentials,
     version_id: Option<&str>,
-    region: Option<s3s::region::Region>,
+    location_constraint: Option<String>,
     remote_addr: Option<std::net::SocketAddr>,
     client_info: Option<&ClientInfo>,
     action: Action,
@@ -657,18 +929,111 @@ fn authorization_conditions<T>(
         &req.headers,
         cred,
         version_id,
-        region,
+        None,
         remote_addr,
         req.uri.query(),
         client_info,
     );
-    if req.extensions.get::<InternalObjectAuthorization>().is_some() {
+    let internal_object_authorization = req.extensions.get::<InternalObjectAuthorization>().is_some();
+    if internal_object_authorization {
         retain_internal_object_authorization_conditions(&mut conditions, cred);
+    }
+    if action == Action::S3Action(S3Action::PutObjectAction) {
+        let creates_object = internal_object_authorization || req.extensions.get::<MultipartStagingOperation>().is_none();
+        conditions.insert(OBJECT_CREATION_OPERATION_CONDITION.to_string(), vec![creates_object.to_string()]);
+    }
+    if internal_object_authorization {
         return Ok(conditions);
+    }
+    if action == Action::S3Action(S3Action::CreateBucketAction)
+        && let Some(location) = location_constraint
+    {
+        conditions.insert("LocationConstraint".to_string(), vec![location]);
     }
     merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
     merge_request_object_tag_conditions(action, &req.headers, &mut conditions)?;
+    if let Some(RequestedObjectLockRetention(retention)) = req.extensions.get::<RequestedObjectLockRetention>() {
+        // Standalone retention writes apply the XML body, so headers must not
+        // supply a different value to the policy decision.
+        conditions.remove("object-lock-mode");
+        conditions.remove("object-lock-retain-until-date");
+        if let Some(mode) = &retention.mode {
+            conditions.insert("object-lock-mode".to_string(), vec![mode.as_str().to_string()]);
+        }
+        if let Some(date) = &retention.retain_until_date {
+            let date = OffsetDateTime::from(date.clone())
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid retain-until date"))?;
+            conditions.insert("object-lock-retain-until-date".to_string(), vec![date]);
+        }
+    }
+    merge_object_lock_remaining_retention_days_condition(
+        req.extensions.get::<RequestedObjectLockRetainUntil>(),
+        OffsetDateTime::now_utc(),
+        &mut conditions,
+    );
     Ok(conditions)
+}
+
+/// Records the retain-until date a request asks to set, or clears it when the
+/// request sets none. Call it before `authorize_request` with the parsed date from
+/// headers, form fields, the PutObjectRetention XML body, or an archive member.
+pub(crate) fn set_requested_object_lock_retain_until<T>(req: &mut S3Request<T>, retain_until: Option<&Timestamp>) {
+    match retain_until {
+        Some(retain_until) => {
+            req.extensions
+                .insert(RequestedObjectLockRetainUntil(OffsetDateTime::from(retain_until.clone())));
+        }
+        None => {
+            req.extensions.remove::<RequestedObjectLockRetainUntil>();
+        }
+    }
+}
+
+/// Keep the XML value literal for IAM; endpoint aliases are resolved later.
+fn requested_bucket_location_constraint(input: &CreateBucketInput) -> Option<String> {
+    input
+        .create_bucket_configuration
+        .as_ref()
+        .and_then(|configuration| configuration.location_constraint.as_ref())
+        .map(BucketLocationConstraint::as_str)
+        .filter(|location| !location.is_empty())
+        .map(str::to_owned)
+}
+
+fn set_requested_object_lock_retention(req: &mut S3Request<PutObjectRetentionInput>) {
+    let retention = req.input.retention.clone().unwrap_or_default();
+    set_requested_object_lock_retain_until(req, retention.retain_until_date.as_ref());
+    req.extensions.insert(RequestedObjectLockRetention(retention));
+}
+
+fn merge_object_lock_remaining_retention_days_condition(
+    requested: Option<&RequestedObjectLockRetainUntil>,
+    now: OffsetDateTime,
+    conditions: &mut HashMap<String, Vec<String>>,
+) {
+    if let Some(RequestedObjectLockRetainUntil(retain_until)) = requested {
+        conditions.insert(
+            OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION.to_string(),
+            vec![remaining_retention_days(*retain_until, now).to_string()],
+        );
+    }
+}
+
+/// Whole days from `now` to `retain_until`, rounded up as MinIO does, so a policy
+/// limit of N days rejects a date even one second past day N. A date that is not
+/// in the future yields 0.
+fn remaining_retention_days(retain_until: OffsetDateTime, now: OffsetDateTime) -> i64 {
+    let remaining = retain_until - now;
+    if remaining <= time::Duration::ZERO {
+        return 0;
+    }
+    let days = remaining.whole_days();
+    if remaining > time::Duration::days(days) {
+        days + 1
+    } else {
+        days
+    }
 }
 
 fn retain_internal_object_authorization_conditions(
@@ -831,6 +1196,8 @@ pub(crate) fn log_list_buckets_iam_implicit_deny<T>(req: &S3Request<T>) -> S3Res
     let req_info = req_info_ref(req)?;
     let denial = DenialContext {
         quiet: true,
+        suppress_audit: true,
+        auditor: DenialAuditor::global(),
         bucket: req_info.bucket.as_deref().unwrap_or_default(),
         object: req_info.object.as_deref().unwrap_or_default(),
         version_id: req_info.version_id.as_deref(),
@@ -857,17 +1224,28 @@ pub(crate) fn delete_object_authorize_action(version_id: Option<&str>) -> Action
 /// conflated at the authorization boundary.
 ///
 /// Note: `ActionSet::is_match` still maps a `s3:GetObjectVersion` grant onto a
-/// `s3:GetObject` request. That mapping is intentionally left in place until the
-/// remaining version-aware read paths (HeadObject, GetObjectAcl, tagging) get the
-/// same treatment — see the GHSA-3ppv follow-up audit. It does not re-open this
-/// disclosure: it only broadens a Version grant toward current reads, never the
-/// reverse.
+/// `s3:GetObject` request. It only broadens a Version grant toward current
+/// reads, never the reverse.
 fn versioned_read_action(version_id: Option<&str>) -> Action {
     if version_id.is_some() {
         Action::S3Action(S3Action::GetObjectVersionAction)
     } else {
         Action::S3Action(S3Action::GetObjectAction)
     }
+}
+
+fn versioned_tagging_action(action: S3Action, version_id: Option<&str>) -> Action {
+    let action = if version_id.is_some() {
+        match action {
+            S3Action::GetObjectTaggingAction => S3Action::GetObjectVersionTaggingAction,
+            S3Action::PutObjectTaggingAction => S3Action::PutObjectVersionTaggingAction,
+            S3Action::DeleteObjectTaggingAction => S3Action::DeleteObjectVersionTaggingAction,
+            action => action,
+        }
+    } else {
+        action
+    };
+    Action::S3Action(action)
 }
 
 async fn get_or_fetch_object_tag_conditions<T>(
@@ -935,6 +1313,8 @@ pub(crate) fn owner_can_bypass_policy_deny(is_owner: bool, action: &Action) -> b
 /// instead of `warn`.
 struct DenialContext<'a> {
     quiet: bool,
+    suppress_audit: bool,
+    auditor: &'a DenialAuditor,
     bucket: &'a str,
     object: &'a str,
     version_id: Option<&'a str>,
@@ -971,16 +1351,78 @@ impl DenialContext<'_> {
         );
     }
 
-    /// Build the generic AccessDenied response after recording the structured
-    /// denial event.
-    fn deny(&self, reason: &'static str, action: Action) -> S3Error {
+    /// Log the denial and, unless it is a quiet probe denial or audited in aggregate by the
+    /// caller, audit it.
+    fn record<T>(&self, req: &S3Request<T>, reason: &'static str, action: Action) {
         self.log(reason, action);
+        if !self.quiet && !self.suppress_audit {
+            self.auditor.audit(req, &action, reason, DenialScope::Request);
+        }
+    }
+
+    /// Build the generic AccessDenied response after recording the structured
+    /// denial event and, unless this is a quiet probe denial, an audit entry.
+    fn deny<T>(&self, req: &S3Request<T>, reason: &'static str, action: Action) -> S3Error {
+        self.record(req, reason, action);
         s3_error!(AccessDenied, "Access Denied")
+    }
+}
+
+/// Audits a denial at an exit that has no [`DenialContext`] of its own. It only audits: those exits
+/// keep their existing logging. The request's own probe flags are honored.
+fn audit_request_denial<T>(req: &S3Request<T>, auditor: &DenialAuditor, reason: &'static str, action: Action) {
+    let info = req.extensions.get::<ReqInfo>();
+    if info.is_some_and(|info| info.suppress_denial_log || info.suppress_denial_audit) {
+        return;
+    }
+    auditor.audit(req, &action, reason, DenialScope::Request);
+}
+
+/// Audits the refused keys of a bulk request (DeleteObjects) in aggregate instead of once per key.
+///
+/// `start` marks the request so per-key denials are logged but not audited; `finish` clears the
+/// mark and emits one entry per denied action with the number of keys refused for it.
+pub(crate) struct BulkDenialAudit {
+    denied: Vec<(Action, u64)>,
+}
+
+impl BulkDenialAudit {
+    pub(crate) fn start<T>(req: &mut S3Request<T>) -> S3Result<Self> {
+        ext_req_info_mut(&mut req.extensions)?.suppress_denial_audit = true;
+        Ok(Self { denied: Vec::new() })
+    }
+
+    /// Counts one refused key for `action`.
+    pub(crate) fn denied(&mut self, action: Action) {
+        match self.denied.iter_mut().find(|(denied_action, _)| *denied_action == action) {
+            Some((_, count)) => *count += 1,
+            None => self.denied.push((action, 1)),
+        }
+    }
+
+    pub(crate) fn finish<T>(self, req: &mut S3Request<T>) -> S3Result<()> {
+        self.finish_with(req, DenialAuditor::global())
+    }
+
+    fn finish_with<T>(self, req: &mut S3Request<T>, auditor: &DenialAuditor) -> S3Result<()> {
+        ext_req_info_mut(&mut req.extensions)?.suppress_denial_audit = false;
+        for (action, keys) in self.denied {
+            auditor.audit(req, &action, "bulk_request_keys_denied", DenialScope::Keys(keys));
+        }
+        Ok(())
     }
 }
 
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
+    authorize_request_with_location_constraint(req, action, None).await
+}
+
+async fn authorize_request_with_location_constraint<T>(
+    req: &mut S3Request<T>,
+    action: Action,
+    location_constraint: Option<String>,
+) -> S3Result<()> {
     let internal_object_authorization = req.extensions.get::<InternalObjectAuthorization>().is_some();
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
     let req_info = req_info_ref(req)?;
@@ -990,9 +1432,12 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     let object = req_info.object.clone().unwrap_or_default();
     let version_id = req_info.version_id.clone();
     let quiet_denial = req_info.suppress_denial_log;
+    let suppress_denial_audit = req_info.suppress_denial_audit;
     let store = request_object_store(req)?;
     let denial = DenialContext {
         quiet: quiet_denial,
+        suppress_audit: suppress_denial_audit,
+        auditor: DenialAuditor::global(),
         bucket: bucket.as_str(),
         object: object.as_str(),
         version_id: version_id.as_deref(),
@@ -1006,7 +1451,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
         let client_info = req.extensions.get::<ClientInfo>();
-        let mut conditions = authorization_conditions(req, cred, version_id.as_deref(), None, remote_addr, client_info, action)?;
+        let mut conditions =
+            authorization_conditions(req, cred, version_id.as_deref(), location_constraint, remote_addr, client_info, action)?;
 
         let action_args = Args {
             account: &cred.access_key,
@@ -1092,7 +1538,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             .await
             .map_err(ApiError::from)?
         {
-            return Err(denial.deny("bucket_policy_explicit_deny", action));
+            return Err(denial.deny(req, "bucket_policy_explicit_deny", action));
         }
 
         let iam_allowed = {
@@ -1107,13 +1553,18 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 claims,
                 deny_only: false,
             };
-            let allowed = iam_store.eval_prepared(&prepared, &final_args).await;
+            let allowed = iam_store
+                .try_eval_prepared(&prepared, &final_args)
+                .await
+                .map_err(iam_authorization_error)?;
             if !allowed
                 && matches!(
                     action,
                     Action::S3Action(
                         S3Action::DeleteObjectAction
                             | S3Action::DeleteObjectVersionAction
+                            | S3Action::ForceDeleteBucketAction
+                            | S3Action::ForceDeleteObjectAction
                             | S3Action::ListBucketVersionsAction
                             | S3Action::BypassGovernanceRetentionAction
                             | S3Action::ReplicateDeleteAction
@@ -1124,8 +1575,12 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 // Bucket policy Allow may supplement an implicit IAM denial,
                 // but must not override an explicit deletion-policy Deny.
                 final_args.deny_only = true;
-                if !iam_store.eval_prepared(&prepared, &final_args).await {
-                    return Err(denial.deny("iam_explicit_deny", action));
+                if !iam_store
+                    .try_eval_prepared(&prepared, &final_args)
+                    .await
+                    .map_err(iam_authorization_error)?
+                {
+                    return Err(denial.deny(req, "iam_explicit_deny", action));
                 }
             }
             allowed
@@ -1173,7 +1628,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             req,
             &default_cred,
             version_id.as_deref(),
-            req.region.clone(),
+            location_constraint,
             remote_addr,
             client_info,
             action,
@@ -1239,7 +1694,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             .await
             .map_err(ApiError::from)?
         {
-            return Err(denial.deny("bucket_policy_explicit_deny", action));
+            return Err(denial.deny(req, "bucket_policy_explicit_deny", action));
         }
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
@@ -1281,11 +1736,11 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
                 deny_anonymous_table_data_plane_if_needed(req, action, bucket.as_str(), object.as_str()).await?;
                 // RestrictPublicBuckets: when true, deny public access even if bucket policy allows it.
                 match store.restricts_public_bucket_access(bucket_name).await {
-                    Ok(true) => return Err(denial.deny("restrict_public_buckets", action)),
+                    Ok(true) => return Err(denial.deny(req, "restrict_public_buckets", action)),
                     Ok(false) => {}
                     Err(StorageError::ConfigNotFound) => {}
                     Err(_) => {
-                        return Err(denial.deny("public_access_block_unavailable", action));
+                        return Err(denial.deny(req, "public_access_block_unavailable", action));
                     }
                 }
                 return Ok(());
@@ -1293,7 +1748,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
     }
 
-    Err(denial.deny("no_policy_allows_action", action))
+    Err(denial.deny(req, "no_policy_allows_action", action))
 }
 
 // Multipart parts are staged and become visible only after CompleteMultipartUpload,
@@ -1434,11 +1889,7 @@ fn table_catalog_store_for_data_plane<T>(
 }
 
 fn table_publication_guard_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
-    let code = match &err {
-        crate::table_catalog::TableCatalogStoreError::Unavailable(_) => S3ErrorCode::ServiceUnavailable,
-        _ => S3ErrorCode::InternalError,
-    };
-    S3Error::with_message(code, format!("failed to acquire table publication guard: {err}"))
+    S3Error::from(ApiError::from(err))
 }
 
 async fn retain_table_data_plane_publication_guard<T>(
@@ -1460,9 +1911,13 @@ async fn retain_table_data_plane_publication_guard<T>(
     let guard = crate::table_catalog::TableCatalogObjectBackend::acquire_read_lock(&backend, table_bucket, lock_object)
         .await
         .map_err(table_publication_guard_error)?;
+    let lock_lost_signal = guard.lock_lost_signal();
     let mut state = retained.state.lock();
     state.keys.insert(key);
     state.guards.push(Box::new(guard));
+    if let Some(signal) = lock_lost_signal {
+        state.lock_lost_signals.push(signal);
+    }
     drop(state);
     req.extensions.insert(retained);
     Ok(())
@@ -1508,9 +1963,8 @@ async fn table_bucket_enabled_for_data_plane<T>(req: &S3Request<T>, bucket: &str
         return Ok(false);
     }
 
-    match request_object_store(req)?.get_bucket_metadata(bucket).await {
-        Ok(metadata) => Ok(metadata.table_bucket_enabled()),
-        Err(StorageError::ConfigNotFound) => Ok(false),
+    match request_object_store(req)?.table_bucket_enabled(bucket).await {
+        Ok(table_bucket_enabled) => Ok(table_bucket_enabled),
         Err(err) if is_err_bucket_not_found(&err) => Ok(false),
         Err(err) => {
             tracing::warn!(
@@ -1523,6 +1977,143 @@ async fn table_bucket_enabled_for_data_plane<T>(req: &S3Request<T>, bucket: &str
     }
 }
 
+fn update_table_list_fingerprint_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn table_list_principal_fingerprint(cred: Option<&rustfs_credentials::Credentials>, is_owner: bool) -> String {
+    let mut hasher = Sha256::new();
+    update_table_list_fingerprint_field(
+        &mut hasher,
+        cred.map_or(b"anonymous".as_slice(), |credential| credential.access_key.as_bytes()),
+    );
+    hasher.update([u8::from(is_owner)]);
+    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
+}
+
+fn table_list_snapshot_fingerprint(resources: &[TableDataPlaneListResource]) -> String {
+    let mut hasher = Sha256::new();
+    for entry in resources {
+        for value in [
+            entry.resource.table_bucket.as_bytes(),
+            entry.resource.namespace.as_bytes(),
+            entry.resource.table.as_bytes(),
+            entry.resource.table_id.as_bytes(),
+            entry.resource.warehouse_object_prefix.as_bytes(),
+        ] {
+            update_table_list_fingerprint_field(&mut hasher, value);
+        }
+        hasher.update([u8::from(entry.allowed)]);
+    }
+    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
+}
+
+fn table_list_cursor_key<T>(req: &S3Request<T>) -> S3Result<[u8; 32]> {
+    let credentials = match req.extensions.get::<Arc<ServerContextSlot>>() {
+        Some(server_ctx) => server_ctx
+            .installed_app_context()
+            .and_then(|context| context.action_credentials().get()),
+        None => runtime_sources::current_action_credentials(),
+    }
+    .ok_or_else(|| table_data_plane_list_internal_error("action credentials are not initialized"))?;
+    let mut hasher = Sha256::new();
+    update_table_list_fingerprint_field(&mut hasher, TABLE_DATA_PLANE_LIST_CURSOR_KEY_CONTEXT);
+    update_table_list_fingerprint_field(&mut hasher, credentials.access_key.as_bytes());
+    update_table_list_fingerprint_field(&mut hasher, credentials.secret_key.as_bytes());
+    Ok(hasher.finalize().into())
+}
+
+fn table_list_catalog_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
+    if err.is_unavailable() {
+        S3Error::from(ApiError::from(err))
+    } else {
+        S3Error::from(ApiError::access_denied())
+    }
+}
+
+async fn prepare_table_data_plane_list_access<T>(req: &mut S3Request<T>, bucket: &str, action: S3Action) -> S3Result<()> {
+    if !table_bucket_enabled_for_data_plane(req, bucket).await? {
+        return Ok(());
+    }
+    retain_table_bucket_publication_guard(req, bucket).await?;
+    if !table_bucket_enabled_for_data_plane(req, bucket).await? {
+        return Err(S3Error::from(ApiError::access_denied()));
+    }
+
+    let (cred, is_owner) = {
+        let req_info = req_info_ref(req)?;
+        (req_info.cred.clone(), req_info.is_owner)
+    };
+    let remote_addr = req
+        .extensions
+        .get::<Option<RemoteAddr>>()
+        .and_then(|value| value.map(|address| address.0));
+    let client_info = req.extensions.get::<ClientInfo>();
+    let default_cred = rustfs_credentials::Credentials::default();
+    let condition_cred = cred.as_ref().unwrap_or(&default_cred);
+    let conditions =
+        authorization_conditions(req, condition_cred, None, None, remote_addr, client_info, Action::S3Action(action))?;
+    let iam_store = cred.as_ref().map(|_| request_iam_store(req)).transpose()?;
+    let store = table_catalog_store_for_data_plane(req)?;
+    let tables = crate::table_catalog::TableCatalogStore::list_all_tables(&store, bucket)
+        .await
+        .map_err(table_list_catalog_error)?;
+    let default_claims = HashMap::new();
+    let claims = cred
+        .as_ref()
+        .and_then(|credential| credential.claims.as_ref())
+        .unwrap_or(&default_claims);
+    let mut resources = Vec::with_capacity(tables.len());
+    for table in tables {
+        let warehouse_object_prefix =
+            crate::table_catalog::table_warehouse_object_prefix(&table).map_err(table_list_catalog_error)?;
+        let resource = crate::table_catalog::table_data_plane_resource_from_entry(table.clone(), warehouse_object_prefix);
+        let allowed = match (cred.as_ref(), iam_store.as_ref()) {
+            (Some(credential), Some(iam_store)) => {
+                let resource_object = resource.catalog_resource_object();
+                iam_store
+                    .is_allowed(&Args {
+                        account: &credential.access_key,
+                        groups: &credential.groups,
+                        action: Action::AdminAction(AdminAction::GetTableMetadataAction),
+                        bucket,
+                        conditions: &conditions,
+                        is_owner,
+                        object: &resource_object,
+                        claims,
+                        deny_only: false,
+                    })
+                    .await
+            }
+            _ => false,
+        };
+        resources.push(TableDataPlaneListResource { resource, allowed });
+    }
+    resources.sort_by(|left, right| {
+        left.resource
+            .warehouse_object_prefix
+            .cmp(&right.resource.warehouse_object_prefix)
+    });
+    if resources.windows(2).any(|window| {
+        crate::table_catalog::warehouse_object_prefixes_overlap(
+            &window[0].resource.warehouse_object_prefix,
+            &window[1].resource.warehouse_object_prefix,
+        )
+    }) {
+        return Err(S3Error::from(ApiError::access_denied()));
+    }
+    let access = TableDataPlaneListAccess {
+        bucket: bucket.to_string(),
+        principal_fingerprint: table_list_principal_fingerprint(cred.as_ref(), is_owner),
+        snapshot_fingerprint: table_list_snapshot_fingerprint(&resources),
+        cursor_key: table_list_cursor_key(req)?,
+        resources,
+    };
+    req.extensions.insert(access);
+    Ok(())
+}
+
 async fn table_data_plane_resource_for_request<T>(
     req: &mut S3Request<T>,
     bucket: &str,
@@ -1533,6 +2124,8 @@ async fn table_data_plane_resource_for_request<T>(
         return Ok(None);
     }
 
+    let catalog_metadata = crate::table_catalog::is_reserved_table_object_key(object)
+        && crate::table_catalog::table_identity_from_metadata_object_key(object).is_some();
     let key = (bucket.to_string(), object.to_string());
     let retained = req
         .extensions
@@ -1544,38 +2137,46 @@ async fn table_data_plane_resource_for_request<T>(
         if state.missing_resources.contains(&key) {
             return Ok(None);
         }
-        if let Some(resource) = state
-            .resources
-            .values()
-            .find(|resource| resource.table_bucket == bucket && object.starts_with(&resource.warehouse_object_prefix))
-            .cloned()
+        if !catalog_metadata
+            && let Some(resource) = state
+                .resources
+                .values()
+                .find(|resource| resource.table_bucket == bucket && object.starts_with(&resource.warehouse_object_prefix))
+                .cloned()
         {
             return Ok(Some(resource));
         }
     }
 
     let store = table_catalog_store_for_data_plane(req)?;
-    let resource = crate::table_catalog::table_data_plane_resource_for_object(&store, bucket, object)
-        .await
-        .map_err(|err| {
-            tracing::warn!(
-                bucket = %bucket,
-                object = %object,
-                error = %err,
-                "failed to resolve table data-plane resource"
-            );
-            if matches!(err, crate::table_catalog::TableCatalogStoreError::Unavailable(_)) {
-                S3Error::from(ApiError::service_unavailable())
-            } else {
-                s3_error!(AccessDenied, "Access Denied")
-            }
-        })?;
+    let resource = if catalog_metadata {
+        crate::table_catalog::table_metadata_data_plane_resource_for_object(&store, bucket, object).await
+    } else {
+        crate::table_catalog::table_data_plane_resource_for_object(&store, bucket, object).await
+    }
+    .map_err(|err| {
+        tracing::warn!(
+            bucket = %bucket,
+            object = %object,
+            error = %err,
+            "failed to resolve table data-plane resource"
+        );
+        table_list_catalog_error(err)
+    })?;
+    let resource = require_owned_reserved_table_object(object, resource)?;
     let bucket_fence_key = (bucket.to_string(), crate::table_catalog::default_table_bucket_publication_lock_path());
     let mut state = retained.state.lock();
     if resource.is_none() && state.keys.contains(&bucket_fence_key) {
         state.missing_resources.insert(key);
         drop(state);
         req.extensions.insert(retained);
+    }
+    Ok(resource)
+}
+
+fn require_owned_reserved_table_object<T>(object: &str, resource: Option<T>) -> S3Result<Option<T>> {
+    if crate::table_catalog::is_reserved_table_object_key(object) && resource.is_none() {
+        return Err(S3Error::from(ApiError::access_denied()));
     }
     Ok(resource)
 }
@@ -1643,6 +2244,7 @@ async fn authorize_table_data_plane_if_needed<T>(
         ?admin_action,
         "table data-plane access denied by table resource policy"
     );
+    audit_request_denial(req, DenialAuditor::global(), "table_resource_policy_denied", action);
     Err(s3_error!(AccessDenied, "Access Denied"))
 }
 
@@ -1671,6 +2273,7 @@ async fn deny_anonymous_table_data_plane_if_needed<T>(
         .await?
         .is_some()
     {
+        audit_request_denial(req, DenialAuditor::global(), "anonymous_table_data_plane_access", action);
         return Err(s3_error!(AccessDenied, "Access Denied"));
     }
     Ok(())
@@ -1732,10 +2335,10 @@ impl S3Access for FS {
 
         let request_context = cx.extensions_mut().get::<RequestContext>().cloned();
 
-        let region = app_context
-            .as_deref()
-            .and_then(|context| context.region().get())
-            .or_else(runtime_sources::current_region);
+        let region = match app_context.as_deref() {
+            Some(context) => context.region().get(),
+            None => runtime_sources::current_region(),
+        };
 
         let req_info = ReqInfo {
             cred,
@@ -1748,12 +2351,16 @@ impl S3Access for FS {
         let auth_type = get_request_auth_type_with_query(cx.headers(), cx.uri().query());
         let verified_presigned = matches!(auth_type, AuthType::Presigned);
         let verified_sigv4 = matches!(auth_type, AuthType::Presigned | AuthType::Signed);
+        let multipart_staging_operation = MultipartStagingOperation::for_operation(cx.s3_op().name());
         // Publish this server's context slot so downstream data-plane handlers
         // resolve the same store (backlog#1052 S6).
         {
             let ext = cx.extensions_mut();
             ext.insert(self.server_ctx().clone());
             ext.insert(req_info);
+            if let Some(operation) = multipart_staging_operation {
+                ext.insert(operation);
+            }
             if verified_presigned {
                 ext.insert(VerifiedPresignedRequest);
             }
@@ -1802,7 +2409,9 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::CreateBucketAction)).await?;
+        let location_constraint = requested_bucket_location_constraint(&req.input);
+        authorize_request_with_location_constraint(req, Action::S3Action(S3Action::CreateBucketAction), location_constraint)
+            .await?;
 
         if req.input.object_lock_enabled_for_bucket.is_some_and(|v| v) {
             authorize_request(req, Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)).await?;
@@ -1875,6 +2484,8 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
+        let requested_retain_until = req.input.object_lock_retain_until_date.clone();
+        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
         authorize_replication_only_put_headers(req).await?;
@@ -1899,6 +2510,8 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
 
+        let requested_retain_until = req.input.object_lock_retain_until_date.clone();
+        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
         authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
 
         authorize_replication_only_put_headers(req).await?;
@@ -1924,7 +2537,13 @@ impl S3Access for FS {
 
         authorize_request(req, Action::S3Action(S3Action::DeleteBucketAction)).await?;
 
-        if req.input.force_delete.is_some_and(|v| v) {
+        // MinIO evaluates s3:ForceDeleteBucket whenever the header is present,
+        // including the value `false`. Only a parsed `true` later skips the
+        // emptiness check. `s3:*` does not grant this action.
+        if force_delete_header(&req.headers)
+            .map_err(|_| invalid_force_delete_header())?
+            .is_some()
+        {
             authorize_request(req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
         }
         Ok(())
@@ -2053,6 +2672,8 @@ impl S3Access for FS {
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
         let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        #[cfg(test)]
+        wait_for_object_generation_test_hook(&bucket).await;
         // Preserve DeleteObject's established NoSuchBucket response instead of
         // letting policy lookup turn a missing bucket into AccessDenied.
         if let Err(err) = &bucket_generation
@@ -2073,12 +2694,28 @@ impl S3Access for FS {
 
         authorize_request(req, action).await?;
 
+        let force_delete = match force_delete_header(&req.headers) {
+            Ok(value) => value.unwrap_or(false),
+            Err(_) => return Err(invalid_force_delete_header()),
+        };
         let replica_request = req
             .headers
             .get(AMZ_BUCKET_REPLICATION_STATUS)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value == ReplicationStatusType::Replica.as_str());
+        // The REPLICA header is caller-supplied, so it must not skip this
+        // check. s3:ReplicateDelete is still required separately for replica
+        // deletes; s3:* does not grant s3:ForceDeleteObject.
+        if force_delete {
+            authorize_request(req, Action::S3Action(S3Action::ForceDeleteObjectAction)).await?;
+        }
         if !recursive_force_delete_has_authenticated_caller(&req.headers, authenticated, replica_request) {
+            audit_request_denial(
+                req,
+                DenialAuditor::global(),
+                "recursive_force_delete_requires_authenticated_caller",
+                Action::S3Action(S3Action::ForceDeleteObjectAction),
+            );
             return Err(s3_error!(AccessDenied, "Recursive force-delete requires an authenticated caller"));
         }
 
@@ -2102,7 +2739,11 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::DeleteObjectTaggingAction)).await
+        authorize_request(
+            req,
+            versioned_tagging_action(S3Action::DeleteObjectTaggingAction, req.input.version_id.as_deref()),
+        )
+        .await
     }
 
     /// Checks whether the DeleteObjects request has accesses to the resources.
@@ -2423,7 +3064,11 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::GetObjectTaggingAction)).await
+        authorize_request(
+            req,
+            versioned_tagging_action(S3Action::GetObjectTaggingAction, req.input.version_id.as_deref()),
+        )
+        .await
     }
 
     /// Checks whether the GetObjectTorrent request has accesses to the resources.
@@ -2475,7 +3120,7 @@ impl S3Access for FS {
             return Ok(());
         }
 
-        authorize_request(req, Action::S3Action(S3Action::GetObjectAction)).await?;
+        authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await?;
         req.extensions.insert(source_generation);
         Ok(())
     }
@@ -2538,6 +3183,7 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::ListBucketMultipartUploadsAction)).await?;
+        prepare_table_data_plane_list_access(req, &bucket, S3Action::ListBucketMultipartUploadsAction).await?;
         req.extensions.insert(bucket_generation?);
         Ok(())
     }
@@ -2547,19 +3193,23 @@ impl S3Access for FS {
     /// Returns `Ok(())` if the request is allowed, or an error if access is denied or another
     /// authorization-related issue occurs.
     async fn list_object_versions(&self, req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
-        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
+        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await?;
+        prepare_table_data_plane_list_access(req, &bucket, S3Action::ListBucketVersionsAction).await
     }
 
     /// Checks whether the ListObjects request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
     async fn list_objects(&self, req: &mut S3Request<ListObjectsInput>) -> S3Result<()> {
+        let bucket = req.input.bucket.clone();
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
+        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await?;
+        prepare_table_data_plane_list_access(req, &bucket, S3Action::ListBucketAction).await
     }
 
     /// Checks whether the ListObjectsV2 request has accesses to the resources.
@@ -2572,6 +3222,7 @@ impl S3Access for FS {
         req_info.bucket = Some(req.input.bucket.clone());
 
         authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await?;
+        prepare_table_data_plane_list_access(req, &bucket, S3Action::ListBucketAction).await?;
         req.extensions.insert(source_generation);
         Ok(())
     }
@@ -2789,38 +3440,50 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
         crate::hp_guard!("S3Access::put_object");
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
+        async {
+            let req_info = ext_req_info_mut(&mut req.extensions)?;
+            req_info.bucket = Some(req.input.bucket.clone());
+            req_info.object = Some(req.input.key.clone());
+            req_info.version_id = req.input.version_id.clone();
 
-        if has_write_offset_bytes_header(&req.headers) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::NotImplemented,
-                ApiError::error_code_to_message(&S3ErrorCode::NotImplemented),
-            ));
+            if has_write_offset_bytes_header(&req.headers) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::NotImplemented,
+                    ApiError::error_code_to_message(&S3ErrorCode::NotImplemented),
+                ));
+            }
+
+            let bucket = req.input.bucket.clone();
+            // Snapshot before authorization, but preserve AccessDenied precedence
+            // by exposing any bucket-state error only after authorization succeeds.
+            let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+            #[cfg(test)]
+            let bucket_generation = if PUT_GENERATION_READ_QUORUM_FAILURE.try_with(|_| ()).is_ok() {
+                Err(ApiError::from(StorageError::ErasureReadQuorum).into())
+            } else {
+                bucket_generation
+            };
+            let requested_retain_until = req.input.object_lock_retain_until_date.clone();
+            set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
+            authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+            req.extensions.insert(bucket_generation?);
+
+            if req.method != http::Method::POST {
+                authorize_replication_only_put_headers(req).await?;
+            }
+
+            if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
+                authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+            }
+
+            if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
+                authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+            }
+
+            Ok(())
         }
-
-        let bucket = req.input.bucket.clone();
-        // Snapshot before authorization, but preserve AccessDenied precedence
-        // by exposing any bucket-state error only after authorization succeeds.
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
-        req.extensions.insert(bucket_generation?);
-
-        if req.method != http::Method::POST {
-            authorize_replication_only_put_headers(req).await?;
-        }
-
-        if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-        }
-
-        if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
-        }
-
-        Ok(())
+        .await
+        .map_err(normalize_read_quorum_error)
     }
 
     /// Checks whether the PutObjectAcl request has accesses to the resources.
@@ -2870,6 +3533,7 @@ impl S3Access for FS {
 
         let bucket = req.input.bucket.clone();
         let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        set_requested_object_lock_retention(req);
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
 
         // S3 Standard: When bypass_governance header is set, must have s3:BypassGovernanceRetention permission
@@ -2890,7 +3554,11 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        authorize_request(req, Action::S3Action(S3Action::PutObjectTaggingAction)).await
+        authorize_request(
+            req,
+            versioned_tagging_action(S3Action::PutObjectTaggingAction, req.input.version_id.as_deref()),
+        )
+        .await
     }
 
     /// Checks whether the PutPublicAccessBlock request has accesses to the resources.
@@ -2909,14 +3577,14 @@ impl S3Access for FS {
     async fn restore_object(&self, req: &mut S3Request<RestoreObjectInput>) -> S3Result<()> {
         let bucket = req.input.bucket.clone();
         let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+        #[cfg(test)]
+        wait_for_object_generation_test_hook(&bucket).await;
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
         authorize_request(req, Action::S3Action(S3Action::RestoreObjectAction)).await?;
-        #[cfg(test)]
-        wait_for_restore_authorization_test_hook(&bucket).await;
         req.extensions.insert(bucket_generation?);
         Ok(())
     }
@@ -2998,19 +3666,27 @@ mod tests {
     use super::{
         AMZ_WRITE_OFFSET_BYTES_HEADER, BucketGenerationGuard, BucketPolicyArgs, BucketPolicyExistingObjectTagHint,
         BucketPolicyRawLoadErrorKind, DenialContext, FS, InternalObjectAuthorization, ObjectTagConditions,
-        PostObjectRequestMarker, ReqInfo, S3Access, StorageError, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
-        apply_copy_source_bucket_generation_guard, authorization_conditions, bucket_policy_needs_existing_object_tag_from_hint,
-        bucket_website_config_authorize_action, classify_bucket_policy_raw_load_error,
-        complete_multipart_upload_authorize_action, delete_object_authorize_action, get_bucket_policy_authorize_action,
-        has_write_offset_bytes_header, install_restore_authorization_test_hook, legal_hold_write_requested,
-        list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint, maybe_merge_object_tag_conditions,
-        merge_list_bucket_query_conditions, merge_request_object_tag_conditions, owner_can_bypass_policy_deny,
-        post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req, request_object_store,
-        retention_write_requested, table_data_plane_admin_action, table_data_plane_content_mutation,
-        table_data_plane_resource_for_request, table_publication_guard_error, validate_post_object_success_controls,
-        versioned_read_action,
+        PostObjectRequestMarker, ReqInfo, S3Access, StorageError, TABLE_DATA_PLANE_LIST_CURSOR_MAX_ENCODED_LEN,
+        TableDataPlaneListAccess, TableDataPlaneListCursorPosition, TableDataPlaneListResource, TableDataPlanePublicationGuards,
+        apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorization_conditions,
+        bucket_policy_needs_existing_object_tag_from_hint, bucket_website_config_authorize_action,
+        classify_bucket_policy_raw_load_error, complete_multipart_upload_authorize_action, delete_object_authorize_action,
+        get_bucket_policy_authorize_action, has_write_offset_bytes_header, install_object_generation_test_hook,
+        legal_hold_write_requested, list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint,
+        maybe_merge_object_tag_conditions, merge_list_bucket_query_conditions, merge_request_object_tag_conditions,
+        owner_can_bypass_policy_deny, post_object_authorize_action, put_bucket_policy_authorize_action, request_context_from_req,
+        request_object_store, require_owned_reserved_table_object, retention_write_requested, table_data_plane_admin_action,
+        table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
+        validate_post_object_success_controls, versioned_read_action, versioned_tagging_action,
     };
+    use super::{BulkDenialAudit, audit_request_denial};
+    use super::{
+        remaining_retention_days, requested_bucket_location_constraint, set_requested_object_lock_retain_until,
+        set_requested_object_lock_retention,
+    };
+    use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
     use crate::error::ApiError;
+    use crate::storage::denial_audit::{DenialAuditor, DenialRateLimiter};
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage::storage_api::contract::multipart::MultipartOperations as _;
     use crate::storage::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
@@ -3024,6 +3700,14 @@ mod tests {
     use serial_test::serial;
     use std::{collections::HashMap, sync::Arc};
     use time::OffsetDateTime;
+
+    #[test]
+    fn terminal_iam_denial_is_access_denied_and_backend_failure_stays_internal() {
+        let denied = s3s::S3Error::from(super::iam_authorization_error(rustfs_iam::error::Error::IAMActionNotAllowed));
+        assert_eq!(denied.code(), &S3ErrorCode::AccessDenied);
+        let unavailable = s3s::S3Error::from(super::iam_authorization_error(rustfs_iam::error::Error::IamSysNotInitialized));
+        assert_eq!(unavailable.code(), &S3ErrorCode::InternalError);
+    }
 
     struct UnreadyIam;
 
@@ -3147,6 +3831,120 @@ mod tests {
         assert_eq!(table_data_plane_admin_action(Action::S3Action(S3Action::ListBucketAction)), None);
     }
 
+    fn table_list_access(allowed: bool) -> TableDataPlaneListAccess {
+        TableDataPlaneListAccess {
+            bucket: "analytics".to_string(),
+            principal_fingerprint: "principal".to_string(),
+            snapshot_fingerprint: "snapshot".to_string(),
+            cursor_key: [0x42; 32],
+            resources: vec![TableDataPlaneListResource {
+                resource: crate::table_catalog::TableDataPlaneResource {
+                    table_bucket: "analytics".to_string(),
+                    namespace: "sales".to_string(),
+                    table: "orders".to_string(),
+                    table_id: "table-id".to_string(),
+                    warehouse_object_prefix: "tables/table-id/".to_string(),
+                },
+                allowed,
+            }],
+        }
+    }
+
+    #[test]
+    fn table_list_access_hides_unauthorized_table_objects_and_reserved_metadata() {
+        let denied = table_list_access(false);
+        assert!(!denied.allows_object("tables/table-id/data/file.parquet"));
+        assert!(
+            !denied.allows_object(".rustfs-table/warehouses/default/namespaces/sales/tables/orders/metadata/00001.metadata.json")
+        );
+        assert!(!denied.allows_object(".rustfs-table/private/catalog.json"));
+        assert!(denied.allows_object("ordinary/file.txt"));
+
+        let allowed = table_list_access(true);
+        assert!(allowed.allows_object("tables/table-id/data/file.parquet"));
+        assert!(
+            !allowed
+                .allows_object(".rustfs-table/warehouses/default/namespaces/sales/tables/orders/metadata/00001.metadata.json")
+        );
+        assert!(!allowed.allows_object(".rustfs-table/private/catalog.json"));
+    }
+
+    #[test]
+    fn table_list_cursor_is_confidential_and_bound_to_the_request_snapshot() {
+        let access = table_list_access(true);
+        let marker = "tables/hidden/data/file.parquet";
+        let token = access
+            .encode_cursor(
+                "ListObjectsV2",
+                "tables/",
+                Some("/"),
+                1000,
+                TableDataPlaneListCursorPosition {
+                    marker: Some(marker.to_string()),
+                    version_marker: None,
+                    common_prefix: None,
+                },
+            )
+            .expect("cursor should encode");
+        assert!(!token.contains(marker));
+        let decoded = access
+            .decode_cursor("ListObjectsV2", "tables/", Some("/"), 1000, &token)
+            .expect("cursor should decode");
+        assert_eq!(decoded.marker(), Some(marker));
+
+        let mut changed = access.clone();
+        changed.snapshot_fingerprint = "changed".to_string();
+        assert!(
+            changed
+                .decode_cursor("ListObjectsV2", "tables/", Some("/"), 1000, &token)
+                .is_err()
+        );
+        assert!(
+            access
+                .decode_cursor("ListObjectsV2", "other/", Some("/"), 1000, &token)
+                .is_err()
+        );
+        let mut rotated_key = access.clone();
+        rotated_key.cursor_key[0] ^= 1;
+        assert!(
+            rotated_key
+                .decode_cursor("ListObjectsV2", "tables/", Some("/"), 1000, &token)
+                .is_err()
+        );
+        assert!(
+            access
+                .decode_cursor(
+                    "ListObjectsV2",
+                    "tables/",
+                    Some("/"),
+                    1000,
+                    &"x".repeat(TABLE_DATA_PLANE_LIST_CURSOR_MAX_ENCODED_LEN + 1),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reserved_table_metadata_requires_an_active_table_owner() {
+        let error = require_owned_reserved_table_object::<()>(
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
+            None,
+        )
+        .expect_err("unowned reserved metadata must fail closed");
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+
+        assert!(
+            require_owned_reserved_table_object("objects/data.parquet", None::<()>)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            require_owned_reserved_table_object(".rustfs-table/metadata.json", Some(()))
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn table_data_plane_publication_guard_covers_content_mutations_only() {
         for action in [
@@ -3181,7 +3979,7 @@ mod tests {
             "",
         ] {
             let error = TableCatalogStoreError::Unavailable(message.to_string());
-            let expected_message = format!("failed to acquire table publication guard: {error}");
+            let expected_message = ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable);
             let err = table_publication_guard_error(error);
             assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "{message}");
             assert_eq!(
@@ -3189,6 +3987,8 @@ mod tests {
                 Some(http::StatusCode::SERVICE_UNAVAILABLE)
             );
             assert_eq!(err.message(), Some(expected_message.as_str()));
+            let response = err.to_http_response().expect("serialize catalog failure");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
     }
 
@@ -3207,7 +4007,7 @@ mod tests {
             TableCatalogStoreError::AlreadyExists(message.clone()),
             TableCatalogStoreError::Conflict(message),
         ] {
-            let expected_message = format!("failed to acquire table publication guard: {error}");
+            let expected_message = ApiError::error_code_to_message(&S3ErrorCode::InternalError);
             let err = table_publication_guard_error(error);
             assert_eq!(err.code(), &S3ErrorCode::InternalError);
             assert_eq!(
@@ -3215,13 +4015,16 @@ mod tests {
                 Some(http::StatusCode::INTERNAL_SERVER_ERROR)
             );
             assert_eq!(err.message(), Some(expected_message.as_str()));
+            let response = err.to_http_response().expect("serialize catalog failure");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
     }
 
     #[tokio::test]
     #[serial]
-    async fn table_publication_guard_timeout_blocks_put_and_multipart_authorization() {
+    async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authorization() {
         use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
+        use http_body_util::BodyExt as _;
         use std::time::Duration;
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
@@ -3234,7 +4037,7 @@ mod tests {
             .await
             .expect("test bucket should be created");
         let policy_json = format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
         );
         let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
             .await
@@ -3270,6 +4073,16 @@ mod tests {
                 .expect("multipart input should build"),
             Method::POST,
         );
+        let mut delete_req = build_request(
+            DeleteObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("object".to_string())
+                .build()
+                .expect("DELETE input should build"),
+            Method::DELETE,
+        );
+        ensure_req_info(&mut delete_req);
+        delete_req.extensions.insert(fs.server_ctx().clone());
         ensure_req_info(&mut put_req);
         ensure_req_info(&mut multipart_req);
         put_req.extensions.insert(fs.server_ctx().clone());
@@ -3283,6 +4096,12 @@ mod tests {
                     .expect_err("PUT must wait for the publication writer"),
             ),
             (
+                "DeleteObject",
+                fs.delete_object(&mut delete_req)
+                    .await
+                    .expect_err("DELETE must wait for the publication writer"),
+            ),
+            (
                 "CreateMultipartUpload",
                 fs.create_multipart_upload(&mut multipart_req)
                     .await
@@ -3290,8 +4109,24 @@ mod tests {
             ),
         ] {
             assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "{operation}: {err}");
+            let source = err.source().expect("retain the typed publication lock failure");
+            let storage = source
+                .downcast_ref::<crate::storage_api::error::StorageError>()
+                .expect("use the canonical storage error boundary");
+            assert!(matches!(
+                storage,
+                crate::storage_api::error::StorageError::Lock(rustfs_lock::LockError::Timeout { .. })
+            ));
+            let response = err.to_http_response().expect("serialize publication failure");
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+            let body = response.into_body().collect().await.expect("read error XML").to_bytes();
+            let body = String::from_utf8(body.to_vec()).expect("S3 XML is UTF-8");
+            assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+            assert!(!body.contains(&bucket));
+            assert!(!body.contains(&lock_object));
         }
-        for extensions in [&put_req.extensions, &multipart_req.extensions] {
+        for extensions in [&put_req.extensions, &delete_req.extensions, &multipart_req.extensions] {
             assert!(extensions.get::<TableDataPlanePublicationGuards>().is_none());
         }
 
@@ -3303,7 +4138,10 @@ mod tests {
             fs.create_multipart_upload(&mut multipart_req)
                 .await
                 .expect("multipart initialization may retry after publication finishes");
-            for extensions in [&put_req.extensions, &multipart_req.extensions] {
+            fs.delete_object(&mut delete_req)
+                .await
+                .expect("DELETE may retry after publication finishes");
+            for extensions in [&put_req.extensions, &delete_req.extensions, &multipart_req.extensions] {
                 let retained = extensions
                     .get::<TableDataPlanePublicationGuards>()
                     .expect("successful admission retains the guard");
@@ -3314,6 +4152,7 @@ mod tests {
         }
         drop(put_req);
         drop(multipart_req);
+        drop(delete_req);
         lock.get_write_lock(Duration::from_secs(1))
             .await
             .expect("dropping the request must release its publication guard");
@@ -3484,6 +4323,35 @@ mod tests {
             .await
             .expect("commit should continue after the request releases its publication guard")
             .expect("commit task should join");
+    }
+
+    #[tokio::test]
+    async fn table_data_plane_request_reuses_reserved_warehouse_resource() {
+        let resource = crate::table_catalog::TableDataPlaneResource {
+            table_bucket: "warehouse".to_string(),
+            namespace: "analytics".to_string(),
+            table: "events".to_string(),
+            table_id: "table-id".to_string(),
+            warehouse_object_prefix: ".rustfs-table/custom-warehouse/events/".to_string(),
+        };
+        let retained = TableDataPlanePublicationGuards::default();
+        retained.state.lock().resources.insert(
+            (resource.table_bucket.clone(), resource.warehouse_object_prefix.clone()),
+            resource.clone(),
+        );
+        let mut req = build_request((), Method::GET);
+        req.extensions.insert(retained);
+
+        let resolved = table_data_plane_resource_for_request(
+            &mut req,
+            "warehouse",
+            ".rustfs-table/custom-warehouse/events/data/part-00001.parquet",
+            true,
+        )
+        .await
+        .expect("a reserved-prefix warehouse object should use ordinary table resolution");
+
+        assert_eq!(resolved, Some(resource));
     }
 
     #[tokio::test]
@@ -3667,6 +4535,500 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn versioned_tagging_requires_version_permissions() {
+        use rustfs_policy::policy::{Args, Policy};
+        let policy = Policy::parse_config(br#"{
+            "Version":"2012-10-17",
+            "Statement":[{"Effect":"Allow","Action":["s3:GetObjectTagging","s3:PutObjectTagging","s3:DeleteObjectTagging"],"Resource":"arn:aws:s3:::bucket/*"}]
+        }"#).expect("current-object tagging policy should parse");
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+        for (current, versioned) in [
+            (S3Action::GetObjectTaggingAction, S3Action::GetObjectVersionTaggingAction),
+            (S3Action::PutObjectTaggingAction, S3Action::PutObjectVersionTaggingAction),
+            (S3Action::DeleteObjectTaggingAction, S3Action::DeleteObjectVersionTaggingAction),
+        ] {
+            for version in [None, Some("null"), Some("0194e0f1-0000-7000-8000-000000000000")] {
+                let action = versioned_tagging_action(current, version);
+                assert_eq!(action, Action::S3Action(if version.is_some() { versioned } else { current }));
+                let args = Args {
+                    account: "writer",
+                    groups: &groups,
+                    action,
+                    bucket: "bucket",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "object",
+                    claims: &claims,
+                    deny_only: false,
+                };
+                assert_eq!(policy.is_allowed(&args).await, version.is_none(), "version selector {version:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn object_creation_operation_classifies_only_multipart_staging() {
+        for (operation, staging) in [
+            ("CreateMultipartUpload", true),
+            ("UploadPart", true),
+            ("UploadPartCopy", true),
+            ("PutObject", false),
+            ("CopyObject", false),
+            ("CompleteMultipartUpload", false),
+            ("PostObject", false),
+            ("GetObject", false),
+            ("InternalObjectWrite", false),
+        ] {
+            assert_eq!(
+                super::MultipartStagingOperation::for_operation(operation).is_some(),
+                staging,
+                "{operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_creation_operation_ignores_request_and_claim_spoofing() {
+        use crate::auth::{OBJECT_CREATION_OPERATION_CONDITION, get_condition_values};
+        for forged in ["false", "true"] {
+            for claim in [
+                "ObjectCreationOperation",
+                "objectcreationoperation",
+                "OBJECTCREATIONOPERATION",
+                "ldapObjectCreationOperation",
+                "ldapldapObjectCreationOperation",
+            ] {
+                let credentials = rustfs_credentials::Credentials {
+                    claims: Some(HashMap::from([(claim.to_string(), serde_json::json!(forged))])),
+                    ..Default::default()
+                };
+                let mut req = build_request((), Method::GET);
+                req.uri = format!("/bucket/key?ObjectCreationOperation={forged}&uploadId=fake&partNumber=1")
+                    .parse()
+                    .expect("spoofed query should parse");
+                req.headers
+                    .insert("objectcreationoperation", HeaderValue::from_str(forged).expect("header should parse"));
+                assert!(
+                    !get_condition_values(&req.headers, &credentials, None, None, None)
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case(OBJECT_CREATION_OPERATION_CONDITION))
+                );
+                for staging in [false, true] {
+                    if staging {
+                        req.extensions.insert(super::MultipartStagingOperation);
+                    }
+                    for internal in [false, true] {
+                        if internal {
+                            req.extensions.insert(InternalObjectAuthorization);
+                        } else {
+                            req.extensions.remove::<InternalObjectAuthorization>();
+                        }
+                        for action in [
+                            S3Action::PutObjectAction,
+                            S3Action::GetObjectAction,
+                            S3Action::GetObjectVersionAction,
+                        ] {
+                            let conditions =
+                                authorization_conditions(&req, &credentials, None, None, None, None, Action::S3Action(action))
+                                    .expect("conditions should build");
+                            let values = conditions
+                                .iter()
+                                .filter(|(key, _)| key.eq_ignore_ascii_case(OBJECT_CREATION_OPERATION_CONDITION))
+                                .collect::<Vec<_>>();
+                            if action == S3Action::PutObjectAction {
+                                assert_eq!(values.len(), 1, "one canonical server-derived value");
+                                assert_eq!(values[0].0, OBJECT_CREATION_OPERATION_CONDITION);
+                                assert_eq!(
+                                    values[0].1,
+                                    &vec![(internal || !staging).to_string()],
+                                    "{claim}, internal={internal}, staging={staging}"
+                                );
+                            } else {
+                                assert!(values.is_empty(), "non-PutObject action {action:?} must have no creation condition");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn object_creation_operation_controls_identity_and_bucket_policies() {
+        use rustfs_policy::policy::{Args, Policy};
+        for effect in ["Allow", "Deny"] {
+            for expected in [false, true] {
+                let mut statements = vec![serde_json::json!({
+                    "Effect": effect, "Action": "s3:PutObject", "Resource": "arn:aws:s3:::bucket/*",
+                    "Condition": { "Bool": { "s3:ObjectCreationOperation": expected.to_string() } }
+                })];
+                if effect == "Deny" {
+                    statements.push(serde_json::json!({
+                        "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::bucket/*"
+                    }));
+                }
+                let identity: Policy = serde_json::from_str(
+                    &serde_json::json!({
+                        "Version": "2012-10-17", "Statement": statements
+                    })
+                    .to_string(),
+                )
+                .expect("identity policy should accept the AWS Bool key");
+                for statement in &mut statements {
+                    statement["Principal"] = serde_json::json!("*");
+                }
+                let bucket: BucketPolicy = serde_json::from_str(
+                    &serde_json::json!({
+                        "Version": "2012-10-17", "Statement": statements
+                    })
+                    .to_string(),
+                )
+                .expect("bucket policy should accept the AWS Bool key");
+                for actual in [None, Some(false), Some(true)] {
+                    let conditions = actual
+                        .map(|value| HashMap::from([("ObjectCreationOperation".to_string(), vec![value.to_string()])]))
+                        .unwrap_or_default();
+                    let allowed = if effect == "Allow" {
+                        actual == Some(expected)
+                    } else {
+                        actual != Some(expected)
+                    };
+                    assert_eq!(
+                        identity
+                            .is_allowed(&Args {
+                                account: "writer",
+                                groups: &None,
+                                action: Action::S3Action(S3Action::PutObjectAction),
+                                bucket: "bucket",
+                                object: "object",
+                                conditions: &conditions,
+                                is_owner: false,
+                                claims: &HashMap::new(),
+                                deny_only: false,
+                            })
+                            .await,
+                        allowed,
+                        "identity {effect}, expected={expected}, actual={actual:?}"
+                    );
+                    assert_eq!(
+                        bucket
+                            .is_allowed(&BucketPolicyArgs {
+                                account: "writer",
+                                groups: &None,
+                                action: Action::S3Action(S3Action::PutObjectAction),
+                                bucket: "bucket",
+                                object: "object",
+                                conditions: &conditions,
+                                is_owner: false,
+                            })
+                            .await,
+                        allowed,
+                        "bucket {effect}, expected={expected}, actual={actual:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn create_bucket_location_constraint_conditions_use_only_xml() {
+        let configuration = |region: &str| CreateBucketConfiguration {
+            location_constraint: Some(BucketLocationConstraint::from(region.to_owned())),
+            ..Default::default()
+        };
+        for (configuration, expected) in [
+            (None, None),
+            (Some(CreateBucketConfiguration::default()), None),
+            (Some(configuration("")), None),
+            (Some(configuration("eu-west-1")), Some("eu-west-1")),
+            (Some(configuration("EU")), Some("EU")),
+            (Some(configuration("tenant-region-1")), Some("tenant-region-1")),
+        ] {
+            let mut req = build_request(
+                CreateBucketInput {
+                    bucket: "location-policy-bucket".to_string(),
+                    create_bucket_configuration: configuration,
+                    ..Default::default()
+                },
+                Method::PUT,
+            );
+            req.region = Some("us-east-1".parse().expect("signing region"));
+            req.uri = Uri::from_static("/location-policy-bucket?LocationConstraint=forged&s3%3ALocationConstraint=forged");
+            req.headers.insert("locationconstraint", HeaderValue::from_static("forged"));
+            let credentials = rustfs_credentials::Credentials {
+                claims: Some(
+                    [
+                        ("LocationConstraint".to_string(), serde_json::json!("forged")),
+                        ("ldapLocationConstraint".to_string(), serde_json::json!("forged")),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            };
+            let location = requested_bucket_location_constraint(&req.input);
+            let conditions = authorization_conditions(
+                &req,
+                &credentials,
+                None,
+                location,
+                None,
+                None,
+                Action::S3Action(S3Action::CreateBucketAction),
+            )
+            .expect("CreateBucket conditions");
+            assert_eq!(
+                conditions
+                    .get("LocationConstraint")
+                    .and_then(|values| values.first())
+                    .map(String::as_str),
+                expected,
+            );
+            for action in [
+                S3Action::PutBucketObjectLockConfigurationAction,
+                S3Action::PutBucketVersioningAction,
+                S3Action::GetObjectAction,
+            ] {
+                let conditions = authorization_conditions(
+                    &req,
+                    &credentials,
+                    None,
+                    expected.map(str::to_owned),
+                    None,
+                    None,
+                    Action::S3Action(action),
+                )
+                .expect("non-CreateBucket conditions");
+                assert!(!conditions.contains_key("LocationConstraint"), "{action:?}");
+            }
+        }
+    }
+
+    fn remaining_retention_days_conditions<T>(req: &S3Request<T>, action: Action) -> HashMap<String, Vec<String>> {
+        let credentials = rustfs_credentials::Credentials::default();
+        authorization_conditions(req, &credentials, None, None, None, None, action).expect("conditions should build")
+    }
+
+    #[tokio::test]
+    async fn retention_policy_checks_body_instead_of_conflicting_headers() {
+        use rustfs_policy::policy::{Args, Policy};
+        let mut req = build_request(
+            PutObjectRetentionInput {
+                retention: Some(ObjectLockRetention {
+                    mode: Some(ObjectLockRetentionMode::from_static("COMPLIANCE")),
+                    retain_until_date: Some(
+                        Timestamp::parse(TimestampFormat::DateTime, "2035-01-02T00:00:00+23:59").expect("body date should parse"),
+                    ),
+                }),
+                ..Default::default()
+            },
+            Method::PUT,
+        );
+        req.headers
+            .insert("x-amz-object-lock-mode", HeaderValue::from_static("GOVERNANCE"));
+        req.headers
+            .insert("x-amz-object-lock-retain-until-date", HeaderValue::from_static("2029-01-01T00:00:00Z"));
+        set_requested_object_lock_retention(&mut req);
+        let action = Action::S3Action(S3Action::PutObjectRetentionAction);
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert_eq!(conditions.get("object-lock-mode"), Some(&vec!["COMPLIANCE".to_string()]));
+        let applied = OffsetDateTime::from(
+            req.input
+                .retention
+                .as_ref()
+                .expect("body retention")
+                .retain_until_date
+                .clone()
+                .expect("body date"),
+        );
+        let authorized = OffsetDateTime::parse(
+            &conditions["object-lock-retain-until-date"][0],
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("condition date should parse");
+        assert_eq!(authorized.unix_timestamp(), applied.unix_timestamp());
+        let policy = Policy::parse_config(br#"{
+            "Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObjectRetention","Resource":"arn:aws:s3:::bucket/*",
+            "Condition":{"DateLessThan":{"s3:object-lock-retain-until-date":"2030-01-01T00:00:00Z"}}}]
+        }"#).expect("bounded retention policy should parse");
+        let args = Args {
+            account: "writer",
+            groups: &None,
+            action,
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "object",
+            claims: &HashMap::new(),
+            deny_only: false,
+        };
+        assert!(
+            !policy.is_allowed(&args).await,
+            "an in-range header cannot authorize an out-of-range body"
+        );
+        req.input.retention = None;
+        set_requested_object_lock_retention(&mut req);
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert!(!conditions.contains_key("object-lock-mode"));
+        assert!(!conditions.contains_key("object-lock-retain-until-date"));
+    }
+
+    fn request_retaining_for(retain_for: time::Duration) -> S3Request<()> {
+        let mut req = build_request((), Method::PUT);
+        let retain_until = OffsetDateTime::now_utc() + retain_for;
+        set_requested_object_lock_retain_until(&mut req, Some(&retain_until.into()));
+        req
+    }
+
+    /// AWS does not document how it rounds partial days. MinIO computes
+    /// `ceil(hours / 24)` in `enforceRetentionBypassForPut`
+    /// (cmd/bucket-object-lock.go), and RustFS keeps that rounding so a policy
+    /// moved from MinIO evaluates the same way.
+    #[test]
+    fn remaining_retention_days_matches_s3_ceil_rounding() {
+        let now = OffsetDateTime::now_utc();
+        let cases = [
+            (time::Duration::NANOSECOND, 1),
+            (time::Duration::HOUR, 1),
+            (time::Duration::DAY - time::Duration::SECOND, 1),
+            (time::Duration::DAY, 1),
+            (time::Duration::DAY + time::Duration::SECOND, 2),
+            (time::Duration::days(29) + time::Duration::hours(12), 30),
+            (time::Duration::days(30), 30),
+            (time::Duration::days(30) + time::Duration::SECOND, 31),
+        ];
+
+        for (retain_for, expected) in cases {
+            let minio_days = (retain_for.as_seconds_f64() / 3600.0 / 24.0).ceil() as i64;
+            assert_eq!(minio_days, expected, "MinIO reference for {retain_for}");
+            assert_eq!(remaining_retention_days(now + retain_for, now), expected, "retain for {retain_for}");
+        }
+    }
+
+    #[test]
+    fn remaining_retention_days_is_zero_for_dates_not_in_future() {
+        let now = OffsetDateTime::now_utc();
+
+        assert_eq!(remaining_retention_days(now, now), 0);
+        assert_eq!(remaining_retention_days(now - time::Duration::NANOSECOND, now), 0);
+        assert_eq!(remaining_retention_days(now - time::Duration::days(3), now), 0);
+    }
+
+    #[test]
+    fn requested_retain_until_sets_remaining_retention_days_condition() {
+        let req = request_retaining_for(time::Duration::days(10) - time::Duration::HOUR);
+
+        let conditions = remaining_retention_days_conditions(&req, Action::S3Action(S3Action::PutObjectAction));
+
+        assert_eq!(
+            conditions.get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION),
+            Some(&vec!["10".to_string()])
+        );
+    }
+
+    #[test]
+    fn request_without_retention_has_no_remaining_retention_days_condition() {
+        let action = Action::S3Action(S3Action::PutObjectAction);
+        let req = build_request((), Method::PUT);
+        assert_eq!(
+            remaining_retention_days_conditions(&req, action).get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION),
+            None
+        );
+
+        let mut req = request_retaining_for(time::Duration::days(5));
+        set_requested_object_lock_retain_until(&mut req, None);
+        assert_eq!(
+            remaining_retention_days_conditions(&req, action).get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION),
+            None
+        );
+    }
+
+    #[test]
+    fn remaining_retention_days_condition_ignores_client_header() {
+        let action = Action::S3Action(S3Action::PutObjectRetentionAction);
+        let mut req = build_request((), Method::PUT);
+        req.headers
+            .insert(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION, HeaderValue::from_static("1"));
+        assert_eq!(
+            remaining_retention_days_conditions(&req, action).get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION),
+            None
+        );
+
+        let retain_until = OffsetDateTime::now_utc() + time::Duration::days(400);
+        set_requested_object_lock_retain_until(&mut req, Some(&retain_until.into()));
+        assert_eq!(
+            remaining_retention_days_conditions(&req, action).get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION),
+            Some(&vec!["400".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_policy_limits_retention_to_thirty_days() {
+        let policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Principal":{"AWS":"*"},
+      "Action":["s3:PutObjectRetention"],
+      "Resource":["arn:aws:s3:::bucket/*"]
+    },
+    {
+      "Effect":"Deny",
+      "Principal":{"AWS":"*"},
+      "Action":["s3:PutObjectRetention"],
+      "Resource":["arn:aws:s3:::bucket/*"],
+      "Condition":{"NumericGreaterThan":{"s3:object-lock-remaining-retention-days":"30"}}
+    }
+  ]
+}"#,
+        )
+        .expect("bucket policy should parse");
+        let no_groups: Option<Vec<String>> = None;
+        let action = Action::S3Action(S3Action::PutObjectRetentionAction);
+        let spoofed_header = |mut req: S3Request<()>| {
+            req.headers
+                .insert(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION, HeaderValue::from_static("1"));
+            req
+        };
+
+        let cases = [
+            ("29 days", request_retaining_for(time::Duration::days(29)), true),
+            ("30 days", request_retaining_for(time::Duration::days(30)), true),
+            ("31 days", request_retaining_for(time::Duration::days(31)), false),
+            (
+                "30 days and a minute",
+                request_retaining_for(time::Duration::days(30) + time::Duration::MINUTE),
+                false,
+            ),
+            ("no retention", build_request((), Method::PUT), true),
+            (
+                "31 days with spoofed header",
+                spoofed_header(request_retaining_for(time::Duration::days(31))),
+                false,
+            ),
+        ];
+
+        for (name, req, allowed) in cases {
+            let conditions = remaining_retention_days_conditions(&req, action);
+            let args = BucketPolicyArgs {
+                bucket: "bucket",
+                action,
+                is_owner: false,
+                account: "",
+                groups: &no_groups,
+                conditions: &conditions,
+                object: "obj",
+            };
+
+            assert_eq!(policy.is_allowed(&args).await, allowed, "{name}");
+        }
+    }
+
     #[test]
     fn internal_object_authorization_ignores_unapplied_request_options() {
         let mut req = build_request((), Method::POST);
@@ -3821,21 +5183,268 @@ mod tests {
         ));
     }
 
+    type CapturedAudit = Arc<std::sync::Mutex<Vec<rustfs_audit::AuditEntry>>>;
+
+    /// An auditor wired like the global one except that entries land in the returned vector.
+    fn test_auditor(enabled: bool, authenticated_rate: u64, anonymous_rate: u64) -> (DenialAuditor, CapturedAudit) {
+        let captured: CapturedAudit = Arc::default();
+        let sink = Arc::clone(&captured);
+        // A frozen clock: no wall-clock refill can change what the limiter admits.
+        let t0 = std::time::Instant::now();
+        let limiter = DenialRateLimiter::new(authenticated_rate, anonymous_rate, t0);
+        let auditor =
+            DenialAuditor::new(limiter, move || enabled, move |_, entry| sink.lock().unwrap().push(entry)).with_clock(move || t0);
+        (auditor, captured)
+    }
+
+    fn denial_request(request_id: &str, authenticated: bool) -> S3Request<()> {
+        let mut req = build_request((), Method::GET);
+        req.uri = Uri::from_static("/audit-bucket/audit-object");
+        req.extensions.insert(crate::storage::request_context::RequestContext {
+            request_id: request_id.to_string(),
+            x_amz_request_id: request_id.to_string(),
+            trace_id: None,
+            span_id: None,
+            start_time: std::time::Instant::now(),
+        });
+        req.extensions.insert(ReqInfo {
+            cred: authenticated.then(|| rustfs_credentials::Credentials {
+                access_key: "denied-user".to_string(),
+                ..Default::default()
+            }),
+            bucket: Some("audit-bucket".to_string()),
+            object: Some("audit-object".to_string()),
+            ..Default::default()
+        });
+        req
+    }
+
+    fn denial_context(auditor: &DenialAuditor, quiet: bool) -> DenialContext<'_> {
+        DenialContext {
+            quiet,
+            suppress_audit: false,
+            auditor,
+            bucket: "audit-bucket",
+            object: "audit-object",
+            version_id: Some("version"),
+            account: Some("denied-user"),
+            is_owner: false,
+        }
+    }
+
+    const GET_OBJECT: Action = Action::S3Action(S3Action::GetObjectAction);
+
     /// Issue #5740: the denial helper must keep the client-facing error identical
     /// to the historical bare response — the added diagnostics are log-only.
     #[test]
     fn test_access_denied_helper_keeps_generic_wire_response() {
-        let denial = DenialContext {
-            quiet: false,
-            bucket: "bucket",
-            object: "object",
-            version_id: Some("version"),
-            account: Some("account"),
-            is_owner: false,
-        };
-        let err = denial.deny("bucket_policy_explicit_deny", Action::S3Action(S3Action::GetObjectAction));
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let req = denial_request("denial-wire-response", true);
+        let err = denial_context(&auditor, false).deny(&req, "bucket_policy_explicit_deny", GET_OBJECT);
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
         assert_eq!(err.message(), Some("Access Denied"));
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    /// A real denial yields exactly one audit entry naming the account, bucket, object,
+    /// denied action and internal reason.
+    #[test]
+    fn denial_is_audited_once_with_account_resource_action_and_reason() {
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let req = denial_request("denial-audited-once", true);
+        let _ = denial_context(&auditor, false).deny(&req, "iam_explicit_deny", Action::S3Action(S3Action::PutObjectAction));
+
+        let entries = captured.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.request_id.as_deref(), Some("denial-audited-once"));
+        assert_eq!(entry.access_key.as_deref(), Some("denied-user"));
+        assert_eq!(entry.api.name.as_deref(), Some("s3:PutObject"));
+        assert_eq!(entry.api.bucket.as_deref(), Some("audit-bucket"));
+        assert_eq!(entry.api.object.as_deref(), Some("audit-object"));
+        assert_eq!(entry.api.status.as_deref(), Some("failure"));
+        assert_eq!(entry.api.status_code, Some(403));
+        assert_eq!(entry.error.as_deref(), Some("Access Denied"));
+        let tags = entry.tags.as_ref().expect("denial entry carries its reason");
+        assert_eq!(tags.get("denialReason").and_then(|value| value.as_str()), Some("iam_explicit_deny"));
+        assert!(!tags.contains_key("suppressedDenials"));
+    }
+
+    /// Probe denials (per-bucket ListBuckets fallback, per-object metadata collection) are
+    /// expected filter outcomes and must not flood the audit stream.
+    #[test]
+    fn quiet_probe_denial_is_not_audited() {
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let req = denial_request("denial-quiet-probe", true);
+        let err =
+            denial_context(&auditor, true).deny(&req, "no_policy_allows_action", Action::S3Action(S3Action::ListBucketAction));
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn denial_is_not_audited_when_the_audit_module_is_off() {
+        let (auditor, captured) = test_auditor(false, 10, 10);
+        let req = denial_request("denial-audit-off", true);
+        let _ = denial_context(&auditor, false).deny(&req, "no_policy_allows_action", GET_OBJECT);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn denial_audited_in_aggregate_by_the_caller_is_not_audited_per_key() {
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let req = denial_request("denial-per-key", true);
+        let mut denial = denial_context(&auditor, false);
+        denial.suppress_audit = true;
+        let _ = denial.deny(&req, "iam_explicit_deny", GET_OBJECT);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    /// A flood of denials emits a bounded number of entries; the rest are only counted.
+    #[test]
+    fn denial_flood_emits_bounded_entries() {
+        let (auditor, captured) = test_auditor(true, 3, 3);
+        let req = denial_request("denial-flood", true);
+        for _ in 0..20 {
+            let _ = denial_context(&auditor, false).deny(&req, "no_policy_allows_action", GET_OBJECT);
+        }
+        assert_eq!(captured.lock().unwrap().len(), 3);
+    }
+
+    /// The entry that follows a suppressed run reports how many denials were dropped.
+    #[test]
+    fn entry_after_a_flood_reports_the_suppressed_count() {
+        use crate::storage::helper::DenialScope;
+        let (auditor, captured) = test_auditor(true, 1, 1);
+        let req = denial_request("denial-suppressed-count", true);
+        let t0 = std::time::Instant::now();
+        for _ in 0..5 {
+            auditor.audit_at(&req, &GET_OBJECT, "no_policy_allows_action", DenialScope::Request, t0);
+        }
+        auditor.audit_at(
+            &req,
+            &GET_OBJECT,
+            "no_policy_allows_action",
+            DenialScope::Request,
+            t0 + std::time::Duration::from_secs(2),
+        );
+        let entries = captured.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        let tag = |index: usize| {
+            entries[index]
+                .tags
+                .as_ref()
+                .unwrap()
+                .get("suppressedDenials")
+                .and_then(|v| v.as_u64())
+        };
+        assert_eq!(tag(0), None);
+        assert_eq!(tag(1), Some(4));
+    }
+
+    /// Anonymous callers have their own, lower limit, so an unauthenticated scanner cannot
+    /// use up the budget for authenticated callers.
+    #[test]
+    fn anonymous_denials_are_limited_separately_from_authenticated_ones() {
+        let (auditor, captured) = test_auditor(true, 10, 1);
+        let anonymous = denial_request("denial-anonymous", false);
+        let authenticated = denial_request("denial-authenticated", true);
+        for _ in 0..5 {
+            let _ = denial_context(&auditor, false).deny(&anonymous, "no_policy_allows_action", GET_OBJECT);
+        }
+        for _ in 0..5 {
+            let _ = denial_context(&auditor, false).deny(&authenticated, "no_policy_allows_action", GET_OBJECT);
+        }
+        let entries = captured.lock().unwrap();
+        let count = |id: &str| entries.iter().filter(|entry| entry.request_id.as_deref() == Some(id)).count();
+        assert_eq!(count("denial-anonymous"), 1);
+        assert_eq!(count("denial-authenticated"), 5);
+    }
+
+    /// Exits that have no `DenialContext` of their own audit through the request's own state
+    /// and honor the same probe flags.
+    #[test]
+    fn request_denial_exit_is_audited_and_honors_the_probe_flags() {
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let mut req = denial_request("denial-exit", true);
+        audit_request_denial(&req, &auditor, "table_resource_policy_denied", GET_OBJECT);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+
+        req.extensions.get_mut::<ReqInfo>().unwrap().suppress_denial_log = true;
+        audit_request_denial(&req, &auditor, "table_resource_policy_denied", GET_OBJECT);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+
+        req.extensions.get_mut::<ReqInfo>().unwrap().suppress_denial_log = false;
+        req.extensions.get_mut::<ReqInfo>().unwrap().suppress_denial_audit = true;
+        audit_request_denial(&req, &auditor, "table_resource_policy_denied", GET_OBJECT);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    /// The table-policy, anonymous table and force-delete exits live deep in the authorization
+    /// flow and need a table catalog to reach. This source-level guard fails if one stops
+    /// auditing; it does not execute them.
+    #[test]
+    fn denial_exits_without_a_context_call_the_audit_function() {
+        // Only the production code counts; the tests' own calls must not satisfy the guard.
+        let source = include_str!("access.rs").split("\nmod tests {").next().unwrap();
+        for reason in [
+            "\"table_resource_policy_denied\"",
+            "\"anonymous_table_data_plane_access\"",
+            "\"recursive_force_delete_requires_authenticated_caller\"",
+        ] {
+            let call = source
+                .match_indices("audit_request_denial(")
+                .any(|(at, _)| source[at..].chars().take(260).collect::<String>().contains(reason));
+            assert!(call, "{reason} exit does not call audit_request_denial");
+        }
+    }
+
+    /// DeleteObjects audits its refused keys as one entry per denied action, carrying the count and
+    /// no single object, and the per-key mark is cleared afterwards.
+    #[test]
+    fn bulk_denial_is_one_entry_per_denied_action_with_the_key_count() {
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let mut req = denial_request("denial-bulk", true);
+
+        let nothing_denied = BulkDenialAudit::start(&mut req).unwrap();
+        assert!(req.extensions.get::<ReqInfo>().unwrap().suppress_denial_audit);
+        nothing_denied.finish_with(&mut req, &auditor).unwrap();
+        assert!(!req.extensions.get::<ReqInfo>().unwrap().suppress_denial_audit);
+        assert!(captured.lock().unwrap().is_empty());
+
+        let mut bulk = BulkDenialAudit::start(&mut req).unwrap();
+        let delete = Action::S3Action(S3Action::DeleteObjectAction);
+        let bypass = Action::S3Action(S3Action::BypassGovernanceRetentionAction);
+        for action in [delete, delete, bypass, delete] {
+            bulk.denied(action);
+        }
+        bulk.finish_with(&mut req, &auditor).unwrap();
+
+        let entries = captured.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        let summary: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry.api.object, None);
+                (
+                    entry.api.name.clone().unwrap(),
+                    entry
+                        .tags
+                        .as_ref()
+                        .unwrap()
+                        .get("deniedKeys")
+                        .and_then(|value| value.as_u64())
+                        .unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("s3:DeleteObject".to_string(), 3),
+                ("s3:BypassGovernanceRetention".to_string(), 1)
+            ]
+        );
     }
 
     #[test]
@@ -4269,6 +5878,60 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn put_read_quorum_access_keeps_authorization_precedence() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        assert!(server_ctx.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)))));
+        let fs = FS::with_server_ctx(server_ctx);
+
+        for effect in ["Allow", "Deny"] {
+            let bucket = format!("put-quorum-access-{}", uuid::Uuid::new_v4());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("authorization precedence bucket must be created");
+            let policy_json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+            );
+            let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+                .await
+                .expect("test bucket metadata must be cached"))
+            .clone();
+            metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy must parse"));
+            metadata.policy_config_json = policy_json.into_bytes();
+            crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+                .await
+                .expect("test policy must be installed");
+
+            let input = PutObjectInput::builder()
+                .bucket(bucket)
+                .key("object".into())
+                .build()
+                .expect("access probe input must build");
+            let mut req = build_request(input, Method::PUT);
+            ensure_req_info(&mut req);
+            req.extensions.insert(fs.server_ctx().clone());
+            let err = super::PUT_GENERATION_READ_QUORUM_FAILURE
+                .scope((), fs.put_object(&mut req))
+                .await
+                .expect_err("a generation failure must never admit a write");
+            if effect == "Allow" {
+                assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+                assert_eq!(err.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+                assert!(matches!(
+                    err.source().and_then(|source| source.downcast_ref::<StorageError>()),
+                    Some(StorageError::ErasureReadQuorum)
+                ));
+            } else {
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(err.status_code(), Some(http::StatusCode::FORBIDDEN));
+            }
+            assert!(req.extensions.get::<BucketGenerationGuard>().is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn put_object_access_captures_authorized_bucket_incarnation() {
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         let server_ctx = ServerContextSlot::new();
@@ -4469,9 +6132,16 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn delete_object_access_captures_authorized_bucket_incarnation() {
+    fn delete_object_access_keeps_snapshot_across_recreation_before_admission() {
+        crate::app::gating_test_env::run_large_stack_test(
+            "delete-object-generation-guard",
+            delete_object_access_keeps_snapshot_across_recreation_before_admission_inner,
+        );
+    }
+
+    async fn delete_object_access_keeps_snapshot_across_recreation_before_admission_inner() {
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         let server_ctx = ServerContextSlot::new();
         let app_context = Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)));
@@ -4503,7 +6173,7 @@ mod tests {
             .expect("new bucket metadata should be cached"))
         .clone();
         metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test bucket policy should parse"));
-        metadata.policy_config_json = policy_json.into_bytes();
+        metadata.policy_config_json = policy_json.clone().into_bytes();
         crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
             .await
             .expect("test bucket policy should be published");
@@ -4517,20 +6187,21 @@ mod tests {
         ensure_req_info(&mut req);
         req.extensions.insert(fs.server_ctx().clone());
 
-        fs.delete_object(&mut req)
+        let captured_incarnation_id = store
+            .bucket_incarnation_id(&bucket)
             .await
-            .expect("anonymous DeleteObject should be authorized by the test policy");
-        let mut opts = crate::storage::ObjectOptions::default();
-        apply_bucket_generation_guard(&req, &bucket, &mut opts).expect("request snapshot should apply to DeleteObject options");
-        assert_eq!(
-            opts.expected_bucket_incarnation_id,
-            Some(
-                store
-                    .bucket_incarnation_id(&bucket)
-                    .await
-                    .expect("bucket incarnation should remain readable")
-            )
-        );
+            .expect("read the bucket generation before admission");
+        let (loaded_tx, loaded_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        install_object_generation_test_hook(bucket.clone(), loaded_tx, resume_rx);
+        let access = tokio::spawn(async move {
+            let result = fs.delete_object(&mut req).await;
+            (result, req)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), loaded_rx)
+            .await
+            .expect("DeleteObject should reach the generation snapshot hook")
+            .expect("DeleteObject access should remain paused before admission");
 
         store
             .delete_bucket(&bucket, &DeleteBucketOptions::default())
@@ -4540,11 +6211,36 @@ mod tests {
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
             .expect("recreate the same bucket name");
+        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+            .await
+            .expect("recreated bucket metadata should be cached"))
+        .clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
+        metadata.policy_config_json = policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+            .await
+            .expect("republish the same policy for admission");
         let mut reader = crate::storage::PutObjReader::from_vec(b"new generation".to_vec());
         store
             .put_object(&bucket, "object", &mut reader, &crate::storage::ObjectOptions::default())
             .await
             .expect("put the new-generation object");
+
+        assert_ne!(
+            captured_incarnation_id,
+            store
+                .bucket_incarnation_id(&bucket)
+                .await
+                .expect("read the recreated bucket generation")
+        );
+        resume_tx
+            .send(())
+            .expect("DeleteObject should still be paused before admission");
+        let (result, req) = access.await.expect("DeleteObject access task should join");
+        result.expect("the equivalent policy should authorize DeleteObject");
+        let mut opts = crate::storage::ObjectOptions::default();
+        apply_bucket_generation_guard(&req, &bucket, &mut opts).expect("request snapshot should apply to DeleteObject options");
+        assert_eq!(opts.expected_bucket_incarnation_id, Some(captured_incarnation_id));
 
         let err = crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(app_context))
             .execute_delete_object(req)
@@ -4688,14 +6384,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn restore_object_access_keeps_authorized_bucket_incarnation_across_recreation() {
+    fn restore_object_access_keeps_snapshot_across_recreation_before_admission() {
         crate::app::gating_test_env::run_large_stack_test(
             "restore-object-generation-guard",
-            restore_object_access_keeps_authorized_bucket_incarnation_across_recreation_inner,
+            restore_object_access_keeps_snapshot_across_recreation_before_admission_inner,
         );
     }
 
-    async fn restore_object_access_keeps_authorized_bucket_incarnation_across_recreation_inner() {
+    async fn restore_object_access_keeps_snapshot_across_recreation_before_admission_inner() {
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         let server_ctx = ServerContextSlot::new();
         let app_context = Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)));
@@ -4719,7 +6415,7 @@ mod tests {
             .expect("authorized bucket metadata should be cached"))
         .clone();
         metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
-        metadata.policy_config_json = policy_json.into_bytes();
+        metadata.policy_config_json = policy_json.clone().into_bytes();
         crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
             .await
             .expect("publish the RestoreObject policy");
@@ -4743,7 +6439,7 @@ mod tests {
         req.extensions.insert(fs.server_ctx().clone());
         let (authorized_tx, authorized_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-        install_restore_authorization_test_hook(bucket.clone(), authorized_tx, resume_rx);
+        install_object_generation_test_hook(bucket.clone(), authorized_tx, resume_rx);
 
         let access = tokio::spawn(async move {
             let result = fs.restore_object(&mut req).await;
@@ -4751,7 +6447,7 @@ mod tests {
         });
         tokio::time::timeout(std::time::Duration::from_secs(10), authorized_rx)
             .await
-            .expect("RestoreObject authorization should reach the test hook")
+            .expect("RestoreObject should reach the generation snapshot hook")
             .expect("RestoreObject access must not fail before reaching the test hook");
 
         store
@@ -4762,6 +6458,15 @@ mod tests {
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
             .expect("recreate the bucket with the same name");
+        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+            .await
+            .expect("recreated bucket metadata should be cached"))
+        .clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
+        metadata.policy_config_json = policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+            .await
+            .expect("republish the same policy for admission");
         let recreated_incarnation_id = store
             .bucket_incarnation_id(&bucket)
             .await
@@ -4772,7 +6477,7 @@ mod tests {
             .expect("RestoreObject access should still be waiting at the test hook");
 
         let (result, req) = access.await.expect("RestoreObject access task should join");
-        result.expect("the already-authorized request should retain its generation guard");
+        result.expect("the equivalent policy should authorize RestoreObject without refreshing its snapshot");
         let mut opts = crate::storage::ObjectOptions::default();
         apply_bucket_generation_guard(&req, &bucket, &mut opts).expect("apply the RestoreObject authorization guard");
         assert_eq!(opts.expected_bucket_incarnation_id, Some(authorized_incarnation_id));

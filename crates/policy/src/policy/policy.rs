@@ -1749,6 +1749,53 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_table_location_claim_is_limited_to_the_physical_prefix() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "admin:CreateTable", "Resource": "arn:aws:s3:::warehouse/namespaces/lab"},
+                    {"Effect": "Allow", "Action": "admin:ClaimTableLocation", "Resource": [
+                        "arn:aws:s3:::warehouse/owned", "arn:aws:s3:::warehouse/owned/*"
+                    ]},
+                    {"Effect": "Deny", "Action": "admin:ClaimTableLocation", "Resource": [
+                        "arn:aws:s3:::warehouse/owned/private", "arn:aws:s3:::warehouse/owned/private/*"
+                    ]}
+                ]
+            }"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+        for (bucket, object, allowed) in [
+            ("warehouse", "owned", true),
+            ("warehouse", "owned/", true),
+            ("warehouse", "owned/child/", true),
+            ("warehouse", "owned/private/", false),
+            ("warehouse", "owned2/", false),
+            ("warehouse", "shared/", false),
+            ("warehouse", "namespaces/lab", false),
+            ("another-warehouse", "owned/", false),
+        ] {
+            let args = Args {
+                account: "creator",
+                groups: &groups,
+                action: Action::AdminAction(AdminAction::ClaimTableLocationAction),
+                bucket,
+                conditions: &conditions,
+                is_owner: false,
+                object,
+                claims: &claims,
+                deny_only: false,
+            };
+            assert_eq!(policy.is_allowed(&args).await, allowed, "{bucket}/{object}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_table_admin_action_with_resource_is_limited_to_bucket() -> Result<()> {
         use crate::policy::action::{Action, AdminAction};
 
@@ -3367,5 +3414,124 @@ mod test {
         assert_eq!(round_trip.version, policy.version);
         assert_eq!(round_trip.statements.len(), policy.statements.len());
         assert_eq!(round_trip.statements[0].effect, policy.statements[0].effect);
+    }
+
+    #[tokio::test]
+    async fn force_delete_actions_require_an_explicit_grant() {
+        let wildcard = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}]}"#,
+        )
+        .expect("wildcard policy parses");
+        let explicit = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ForceDeleteObject","s3:ForceDeleteBucket","s3:DeleteObject"],"Resource":["arn:aws:s3:::*"]}]}"#,
+        )
+        .expect("explicit policy parses");
+        let denied = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:ForceDeleteObject"],"Resource":["arn:aws:s3:::*"]},
+                {"Effect":"Deny","Action":["s3:ForceDeleteObject"],"Resource":["arn:aws:s3:::*"]}
+            ]}"#,
+        )
+        .expect("deny policy parses");
+
+        let wildcard_deny = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:ForceDeleteObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::*"]},
+                {"Effect":"Deny","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}
+            ]}"#,
+        )
+        .expect("wildcard deny policy parses");
+
+        assert!(allows(&wildcard, "s3:DeleteObject").await);
+        assert!(!allows(&wildcard, "s3:ForceDeleteObject").await);
+        assert!(!allows(&wildcard, "s3:ForceDeleteBucket").await);
+        assert!(allows(&explicit, "s3:ForceDeleteObject").await);
+        assert!(allows(&explicit, "s3:ForceDeleteBucket").await);
+        assert!(!allows(&denied, "s3:ForceDeleteObject").await);
+        assert!(!allows(&wildcard_deny, "s3:ForceDeleteObject").await);
+        assert!(!allows(&wildcard_deny, "s3:DeleteObject").await);
+    }
+
+    #[tokio::test]
+    async fn not_action_allow_does_not_grant_force_delete() {
+        for not_action in ["s3:*", "s3:GetObject"] {
+            let iam = Policy::parse_config(
+                format!(
+                    r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","NotAction":["{not_action}"],"Resource":["arn:aws:s3:::*"]}}]}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("NotAction policy parses");
+            let bucket: BucketPolicy = serde_json::from_str(&format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":["*"]}},"NotAction":["{not_action}"],"Resource":["arn:aws:s3:::bucket","arn:aws:s3:::bucket/*"]}}]}}"#
+            ))
+            .expect("NotAction bucket policy parses");
+
+            for action in ["s3:ForceDeleteObject", "s3:ForceDeleteBucket"] {
+                assert!(!allows(&iam, action).await, "IAM NotAction {not_action} must not grant {action}");
+                assert!(
+                    !bucket_allows(&bucket, action).await,
+                    "bucket NotAction {not_action} must not grant {action}"
+                );
+            }
+        }
+
+        // NotAction still grants ordinary actions it does not exclude.
+        let iam = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotAction":["s3:GetObject"],"Resource":["arn:aws:s3:::*"]}]}"#,
+        )
+        .expect("NotAction policy parses");
+        assert!(allows(&iam, "s3:DeleteObject").await);
+
+        // Deny + NotAction keeps plain wildcard semantics: s3:* excludes
+        // force-delete, a narrower exclusion still denies it.
+        let deny_all_but = |not_action: &str| {
+            Policy::parse_config(
+                format!(
+                    r#"{{"Version":"2012-10-17","Statement":[
+                        {{"Effect":"Allow","Action":["s3:ForceDeleteObject"],"Resource":["arn:aws:s3:::*"]}},
+                        {{"Effect":"Deny","NotAction":["{not_action}"],"Resource":["arn:aws:s3:::*"]}}
+                    ]}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("deny NotAction policy parses")
+        };
+        assert!(allows(&deny_all_but("s3:*"), "s3:ForceDeleteObject").await);
+        assert!(!allows(&deny_all_but("s3:GetObject"), "s3:ForceDeleteObject").await);
+    }
+
+    async fn bucket_allows(policy: &BucketPolicy, action: &str) -> bool {
+        let conditions = HashMap::new();
+        policy
+            .is_allowed(&BucketPolicyArgs {
+                account: "user",
+                groups: &None,
+                action: Action::try_from(action).expect("action parses"),
+                bucket: "bucket",
+                conditions: &conditions,
+                is_owner: false,
+                object: "folder/a",
+            })
+            .await
+    }
+
+    async fn allows(policy: &Policy, action: &str) -> bool {
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+        policy
+            .is_allowed(&Args {
+                account: "user",
+                groups: &groups,
+                action: Action::try_from(action).expect("action parses"),
+                bucket: "bucket",
+                conditions: &conditions,
+                is_owner: false,
+                object: "folder/a",
+                claims: &claims,
+                deny_only: false,
+            })
+            .await
     }
 }

@@ -14,14 +14,18 @@
 
 use crate::runtime_sources::current_action_credentials;
 #[cfg(feature = "webdav")]
+use crate::runtime_sources::current_object_store_handle;
 use crate::shared_types::RemoteAddr;
-use crate::storage_api::protocols::client::{FS, ReqInfo, RequestContext};
+#[cfg(feature = "webdav")]
+use crate::storage_api::protocols::client::capacity;
+use crate::storage_api::protocols::client::{FS, MultipartStagingOperation, ReqInfo, RequestContext, authorize_request};
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
-#[cfg(feature = "webdav")]
 use rustfs_protocols::common::SessionContext;
 #[cfg(feature = "webdav")]
+use rustfs_protocols::common::client::s3::{BucketCapacity, SessionCapacityView};
+use rustfs_protocols::common::gateway::{AuthorizationError, S3Action, is_operation_supported};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 use s3s::dto::*;
@@ -96,14 +100,19 @@ fn trace_protocol_request(operation: &str, bucket: Option<&str>, object: Option<
     );
 }
 
-#[cfg(feature = "webdav")]
+#[cfg(any(feature = "webdav", feature = "sftp"))]
 fn session_list_buckets_request(
     input: ListBucketsInput,
     session_context: &SessionContext,
     request_headers: &HeaderMap,
     secure_transport: bool,
+    credentials: rustfs_credentials::Credentials,
+    is_owner: bool,
 ) -> S3Request<ListBucketsInput> {
-    let credentials = &session_context.principal.user_identity.credentials;
+    let request_credentials = s3s::auth::Credentials {
+        access_key: credentials.access_key.clone(),
+        secret_key: credentials.secret_key.clone().into(),
+    };
     let mut extensions = http::Extensions::default();
     let remote_addr = std::net::SocketAddr::new(session_context.source_ip, 0);
     extensions.insert(Some(RemoteAddr(remote_addr)));
@@ -111,9 +120,8 @@ fn session_list_buckets_request(
     client_info.forwarded_proto = Some(if secure_transport { "https" } else { "http" }.to_string());
     extensions.insert(client_info);
 
-    let is_owner = current_action_credentials().is_some_and(|global_cred| credentials.access_key == global_cred.access_key);
     extensions.insert(ReqInfo {
-        cred: Some(credentials.clone()),
+        cred: Some(credentials),
         is_owner,
         bucket: None,
         object: None,
@@ -122,6 +130,7 @@ fn session_list_buckets_request(
         region: None,
         request_context: Some(RequestContext::fallback()),
         suppress_denial_log: false,
+        suppress_denial_audit: false,
     });
 
     S3Request {
@@ -130,14 +139,58 @@ fn session_list_buckets_request(
         uri: http::Uri::from_static("/"),
         headers: request_headers.clone(),
         extensions,
-        credentials: Some(s3s::auth::Credentials {
-            access_key: credentials.access_key.clone(),
-            secret_key: credentials.secret_key.clone().into(),
-        }),
+        credentials: Some(request_credentials),
         region: None,
         service: None,
         trailing_headers: None,
     }
+}
+
+/// TTL for the cluster usable-capacity snapshot behind WebDAV quota
+/// properties. WebDAV clients poll quota on a timer and the underlying
+/// storage-info fan-out touches every disk (plus every peer when
+/// distributed), so quota responses reuse the snapshot for this long.
+#[cfg(feature = "webdav")]
+const CLUSTER_CAPACITY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cached cluster usable capacity as `(loaded_at, (used_bytes, total_bytes))`.
+#[cfg(feature = "webdav")]
+type ClusterCapacitySnapshot = Option<(std::time::Instant, (u64, u64))>;
+
+#[cfg(feature = "webdav")]
+fn cluster_capacity_cache() -> &'static std::sync::Mutex<ClusterCapacitySnapshot> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ClusterCapacitySnapshot>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Cluster usable capacity as (used, total) bytes — the same erasure-aware
+/// numbers the console dashboard reports. Returns None while the object store
+/// is not initialized or no capacity has been measured yet; quota properties
+/// are omitted in that case.
+#[cfg(feature = "webdav")]
+async fn cluster_usable_capacity() -> Option<(u64, u64)> {
+    if let Ok(cache) = cluster_capacity_cache().lock()
+        && let Some((loaded_at, value)) = *cache
+        && loaded_at.elapsed() < CLUSTER_CAPACITY_CACHE_TTL
+    {
+        return Some(value);
+    }
+
+    let store = current_object_store_handle()?;
+    let info = capacity::StorageAdminApi::storage_info(store.as_ref()).await;
+    let total = capacity::get_total_usable_capacity(&info.disks, &info) as u64;
+    if total == 0 {
+        // Disks are still initializing; reporting a zero-capacity drive would
+        // make clients refuse writes, so omit quota properties instead.
+        return None;
+    }
+    let free = capacity::get_total_usable_capacity_free(&info.disks, &info) as u64;
+    let value = (total.saturating_sub(free), total);
+
+    if let Ok(mut cache) = cluster_capacity_cache().lock() {
+        *cache = Some((std::time::Instant::now(), value));
+    }
+    Some(value)
 }
 
 fn build_bucket_uri(bucket: &str, query: &[(&str, Option<&str>)]) -> S3Result<http::Uri> {
@@ -156,6 +209,22 @@ fn build_object_uri(bucket: &str, key: &str, query: &[(&str, Option<&str>)]) -> 
         append_query_param(&mut uri, &mut first, query_key, *value);
     }
     parse_protocol_uri(uri, format!("bucket={bucket} key={key}"))
+}
+
+fn build_list_objects_uri(input: &ListObjectsV2Input) -> S3Result<http::Uri> {
+    let max_keys = input.max_keys.map(|value| value.to_string());
+    let query: Vec<_> = [
+        ("list-type", Some("2")),
+        ("prefix", input.prefix.as_deref()),
+        ("delimiter", input.delimiter.as_deref()),
+        ("max-keys", max_keys.as_deref()),
+        ("continuation-token", input.continuation_token.as_deref()),
+        ("start-after", input.start_after.as_deref()),
+    ]
+    .into_iter()
+    .filter(|(_, value)| value.is_some())
+    .collect();
+    build_bucket_uri(&input.bucket, &query)
 }
 
 /// Request parameters for creating S3 requests
@@ -177,6 +246,58 @@ impl ProtocolStorageClient {
     /// Create a new protocol storage client
     pub fn new(fs: FS) -> Self {
         Self { fs }
+    }
+
+    async fn authorize_protocol_request(
+        &self,
+        session: &SessionContext,
+        action: &S3Action,
+        bucket: &str,
+        object: Option<&str>,
+        listing: Option<&ListObjectsV2Input>,
+    ) -> S3Result<()> {
+        let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
+            s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "protocol server application context is not initialized")
+        })?;
+        let (credentials, is_owner) =
+            crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref())).await?;
+        let uri = if let Some(input) = listing {
+            build_list_objects_uri(input)?
+        } else if let Some(key) = object {
+            build_object_uri(bucket, key, &[])?
+        } else {
+            build_bucket_uri(bucket, &[])?
+        };
+        let mut request = Self::create_request(
+            (),
+            Method::GET,
+            uri,
+            RequestParams {
+                bucket: Some(bucket.to_owned()),
+                object: object.map(str::to_owned),
+                credentials: &credentials,
+            },
+        )?;
+        request.extensions.insert(self.fs.server_ctx().clone());
+        if let Some(info) = request.extensions.get_mut::<ReqInfo>() {
+            info.is_owner = is_owner;
+        }
+        let remote_addr = std::net::SocketAddr::new(session.source_ip, 0);
+        request.extensions.insert(Some(RemoteAddr(remote_addr)));
+        let mut client_info = ClientInfo::direct(remote_addr);
+        client_info.forwarded_proto = Some(if session.secure_transport { "https" } else { "http" }.to_owned());
+        request.extensions.insert(client_info);
+        request.headers = session.request_headers.clone();
+        // Preserve staging semantics before distinct operations collapse to PutObject.
+        if matches!(action, S3Action::CreateMultipartUpload | S3Action::UploadPart) {
+            request.extensions.insert(MultipartStagingOperation);
+        }
+        let policy_action = if matches!(action, S3Action::HeadBucket) {
+            S3Action::ListBucket.into()
+        } else {
+            action.clone().into()
+        };
+        authorize_request(&mut request, policy_action).await
     }
 
     /// Create a proper S3Request with ReqInfo extension for authorization
@@ -204,6 +325,7 @@ impl ProtocolStorageClient {
             region: None,
             request_context: Some(RequestContext::fallback()),
             suppress_denial_log: false,
+            suppress_denial_audit: false,
         });
 
         let req = S3Request {
@@ -224,6 +346,41 @@ impl ProtocolStorageClient {
 #[async_trait::async_trait]
 impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageClient {
     type Error = s3s::S3Error;
+
+    async fn authorize_operation(
+        &self,
+        session: &SessionContext,
+        action: &S3Action,
+        bucket: &str,
+        object: Option<&str>,
+    ) -> Result<(), AuthorizationError> {
+        // ListBucket requires the complete listing input to evaluate request conditions.
+        if matches!(action, S3Action::ListBucket) || !is_operation_supported(session.protocol, action) {
+            return Err(AuthorizationError::AccessDenied);
+        }
+        self.authorize_protocol_request(session, action, bucket, object, None)
+            .await
+            .map_err(|error| match error.code() {
+                s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
+                _ => AuthorizationError::IamUnavailable,
+            })
+    }
+
+    async fn authorize_list_objects(
+        &self,
+        session: &SessionContext,
+        input: &ListObjectsV2Input,
+    ) -> Result<(), AuthorizationError> {
+        if !is_operation_supported(session.protocol, &S3Action::ListBucket) {
+            return Err(AuthorizationError::AccessDenied);
+        }
+        self.authorize_protocol_request(session, &S3Action::ListBucket, &input.bucket, None, Some(input))
+            .await
+            .map_err(|error| match error.code() {
+                s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
+                _ => AuthorizationError::IamUnavailable,
+            })
+    }
 
     async fn get_object(
         &self,
@@ -430,7 +587,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         trace_protocol_request("list_objects_v2", Some(&input.bucket), None);
 
         let bucket = input.bucket.clone();
-        let uri = build_bucket_uri(&bucket, &[("list-type", Some("2"))])?;
+        let uri = build_list_objects_uri(&input)?;
         let req = Self::create_request(
             input,
             Method::GET,
@@ -479,7 +636,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         }
     }
 
-    #[cfg(feature = "webdav")]
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
     async fn list_buckets_for_session(
         &self,
         session_context: &SessionContext,
@@ -498,8 +655,78 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let input = ListBucketsInput::builder().build().map_err(|e| {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
         })?;
-        let request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
+        let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
+            s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "protocol server application context is not initialized")
+        })?;
+        // The session identity is captured at login. Re-check the key as
+        // authorize_protocol_request does for every other operation, so a key
+        // disabled or expired since then stops listing buckets. An invalid key
+        // is an access denial, as in authorize_operation.
+        let (credentials, is_owner) =
+            crate::auth::check_key_valid_with_context("", session_context.access_key(), Some(context.as_ref()))
+                .await
+                .map_err(|e| match e.code() {
+                    s3s::S3ErrorCode::InvalidAccessKeyId => s3s::S3Error::new(s3s::S3ErrorCode::AccessDenied),
+                    _ => e,
+                })?;
+        let mut request =
+            session_list_buckets_request(input, session_context, request_headers, secure_transport, credentials, is_owner);
+        request.extensions.insert(self.fs.server_ctx().clone());
         self.fs.list_buckets(request).await.map(|response| response.output)
+    }
+
+    /// Every input is a cache or snapshot read: quota reporting never triggers
+    /// a scanner cycle or a live object listing.
+    #[cfg(feature = "webdav")]
+    async fn session_capacity_view(
+        &self,
+        session_context: &SessionContext,
+        request_headers: &HeaderMap,
+        secure_transport: bool,
+    ) -> Result<Option<SessionCapacityView>, Self::Error> {
+        // List buckets under the session's own authorization so the view
+        // never covers buckets the caller cannot see.
+        let listing = self
+            .list_buckets_for_session(session_context, request_headers, secure_transport)
+            .await?;
+
+        let store = current_object_store_handle();
+        let listed = listing.buckets.unwrap_or_default();
+        let mut buckets = Vec::with_capacity(listed.len());
+        for bucket in listed {
+            let Some(name) = bucket.name else { continue };
+            let quota_limit = match capacity::get_quota_config(&name).await {
+                Ok((config, _)) => config.get_quota_limit(),
+                // No quota configured, or the bucket was deleted between the
+                // listing and this read: either way it has no limit.
+                Err(e) if matches!(e, capacity::BucketConfigError::ConfigNotFound) || capacity::is_err_bucket_not_found(&e) => {
+                    None
+                }
+                Err(e) => {
+                    return Err(s3s::S3Error::with_message(
+                        s3s::S3ErrorCode::InternalError,
+                        format!("Failed to read bucket quota config: {e}"),
+                    ));
+                }
+            };
+            let usage = match capacity::get_bucket_usage_memory(&name).await {
+                Some(usage) => Some(usage),
+                // Degraded windows (pre-v2 upgrade, or a bucket no complete
+                // scanner cycle has covered) fall back to the last persisted
+                // scanner snapshot; absent everywhere means unknown, which the
+                // aggregation reports as zero.
+                None => match &store {
+                    Some(store) => capacity::lookup_degraded_bucket_usage_baseline(store.clone(), &name).await,
+                    None => None,
+                },
+            };
+            buckets.push(BucketCapacity { quota_limit, usage });
+        }
+
+        Ok(Some(SessionCapacityView {
+            buckets,
+            cluster_usable: cluster_usable_capacity().await,
+        }))
     }
 
     async fn create_bucket(
@@ -920,7 +1147,7 @@ mod tests {
         assert!(copied.is_service_account());
     }
 
-    #[cfg(feature = "webdav")]
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
     #[test]
     fn request_extensions_preserve_authenticated_identity_and_source_ip() {
         use std::collections::HashMap;
@@ -939,14 +1166,26 @@ mod tests {
         let source_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
 
         let identity = rustfs_policy::auth::UserIdentity {
-            credentials: credentials.clone(),
+            credentials: rustfs_credentials::Credentials {
+                secret_key: "stale-secret".to_string(),
+                groups: None,
+                claims: None,
+                ..credentials.clone()
+            },
             ..Default::default()
         };
         let principal = rustfs_protocols::common::ProtocolPrincipal::new(std::sync::Arc::new(identity));
         let session_context = SessionContext::new(principal, rustfs_protocols::Protocol::WebDav, source_ip);
         let mut headers = HeaderMap::new();
         headers.insert("user-agent", http::HeaderValue::from_static("webdav-client"));
-        let request = session_list_buckets_request(ListBucketsInput::default(), &session_context, &headers, true);
+        let request = session_list_buckets_request(
+            ListBucketsInput::default(),
+            &session_context,
+            &headers,
+            true,
+            credentials.clone(),
+            true,
+        );
         let request_info = request.extensions.get::<ReqInfo>().expect("request info should be present");
         let copied = request_info.cred.as_ref().expect("credentials should be present");
         let remote_addr = request
@@ -962,12 +1201,18 @@ mod tests {
         assert_eq!(copied.parent_user, credentials.parent_user);
         assert_eq!(copied.groups, credentials.groups);
         assert_eq!(copied.claims, Some(claims));
+        assert!(request_info.is_owner, "ownership comes from the server's credential validation");
+        let request_credentials = request.credentials.as_ref().expect("request credentials");
+        assert_eq!(request_credentials.access_key, credentials.access_key);
+        assert_eq!(request_credentials.secret_key.expose(), credentials.secret_key);
         assert_eq!(remote_addr.0.ip(), source_ip);
         assert_eq!(client_info.real_ip, source_ip);
         assert_eq!(client_info.forwarded_proto.as_deref(), Some("https"));
         assert_eq!(request.headers.get("user-agent").expect("user agent"), "webdav-client");
 
-        let insecure_request = session_list_buckets_request(ListBucketsInput::default(), &session_context, &headers, false);
+        let insecure_request =
+            session_list_buckets_request(ListBucketsInput::default(), &session_context, &headers, false, credentials, false);
+        assert!(!insecure_request.extensions.get::<ReqInfo>().expect("request info").is_owner);
         let insecure_client_info = insecure_request
             .extensions
             .get::<ClientInfo>()

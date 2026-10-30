@@ -24,6 +24,17 @@ pub(crate) fn EndpointServerPools(
     crate::storage::storage_api::EndpointServerPools::from(pools)
 }
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub(crate) mod diagnostic {
+    pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{
+        ReadVersionContextBoundary, ReadVersionEntrySource, with_captured_read_version_context, with_read_version_spawn_context,
+    };
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{
+        current_read_version_entry_source, with_read_version_entry,
+    };
+}
+
 /// S3 wire types for app-layer modules, funneled here so new files stay off
 /// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
 pub(crate) mod s3 {
@@ -43,6 +54,8 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::service::{S3Service, S3ServiceBuilder};
     #[cfg(test)]
+    pub(crate) use s3s::stream::upload_stream::{UploadStream, UploadStreamError};
+    #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     #[cfg(test)]
     pub(crate) use s3s::{Body, S3, S3Response};
@@ -57,9 +70,18 @@ pub(crate) mod admin {
 
 pub(crate) mod capacity {
     pub(crate) type DecommissionUnresolvedEntry = crate::storage::storage_api::ecstore_capacity::DecommissionUnresolvedEntry;
+    pub(crate) type PoolAdminDiagnostic = crate::storage::storage_api::ecstore_capacity::PoolAdminDiagnostic;
+    #[cfg(test)]
+    pub(crate) type PoolAvailability = crate::storage::storage_api::ecstore_capacity::PoolAvailability;
+    #[cfg(test)]
+    pub(crate) type PoolCapacityStatus = crate::storage::storage_api::ecstore_capacity::PoolCapacityStatus;
+    #[cfg(test)]
+    pub(crate) type PoolDiagnosticStatus = crate::storage::storage_api::ecstore_capacity::PoolDiagnosticStatus;
     pub(crate) type PoolDecommissionInfo = crate::storage::storage_api::ecstore_capacity::PoolDecommissionInfo;
+    pub(crate) type PoolMeta = crate::storage::storage_api::ecstore_capacity::PoolMeta;
     pub(crate) type PoolStatus = crate::storage::storage_api::ecstore_capacity::PoolStatus;
     pub(crate) type RebalStatus = crate::storage::storage_api::ecstore_rebalance::RebalStatus;
+    pub(crate) type RebalanceMeta = crate::storage::storage_api::ecstore_rebalance::RebalanceMeta;
 
     pub(crate) fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
         crate::storage::storage_api::ecstore_capacity::get_total_usable_capacity(disks, info)
@@ -83,6 +105,14 @@ pub(crate) mod data_usage {
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_from_backend_cached(store).await
+    }
+
+    pub(crate) async fn load_bucket_usage_from_backend_cached(
+        store: Arc<crate::storage::storage_api::ECStore>,
+        bucket: &str,
+        incarnation: uuid::Uuid,
+    ) -> Result<Option<u64>, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_bucket_usage_from_backend_cached(store, bucket, incarnation).await
     }
 
     #[cfg(test)]
@@ -271,11 +301,13 @@ pub(crate) mod access {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
     pub(crate) use crate::storage::storage_api::access_consumer::{
-        PostObjectRequestMarker, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_request,
-        bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
+        PostObjectRequestMarker, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
+        TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+        authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
         load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
-        replication_request_authorized, req_info_mut, req_info_ref,
+        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
+        set_requested_object_lock_retain_until,
     };
 }
 
@@ -655,8 +687,8 @@ pub(crate) mod bucket {
             pub(crate) type QuotaChecker = crate::storage::storage_api::ecstore_bucket::quota::checker::QuotaChecker;
         }
 
-        #[cfg(test)]
         pub(crate) type BucketQuota = crate::storage::storage_api::ecstore_bucket::quota::BucketQuota;
+        pub(crate) type QuotaType = crate::storage::storage_api::ecstore_bucket::quota::QuotaType;
         pub(crate) type QuotaOperation = crate::storage::storage_api::ecstore_bucket::quota::QuotaOperation;
         pub(crate) type QuotaCheckResult = crate::storage::storage_api::ecstore_bucket::quota::QuotaCheckResult;
         pub(crate) type QuotaError = crate::storage::storage_api::ecstore_bucket::quota::QuotaError;
@@ -1040,7 +1072,7 @@ pub(crate) mod ecfs {
 
 pub(crate) mod error {
     pub(crate) use crate::storage::storage_api::{
-        StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
+        StorageError, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
     };
 
     pub(crate) type Error = StorageError;
@@ -1121,8 +1153,8 @@ pub(crate) mod s3_api {
     pub(crate) mod bucket {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::bucket::{
             ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-            build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
-            parse_list_objects_v2_params,
+            build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
+            parse_list_object_versions_params, parse_list_objects_v2_params,
         };
         pub(crate) use crate::storage::storage_api::s3_api_consumer::common::rustfs_owner;
     }
@@ -1179,7 +1211,8 @@ pub(crate) mod bucket_usecase {
 }
 
 pub(crate) mod object_usecase {
-    pub(crate) use super::storage_contracts::BUCKET_LIFECYCLE_LOCK_OBJECT;
+    pub(crate) use super::storage_contracts::object::DeleteObjectCondition;
+    pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
 
     pub(crate) mod object_cache {
         #[cfg(test)]
@@ -1187,8 +1220,10 @@ pub(crate) mod object_usecase {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_object::lookup_get_object_body_cache_hook;
         pub(crate) use crate::storage::storage_api::ecstore_object::{
-            GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len,
+            GetObjectBodyCacheHookLookup, GetObjectReadCondition, GetObjectReadMetadata, get_object_body_cache_plaintext_len,
+            with_get_object_read_condition,
         };
+        pub(crate) use crate::storage::storage_api::{evaluate_read_preconditions, has_read_preconditions};
     }
 
     pub(crate) mod contract {
@@ -1231,7 +1266,9 @@ pub(crate) mod multipart_usecase {
         }
 
         pub(crate) mod multipart {
-            pub(crate) use super::super::super::storage_contracts::{CompletePart, MultipartOperations, MultipartUploadResult};
+            pub(crate) use super::super::super::storage_contracts::{
+                CompletePart, ListMultipartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult,
+            };
             pub(crate) use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }
 
@@ -1317,8 +1354,8 @@ pub(crate) mod test {
     };
     pub(crate) mod set_disk {
         pub(crate) use crate::storage::storage_api::ecstore_set_disk::{
-            MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause,
-            fail_next_quota_ledger_save_for_test,
+            ConditionalReadBenchmarkMetadataGuard, MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier,
+            PutObjectCommitPause, fail_next_quota_ledger_save_for_test,
         };
     }
 

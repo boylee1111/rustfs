@@ -113,6 +113,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
     }
 
+    async fn acquire_quota_mutation_fence(
+        &self,
+        _request: Request<SnapshotLeaseRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
     async fn renew_snapshot_lease(
         &self,
         _request: Request<SnapshotLeaseRenewRequest>,
@@ -121,6 +128,13 @@ impl NodeService for MinimalLockNodeService {
     }
 
     async fn release_snapshot_lease(
+        &self,
+        _request: Request<SnapshotLeaseReleaseRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn release_quota_mutation_fence(
         &self,
         _request: Request<SnapshotLeaseReleaseRequest>,
     ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
@@ -360,6 +374,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn heal_bucket_at_incarnation(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::HealBucketRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::HealBucketResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn list_bucket(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::ListBucketRequest>,
@@ -402,7 +423,21 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn compare_and_update_file(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::CompareAndUpdateFileRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::CompareAndUpdateFileResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn delete(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::DeleteRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::DeleteResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn delete_at_incarnation(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::DeleteRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::DeleteResponse>, Status> {
@@ -442,6 +477,13 @@ impl NodeService for MinimalLockNodeService {
         _request: Request<rustfs_protos::proto_gen::node_service::PreparePartTransactionRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::PreparePartTransactionResponse>, Status> {
         Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn recover_delete_transaction(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RecoverDeleteTransactionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RecoverDeleteTransactionResponse>, Status> {
+        Err(Status::unimplemented("delete recovery is not supported by the lock fixture"))
     }
 
     async fn settle_part_transaction(
@@ -506,6 +548,53 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn rename_multipart_data(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn recover_multipart_source(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RecoverMultipartSourceRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RecoverMultipartSourceResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn rename_data_at_incarnation(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn rename_data_with_quota_fence(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn rename_data_with_pool_meta_cas(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+    async fn undo_pool_meta_write(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::DeleteVersionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::DeleteVersionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+    async fn pool_meta_native_recovery(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::PoolMetaNativeRecoveryRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::PoolMetaNativeRecoveryResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn make_volumes(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::MakeVolumesRequest>,
@@ -562,6 +651,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn write_metadata_at_incarnation(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::WriteMetadataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::WriteMetadataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn read_version(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::ReadVersionRequest>,
@@ -580,6 +676,27 @@ impl NodeService for MinimalLockNodeService {
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::DeleteVersionRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::DeleteVersionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn delete_version_at_incarnation(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::DeleteVersionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::DeleteVersionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn delete_retired_marker(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::DeleteVersionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::DeleteVersionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn guarded_delete_versions(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::GuardedDeleteVersionsRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::DeleteVersionsResponse>, Status> {
         Err(Status::unimplemented("lock-only test server"))
     }
 
@@ -874,6 +991,13 @@ impl NodeService for MinimalLockNodeService {
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::ReplacementRecoveryStatusRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::ReplacementRecoveryStatusResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn peer_drive_admission(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::PeerDriveAdmissionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::PeerDriveAdmissionResponse>, Status> {
         Err(Status::unimplemented("lock-only test server"))
     }
 

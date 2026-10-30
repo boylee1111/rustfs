@@ -2,7 +2,7 @@
 pub(crate) mod bug_fixes {
     pub(crate) use rustfs_ecstore::api::disk::DiskStore;
     pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint;
-    pub(crate) use rustfs_storage_api::BucketInfo;
+    pub(crate) use rustfs_storage_api::{BucketInfo, DiskSetSelector};
 }
 
 #[allow(unused_imports)]
@@ -11,6 +11,7 @@ pub(crate) mod endpoint_index {
     pub(crate) use rustfs_ecstore::api::layout::EndpointServerPools;
     pub(crate) use rustfs_ecstore::api::layout::Endpoints;
     pub(crate) use rustfs_ecstore::api::layout::PoolEndpoints;
+    pub(crate) use rustfs_ecstore::api::runtime::local_disk_map_read;
     pub(crate) use rustfs_ecstore::api::storage::ECStore;
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
 }
@@ -20,10 +21,28 @@ pub(crate) mod endpoint_index {
 // still touch directly.
 #[allow(unused_imports)]
 pub(crate) mod integration {
+    pub(crate) use rustfs_ecstore::api::disk::{
+        DeleteOptions, DeleteRecoveryAction, DeleteRecoveryState, DiskAPI, DiskError, DiskOption, DiskStore, Endpoint,
+        RUSTFS_META_BUCKET, ReadOptions, new_disk,
+    };
+    pub(crate) use rustfs_ecstore::api::error::StorageError as EcstoreStorageError;
+    pub(crate) use rustfs_ecstore::api::object::{
+        ObjectOptions, PutObjReader, ShardIntegrityWriteMode, WriteCommitGuard, WriteCompletion,
+    };
+    pub(crate) use rustfs_ecstore::api::rebalance::{RebalStatus, RebalanceMeta, RebalanceStats};
     pub(crate) use rustfs_ecstore::api::storage::ECStore;
     pub(crate) use rustfs_storage_api::BucketOperations;
     pub(crate) use rustfs_storage_api::MakeBucketOptions;
     pub(crate) use rustfs_storage_api::NamespaceLocking;
     pub(crate) use rustfs_storage_api::ObjectIO;
     pub(crate) use rustfs_storage_api::ObjectOperations;
+    pub(crate) use rustfs_storage_api::{BucketInfo, DeleteBucketOptions, ObjectToDelete};
+    pub(crate) use rustfs_storage_api::{DiskSetSelector, StorageAdminApi};
+}
+
+#[allow(unused_imports)]
+pub(crate) mod pool_metadata {
+    pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys;
+    pub(crate) use rustfs_ecstore::api::disk::{HEALING_MARKER_PATH, RUSTFS_META_BUCKET};
+    pub(crate) use rustfs_ecstore::api::storage::POOL_META_NAME;
 }

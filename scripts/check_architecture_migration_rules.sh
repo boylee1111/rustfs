@@ -6,7 +6,7 @@
 # #1052 — all closed) and now keep the resulting boundaries from rotting
 # (facade bypasses, compat-shim resurrection, owner-module drift). Closed
 # migration issues are NOT a reason to retire this script or its pins.
-# Runs in ci.yml Quick Checks and .github/workflows/architecture-migration-rules.yml.
+# Runs in ci.yml Quick Checks for every pull request.
 
 set -euo pipefail
 
@@ -59,12 +59,14 @@ require_source_contains "docs/architecture/overview.md" "## Phase Order" "archit
 require_source_contains "docs/architecture/runtime-lifecycle.md" "## Startup And Readiness" "runtime lifecycle startup readiness section"
 require_source_contains "docs/architecture/runtime-lifecycle.md" "## Shutdown Lifecycle Boundary" "runtime lifecycle shutdown boundary section"
 require_source_contains "docs/architecture/runtime-lifecycle.md" "## AppContext Foundation" "runtime lifecycle AppContext section"
+require_source_contains "docs/architecture/runtime-lifecycle.md" "## OIDC Runtime Publication" "runtime lifecycle OIDC publication section"
 require_source_contains "docs/architecture/storage-control-data-plane.md" "## Storage API Contracts" "storage control/data plane contracts section"
 require_source_contains "docs/architecture/storage-control-data-plane.md" "## Cluster Control Plane" "storage control/data plane cluster section"
 require_source_contains "docs/architecture/storage-control-data-plane.md" "## Background Controllers" "storage control/data plane background controllers section"
 require_source_contains "docs/architecture/crate-boundaries.md" "## Dependency Direction" "crate boundaries dependency direction section"
 require_source_contains "docs/architecture/crate-boundaries.md" "storage-api -> ecstore" "crate boundaries storage dependency rule"
 require_source_contains "docs/architecture/crate-boundaries.md" "extension-schema -> rustfs" "crate boundaries extension dependency rule"
+require_source_contains "docs/architecture/crate-boundaries.md" "## OIDC Ownership" "crate boundaries OIDC ownership section"
 require_source_contains "docs/architecture/readiness-matrix.md" "## Request Behavior Matrix" "readiness matrix request behavior section"
 require_source_contains "docs/architecture/readiness-matrix.md" "## Runtime Dependency Matrix" "readiness matrix runtime dependency section"
 require_source_contains "docs/architecture/readiness-matrix.md" "## Probe Semantics" "readiness matrix probe semantics section"
@@ -2277,7 +2279,7 @@ fi
     rustfs/src/admin/router.rs \
     rustfs/src/admin/console.rs \
     rustfs/src/admin/handlers/heal.rs \
-    rustfs/src/admin/handlers/metrics.rs \
+    rustfs/src/admin/handlers/realtime.rs \
     rustfs/src/admin/handlers/object_zip_download.rs || true
 ) >"$RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE"
 
@@ -5438,10 +5440,9 @@ require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn set_disks_implements_storage_object_operations_contract()" \
   "SetDisks storage-api ObjectOperations compile-time coverage test"
-require_source_contains \
-  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
-  "fn set_disks_implements_storage_list_operations_contract()" \
-  "SetDisks storage-api ListOperations compile-time coverage test"
+# No ListOperations row for SetDisks: a paginated listing merges every set of
+# every pool, so the contract is implemented by ECStore only and SetDisks
+# exposes `walk` as an inherent method (crates/ecstore/src/set_disk/ops/list.rs).
 require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn set_disks_implements_storage_multipart_operations_contract()" \
@@ -5542,6 +5543,10 @@ else
       report_failure "scripts/ecstore-module-lint-register.txt lists '${entry}' but the blanket is gone; delete the line in the same PR so the register can only shrink (backlog#1823 step 9)"
     fi
   done <"$ECSTORE_LINT_EXPECTED"
+fi
+
+if ! bash "${ROOT_DIR}/scripts/check_oidc_architecture_boundaries.sh"; then
+  report_failure "OIDC architecture boundary check"
 fi
 
 if (( FAILURES > 0 )); then

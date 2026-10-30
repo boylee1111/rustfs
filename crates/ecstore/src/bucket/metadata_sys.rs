@@ -24,6 +24,7 @@ use crate::bucket::metadata::{load_bucket_metadata_parse, load_bucket_metadata_p
 use crate::bucket::utils::is_meta_bucketname;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, is_err_bucket_not_found, is_err_strict_volume_not_found};
+use crate::object_api::ObjectOptions;
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
@@ -177,6 +178,13 @@ pub(crate) fn object_lock_config_state_from_authoritative_metadata(bm: &BucketMe
     Ok(ObjectLockConfigState::ConfirmedAbsent)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CachedQuotaMetadataSnapshot {
+    pub(crate) quota: Option<BucketQuota>,
+    pub(crate) bucket_incarnation: Uuid,
+    pub(crate) quota_revision: OffsetDateTime,
+}
+
 /// Convert the persisted serving-layer configuration into the storage-level
 /// [`DefaultRetention`](crate::bucket::object_lock::types::DefaultRetention)
 /// the WORM evaluation code consumes (rustfs/backlog#1842). A rule without a
@@ -311,6 +319,33 @@ pub async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {
     let sys = get_bucket_metadata_sys()?;
     let lock = sys.read().await;
     Ok(lock.remove(bucket).await)
+}
+
+/// Remove a peer's cached metadata only when the bucket is absent under the
+/// namespace read fence. A delayed delete notification must not withdraw the
+/// metadata of a same-name bucket that has already been recreated.
+pub async fn remove_bucket_metadata_if_absent(api: Arc<ECStore>, bucket: &str) -> Result<bool> {
+    if is_meta_bucketname(bucket) {
+        return Ok(false);
+    }
+    // Lock order: bucket namespace read -> metadata system read (released)
+    // -> metadata publish, matching peer reloads.
+    let namespace_lock = api.new_ns_lock(bucket, bucket).await?;
+    let namespace_guard = namespace_lock
+        .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
+        .await?;
+    let sys = bucket_metadata_sys_of(&api.ctx)?;
+    let sys = sys.read().await.clone();
+    if sys
+        .bucket_exists(bucket, &namespace_guard, "peer bucket metadata removal existence check")
+        .await?
+    {
+        return Ok(false);
+    }
+    await_bucket_namespace_operation(Some(&namespace_guard), bucket, "peer bucket metadata removal", async {
+        Ok(sys.remove(bucket).await)
+    })
+    .await
 }
 
 fn start_refresh_buckets_metadata_loop(sys: Arc<RwLock<BucketMetadataSys>>) {
@@ -490,6 +525,84 @@ pub(crate) async fn get_bucket_incarnation_id_in(ctx: &crate::runtime::instance:
     sys.get_bucket_incarnation_id_from_disk(bucket).await
 }
 
+pub(crate) async fn find_bucket_incarnation_id_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Option<Uuid>> {
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let sys = sys.read().await.clone();
+    sys.find_bucket_incarnation_id_from_disk(bucket).await
+}
+
+/// Directory loss is recoverable only for a committed, non-retired generation.
+/// The caller retains the bucket lifecycle fence through the ensuing reconstruction.
+pub(crate) async fn validate_bucket_reconstruction_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    expected: Uuid,
+) -> Result<()> {
+    let api = bucket_metadata_sys_of(ctx)?.read().await.object_store();
+    let lock = api
+        .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
+        .await?;
+    let guard = lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?;
+    let (metadata, persisted) = load_bucket_metadata_parse_with_presence(api.clone(), bucket, true).await?;
+    if !persisted
+        || !metadata.bucket_incarnation_sidecar
+        || expected.is_nil()
+        || metadata.bucket_incarnation_id != expected
+        || !metadata.bucket_creation_committed
+    {
+        return Err(Error::PreconditionFailed);
+    }
+    if crate::bucket::retirement::is_retired(api, bucket, expected).await? {
+        return Err(Error::BucketNotFound(bucket.to_owned()));
+    }
+    if guard.is_lock_lost() {
+        return Err(Error::PreconditionFailed);
+    }
+    Ok(())
+}
+
+/// Resolve the authoritative bucket incarnation id for `opts`:
+/// 1. When namespace locking is enabled and `opts.object_lock_config_snapshot` is
+///    present, validate and return the snapshot's incarnation under its held
+///    lifecycle and metadata-transaction fences.
+/// 2. When namespace locking is enabled and `opts.bucket_lifecycle_lock_fence` is
+///    present and not lost, reuse the store's `BucketFenceRegistry` memo if a
+///    registered lifecycle read guard is currently held without lock loss.
+/// 3. Otherwise, acquire the bucket metadata transaction read lock (unless
+///    already held on `opts`) and read the incarnation from disk.
+pub(crate) async fn get_bucket_incarnation_id_for_options_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    opts: &ObjectOptions,
+) -> Result<Uuid> {
+    if !ctx.lock_manager().is_disabled() {
+        if let Some(snapshot) = opts.object_lock_config_snapshot.as_ref() {
+            let store = object_store_in(ctx).await?;
+            return snapshot
+                .validated_bucket_incarnation_for(store.id, bucket, opts.expected_bucket_incarnation_id)
+                .ok_or_else(|| {
+                    Error::other("Object Lock snapshot does not hold a valid metadata transaction fence for this bucket")
+                });
+        }
+        if opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_lock_lost())
+            && let Some(store) = object_store_if_initialized_in(ctx).await
+            && let Some(incarnation) = store.bucket_fence_registry.validated_incarnation(bucket)
+        {
+            return Ok(incarnation);
+        }
+    }
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let sys = sys.read().await.clone();
+    let guard = acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts).await?;
+    sys.get_bucket_incarnation_id_under_transaction_lock(bucket, &guard).await
+}
+
 pub(crate) async fn get_cached_bucket_incarnation_id_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
@@ -514,11 +627,19 @@ pub(crate) async fn set_new_bucket_metadata_in(
     lock.persist_new_and_set(bm).await
 }
 
-pub(crate) async fn cache_bucket_metadata_in(ctx: &crate::runtime::instance::InstanceContext, bm: BucketMetadata) -> Result<()> {
+pub(crate) async fn set_new_bucket_metadata_intent_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bm: BucketMetadata,
+) -> Result<()> {
     let sys = bucket_metadata_sys_of(ctx)?;
     let lock = sys.read().await;
-    lock.set(bm.name.clone(), Arc::new(bm)).await;
-    Ok(())
+    lock.persist_new_bucket_metadata_intent(bm).await
+}
+
+pub(crate) async fn commit_bucket_metadata_in(ctx: &crate::runtime::instance::InstanceContext, bm: BucketMetadata) -> Result<()> {
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let lock = sys.read().await;
+    lock.commit_bucket_metadata(bm).await
 }
 
 pub(crate) async fn remove_bucket_metadata_in(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<bool> {
@@ -553,6 +674,27 @@ pub(crate) async fn update_in(
     data: Vec<u8>,
 ) -> Result<OffsetDateTime> {
     Box::pin(update_with_sys(require_bucket_metadata_sys_in(ctx)?, bucket, config_file, data)).await
+}
+
+/// Validate a caller's fence after acquiring the lifecycle and metadata
+/// transaction locks, before changing the configuration.
+pub(crate) async fn update_validated_in<F>(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    config_file: &str,
+    data: Vec<u8>,
+    validate: F,
+) -> Result<OffsetDateTime>
+where
+    F: FnOnce() -> Result<()> + Send,
+{
+    Box::pin(async {
+        let sys = require_bucket_metadata_sys_in(ctx)?;
+        let guard = acquire_config_write_guard(sys.clone(), bucket).await?;
+        validate()?;
+        update_under_config_write_guard(sys, &guard, config_file, data, None).await
+    })
+    .await
 }
 
 pub async fn delete(bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
@@ -912,6 +1054,52 @@ async fn update_quota_if_incarnation_stamped(
     update_under_config_write_guard(sys, &guard, rustfs_config::QUOTA_CONFIG_FILE, data, updated_at).await
 }
 
+/// Rewrite the quota configuration only while the bucket still carries
+/// `expected_incarnation_id` and `expected_quota_revision` (its
+/// `quota_config_updated_at`), under the same guards and fleet proof as
+/// [`update_quota_if_incarnation`].
+///
+/// The revision check turns a stale read into a typed
+/// [`Error::PreconditionFailed`] instead of a lost update: the reservation
+/// protocol migration (rustfs/backlog#2904) rewrites a configuration it read
+/// from the cache, and an admin save landing in between must win. The system
+/// is passed explicitly so the write publishes into the cache the caller
+/// reads from.
+pub async fn update_quota_with_sys_if_incarnation_and_revision(
+    sys: Arc<RwLock<BucketMetadataSys>>,
+    bucket: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Uuid,
+    expected_quota_revision: OffsetDateTime,
+    proof: &crate::services::notification_sys::CrossPoolFenceFleetProofToken,
+) -> Result<OffsetDateTime> {
+    let guard = Box::pin(acquire_config_write_guard_for_incarnation(
+        sys.clone(),
+        bucket,
+        Some(expected_incarnation_id),
+    ))
+    .await?;
+    if !crate::services::notification_sys::cross_pool_fence_fleet_proof_matches(proof) {
+        return Err(Error::NamespaceLockQuorumUnavailable {
+            mode: "quota_capability",
+            bucket: bucket.to_string(),
+            object: rustfs_config::QUOTA_CONFIG_FILE.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    let metadata_sys = sys.read().await.clone();
+    match Box::pin(metadata_sys.read_authoritative_metadata_from_disk_under_transaction_lock(bucket)).await? {
+        BucketMetadataAuthority::Authoritative(current) if current.quota_config_updated_at == expected_quota_revision => {}
+        BucketMetadataAuthority::Authoritative(_) => return Err(Error::PreconditionFailed),
+        BucketMetadataAuthority::MissingBucket => return Err(Error::BucketNotFound(bucket.to_string())),
+        BucketMetadataAuthority::Fabricated => {
+            return Err(Error::other("bucket quota metadata is not authoritative"));
+        }
+    }
+    update_under_config_write_guard(sys, &guard, rustfs_config::QUOTA_CONFIG_FILE, data, None).await
+}
+
 pub async fn update_bucket_targets_under_transaction_lock(
     guard: &BucketMetadataMutationGuard,
     bucket: &str,
@@ -1055,6 +1243,24 @@ pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_in(
     Ok(lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?)
 }
 
+/// Readers already holding an Object Lock snapshot must share its guard:
+/// a fresh read acquisition can queue behind a writer waiting for that snapshot.
+pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_for_options_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    opts: &ObjectOptions,
+) -> Result<Arc<rustfs_lock::NamespaceLockGuard>> {
+    if let Some(snapshot) = opts.object_lock_config_snapshot.as_ref() {
+        let store = object_store_in(ctx).await?;
+        return snapshot
+            .metadata_transaction_guard_for(store.id, bucket, opts.expected_bucket_incarnation_id)
+            .ok_or_else(|| {
+                Error::other("Object Lock snapshot does not hold a valid metadata transaction fence for this bucket")
+            });
+    }
+    Ok(Arc::new(acquire_bucket_metadata_transaction_read_lock_in(ctx, bucket).await?))
+}
+
 async fn acquire_transaction_lock_with_sys(
     sys: &Arc<RwLock<BucketMetadataSys>>,
     bucket: &str,
@@ -1093,7 +1299,7 @@ async fn acquire_transaction_lock_with_sys(
 /// agree on, so renaming it would leave a mixed-version cluster with two
 /// disjoint keys — and old and new nodes would stop excluding each other on
 /// the very writes that are serialized today.
-fn bucket_metadata_transaction_lock_key(bucket: &str) -> String {
+pub(crate) fn bucket_metadata_transaction_lock_key(bucket: &str) -> String {
     format!("bucket-targets/{bucket}/transaction.lock")
 }
 
@@ -1229,26 +1435,105 @@ pub(crate) async fn get_object_lock_config_state_in(
 
 /// Re-read the Object Lock state and bucket incarnation from the same
 /// authoritative metadata blob while the caller holds the transaction lock.
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
 ) -> Result<(ObjectLockConfigState, Uuid, OffsetDateTime)> {
+    get_object_lock_config_and_incarnation_from_disk_with_guard_in(ctx, bucket, None).await
+}
+
+/// Bucket deletion already owns the namespace/lifecycle fences. Reuse its
+/// live guard rather than recursively acquiring the bucket namespace lock.
+/// The caller must also hold the metadata transaction read lock.
+pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_with_guard_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(ObjectLockConfigState, Uuid, OffsetDateTime)> {
+    get_delete_config_from_disk_in(ctx, bucket, guard, None).await
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) async fn get_object_lock_and_quota_config_from_disk_with_guard_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(
+    ObjectLockConfigState,
+    Uuid,
+    OffsetDateTime,
+    std::result::Result<(Option<BucketQuota>, Uuid, OffsetDateTime), String>,
+)> {
+    let (state, incarnation_id, updated_at, quota_res) =
+        get_delete_and_quota_config_from_disk_in(ctx, bucket, guard, None, true).await?;
+    Ok((
+        state,
+        incarnation_id,
+        updated_at,
+        quota_res.unwrap_or(Ok((None, incarnation_id, updated_at))),
+    ))
+}
+
+/// Validate queued expiration against the same fresh metadata used for Object
+/// Lock admission. The caller holds the transaction read lock through commit,
+/// so a successful lifecycle update cannot be followed by an old-policy delete.
+pub(crate) async fn get_delete_config_from_disk_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    expiry_policy: Option<&rustfs_lifecycle::ExpiryPolicySnapshot>,
+) -> Result<(ObjectLockConfigState, Uuid, OffsetDateTime)> {
+    let (state, incarnation_id, updated_at, _) =
+        get_delete_and_quota_config_from_disk_in(ctx, bucket, guard, expiry_policy, false).await?;
+    Ok((state, incarnation_id, updated_at))
+}
+
+#[allow(clippy::type_complexity)]
+async fn get_delete_and_quota_config_from_disk_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    expiry_policy: Option<&rustfs_lifecycle::ExpiryPolicySnapshot>,
+    include_quota: bool,
+) -> Result<(
+    ObjectLockConfigState,
+    Uuid,
+    OffsetDateTime,
+    Option<std::result::Result<(Option<BucketQuota>, Uuid, OffsetDateTime), String>>,
+)> {
     let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
 
-    match bucket_meta_sys
-        .read_authoritative_metadata_from_disk_under_transaction_lock(bucket)
-        .await?
-    {
+    let authority = match guard {
+        Some(guard) => {
+            bucket_meta_sys
+                .read_authoritative_metadata_from_disk_under_guard(bucket, guard)
+                .await?
+        }
+        None => {
+            bucket_meta_sys
+                .read_authoritative_metadata_from_disk_under_transaction_lock(bucket)
+                .await?
+        }
+    };
+    match &authority {
         BucketMetadataAuthority::Authoritative(metadata)
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
+            if let Some(expected) = expiry_policy {
+                let current = ConfigState::of(&metadata.lifecycle_config_xml, &metadata.lifecycle_config)
+                    .require(bucket, BUCKET_LIFECYCLE_CONFIG)?;
+                if !expected.matches_configuration(current) {
+                    return Err(Error::PreconditionFailed);
+                }
+            }
             let object_lock_config_updated_at = metadata.object_lock_config_updated_at;
-            Ok((
-                object_lock_config_state_from_authoritative_metadata(&metadata)?,
-                metadata.bucket_incarnation_id,
-                object_lock_config_updated_at,
-            ))
+            let state = object_lock_config_state_from_authoritative_metadata(metadata)?;
+            let incarnation_id = metadata.bucket_incarnation_id;
+            let quota_res = include_quota
+                .then(|| quota_config_and_incarnation_from_authority(bucket, authority).map_err(|err| err.to_string()));
+            Ok((state, incarnation_id, object_lock_config_updated_at, quota_res))
         }
         BucketMetadataAuthority::Authoritative(_) => {
             Err(Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}")))
@@ -1257,6 +1542,28 @@ pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_in(
         BucketMetadataAuthority::Fabricated => {
             Err(Error::other(format!("bucket Object Lock metadata is not authoritative: {bucket}")))
         }
+    }
+}
+
+/// Inspect all migration-relevant settings while the caller holds an Object Lock
+/// snapshot's lifecycle and metadata transaction guards. Cached settings are not
+/// sufficient to authorize a direct storage writer that cannot apply S3 defaults.
+pub(crate) async fn integrity_migration_metadata_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Arc<BucketMetadata>> {
+    let sys = bucket_metadata_sys_of(ctx)?.read().await.clone();
+    match sys
+        .read_authoritative_metadata_from_disk_under_transaction_lock(bucket)
+        .await?
+    {
+        BucketMetadataAuthority::Authoritative(metadata)
+            if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
+        {
+            Ok(metadata)
+        }
+        BucketMetadataAuthority::MissingBucket => Err(Error::BucketNotFound(bucket.to_string())),
+        _ => Err(Error::other("migration requires authoritative bucket metadata")),
     }
 }
 
@@ -1270,13 +1577,77 @@ pub(crate) async fn get_quota_config_and_incarnation_from_disk_in(
     let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
 
-    match bucket_meta_sys
-        .read_authoritative_metadata_from_disk_under_transaction_lock(bucket)
-        .await?
+    quota_config_and_incarnation_from_authority(
+        bucket,
+        bucket_meta_sys
+            .read_authoritative_metadata_from_disk_under_transaction_lock(bucket)
+            .await?,
+    )
+}
+
+pub(crate) async fn get_quota_config_and_incarnation_from_disk_for_options_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    opts: &ObjectOptions,
+    transaction_guard: &Arc<rustfs_lock::NamespaceLockGuard>,
+) -> Result<(Option<BucketQuota>, Uuid, OffsetDateTime)> {
+    let Some(snapshot) = opts.object_lock_config_snapshot.as_ref() else {
+        return get_quota_config_and_incarnation_from_disk_in(ctx, bucket).await;
+    };
+    let sys = bucket_metadata_sys_of(ctx)?.read().await.clone();
+    let store = sys.object_store();
+    let snapshot_guard = snapshot
+        .metadata_transaction_guard_for(store.id, bucket, opts.expected_bucket_incarnation_id)
+        .filter(|guard| Arc::ptr_eq(guard, transaction_guard))
+        .ok_or_else(|| Error::other("quota snapshot does not hold this bucket's metadata transaction fence"))?;
+    if snapshot_guard.is_released() {
+        return Err(Error::other("quota snapshot metadata transaction fence was released"));
+    }
+
+    #[cfg(test)]
+    let has_injected_error = sys.object_lock_disk_read_errors.read().await.contains(bucket);
+    #[cfg(not(test))]
+    let has_injected_error = false;
+    if !ctx.lock_manager().is_disabled()
+        && !has_injected_error
+        && let Some(fresh_quota) = snapshot.take_fresh_put_quota()
     {
+        if snapshot_guard.is_lock_lost()
+            || snapshot_guard.is_released()
+            || !snapshot.is_valid_for_destructive_put(store.id, bucket, opts.expected_bucket_incarnation_id.unwrap_or_default())
+        {
+            return Err(Error::other("quota snapshot fence or bucket incarnation changed during the disk read"));
+        }
+        return fresh_quota.map_err(Error::other);
+    }
+
+    // The snapshot carries the caller's lifecycle fence, excluding deletion.
+    // Its transaction guard excludes config writes, so a same-name object
+    // owner need not recursively acquire the bucket namespace here.
+    let authority = sys
+        .read_authoritative_metadata_from_disk_under_guard(bucket, transaction_guard)
+        .await?;
+    if snapshot_guard.is_lock_lost()
+        || snapshot_guard.is_released()
+        || matches!(&authority, BucketMetadataAuthority::Authoritative(metadata)
+            if !snapshot.is_valid_for_destructive_put(store.id, bucket, metadata.bucket_incarnation_id))
+    {
+        return Err(Error::other("quota snapshot fence or bucket incarnation changed during the disk read"));
+    }
+    quota_config_and_incarnation_from_authority(bucket, authority)
+}
+
+fn quota_config_and_incarnation_from_authority(
+    bucket: &str,
+    authority: BucketMetadataAuthority,
+) -> Result<(Option<BucketQuota>, Uuid, OffsetDateTime)> {
+    match authority {
         BucketMetadataAuthority::Authoritative(metadata)
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
+            if !metadata.quota_config_json.is_empty() && metadata.quota_config.is_none() {
+                return Err(Error::other("persisted bucket quota configuration is invalid"));
+            }
             Ok((
                 metadata.quota_config.clone(),
                 metadata.bucket_incarnation_id,
@@ -1289,6 +1660,15 @@ pub(crate) async fn get_quota_config_and_incarnation_from_disk_in(
         BucketMetadataAuthority::MissingBucket => Err(Error::BucketNotFound(bucket.to_string())),
         BucketMetadataAuthority::Fabricated => Err(Error::other(format!("bucket quota metadata is not authoritative: {bucket}"))),
     }
+}
+
+pub(crate) async fn get_cached_quota_config_and_incarnation_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Option<CachedQuotaMetadataSnapshot>> {
+    let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
+    bucket_meta_sys.cached_quota_config_and_incarnation(bucket).await
 }
 
 pub async fn get_replication_config(bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
@@ -1427,9 +1807,22 @@ struct MetadataPublishGuard {
     _guard: tokio::sync::OwnedMutexGuard<MetadataPublishLockState>,
 }
 
+static LOCAL_META_MUTATION_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn bump_local_meta_mutation_gen() {
+    LOCAL_META_MUTATION_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn current_local_meta_mutation_gen() -> u64 {
+    LOCAL_META_MUTATION_GEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+type LocalAuthorityCache = Arc<StdMutex<HashMap<String, (u64, Arc<BucketMetadata>)>>>;
+
 #[derive(Debug, Clone)]
 pub struct BucketMetadataSys {
     metadata_map: Arc<RwLock<HashMap<String, Arc<BucketMetadata>>>>,
+    local_authority_cache: LocalAuthorityCache,
     /// Serializes metadata-map commits and their derived cache updates for one
     /// bucket. Namespace locks, when present, are acquired before this lock.
     metadata_publish_locks: Arc<MetadataPublishLockRegistry>,
@@ -1473,6 +1866,7 @@ impl BucketMetadataSys {
     pub fn new(api: Arc<ECStore>) -> Self {
         Self {
             metadata_map: Arc::new(RwLock::new(HashMap::new())),
+            local_authority_cache: Arc::new(StdMutex::new(HashMap::new())),
             metadata_publish_locks: Arc::new(MetadataPublishLockRegistry {
                 locks: StdMutex::new(HashMap::new()),
             }),
@@ -1837,6 +2231,7 @@ impl BucketMetadataSys {
     }
 
     pub async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
+        bump_local_meta_mutation_gen();
         if !is_meta_bucketname(&bucket) {
             let publish_lock = self.metadata_publish_lock(&bucket);
             let _publish_guard = publish_lock.lock().await;
@@ -1855,6 +2250,7 @@ impl BucketMetadataSys {
     ///
     /// Returns `true` if an entry was present. Reserved meta buckets are ignored.
     pub async fn remove(&self, bucket: &str) -> bool {
+        bump_local_meta_mutation_gen();
         if is_meta_bucketname(bucket) {
             return false;
         }
@@ -1875,6 +2271,7 @@ impl BucketMetadataSys {
     }
 
     async fn _reset(&mut self) {
+        bump_local_meta_mutation_gen();
         let mut map = self.metadata_map.write().await;
         map.clear();
         drop(map);
@@ -2021,9 +2418,32 @@ impl BucketMetadataSys {
     }
 
     async fn persist_new_and_set(&self, mut bm: BucketMetadata) -> Result<()> {
+        bm.bucket_creation_committed = true;
+        bm.save_with_store_committed(self.object_store()).await?;
+        save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
+        bm.bucket_incarnation_sidecar = true;
+        self.set(bm.name.clone(), Arc::new(bm)).await;
+        Ok(())
+    }
+
+    async fn persist_new_bucket_metadata_intent(&self, mut bm: BucketMetadata) -> Result<()> {
+        bm.bucket_creation_committed = false;
         bm.save_with_store(self.object_store()).await?;
         save_bucket_incarnation(self.object_store(), &bm.name, bm.bucket_incarnation_id).await?;
         bm.bucket_incarnation_sidecar = true;
+        // A pending creation intent must not enter the authoritative cache. The
+        // caller publishes it only after physical creation and commit-marker write.
+        Ok(())
+    }
+
+    async fn commit_bucket_metadata(&self, mut bm: BucketMetadata) -> Result<()> {
+        bm.parse_all_configs()?;
+        bm.bucket_incarnation_sidecar = true;
+        // The caller holds the full bucket creation fence (lifecycle, metadata
+        // transaction, and namespace write) and physical creation already
+        // returned, so this generation is committed.
+        bm.bucket_creation_committed = true;
+        bm.save_with_store_committed(self.object_store()).await?;
         self.set(bm.name.clone(), Arc::new(bm)).await;
         Ok(())
     }
@@ -2139,18 +2559,25 @@ impl BucketMetadataSys {
             )
             .await?;
 
-            let bm = Arc::new(bm);
-
             if persisted {
+                // Object Lock metadata is persisted before physical bucket creation as a
+                // creation intent. The commit marker distinguishes a committed bucket
+                // from an intent left behind by an interrupted create.
+                let require_write_quorum = bm.needs_bucket_creation_commit();
+
                 await_bucket_namespace_operation(
                     Some(&guard),
                     bucket,
                     "lazy bucket metadata existence check",
                     Box::pin(async {
-                        self.object_store()
-                            .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
-                            .await
-                            .map(|_| ())
+                        let store = self.object_store();
+                        let options = crate::storage_api_contracts::bucket::BucketOptions::default();
+                        let info = if require_write_quorum {
+                            store.get_bucket_info_from_sets(bucket, &options).await
+                        } else {
+                            store.get_bucket_info_from_sets_at_read_quorum(bucket, &options).await
+                        };
+                        info.map(|_| ())
                     }),
                 )
                 .await?;
@@ -2159,6 +2586,7 @@ impl BucketMetadataSys {
                         "bucket namespace lock was lost before lazy bucket metadata publish: {bucket}"
                     )));
                 }
+                let bm = Arc::new(bm);
                 let _publish_guard = self
                     .lock_metadata_publish(bucket, &guard, "lazy bucket metadata publish")
                     .await?;
@@ -2173,6 +2601,7 @@ impl BucketMetadataSys {
                 sync_bucket_target_sys(bucket, &bm).await;
                 sync_bucket_durability(bucket, &bm);
                 sync_on_demand_migration(bucket, &bm);
+                return Ok((bm, true));
             } else {
                 let exists = self
                     .bucket_exists(bucket, &guard, "lazy bucket metadata existence check")
@@ -2192,7 +2621,7 @@ impl BucketMetadataSys {
                 }
             }
 
-            Ok((bm, true))
+            Ok((Arc::new(bm), true))
         }
     }
 
@@ -2350,6 +2779,11 @@ impl BucketMetadataSys {
     }
 
     async fn get_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Uuid> {
+        let incarnation_id = self.find_bucket_incarnation_id_from_disk(bucket).await?;
+        Self::require_bucket_incarnation_id(bucket, incarnation_id)
+    }
+
+    async fn find_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Option<Uuid>> {
         let transaction_lock = self
             .object_store()
             .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
@@ -2357,18 +2791,45 @@ impl BucketMetadataSys {
         let _transaction_guard = transaction_lock
             .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
             .await?;
+        self.find_bucket_incarnation_id_under_transaction_lock(bucket, &_transaction_guard)
+            .await
+    }
+
+    async fn get_bucket_incarnation_id_under_transaction_lock(
+        &self,
+        bucket: &str,
+        transaction_guard: &rustfs_lock::NamespaceLockGuard,
+    ) -> Result<Uuid> {
+        let incarnation_id = self
+            .find_bucket_incarnation_id_under_transaction_lock(bucket, transaction_guard)
+            .await?;
+        Self::require_bucket_incarnation_id(bucket, incarnation_id)
+    }
+
+    fn require_bucket_incarnation_id(bucket: &str, incarnation_id: Option<Uuid>) -> Result<Uuid> {
+        incarnation_id.ok_or_else(|| Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}")))
+    }
+
+    async fn find_bucket_incarnation_id_under_transaction_lock(
+        &self,
+        bucket: &str,
+        transaction_guard: &rustfs_lock::NamespaceLockGuard,
+    ) -> Result<Option<Uuid>> {
         let incarnation_id = load_bucket_incarnation(self.object_store(), bucket).await?;
-        if _transaction_guard.is_lock_lost() {
+        if transaction_guard.is_lock_lost() {
             return Err(Error::other(format!("bucket incarnation metadata transaction lock was lost: {bucket}")));
         }
-        match incarnation_id {
-            Some(incarnation_id) if !incarnation_id.is_nil() => Ok(incarnation_id),
-            _ => Err(Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}"))),
-        }
+        Ok(incarnation_id)
     }
 
     async fn get_metadata_authority(&self, bucket: &str) -> Result<BucketMetadataAuthority> {
-        if let Some(bm) = self.metadata_map.read().await.get(bucket).cloned() {
+        // Bind before matching: holding the map guard across the migration would
+        // deadlock on the publish write.
+        let cached = self.metadata_map.read().await.get(bucket).cloned();
+        if let Some(bm) = cached {
+            if bm.needs_bucket_creation_commit() {
+                return self.migrate_bucket_creation_commit(bucket).await;
+            }
             return Ok(BucketMetadataAuthority::Authoritative(bm));
         }
         if self.fabricated_metadata.read().await.contains(bucket) {
@@ -2380,8 +2841,13 @@ impl BucketMetadataSys {
 
         self.get_config(bucket).await?;
 
-        if let Some(bm) = self.metadata_map.read().await.get(bucket).cloned() {
-            Ok(BucketMetadataAuthority::Authoritative(bm))
+        let loaded = self.metadata_map.read().await.get(bucket).cloned();
+        if let Some(bm) = loaded {
+            if bm.needs_bucket_creation_commit() {
+                self.migrate_bucket_creation_commit(bucket).await
+            } else {
+                Ok(BucketMetadataAuthority::Authoritative(bm))
+            }
         } else if self.fabricated_metadata.read().await.contains(bucket) {
             Ok(BucketMetadataAuthority::Fabricated)
         } else if self.missing_buckets.get(bucket).await.is_some() {
@@ -2389,6 +2855,70 @@ impl BucketMetadataSys {
         } else {
             Err(Error::other(format!("bucket metadata authority was not classified: {bucket}")))
         }
+    }
+
+    /// Persist the creation-commit proof for an Object Lock bucket created
+    /// before this field existed.
+    ///
+    /// Lock order matches the established config-write order: metadata
+    /// transaction (write), then bucket namespace (read). The authoritative
+    /// metadata is re-read under both fences and the physical namespace is
+    /// revalidated at write quorum, so a stale snapshot can neither revert an
+    /// acknowledged configuration update nor outlive a delete/recreate.
+    async fn migrate_bucket_creation_commit(&self, bucket: &str) -> Result<BucketMetadataAuthority> {
+        let transaction_lock = self
+            .object_store()
+            .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
+            .await?;
+        let transaction_guard = transaction_lock
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await?;
+        let namespace_lock = self.object_store().new_ns_lock(bucket, bucket).await?;
+        let namespace_guard = namespace_lock
+            .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await?;
+
+        // Write quorum must still prove that the physical namespace committed.
+        await_bucket_namespace_operation(
+            Some(&namespace_guard),
+            bucket,
+            "bucket creation commitment existence check",
+            self.object_store()
+                .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default()),
+        )
+        .await?;
+
+        let (mut metadata, persisted) = await_bucket_namespace_operation(
+            Some(&namespace_guard),
+            bucket,
+            "bucket creation commitment metadata reload",
+            load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
+        )
+        .await?;
+        if !persisted {
+            return Ok(BucketMetadataAuthority::Fabricated);
+        }
+        if metadata.needs_bucket_creation_commit() {
+            metadata.bucket_creation_committed = true;
+            metadata.save_with_store_committed(self.object_store()).await?;
+        }
+
+        if transaction_guard.is_lock_lost() || namespace_guard.is_lock_lost() {
+            // Stable message: formatted per-bucket detail would split quorum
+            // error buckets (backlog#1845).
+            return Err(Error::other("bucket creation commitment fence was lost before publish"));
+        }
+        let metadata = Arc::new(metadata);
+        let _publish_guard = self
+            .lock_metadata_publish(bucket, &namespace_guard, "bucket creation commitment publish")
+            .await?;
+        self.metadata_map
+            .write()
+            .await
+            .insert(bucket.to_string(), Arc::clone(&metadata));
+        self.fabricated_metadata.write().await.remove(bucket);
+        self.missing_buckets.invalidate(bucket).await;
+        Ok(BucketMetadataAuthority::Authoritative(metadata))
     }
 
     async fn migrate_legacy_metadata(&self, bucket: &str) -> Result<BucketMetadataAuthority> {
@@ -2464,6 +2994,16 @@ impl BucketMetadataSys {
         if !persisted {
             metadata = BucketMetadata::new(bucket);
             metadata.created = bucket_info.created.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            // An interrupted migration may already have published this
+            // bucket's incarnation; re-read it under the transaction lock so
+            // the retry never replaces an identity other nodes fenced on. A
+            // retired incarnation is residue of a deleted bucket and must not
+            // come back, or heal would reclaim the bucket's new objects.
+            if let Some(stored) = load_bucket_incarnation(self.object_store(), bucket).await?
+                && !crate::bucket::retirement::is_retired(self.object_store(), bucket, stored).await?
+            {
+                metadata.bucket_incarnation_id = stored;
+            }
         } else if metadata.bucket_incarnation_id.is_nil() {
             metadata.bucket_incarnation_id = Uuid::new_v4();
         }
@@ -2492,7 +3032,6 @@ impl BucketMetadataSys {
                 .await?;
             }
         }
-
         if namespace_guard.is_lock_lost() {
             return Err(Error::other(format!(
                 "bucket namespace lock was lost before legacy metadata publish: {bucket}"
@@ -2518,44 +3057,95 @@ impl BucketMetadataSys {
         &self,
         bucket: &str,
     ) -> Result<BucketMetadataAuthority> {
+        let namespace_lock = self.object_store().new_ns_lock(bucket, bucket).await?;
+        let namespace_guard = namespace_lock
+            .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await?;
+        self.read_authoritative_metadata_from_disk_under_guard(bucket, &namespace_guard)
+            .await
+    }
+
+    async fn read_authoritative_metadata_from_disk_under_guard(
+        &self,
+        bucket: &str,
+        guard: &rustfs_lock::NamespaceLockGuard,
+    ) -> Result<BucketMetadataAuthority> {
         #[cfg(test)]
         if self.object_lock_disk_read_errors.write().await.remove(bucket) {
             return Err(Error::other(format!("injected Object Lock metadata disk read failure: {bucket}")));
         }
 
-        let namespace_lock = self.object_store().new_ns_lock(bucket, bucket).await?;
-        let namespace_guard = namespace_lock
-            .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
+        let store = self.object_store();
+        let can_use_local_authority_cache = !store.ctx.lock_manager().is_disabled() && store.all_disks_local_and_online();
+        let gen_before = current_local_meta_mutation_gen();
+        let cached_authority = can_use_local_authority_cache
+            .then(|| {
+                self.local_authority_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(bucket)
+                    .filter(|(cached_gen, _)| *cached_gen == gen_before)
+                    .map(|(_, bm)| Arc::clone(bm))
+            })
+            .flatten();
+        if let Some(cached) = cached_authority {
+            await_bucket_namespace_operation(
+                Some(guard),
+                bucket,
+                "bucket metadata authoritative snapshot",
+                std::future::ready(Ok::<_, Error>(())),
+            )
             .await?;
-        match await_bucket_namespace_operation(
-            Some(&namespace_guard),
-            bucket,
-            "bucket metadata snapshot existence check",
-            async {
-                self.object_store()
-                    .get_bucket_info_from_sets_at_read_quorum(
-                        bucket,
-                        &crate::storage_api_contracts::bucket::BucketOptions::default(),
-                    )
-                    .await
-            },
-        )
-        .await
-        {
+            if current_local_meta_mutation_gen() == gen_before && store.all_disks_local_and_online() {
+                return Ok(BucketMetadataAuthority::Authoritative(cached));
+            }
+        }
+
+        let (bucket_info_res, metadata_res) = tokio::join!(
+            Box::pin(await_bucket_namespace_operation(
+                Some(guard),
+                bucket,
+                "bucket metadata snapshot existence check",
+                async {
+                    store
+                        .get_bucket_info_from_sets_at_read_quorum(
+                            bucket,
+                            &crate::storage_api_contracts::bucket::BucketOptions::default(),
+                        )
+                        .await
+                },
+            )),
+            Box::pin(await_bucket_namespace_operation(
+                Some(guard),
+                bucket,
+                "bucket metadata authoritative snapshot",
+                load_bucket_metadata_parse_with_presence(Arc::clone(&store), bucket, true),
+            )),
+        );
+        match bucket_info_res {
             Ok(_) => {}
             Err(Error::VolumeNotFound) => return Ok(BucketMetadataAuthority::MissingBucket),
             Err(err) => return Err(err),
         }
 
-        let (metadata, persisted) = await_bucket_namespace_operation(
-            Some(&namespace_guard),
-            bucket,
-            "bucket metadata authoritative snapshot",
-            load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
-        )
-        .await?;
+        let (metadata, persisted) = metadata_res?;
+        if persisted && metadata.lock_enabled && !metadata.bucket_creation_committed {
+            return Err(Error::ErasureWriteQuorum);
+        }
         if persisted {
-            Ok(BucketMetadataAuthority::Authoritative(Arc::new(metadata)))
+            let metadata = Arc::new(metadata);
+            if can_use_local_authority_cache
+                && metadata.bucket_incarnation_sidecar
+                && !metadata.bucket_incarnation_id.is_nil()
+                && current_local_meta_mutation_gen() == gen_before
+                && store.all_disks_local_and_online()
+            {
+                self.local_authority_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(bucket.to_string(), (gen_before, Arc::clone(&metadata)));
+            }
+            Ok(BucketMetadataAuthority::Authoritative(metadata))
         } else {
             Ok(BucketMetadataAuthority::Fabricated)
         }
@@ -2677,6 +3267,27 @@ impl BucketMetadataSys {
         }
     }
 
+    async fn cached_quota_config_and_incarnation(&self, bucket: &str) -> Result<Option<CachedQuotaMetadataSnapshot>> {
+        let metadata = {
+            let metadata_map = self.metadata_map.read().await;
+            metadata_map.get(bucket).cloned()
+        };
+        let Some(metadata) = metadata else {
+            return Ok(None);
+        };
+        if !metadata.bucket_incarnation_sidecar || metadata.bucket_incarnation_id.is_nil() {
+            return Ok(None);
+        }
+        if !metadata.quota_config_json.is_empty() && metadata.quota_config.is_none() {
+            return Err(Error::other("persisted bucket quota configuration is invalid"));
+        }
+        Ok(Some(CachedQuotaMetadataSnapshot {
+            quota: metadata.quota_config.clone(),
+            bucket_incarnation: metadata.bucket_incarnation_id,
+            quota_revision: metadata.quota_config_updated_at,
+        }))
+    }
+
     pub async fn get_replication_config(&self, bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
         let (bm, _) = self.get_config(bucket).await?;
 
@@ -2723,9 +3334,17 @@ pub mod test_support {
     use crate::store::init_local_disks_with_instance_ctx;
 
     pub async fn isolated_store_over_temp_disks() -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
-        let mut dirs = Vec::with_capacity(4);
-        let mut endpoints = Vec::with_capacity(4);
-        for disk_idx in 0..4 {
+        isolated_store_over_temp_disks_with_count(4).await
+    }
+
+    pub async fn isolated_store_over_temp_disks_with_count(disk_count: usize) -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
+        assert!(
+            matches!(disk_count, 4 | 16),
+            "isolated store fixture requires a registered logical set geometry"
+        );
+        let mut dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        for disk_idx in 0..disk_count {
             let dir = tempfile::tempdir().expect("tempdir should be created");
             let mut endpoint =
                 Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
@@ -2738,7 +3357,7 @@ pub mod test_support {
         let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
             legacy: false,
             set_count: 1,
-            drives_per_set: 4,
+            drives_per_set: disk_count,
             endpoints: Endpoints::from(endpoints),
             cmd_line: "metadata-sys-cache-test".to_string(),
             platform: "test".to_string(),
@@ -3516,6 +4135,98 @@ mod tests {
         assert!(err.to_string().contains("sidecar is missing"));
     }
 
+    /// rustfs/rustfs#8003: the legacy migration writes the incarnation sidecar
+    /// before `.metadata.bin`. A crash or lost namespace lease between the two
+    /// left every pre-existing bucket answering 500 on every request, with no
+    /// path back. The sidecar-only state must load as a legacy bucket, and the
+    /// retried migration must keep the stored incarnation.
+    #[tokio::test]
+    async fn issue_8003_sidecar_without_metadata_loads_as_legacy_and_migrates_with_its_incarnation() {
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore.clone());
+        let bucket = "issue-8003-sidecar-only";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).unwrap();
+        }
+        let stored = Uuid::new_v4();
+        save_bucket_incarnation(ecstore.clone(), bucket, stored)
+            .await
+            .expect("simulate the interrupted migration's first write");
+
+        let (fabricated, persisted) = load_bucket_metadata_parse_with_presence(ecstore.clone(), bucket, true)
+            .await
+            .expect("a sidecar without metadata must read as a legacy bucket, not fail closed");
+        assert!(!persisted);
+        assert!(!fabricated.bucket_incarnation_sidecar);
+
+        let (_, fabricated_read) = sys
+            .get_config(bucket)
+            .await
+            .expect("request-path metadata reads must not fail closed on the sidecar-only state");
+        assert!(fabricated_read);
+
+        let migrated = sys
+            .get_authoritative_metadata(bucket)
+            .await
+            .expect("the retried legacy migration must complete");
+        assert!(migrated.bucket_incarnation_sidecar);
+        assert_eq!(
+            migrated.bucket_incarnation_id, stored,
+            "the retry must adopt the published incarnation instead of minting a new one"
+        );
+        assert_eq!(sys.get_bucket_incarnation_id(bucket).await.unwrap(), stored);
+
+        let on_disk = sys.get_config_from_disk(bucket).await.expect("metadata is now persisted");
+        assert!(on_disk.bucket_incarnation_sidecar);
+        assert_eq!(on_disk.bucket_incarnation_id, stored);
+        assert_eq!(load_bucket_incarnation(ecstore, bucket).await.unwrap(), Some(stored));
+    }
+
+    /// A sidecar left behind by a deleted bucket names a retired incarnation.
+    /// The migration must mint a new identity for a same-name volume instead
+    /// of re-publishing the retired one, or heal would treat the bucket's new
+    /// objects as reclaimable residue.
+    #[tokio::test]
+    async fn issue_8003_sidecar_only_migration_does_not_adopt_a_retired_incarnation() {
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore.clone());
+        let bucket = "issue-8003-retired-sidecar";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).unwrap();
+        }
+        let retired = Uuid::new_v4();
+        save_bucket_incarnation(ecstore.clone(), bucket, retired)
+            .await
+            .expect("residual sidecar");
+        crate::bucket::retirement::commit_retirement(
+            ecstore.clone(),
+            bucket,
+            retired,
+            &ObjectOptions {
+                max_parity: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("retirement record");
+
+        let migrated = sys
+            .get_authoritative_metadata(bucket)
+            .await
+            .expect("the migration must still complete for the same-name volume");
+        assert!(migrated.bucket_incarnation_sidecar);
+        assert_ne!(
+            migrated.bucket_incarnation_id, retired,
+            "a retired incarnation must never be re-published"
+        );
+        assert!(!migrated.bucket_incarnation_id.is_nil());
+        assert_eq!(
+            load_bucket_incarnation(ecstore, bucket).await.unwrap(),
+            Some(migrated.bucket_incarnation_id),
+            "the sidecar must be rewritten to the new incarnation"
+        );
+    }
+
     /// Concurrent cache misses for one bucket must collapse into a single disk
     /// load.
     ///
@@ -3838,6 +4549,114 @@ mod tests {
         bm.update_config(config_file, raw.to_vec())
             .expect("raw config should be stored");
         sys.persist_new_and_set(bm).await.expect("initial metadata should persist");
+    }
+
+    #[tokio::test]
+    async fn reparse_xml_rmw_corruption_refuses_cached_and_reloaded_encryption() {
+        use crate::bucket::metadata::{BUCKET_SSECONFIG, is_unreadable_config_error};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore);
+        let bucket = "reparse-encryption-corrupt";
+        let valid = br#"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#;
+        let corrupt = b"<ServerSideEncryptionConfiguration";
+        persist_bucket_with_raw_config(&sys, &dirs, bucket, BUCKET_SSECONFIG, valid).await;
+        sys.get_sse_config(bucket).await.expect("valid encryption must be readable");
+
+        let updated = sys
+            .update_config_with(bucket, BUCKET_SSECONFIG, |bm| {
+                assert!(bm.sse_config.is_some(), "rewrite must start with parsed encryption");
+                Ok(corrupt.to_vec())
+            })
+            .await
+            .expect("persist future or corrupt raw encryption without failing the whole bucket");
+
+        let err = sys
+            .get_sse_config(bucket)
+            .await
+            .expect_err("cached old encryption must not hide corrupt raw");
+        assert!(is_unreadable_config_error(&err), "cached refusal must retain its type: {err}");
+        let (cached, _) = sys.get_config(bucket).await.expect("bucket remains readable");
+        assert_eq!(cached.encryption_config_xml, corrupt);
+        assert_eq!(cached.encryption_config_updated_at, updated);
+
+        sys.metadata_map.write().await.clear();
+        let err = sys
+            .get_sse_config(bucket)
+            .await
+            .expect_err("reloaded encryption must still refuse corrupt raw");
+        assert!(is_unreadable_config_error(&err), "reloaded refusal must retain its type: {err}");
+
+        let calls = AtomicUsize::new(0);
+        let err = sys
+            .update_config_with(bucket, BUCKET_SSECONFIG, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+            .await
+            .expect_err("another rewrite must refuse before it consumes corrupt encryption");
+        assert!(is_unreadable_config_error(&err));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "refused rewrite must not erase the original raw");
+        let disk = sys
+            .get_config_from_disk(bucket)
+            .await
+            .expect("read unchanged metadata from disk");
+        assert_eq!(disk.encryption_config_xml, corrupt);
+        assert_eq!(disk.encryption_config_updated_at, updated);
+
+        sys.update(bucket, BUCKET_SSECONFIG, valid.to_vec())
+            .await
+            .expect("explicit repair must remain possible");
+        sys.get_sse_config(bucket)
+            .await
+            .expect("repaired cached encryption must be readable");
+        sys.metadata_map.write().await.clear();
+        sys.get_sse_config(bucket).await.expect("repair must survive a disk reload");
+    }
+
+    #[tokio::test]
+    async fn reparse_xml_rmw_removal_clears_cached_and_reloaded_encryption() {
+        use crate::bucket::metadata::BUCKET_SSECONFIG;
+
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        let sys = BucketMetadataSys::new(ecstore);
+        let bucket = "reparse-encryption-removed";
+        let valid = br#"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#;
+        persist_bucket_with_raw_config(&sys, &dirs, bucket, BUCKET_SSECONFIG, valid).await;
+        sys.get_sse_config(bucket).await.expect("valid encryption must be readable");
+
+        let updated = sys
+            .update_config_with(bucket, BUCKET_SSECONFIG, |bm| {
+                assert!(bm.sse_config.is_some(), "rewrite must start with parsed encryption");
+                Ok(Vec::new())
+            })
+            .await
+            .expect("removing encryption must persist");
+
+        assert_eq!(
+            sys.get_sse_config(bucket)
+                .await
+                .expect_err("old cached encryption must be gone"),
+            Error::ConfigNotFound
+        );
+        let (cached, _) = sys.get_config(bucket).await.expect("bucket remains readable");
+        assert!(cached.encryption_config_xml.is_empty());
+        assert_eq!(cached.encryption_config_updated_at, updated);
+
+        sys.metadata_map.write().await.clear();
+        assert_eq!(
+            sys.get_sse_config(bucket)
+                .await
+                .expect_err("removed encryption must stay absent after reload"),
+            Error::ConfigNotFound
+        );
+        let disk = sys
+            .get_config_from_disk(bucket)
+            .await
+            .expect("read removed encryption from disk");
+        assert!(disk.encryption_config_xml.is_empty());
+        assert_eq!(disk.encryption_config_updated_at, updated);
     }
 
     /// rustfs/backlog#1734: a read-modify-write of a stored config that cannot
@@ -4381,6 +5200,154 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn quota_admission_rejects_stale_cached_no_quota() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("scoped metadata system");
+        let bucket = "stale-no-quota-admission";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let (stale, _) = sys.read().await.get_config(bucket).await.expect("cache initial metadata");
+        store
+            .update_bucket_metadata_config(bucket, "quota.json", br#"{"quota":1}"#.to_vec())
+            .await
+            .expect("publish quota to authoritative storage");
+        // Model a peer that has not received the newer configuration snapshot.
+        sys.read().await.set(bucket.to_owned(), stale).await;
+        assert!(
+            get_cached_quota_config_and_incarnation_in(&store.ctx, bucket)
+                .await
+                .expect("read stale cache")
+                .expect("cached bucket identity")
+                .quota
+                .is_none()
+        );
+
+        temp_env::async_with_vars([("RUSTFS_QUOTA_BEGIN_SAFE_NO_QUOTA_CACHE_FAST_PATH", Some("true"))], async {
+            let error = crate::bucket::quota::reservation::begin(&store.ctx, bucket, "object", &ObjectOptions::default(), 0, 0)
+                .await
+                .err()
+                .expect("persisted quota must reject admission without its snapshot");
+            assert!(matches!(error, Error::PartMissingOrCorrupt), "{error:?}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn peer_reload_clears_negative_cache_after_remote_bucket_creation() {
+        let (dirs, node_a, node_b) = two_nodes_over_one_store().await;
+        let bucket = "cross-node-negative-cache-refresh";
+        let node_b_sys = node_b.read().await.clone();
+
+        assert_eq!(
+            node_b_sys.get_bucket_incarnation_id(bucket).await.unwrap_err(),
+            Error::BucketNotFound(bucket.to_string()),
+            "the probe must populate node B's missing-bucket cache"
+        );
+
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("physical bucket should exist before creation metadata");
+        }
+        let created = BucketMetadata::new(bucket);
+        let created_incarnation = created.bucket_incarnation_id;
+        node_a
+            .read()
+            .await
+            .persist_new_and_set(created)
+            .await
+            .expect("node A should publish the created bucket metadata");
+
+        node_b_sys
+            .reload_from_store(bucket)
+            .await
+            .expect("peer reload should clear the stale negative cache");
+        assert_eq!(
+            node_b_sys.get_bucket_incarnation_id(bucket).await.unwrap(),
+            created_incarnation,
+            "node B should resolve the newly created bucket immediately"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn peer_delete_clears_metadata_for_absent_bucket() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("metadata owner");
+        let bucket = "peer-delete-absent-bucket";
+
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("initial bucket creation");
+        let cached = sys.read().await.get(bucket).await.expect("initial cached metadata");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("bucket deletion");
+
+        // Model a peer that still caches the metadata after the physical delete.
+        sys.read().await.set(bucket.to_string(), cached).await;
+        assert!(
+            remove_bucket_metadata_if_absent(store.clone(), bucket)
+                .await
+                .expect("conditional peer delete"),
+            "the peer must evict the deleted bucket's cached metadata"
+        );
+        let sys = sys.read().await;
+        assert!(matches!(sys.get(bucket).await, Err(Error::ConfigNotFound)));
+        assert_eq!(
+            sys.get_bucket_incarnation_id(bucket)
+                .await
+                .expect_err("deleted bucket lookup"),
+            Error::BucketNotFound(bucket.to_string()),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn delayed_peer_delete_preserves_recreated_bucket_metadata() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("metadata owner");
+        let bucket = "delayed-peer-delete-recreated-bucket";
+
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("initial bucket creation");
+        let old_incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("old incarnation");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("bucket deletion");
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket recreation");
+        let new_incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("new incarnation");
+        assert_ne!(old_incarnation, new_incarnation);
+
+        let removed = remove_bucket_metadata_if_absent(store.clone(), bucket)
+            .await
+            .expect("conditional peer delete");
+        assert!(!removed, "a delayed delete must not remove metadata for a live recreated bucket");
+        assert_eq!(
+            sys.read()
+                .await
+                .get(bucket)
+                .await
+                .expect("recreated metadata should remain cached")
+                .bucket_incarnation_id,
+            new_incarnation,
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn stale_config_request_cannot_mutate_a_recreated_bucket() {
@@ -4453,6 +5420,231 @@ mod tests {
             .expect("DeleteBucket should resume after the config fence is released")
             .expect("DeleteBucket task should join")
             .expect("DeleteBucket should succeed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_snapshot_reuses_same_name_owner_and_rereads_disk_authority() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "quota-same-name-owner";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("quota fixture bucket");
+        let snapshot = store
+            .object_lock_config_snapshot(bucket)
+            .await
+            .expect("guarded Object Lock snapshot");
+        let incarnation = store.bucket_incarnation_id(bucket).await.expect("fixture incarnation");
+        let transaction_guard = snapshot
+            .metadata_transaction_guard_for(store.id, bucket, Some(incarnation))
+            .expect("snapshot's actual transaction guard");
+        let expected = get_quota_config_and_incarnation_from_disk_for_options_in(
+            &store.ctx,
+            bucket,
+            &ObjectOptions::default(),
+            &transaction_guard,
+        )
+        .await
+        .expect("a reader without a snapshot must retain the ordinary namespace path");
+
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("fixture metadata system");
+        let sys = sys.read().await.clone();
+        let mut stale = (*sys.get(bucket).await.expect("cached fixture metadata")).clone();
+        let metadata_path = stale.save_file_path();
+        stale.quota_config = Some(BucketQuota {
+            quota: Some(123),
+            ..Default::default()
+        });
+        sys.set(bucket.to_string(), Arc::new(stale)).await;
+        let namespace = store.new_ns_lock(bucket, bucket).await.expect("same-name object namespace");
+        let _owner = namespace
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("same-name object write owner");
+        let opts = ObjectOptions {
+            object_lock_config_snapshot: Some(snapshot),
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        assert_eq!(
+            get_quota_config_and_incarnation_from_disk_for_options_in(&store.ctx, bucket, &opts, &transaction_guard)
+                .await
+                .expect("quota disk read must reuse the held lifecycle and transaction fences"),
+            expected,
+            "the cached quota must not replace disk authority"
+        );
+
+        crate::config::com::save_config_with_opts(
+            store.clone(),
+            &metadata_path,
+            b"corrupt bucket metadata".to_vec(),
+            &ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("inject committed metadata corruption");
+        assert!(
+            get_quota_config_and_incarnation_from_disk_for_options_in(&store.ctx, bucket, &opts, &transaction_guard)
+                .await
+                .is_err(),
+            "a valid snapshot must not hide corrupt disk metadata"
+        );
+        crate::config::com::delete_config(store.clone(), &metadata_path)
+            .await
+            .expect("remove the persisted metadata while retaining its sidecar");
+        assert!(
+            get_quota_config_and_incarnation_from_disk_for_options_in(&store.ctx, bucket, &opts, &transaction_guard)
+                .await
+                .is_err(),
+            "a valid snapshot must not promote fabricated metadata to authority"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_snapshot_rejects_wrong_scope_incarnation_and_transaction_guard() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "quota-snapshot-scope";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("quota fixture bucket");
+        let incarnation = store.bucket_incarnation_id(bucket).await.expect("fixture incarnation");
+        let snapshot = store
+            .object_lock_config_snapshot(bucket)
+            .await
+            .expect("guarded Object Lock snapshot");
+        let transaction_guard = snapshot
+            .metadata_transaction_guard_for(store.id, bucket, Some(incarnation))
+            .expect("snapshot's actual transaction guard");
+        let mut opts = ObjectOptions {
+            object_lock_config_snapshot: Some(snapshot),
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        assert!(
+            get_quota_config_and_incarnation_from_disk_for_options_in(&store.ctx, "another-bucket", &opts, &transaction_guard)
+                .await
+                .is_err()
+        );
+        opts.expected_bucket_incarnation_id = Some(Uuid::new_v4());
+        assert!(
+            get_quota_config_and_incarnation_from_disk_for_options_in(&store.ctx, bucket, &opts, &transaction_guard)
+                .await
+                .is_err()
+        );
+        opts.expected_bucket_incarnation_id = Some(incarnation);
+        let other_guard = Arc::new(
+            acquire_bucket_metadata_transaction_read_lock_in(&store.ctx, bucket)
+                .await
+                .expect("distinct real transaction read guard"),
+        );
+        assert!(
+            get_quota_config_and_incarnation_from_disk_for_options_in(&store.ctx, bucket, &opts, &other_guard)
+                .await
+                .is_err(),
+            "the same namespace key does not prove that this is the snapshot's actual guard"
+        );
+        let (_other_dirs, other_store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(other_store.clone(), Vec::new()).await;
+        assert!(
+            get_quota_config_and_incarnation_from_disk_for_options_in(&other_store.ctx, bucket, &opts, &transaction_guard)
+                .await
+                .is_err()
+        );
+        opts.object_lock_config_snapshot = Some(Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+            ObjectLockConfigState::ConfirmedAbsent,
+        )));
+        assert!(
+            get_quota_config_and_incarnation_from_disk_for_options_in(&store.ctx, bucket, &opts, &transaction_guard)
+                .await
+                .is_err(),
+            "an unguarded snapshot must not authorize namespace reuse"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_snapshot_rejects_lifecycle_loss_during_read_and_changed_disk_incarnation() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "quota-snapshot-loss";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("quota fixture bucket");
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("fixture metadata system");
+        let sys = sys.read().await.clone();
+        let mut metadata = (*sys.get(bucket).await.expect("fixture metadata")).clone();
+        let incarnation = metadata.bucket_incarnation_id;
+        let _lifecycle_guard = store
+            .acquire_bucket_lifecycle_read_lock(bucket)
+            .await
+            .expect("real lifecycle owner");
+        let transaction_guard = Arc::new(
+            acquire_bucket_metadata_transaction_read_lock_in(&store.ctx, bucket)
+                .await
+                .expect("real metadata transaction owner"),
+        );
+        let (lifecycle_fence, lost) = crate::object_api::NamespaceLockFence::loss_handle_for_test();
+        let snapshot = crate::object_api::ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
+            store.id,
+            bucket,
+            incarnation,
+            metadata.object_lock_config_updated_at,
+            ObjectLockConfigState::ConfirmedAbsent,
+            lifecycle_fence,
+            Arc::clone(&transaction_guard),
+        );
+        let opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(snapshot)),
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        let mut read = Box::pin(get_quota_config_and_incarnation_from_disk_for_options_in(
+            &store.ctx,
+            bucket,
+            &opts,
+            &transaction_guard,
+        ));
+        assert!(
+            futures::poll!(read.as_mut()).is_pending(),
+            "the authoritative disk read must be in flight"
+        );
+        lost.store(true, std::sync::atomic::Ordering::Release);
+        assert!(read.await.is_err(), "a lifecycle fence lost during the disk read must reject its result");
+
+        let snapshot = store
+            .object_lock_config_snapshot(bucket)
+            .await
+            .expect("fresh guarded snapshot");
+        let transaction_guard = snapshot
+            .metadata_transaction_guard_for(store.id, bucket, Some(incarnation))
+            .expect("snapshot's actual transaction guard");
+        let opts = ObjectOptions {
+            object_lock_config_snapshot: Some(snapshot),
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        metadata.bucket_incarnation_id = Uuid::new_v4();
+        save_bucket_incarnation(store.clone(), bucket, metadata.bucket_incarnation_id)
+            .await
+            .expect("inject a new disk incarnation");
+        metadata
+            .save_with_store_committed(store.clone())
+            .await
+            .expect("persist its matching metadata blob");
+        assert!(
+            get_quota_config_and_incarnation_from_disk_for_options_in(&store.ctx, bucket, &opts, &transaction_guard)
+                .await
+                .is_err(),
+            "a matching sidecar and blob from another incarnation must not reuse the old snapshot"
+        );
     }
 
     /// Writers on different nodes updating *different* config files of one

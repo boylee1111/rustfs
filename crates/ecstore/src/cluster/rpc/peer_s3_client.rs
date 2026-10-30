@@ -417,8 +417,10 @@ impl S3PeerSys {
         let errs = join_all(futures).await;
 
         let mut pool_errs = Vec::new();
+        let mut all_pools_have_participants = true;
         for pool_idx in 0..self.pools_count {
             let per_pool_errs = pool_participant_errors(&self.clients, &errs, pool_idx);
+            all_pools_have_participants &= !per_pool_errs.is_empty();
             pool_errs.push(reduce_pool_write_quorum_errs(&per_pool_errs));
         }
 
@@ -451,6 +453,17 @@ impl S3PeerSys {
         for pool_idx in 0..self.pools_count {
             let per_pool_errs = pool_participant_errors(&self.clients, &errs, pool_idx);
             if let Some(pool_err) = reduce_pool_write_quorum_errs(&per_pool_errs) {
+                // A success/busy split can miss quorum without a majority error.
+                // Keep that refusal retryable without masking other peer failures.
+                let pool_err = if pool_err == Error::ErasureWriteQuorum
+                    && all_pools_have_participants
+                    && per_pool_errs.iter().any(|err| err.as_ref() == Some(&Error::TooManyOpenFiles))
+                    && errs.iter().flatten().all(|err| *err == Error::TooManyOpenFiles)
+                {
+                    Error::TooManyOpenFiles
+                } else {
+                    pool_err
+                };
                 tracing::error!("heal_bucket per_pool_errs: {per_pool_errs:?}");
                 tracing::error!("heal_bucket reduce_write_quorum_errs: {pool_err}");
                 return Err(pool_err);
@@ -741,7 +754,10 @@ impl LocalPeerS3Client {
         movement_guard_held: bool,
     ) -> Result<HealResultItem> {
         let disks = self.local_disks_for_pools().await.into_iter().map(Some).collect();
-        let store = runtime_sources::object_store_handle().filter(|store| Arc::ptr_eq(&store.ctx, &self.instance_ctx));
+        let store = crate::store::bucket_heal_scope(bucket)
+            .map(|scope| scope.store.clone())
+            .or_else(runtime_sources::object_store_handle)
+            .filter(|store| Arc::ptr_eq(&store.ctx, &self.instance_ctx));
         #[cfg(not(test))]
         if store.is_none() {
             return Err(Error::other("bucket heal refused: pool metadata is unavailable for this instance"));
@@ -1266,11 +1282,19 @@ impl PeerS3Client for RemotePeerS3Client {
                 let options = encode_heal_bucket_rpc_options(*opts, fenced_pools)?;
                 let mut client = self.get_client().await?;
                 let mut request = Request::new(HealBucketRequest {
+                    bucket_incarnation_id: crate::store::bucket_heal_scope(bucket)
+                        .map(|scope| scope.incarnation.as_bytes().to_vec().into())
+                        .unwrap_or_default(),
                     bucket: bucket.to_string(),
                     options,
                 });
                 set_tonic_mutation_body_digest(&mut request)?;
-                let response = client.heal_bucket(request).await?.into_inner();
+                let response = if request.get_ref().bucket_incarnation_id.is_empty() {
+                    client.heal_bucket(request).await?
+                } else {
+                    client.heal_bucket_at_incarnation(request).await?
+                }
+                .into_inner();
                 if !response.success {
                     return if let Some(err) = response.error {
                         Err(err.into())
@@ -1520,6 +1544,9 @@ async fn heal_bucket_local_on_disks_with_pool_meta(
     pool_meta: Option<&RwLock<PoolMeta>>,
     dispatch_fenced_pools: &[usize],
 ) -> Result<HealResultItem> {
+    if let Some(scope) = crate::store::bucket_heal_scope(bucket) {
+        scope.check()?;
+    }
     let (fenced_disks, mut fenced_pool_idxs) = snapshot_heal_bucket_fence(&disks, pool_meta, dispatch_fenced_pools).await?;
     let fenced_disks = Arc::new(fenced_disks);
     let before_state = Arc::new(RwLock::new(vec![String::new(); disks.len()]));
@@ -1633,6 +1660,9 @@ async fn heal_bucket_local_on_disks_with_pool_meta(
                     if let Some(err) = injected_heal_bucket_operation_error(&bucket, index, HealBucketOperation::Delete) {
                         return Err(err);
                     }
+                    if let Some(scope) = crate::store::bucket_heal_scope(&bucket) {
+                        scope.check()?;
+                    }
                     mutation_disk.delete_volume(&bucket, false).await
                 })
                 .await;
@@ -1686,6 +1716,9 @@ async fn heal_bucket_local_on_disks_with_pool_meta(
                     let result = run_heal_bucket_volume_mutation(&disk, pool_meta, || async move {
                         if let Some(err) = injected_heal_bucket_operation_error(&bucket, idx, HealBucketOperation::Make) {
                             return Err(err);
+                        }
+                        if let Some(scope) = crate::store::bucket_heal_scope(&bucket) {
+                            scope.check()?;
                         }
                         match mutation_disk.make_volume(&bucket).await {
                             Ok(()) | Err(Error::VolumeExists) => Ok(()),
@@ -1790,6 +1823,7 @@ mod tests {
     #[derive(Debug)]
     struct TestPeerS3Client {
         pools: Option<Vec<usize>>,
+        heal_bucket_result: Result<HealResultItem>,
         make_bucket_result: Result<()>,
         list_bucket_result: Result<Vec<BucketInfo>>,
         delete_bucket_result: Result<()>,
@@ -1799,7 +1833,7 @@ mod tests {
     #[async_trait]
     impl PeerS3Client for TestPeerS3Client {
         async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
-            unreachable!("not used by quorum tests")
+            self.heal_bucket_result.clone()
         }
 
         async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
@@ -1815,8 +1849,11 @@ mod tests {
             self.delete_bucket_result.clone()
         }
 
-        async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
-            unreachable!("not used by quorum tests")
+        async fn get_bucket_info(&self, bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
+            Ok(BucketInfo {
+                name: bucket.to_string(),
+                ..Default::default()
+            })
         }
 
         fn get_pools(&self) -> Option<Vec<usize>> {
@@ -1826,6 +1863,17 @@ mod tests {
 
     fn test_peer(pools: &[usize]) -> Client {
         test_peer_with_make_bucket(pools, Ok(()))
+    }
+
+    fn test_peer_with_heal_bucket(pools: &[usize], heal_bucket_result: Result<HealResultItem>) -> Client {
+        Arc::new(Box::new(TestPeerS3Client {
+            pools: Some(pools.to_vec()),
+            heal_bucket_result,
+            make_bucket_result: Ok(()),
+            list_bucket_result: Ok(Vec::new()),
+            delete_bucket_result: Ok(()),
+            make_bucket_calls: Arc::new(AtomicUsize::new(0)),
+        }))
     }
 
     fn test_peer_with_make_bucket(pools: &[usize], make_bucket_result: Result<()>) -> Client {
@@ -1865,6 +1913,7 @@ mod tests {
     ) -> Client {
         Arc::new(Box::new(TestPeerS3Client {
             pools: Some(pools.to_vec()),
+            heal_bucket_result: Ok(HealResultItem::default()),
             make_bucket_result,
             list_bucket_result,
             delete_bucket_result,
@@ -2612,6 +2661,119 @@ mod tests {
         let err = reduce_pool_write_quorum_errs(&per_pool_errs).expect("all pool participants returned VolumeExists");
 
         assert_eq!(err, Error::VolumeExists);
+    }
+
+    #[tokio::test]
+    async fn test_heal_bucket_preserves_busy_refusal_below_error_quorum() {
+        for busy_count in 2..=4 {
+            let peer_sys = S3PeerSys {
+                clients: (0..4)
+                    .map(|peer| {
+                        test_peer_with_heal_bucket(
+                            &[0],
+                            if peer < busy_count {
+                                Err(Error::TooManyOpenFiles)
+                            } else {
+                                Ok(HealResultItem::default())
+                            },
+                        )
+                    })
+                    .collect(),
+                pools_count: 1,
+            };
+
+            let error = peer_sys
+                .heal_bucket("bucket", &HealOpts::default())
+                .await
+                .expect_err("busy peers must not turn a failed heal into success");
+            assert_eq!(error, Error::TooManyOpenFiles, "busy peers: {busy_count}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_heal_bucket_busy_peer_preserves_success_quorum() {
+        let peer_sys = S3PeerSys {
+            clients: vec![
+                test_peer_with_heal_bucket(&[0], Err(Error::TooManyOpenFiles)),
+                test_peer(&[0]),
+                test_peer(&[0]),
+                test_peer(&[0]),
+            ],
+            pools_count: 1,
+        };
+
+        peer_sys
+            .heal_bucket("bucket", &HealOpts::default())
+            .await
+            .expect("three successful peers still satisfy the four-peer write quorum");
+    }
+
+    #[tokio::test]
+    async fn test_heal_bucket_busy_peers_do_not_hide_other_failures() {
+        for failure in [Error::FaultyDisk, Error::VolumeNotFound, Error::ErasureWriteQuorum] {
+            let peer_sys = S3PeerSys {
+                clients: vec![
+                    test_peer_with_heal_bucket(&[0], Err(Error::TooManyOpenFiles)),
+                    test_peer_with_heal_bucket(&[0], Err(Error::TooManyOpenFiles)),
+                    test_peer_with_heal_bucket(&[0], Err(failure.clone())),
+                    test_peer(&[0]),
+                ],
+                pools_count: 1,
+            };
+
+            let error = peer_sys
+                .heal_bucket("bucket", &HealOpts::default())
+                .await
+                .expect_err("a mixed failure must still fail write quorum");
+            assert_eq!(error, Error::ErasureWriteQuorum, "non-busy failure: {failure}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_heal_bucket_busy_pool_does_not_hide_another_pool_failure() {
+        let peer_sys = S3PeerSys {
+            clients: vec![
+                test_peer_with_heal_bucket(&[0], Err(Error::TooManyOpenFiles)),
+                test_peer_with_heal_bucket(&[0], Err(Error::TooManyOpenFiles)),
+                test_peer(&[0]),
+                test_peer(&[0]),
+                test_peer_with_heal_bucket(&[1], Err(Error::FaultyDisk)),
+            ],
+            pools_count: 2,
+        };
+
+        let error = peer_sys
+            .heal_bucket("bucket", &HealOpts::default())
+            .await
+            .expect_err("the busy split must not hide a non-busy failure from another pool");
+        assert_eq!(error, Error::ErasureWriteQuorum);
+    }
+
+    #[tokio::test]
+    async fn test_heal_bucket_missing_pool_participants_remains_quorum_failure() {
+        for occupied_pool in 0..2 {
+            let peer_sys = S3PeerSys {
+                clients: vec![
+                    test_peer_with_heal_bucket(&[occupied_pool], Err(Error::TooManyOpenFiles)),
+                    test_peer_with_heal_bucket(&[occupied_pool], Err(Error::TooManyOpenFiles)),
+                    test_peer(&[occupied_pool]),
+                    test_peer(&[occupied_pool]),
+                ],
+                pools_count: 2,
+            };
+
+            let error = peer_sys
+                .heal_bucket(
+                    "bucket",
+                    &HealOpts {
+                        recreate: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("a pool without participants cannot be treated as a busy gate");
+            assert_eq!(error, Error::ErasureWriteQuorum, "pool with participants: {occupied_pool}");
+        }
     }
 
     #[test]

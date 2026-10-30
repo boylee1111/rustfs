@@ -20,10 +20,11 @@ use rustfs_io_metrics::buffered_write;
 use crate::storage_api::table::get_bucket_metadata;
 
 use super::storage_api::object_usecase::access::{
-    PostObjectRequestMarker, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_request,
-    delete_object_authorize_action, has_bypass_governance_header, load_bucket_generation_from_store, odm_read_generation,
-    prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_request_authorized, req_info_mut,
-    req_info_ref,
+    PostObjectRequestMarker, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
+    apply_copy_source_bucket_generation_guard, authorize_request, delete_object_authorize_action, has_bypass_governance_header,
+    load_bucket_generation_from_store, odm_read_generation, prepare_odm_read_generation,
+    recursive_force_delete_has_authenticated_caller, replication_request_authorized, req_info_mut, req_info_ref,
+    retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
 };
 #[cfg(test)]
 use super::storage_api::object_usecase::bucket::quota::BucketQuota;
@@ -133,7 +134,6 @@ use rustfs_config::MI_B;
 use rustfs_filemeta::{NULL_VERSION_ID, RestoreStatusOps, parse_restore_obj_status};
 use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
-use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -204,6 +204,8 @@ fn remove_source_replication_bookkeeping(user_defined: &mut HashMap<String, Stri
     }
 }
 
+#[cfg(test)]
+mod conditional_read_bench;
 mod copy;
 mod delete;
 mod extract;
@@ -217,8 +219,8 @@ mod restore;
 pub(crate) mod shared;
 #[cfg(test)]
 mod test_support;
+mod veeam_sosapi;
 
-pub(crate) use self::copy::*;
 #[cfg(test)]
 pub(crate) use self::delete::*;
 pub(crate) use self::extract::*;
@@ -237,7 +239,6 @@ use self::test_support::*;
 
 use std::collections::HashMap;
 use std::io;
-use std::ops::Add;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -262,9 +263,8 @@ use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 use super::storage_api::object_usecase::{
-    BUCKET_LIFECYCLE_LOCK_OBJECT, GetObjectReader, StorageDeletedObject, StorageObjectInfo as ObjectInfo,
-    StorageObjectLockDeleteOptions, StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete,
-    StoragePutObjReader as PutObjReader,
+    GetObjectReader, StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectLockDeleteOptions,
+    StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
 use crate::app::object_data_cache::{
     ColdFillCoordinateOutcome, ColdFillDiskPermitOwner, ColdFillError, ColdFillProducer, GetObjectBodyCacheLookup,
@@ -273,9 +273,9 @@ use crate::app::object_data_cache::{
     fill_get_object_body_cache_from_buffered_body, fill_get_object_body_cache_from_materialized_body,
     invalidate_object_data_cache_after_copy_success, invalidate_object_data_cache_after_delete_success,
     invalidate_object_data_cache_after_put_success, invalidate_object_data_cache_before_mutation,
-    invalidate_object_data_cache_objects_after_delete_success, invalidate_object_data_cache_objects_before_mutation,
-    invalidate_object_data_cache_prefix_after_delete, invalidate_object_data_cache_prefix_before_mutation,
-    lookup_get_object_body_cache_hit, lookup_preplanned_get_object_body_cache_hook,
+    invalidate_object_data_cache_objects_before_mutation, invalidate_object_data_cache_prefix_after_delete,
+    invalidate_object_data_cache_prefix_before_mutation, lookup_get_object_body_cache_hit,
+    lookup_preplanned_get_object_body_cache_hook,
 };
 #[cfg(test)]
 use crate::app::object_data_cache::{ColdFillRole, ColdFillWaitOutcome, scope_cold_fill_disk_permit_owner_for_test};
@@ -363,14 +363,7 @@ impl DefaultObjectUsecase {
         map_quota_check_outcome(bucket, quota_checker.check_quota(bucket, op, size).await).map(Some)
     }
 
-    #[hotpath::measure(
-        label = "rustfs::app::object_usecase::DefaultObjectUsecase::execute_put_object",
-        impl_type = "DefaultObjectUsecase"
-    )]
-    #[hotpath::measure(
-        label = "rustfs::app::object_usecase::DefaultObjectUsecase::execute_get_object",
-        impl_type = "DefaultObjectUsecase"
-    )]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_select_object_content(
         &self,

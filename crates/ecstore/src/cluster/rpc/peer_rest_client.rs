@@ -48,13 +48,14 @@ use rustfs_protos::proto_gen::node_service::{
     GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest,
     HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
-    LocalStorageInfoRequest, Mss, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest,
-    ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse,
-    ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
-    ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse, ScannerScopedDirtyUsageEntry, ServerInfoRequest,
-    SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
-    TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse,
-    TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
+    LocalStorageInfoRequest, Mss, PeerDriveAdmissionRequest, PingRequest, ReloadPoolMetaRequest,
+    ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest, ScannerActivityRequest, ScannerActivityResponse,
+    ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseReleaseRequest,
+    ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse, ScannerScopedDirtyUsageAckRequest,
+    ScannerScopedDirtyUsageAckResponse, ScannerScopedDirtyUsageEntry, ServerInfoRequest, SignalServiceRequest,
+    SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest,
+    TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse, TierMutationFailureClass,
+    TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
@@ -89,6 +90,7 @@ pub const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = 2;
 pub const KMS_SIGNAL_SUBSYSTEM: &str = "kms";
 const BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const REPLACEMENT_RECOVERY_STATUS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const PEER_DRIVE_ADMISSION_MAX_MESSAGE_SIZE: usize = 256 * 1024;
 const HEAL_CONTROL_FINGERPRINT_MAX_SIZE: usize = 256;
 const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
@@ -120,6 +122,13 @@ fn peer_failure_without_details(op: &str, bucket: Option<&str>) -> Error {
         Some(bucket) => Error::other(format!("{op}({bucket}): peer returned failure without error details")),
         None => Error::other(format!("{op}: peer returned failure without error details")),
     }
+}
+
+fn heal_control_status_error(status: tonic::Status) -> Error {
+    if status.code() == tonic::Code::InvalidArgument {
+        return Error::InvalidArgument("heal".to_string(), "control".to_string(), status.message().to_owned());
+    }
+    Error::from(status)
 }
 
 /// Decode a control-plane response failure. Peers at or above the typed
@@ -577,6 +586,26 @@ fn heal_control_auth_may_need_replay_scope_refresh(err: &Error) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HealControlRetryAction {
+    Reconnect,
+    RefreshReplayScope,
+}
+
+fn heal_control_retry_action(
+    err: &Error,
+    reconnect_attempted: bool,
+    replay_scope_refresh_attempted: bool,
+) -> Option<HealControlRetryAction> {
+    if !replay_scope_refresh_attempted && heal_control_auth_may_need_replay_scope_refresh(err) {
+        return Some(HealControlRetryAction::RefreshReplayScope);
+    }
+    if !reconnect_attempted && PeerRestClient::is_network_like_error(err) {
+        return Some(HealControlRetryAction::Reconnect);
+    }
+    None
+}
+
 fn decode_remote_version_state_capability(expected_member: &str, result: &[u8]) -> Result<Uuid> {
     let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(result).map_err(Error::other)?;
     if topology_member != expected_member {
@@ -602,6 +631,17 @@ fn decode_cross_pool_fence_capability(expected_member: &str, result: &[u8]) -> R
     Ok((version, epoch))
 }
 
+fn decode_mrf_lifecycle_reader_capability(expected_member: &str, result: &[u8]) -> Result<(u8, Uuid)> {
+    let (&maximum_format_version, identity) = result
+        .split_first()
+        .ok_or_else(|| Error::other("peer returned a truncated MRF lifecycle reader capability"))?;
+    if maximum_format_version == 0 || expected_member.trim().is_empty() {
+        return Err(Error::other("peer returned an invalid MRF lifecycle reader capability"));
+    }
+    let epoch = decode_remote_version_state_capability(expected_member, identity)?;
+    Ok((maximum_format_version, epoch))
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerLiveEventsBatch {
     pub events: Vec<u8>,
@@ -613,6 +653,7 @@ pub struct PeerLiveEventsBatch {
 pub struct ScannerPublicationLease {
     pub token: Uuid,
     pub movement_generation: u64,
+    pub observational_only: bool,
     /// Stable storage owner identity. This is distinct from the activity
     /// session and is bound into both acquire and release proofs.
     pub owner_id: String,
@@ -631,6 +672,7 @@ fn validate_scanner_publication_lease_response_fields(
     response: &ScannerPublicationLeaseResponse,
     expected_session_id: &str,
     expected_generation: u64,
+    expected_observational_only: bool,
 ) -> Result<(Uuid, String)> {
     if !response.success {
         return Err(Error::other(
@@ -646,6 +688,9 @@ fn validate_scanner_publication_lease_response_fields(
     }
     if response.session_id != expected_session_id {
         return Err(Error::other("peer returned a different scanner publication lease session"));
+    }
+    if response.observational_only != expected_observational_only {
+        return Err(Error::other("peer returned a different scanner publication lease purpose"));
     }
     let owner_id = Uuid::parse_str(&response.owner_id)
         .ok()
@@ -677,6 +722,16 @@ fn scanner_publication_lease_deadline(
     request_started
         .checked_add(lease_window)
         .ok_or_else(|| Error::other("scanner publication lease deadline overflowed"))
+}
+
+/// A peer's readiness view of one drive served by another host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerDriveAdmissionView {
+    pub pool_index: i32,
+    pub set_index: i32,
+    pub disk_index: i32,
+    /// True when the peer counts the drive towards its own read quorum.
+    pub online: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -830,6 +885,11 @@ impl PeerRestClient {
             kind = "peer_rest",
             grid_host = %grid_host
         )
+    }
+
+    /// Topology `host:port` this client talks to, as written in the endpoint list.
+    pub fn topology_member(&self) -> &str {
+        &self.topology_member
     }
 
     pub fn new(host: XHost, grid_host: String) -> Self {
@@ -1645,6 +1705,51 @@ impl PeerRestClient {
         .await
     }
 
+    /// Ask the peer how it currently sees the drives served by `host`.
+    ///
+    /// `Ok(None)` means the peer predates the RPC and cannot answer.
+    pub async fn peer_drive_admission(&self, host: &str) -> Result<Option<Vec<PeerDriveAdmissionView>>> {
+        self.finalize_result(
+            async {
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(PEER_DRIVE_ADMISSION_MAX_MESSAGE_SIZE);
+                let response = match client
+                    .peer_drive_admission(Request::new(PeerDriveAdmissionRequest { host: host.to_string() }))
+                    .await
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(status) if status.code() == tonic::Code::Unimplemented => {
+                        // RUSTFS_COMPAT_TODO(peer-drive-admission-v1): old peers cannot report how they see a restarting node, so its startup re-admission gate skips them. Remove after the minimum supported RustFS peer version implements PeerDriveAdmission.
+                        return Ok(None);
+                    }
+                    Err(status) => return Err(status.into()),
+                };
+                if !response.success {
+                    return Err(match (response.error_code, response.error_info) {
+                        (None, None) => Error::other("peer drive admission failed without an error"),
+                        (error_code, error_info) => control_plane_failure("peer_drive_admission", None, error_code, error_info),
+                    });
+                }
+                Ok(Some(
+                    response
+                        .drives
+                        .into_iter()
+                        .map(|drive| PeerDriveAdmissionView {
+                            pool_index: drive.pool_index,
+                            set_index: drive.set_index,
+                            disk_index: drive.disk_index,
+                            online: drive.online,
+                        })
+                        .collect(),
+                ))
+            }
+            .await,
+        )
+        .await
+    }
+
     pub async fn prepare_tier_mutation(&self, mutation_id: Uuid, canonical_payload: Bytes) -> Result<PeerTierMutationOutcome> {
         self.tier_mutation_control(TierMutationRpcPhase::Prepare, mutation_id, canonical_payload)
             .await
@@ -1753,34 +1858,41 @@ impl PeerRestClient {
             return Err(Error::other("heal control command exceeds size limit"));
         }
         let capability_probe = rustfs_protos::is_heal_control_capability_probe(&command);
-        let result = self
-            .heal_control_once(version, &topology_fingerprint, &command, capability_probe)
-            .await;
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(heal_control_auth_may_need_replay_scope_refresh)
-        {
-            self.prepare_heal_control_auth_retry().await;
-            return self
-                .finalize_result(
-                    self.heal_control_once(version, &topology_fingerprint, &command, capability_probe)
-                        .await,
-                )
+        let mut reconnect_attempted = false;
+        let mut replay_scope_refresh_attempted = false;
+        loop {
+            let result = self
+                .heal_control_once(version, &topology_fingerprint, &command, capability_probe)
                 .await;
+            let Some(action) = result
+                .as_ref()
+                .err()
+                .and_then(|err| heal_control_retry_action(err, reconnect_attempted, replay_scope_refresh_attempted))
+            else {
+                return self.finalize_result(result).await;
+            };
+            match action {
+                HealControlRetryAction::Reconnect => reconnect_attempted = true,
+                HealControlRetryAction::RefreshReplayScope => replay_scope_refresh_attempted = true,
+            }
+            self.prepare_heal_control_retry(action).await;
         }
-        self.finalize_result(result).await
     }
 
-    async fn prepare_heal_control_auth_retry(&self) {
-        if let Err(err) = clear_peer_replay_state_for_addr(&self.grid_host) {
+    async fn prepare_heal_control_retry(&self, action: HealControlRetryAction) {
+        if action == HealControlRetryAction::RefreshReplayScope
+            && let Err(err) = clear_peer_replay_state_for_addr(&self.grid_host)
+        {
             debug!(
                 peer = %self.grid_host,
                 error = %err,
                 "could not clear heal control replay state before retry"
             );
         }
-        self.evict_connection().await;
+        // A restart can leave both the local offline gate and the peer replay
+        // epoch stale. Clear the gate on either recovery step so the next
+        // bounded attempt reaches a fresh channel instead of fast-failing.
+        self.prepare_retry().await;
     }
 
     async fn heal_control_once(
@@ -1804,7 +1916,11 @@ impl PeerRestClient {
         });
         request.set_timeout(rustfs_protos::heal_control_execution_timeout());
         set_tonic_canonical_body_digest(&mut request, &canonical_body)?;
-        let response = client.heal_control(request).await?.into_inner();
+        let response = client
+            .heal_control(request)
+            .await
+            .map_err(heal_control_status_error)?
+            .into_inner();
         if !response.success {
             return Err(Error::other(
                 response
@@ -1857,6 +1973,16 @@ impl PeerRestClient {
             .await?;
         let (supported_version, epoch) = decode_cross_pool_fence_capability(&self.topology_member, &result)?;
         Ok((self.topology_member.clone(), supported_version, epoch))
+    }
+
+    /// Reports one peer's reader support without authorizing a lifecycle writer or rollback.
+    pub async fn probe_mrf_lifecycle_reader(&self, topology_fingerprint: String) -> Result<(String, u8, Uuid)> {
+        let probe = rustfs_protos::mrf_lifecycle_reader_capability_probe(Uuid::new_v4().as_bytes());
+        let result = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        let (maximum_format_version, epoch) = decode_mrf_lifecycle_reader_capability(&self.topology_member, &result)?;
+        Ok((self.topology_member.clone(), maximum_format_version, epoch))
     }
 
     pub async fn probe_ilm_recovery_export(&self, topology_fingerprint: String) -> Result<(String, Uuid)> {
@@ -2380,6 +2506,7 @@ impl PeerRestClient {
         &self,
         expected_session_id: &str,
         expected_generation: u64,
+        observational_only: bool,
     ) -> Result<ScannerPublicationLease> {
         let request_started = std::time::Instant::now();
         self.finalize_result(
@@ -2396,6 +2523,7 @@ impl PeerRestClient {
                     ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
                     expected_session_id: expected_session_id.to_string(),
                     token: Bytes::new(),
+                    observational_only,
                 });
                 let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
                     .map_err(|_| Error::other("scanner publication lease request is too large to authenticate"))?;
@@ -2406,11 +2534,16 @@ impl PeerRestClient {
                         .map_err(|_| Error::other("scanner publication lease response is too large to authenticate"))?;
                 verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
                     .map_err(|_| Error::other("peer returned an invalid scanner publication lease proof"))?;
-                let (token, owner_id) =
-                    validate_scanner_publication_lease_response_fields(&response, expected_session_id, expected_generation)?;
+                let (token, owner_id) = validate_scanner_publication_lease_response_fields(
+                    &response,
+                    expected_session_id,
+                    expected_generation,
+                    observational_only,
+                )?;
                 Ok(ScannerPublicationLease {
                     token,
                     movement_generation: response.movement_generation,
+                    observational_only,
                     owner_id,
                     session_id: response.session_id,
                     expires_at: scanner_publication_lease_deadline(
@@ -2445,6 +2578,7 @@ impl PeerRestClient {
                     ttl_ms: crate::store::SCANNER_PUBLICATION_LEASE_TTL_MS,
                     expected_session_id: lease.session_id.clone(),
                     token: lease.token.as_bytes().to_vec().into(),
+                    observational_only: lease.observational_only,
                 });
                 let canonical = rustfs_protos::canonical_scanner_publication_lease_request_body(request.get_ref())
                     .map_err(|_| Error::other("scanner publication lease validation request is too large to authenticate"))?;
@@ -2456,8 +2590,12 @@ impl PeerRestClient {
                     )?;
                 verify_tonic_rpc_response_proof(&response_body, &response.response_proof)
                     .map_err(|_| Error::other("peer returned an invalid scanner publication lease validation proof"))?;
-                let (token, owner_id) =
-                    validate_scanner_publication_lease_response_fields(&response, &lease.session_id, lease.movement_generation)?;
+                let (token, owner_id) = validate_scanner_publication_lease_response_fields(
+                    &response,
+                    &lease.session_id,
+                    lease.movement_generation,
+                    lease.observational_only,
+                )?;
                 if token != lease.token {
                     return Err(Error::other("peer returned a different scanner publication lease token"));
                 }
@@ -2722,6 +2860,21 @@ impl PeerRestClient {
 
         let response = match client.load_transition_tier_config(request).await {
             Ok(response) => response.into_inner(),
+            Err(status)
+                if status.code() == tonic::Code::Unauthenticated && status.message() == "RPC peer replay capability changed" =>
+            {
+                // A restart can revoke the pinned capability. A signed read-only probe
+                // lets the peer prove its new epoch without bypassing the mutation guard.
+                let mut probe = Request::new(PingRequest {
+                    version: 1,
+                    body: Bytes::new(),
+                });
+                probe.set_timeout(rustfs_protos::heal_control_execution_timeout());
+                return match client.ping(probe).await {
+                    Ok(_) => TierConfigReloadOutcome::TransientRetrySameChannel(status.into()),
+                    Err(probe_status) => tier_config_reload_status_outcome(probe_status),
+                };
+            }
             Err(status) => return tier_config_reload_status_outcome(status),
         };
         if !response.success {
@@ -2819,6 +2972,7 @@ mod tests {
     use super::*;
     use crate::config::com::STORAGE_CLASS_SUB_SYS;
     use crate::disk::error::DiskError;
+
     use crate::disk::error_reduce::reduce_errs;
     use crate::layout::{disks_layout::DisksLayout, endpoints::SetupType};
     use rustfs_config::{ENV_KUBERNETES_SERVICE_HOST, ENV_LOCAL_ENDPOINT_HOST, ENV_STARTUP_TOPOLOGY_WAIT_MODE};
@@ -2828,6 +2982,32 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use temp_env::async_with_vars;
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    #[test]
+    fn heal_selector_rpc_error_preserves_invalid_argument_without_retry() {
+        let err = heal_control_status_error(tonic::Status::invalid_argument("heal pool index 99 is out of range"));
+        assert!(matches!(&err, Error::InvalidArgument(_, _, message) if message == "heal pool index 99 is out of range"));
+        assert!(heal_control_retry_action(&err, false, false).is_none());
+        assert!(!PeerRestClient::is_network_like_error(&err));
+
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::Internal,
+            tonic::Code::FailedPrecondition,
+        ] {
+            let err = heal_control_status_error(tonic::Status::new(code, "invalid selector"));
+            assert!(!matches!(err, Error::InvalidArgument(..)), "classify by code, not message");
+            let Error::Io(io_error) = &err else {
+                panic!("non-argument RPC failures must retain their typed transport status: {err:?}");
+            };
+            assert_eq!(
+                embedded_tonic_status(io_error)
+                    .expect("transport status should be preserved")
+                    .code(),
+                code
+            );
+        }
+    }
 
     #[test]
     fn control_plane_failure_prefers_typed_not_initialized_code() {
@@ -2921,15 +3101,16 @@ mod tests {
             response_proof: Bytes::new(),
             owner_id: Uuid::new_v4().to_string(),
             session_id: "session-a".to_string(),
+            observational_only: false,
         };
 
-        assert!(validate_scanner_publication_lease_response_fields(&response, "session-a", 7).is_ok());
+        assert!(validate_scanner_publication_lease_response_fields(&response, "session-a", 7, false).is_ok());
 
         let stale_generation = ScannerPublicationLeaseResponse {
             movement_generation: 6,
             ..response.clone()
         };
-        let error = validate_scanner_publication_lease_response_fields(&stale_generation, "session-a", 7)
+        let error = validate_scanner_publication_lease_response_fields(&stale_generation, "session-a", 7, false)
             .expect_err("a response from an older movement generation must be rejected");
         assert!(error.to_string().contains("different scanner publication lease generation"));
 
@@ -2937,9 +3118,21 @@ mod tests {
             session_id: "session-b".to_string(),
             ..response
         };
-        let error = validate_scanner_publication_lease_response_fields(&stale_session, "session-a", 7)
+        let error = validate_scanner_publication_lease_response_fields(&stale_session, "session-a", 7, false)
             .expect_err("a response from an older scanner session must be rejected");
         assert!(error.to_string().contains("different scanner publication lease session"));
+
+        let observational = ScannerPublicationLeaseResponse {
+            observational_only: true,
+            ..stale_session
+        };
+        assert!(
+            validate_scanner_publication_lease_response_fields(&observational, "session-b", 7, true).is_ok(),
+            "the signed purpose echo should validate an observation lease"
+        );
+        let error = validate_scanner_publication_lease_response_fields(&observational, "session-b", 7, false)
+            .expect_err("a peer must not upgrade an observational lease to authoritative");
+        assert!(error.to_string().contains("different scanner publication lease purpose"));
     }
 
     #[test]
@@ -3868,6 +4061,51 @@ mod tests {
     }
 
     #[test]
+    fn heal_control_retry_plan_allows_one_reconnect_and_one_epoch_refresh() {
+        let offline = Error::RemoteClientUnavailable("peer http://127.0.0.1:9000 is temporarily offline".to_string());
+        let stale_epoch = Error::from(tonic::Status::unauthenticated("No valid auth token"));
+
+        assert_eq!(heal_control_retry_action(&offline, false, false), Some(HealControlRetryAction::Reconnect));
+        assert_eq!(heal_control_retry_action(&offline, true, false), None);
+        assert_eq!(
+            heal_control_retry_action(&stale_epoch, true, false),
+            Some(HealControlRetryAction::RefreshReplayScope),
+            "a reconnect may expose the restarted peer's stale replay epoch"
+        );
+        assert_eq!(heal_control_retry_action(&stale_epoch, true, true), None);
+        assert_eq!(
+            heal_control_retry_action(&stale_epoch, false, false),
+            Some(HealControlRetryAction::RefreshReplayScope)
+        );
+        assert_eq!(
+            heal_control_retry_action(&offline, false, true),
+            Some(HealControlRetryAction::Reconnect),
+            "an epoch refresh may be followed by one bounded reconnect"
+        );
+        assert_eq!(heal_control_retry_action(&offline, true, true), None);
+        assert_eq!(
+            heal_control_retry_action(&Error::from(tonic::Status::permission_denied("bad signature")), false, false),
+            None,
+            "authorization failures must never be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_control_epoch_refresh_clears_offline_gate() {
+        let client = test_peer_client();
+        client.offline.store(true, Ordering::Release);
+
+        client
+            .prepare_heal_control_retry(HealControlRetryAction::RefreshReplayScope)
+            .await;
+
+        assert!(
+            !client.offline.load(Ordering::Acquire),
+            "epoch refresh must not leave the following attempt behind the offline gate"
+        );
+    }
+
+    #[test]
     fn peer_rest_client_network_classifier_keeps_slow_peers_online() {
         // The per-RPC channel deadline (RUSTFS_INTERNODE_RPC_TIMEOUT, 30s)
         // surfaces as Cancelled "Timeout expired" carrying the transport
@@ -4114,6 +4352,49 @@ mod tests {
                 .expect_err("proof must not authenticate a different command or result");
             assert!(err.to_string().contains("invalid heal control response proof"));
         }
+    }
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_decoder_preserves_the_advertised_version() {
+        let epoch = Uuid::new_v4();
+        for version in [1, 2, u8::MAX] {
+            let result = rustfs_protos::encode_mrf_lifecycle_reader_capability(version, "node-a:9000", epoch.as_bytes())
+                .expect("capability frame");
+            assert_eq!(
+                decode_mrf_lifecycle_reader_capability("node-a:9000", &result).expect("reported capability"),
+                (version, epoch)
+            );
+        }
+    }
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_decoder_rejects_unbound_or_malformed_identity() {
+        let epoch = Uuid::new_v4();
+        let valid =
+            rustfs_protos::encode_mrf_lifecycle_reader_capability(2, "node-a:9000", epoch.as_bytes()).expect("capability frame");
+        let mut invalid = vec![Vec::new(), vec![2], valid[..valid.len() - 1].to_vec()];
+        let mut zero = valid.clone();
+        zero[0] = 0;
+        invalid.push(zero);
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        invalid.push(trailing);
+        let mut length_overflow = valid.clone();
+        length_overflow[1..9].copy_from_slice(&u64::MAX.to_be_bytes());
+        invalid.push(length_overflow);
+        let mut invalid_utf8 = valid.clone();
+        invalid_utf8[9] = 0xff;
+        invalid.push(invalid_utf8);
+        invalid.push(
+            rustfs_protos::encode_mrf_lifecycle_reader_capability(2, "node-a:9000", Uuid::nil().as_bytes())
+                .expect("nil epoch fixture"),
+        );
+        for result in invalid {
+            assert!(decode_mrf_lifecycle_reader_capability("node-a:9000", &result).is_err());
+        }
+        assert!(decode_mrf_lifecycle_reader_capability("node-b:9000", &valid).is_err());
+        let empty = rustfs_protos::encode_mrf_lifecycle_reader_capability(2, "", epoch.as_bytes()).expect("empty member fixture");
+        assert!(decode_mrf_lifecycle_reader_capability("", &empty).is_err());
     }
 
     #[test]

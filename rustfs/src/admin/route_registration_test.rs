@@ -116,6 +116,48 @@ fn registered_admin_router() -> S3Router<AdminOperation> {
 
 fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
     vec![
+        admin_route(Method::POST, "/v3/plugin-delegations"),
+        admin_route_sample(Method::GET, "/v3/plugin-delegations/{id}", "/v3/plugin-delegations/test-delegation"),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/revoke",
+            "/v3/plugin-delegations/test-delegation/revoke",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/submit",
+            "/v3/plugin-delegations/test-delegation/submit",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/runs/query",
+            "/v3/plugin-delegations/test-delegation/runs/query",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/runs/history",
+            "/v3/plugin-delegations/test-delegation/runs/history",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/runs/cancel",
+            "/v3/plugin-delegations/test-delegation/runs/cancel",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/runs/page",
+            "/v3/plugin-delegations/test-delegation/runs/page",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/runs/replay",
+            "/v3/plugin-delegations/test-delegation/runs/replay",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/plugin-delegations/{id}/issue-attempt",
+            "/v3/plugin-delegations/test-delegation/issue-attempt",
+        ),
         route(Method::GET, HEALTH_PREFIX),
         route(Method::HEAD, HEALTH_PREFIX),
         route(Method::GET, HEALTH_READY_PATH),
@@ -175,6 +217,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/v3/target/webhook/test-target/reset",
         ),
         admin_route(Method::GET, "/v3/target/arns"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/target/{target_type}/{target_name}/subscriptions",
+            "/v3/target/notify_webhook/test-target/subscriptions",
+        ),
         admin_route(Method::POST, "/v3/service"),
         admin_route(Method::POST, "/v3/update"),
         admin_route(Method::GET, "/v3/info"),
@@ -185,7 +232,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/storageinfo"),
         admin_route(Method::GET, "/v3/datausageinfo"),
         admin_route_sample(Method::GET, "/v3/usage/{bucket}", "/v3/usage/test-bucket"),
-        admin_route(Method::GET, "/v3/metrics"),
+        admin_route(Method::GET, "/v3/realtime"),
         admin_route(Method::GET, "/v3/object-data-cache/stats"),
         admin_route(Method::POST, "/v3/object-data-cache/flush"),
         admin_route(Method::GET, "/v3/pools/list"),
@@ -199,12 +246,16 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/rebalance/stop"),
         admin_route(Method::POST, "/v3/heal/"),
         admin_route_sample(Method::POST, "/v3/heal/{bucket}", "/v3/heal/test-bucket"),
-        admin_route_sample(Method::POST, "/v3/heal/{bucket}/{prefix}", "/v3/heal/test-bucket/prefix"),
+        admin_route_sample(Method::POST, "/v3/heal/{bucket}/{*prefix}", "/v3/heal/test-bucket/prefix"),
         admin_route(Method::POST, "/v3/background-heal/status"),
+        admin_route(Method::GET, "/v4/heal/mrf/responsibilities"),
+        admin_route(Method::POST, "/v4/heal/mrf/responsibilities/actions"),
         admin_route(Method::GET, "/v4/heal/replacement-recovery"),
         admin_route(Method::GET, "/v3/tier"),
         admin_route(Method::GET, "/v3/tier-stats"),
         admin_route_sample(Method::GET, "/v3/tier/{tier}", "/v3/tier/HOT"),
+        admin_route_sample(Method::GET, "/v3/tier/{tier}/deletion-check", "/v3/tier/HOT/deletion-check"),
+        admin_route_sample(Method::POST, "/v3/tier/{tier}/cleanup-retry", "/v3/tier/HOT/cleanup-retry"),
         admin_route_sample(Method::DELETE, "/v3/tier/{tiername}", "/v3/tier/HOT"),
         admin_route(Method::PUT, "/v3/tier"),
         admin_route_sample(Method::POST, "/v3/tier/{tiername}", "/v3/tier/HOT"),
@@ -256,6 +307,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(Method::DELETE, "/v3/quota/{bucket}", "/v3/quota/test-bucket"),
         admin_route_sample(Method::GET, "/v3/quota-stats/{bucket}", "/v3/quota-stats/test-bucket"),
         admin_route_sample(Method::POST, "/v3/quota-check/{bucket}", "/v3/quota-check/test-bucket"),
+        admin_route(Method::POST, "/v3/quota-migration"),
         admin_route_sample(Method::PUT, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
         admin_route_sample(Method::GET, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
         admin_route_sample(Method::DELETE, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
@@ -281,6 +333,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/export-bucket-metadata"),
         admin_route(Method::PUT, "/import-bucket-metadata"),
         admin_route(Method::PUT, "/v3/import-bucket-metadata"),
+        admin_route_sample(
+            Method::POST,
+            "/v3/recover-orphaned-bucket/{bucket}",
+            "/v3/recover-orphaned-bucket/test-bucket",
+        ),
         admin_route(Method::GET, "/v3/get-config-kv"),
         admin_route(Method::PUT, "/v3/set-config-kv"),
         admin_route(Method::DELETE, "/v3/del-config-kv"),
@@ -290,6 +347,8 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::PUT, "/v3/restore-config-history-kv"),
         admin_route(Method::GET, "/v3/config"),
         admin_route(Method::PUT, "/v3/config"),
+        admin_route(Method::GET, "/v3/tls/certificate-state"),
+        admin_route(Method::POST, "/v3/tls/certificate"),
         admin_route(Method::GET, "/v3/scanner/status"),
         admin_route(Method::POST, "/v3/scanner/cycle-state/reset"),
         admin_route(Method::POST, "/v3/scanner/usage-state/reset"),
@@ -332,6 +391,19 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::DELETE, "/v3/remove-remote-target"),
         admin_route(Method::POST, "/v3/replication/diff"),
         admin_route(Method::GET, "/v3/replication/mrf"),
+        admin_route(Method::GET, "/v3/integrity/readiness"),
+        admin_route_sample(Method::GET, "/v3/integrity/{bucket}/inventory", "/v3/integrity/example/inventory"),
+        admin_route_sample(Method::POST, "/v3/integrity/{bucket}/jobs", "/v3/integrity/example/jobs"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/integrity/{bucket}/jobs/{job_id}",
+            "/v3/integrity/example/jobs/11111111-1111-4111-8111-111111111111",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/integrity/{bucket}/jobs/{job_id}/control",
+            "/v3/integrity/example/jobs/11111111-1111-4111-8111-111111111111/control",
+        ),
         admin_route(Method::POST, "/v3/start-job"),
         admin_route(Method::GET, "/v3/list-jobs"),
         admin_route(Method::GET, "/v3/status-job"),
@@ -437,10 +509,18 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/idp/openid/list-access-keys-bulk"),
         table_route(Method::GET, "/config"),
         table_route_sample(Method::PUT, "/buckets/{warehouse}", "/buckets/analytics"),
+        table_route_sample(Method::DELETE, "/buckets/{warehouse}", "/buckets/analytics"),
         table_route_sample(Method::GET, "/buckets/{warehouse}", "/buckets/analytics"),
         table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        table_route_sample(Method::POST, "/{warehouse}/catalog/backup", "/analytics/catalog/backup"),
+        table_route_sample(Method::POST, "/{warehouse}/catalog/restore", "/analytics/catalog/restore"),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/catalog/warehouse-index/backfill",
+            "/analytics/catalog/warehouse-index/backfill",
+        ),
         table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
         table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
@@ -634,10 +714,18 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         ),
         compat_table_route(Method::GET, "/config"),
         compat_table_route_sample(Method::PUT, "/buckets/{warehouse}", "/buckets/analytics"),
+        compat_table_route_sample(Method::DELETE, "/buckets/{warehouse}", "/buckets/analytics"),
         compat_table_route_sample(Method::GET, "/buckets/{warehouse}", "/buckets/analytics"),
         compat_table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         compat_table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         compat_table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        compat_table_route_sample(Method::POST, "/{warehouse}/catalog/backup", "/analytics/catalog/backup"),
+        compat_table_route_sample(Method::POST, "/{warehouse}/catalog/restore", "/analytics/catalog/restore"),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/catalog/warehouse-index/backfill",
+            "/analytics/catalog/warehouse-index/backfill",
+        ),
         compat_table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
         compat_table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
         compat_table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
@@ -1318,7 +1406,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
     assert_route(&router, Method::GET, &admin_path("/v3/info"));
     assert_route(&router, Method::GET, &admin_path("/v3/storageinfo"));
-    assert_route(&router, Method::GET, &admin_path("/v3/metrics"));
+    assert_route(&router, Method::GET, &admin_path("/v3/realtime"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/pools/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/decommission/status"));
@@ -1328,6 +1416,8 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/heal/test-bucket"));
     assert_route(&router, Method::POST, &admin_path("/v3/heal/test-bucket/prefix"));
     assert_route(&router, Method::POST, &admin_path("/v3/background-heal/status"));
+    assert_route(&router, Method::GET, &admin_path("/v4/heal/mrf/responsibilities"));
+    assert_route(&router, Method::POST, &admin_path("/v4/heal/mrf/responsibilities/actions"));
     assert_route(&router, Method::GET, &admin_path("/v4/heal/replacement-recovery"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/tier"));
@@ -1337,6 +1427,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/get-bucket-quota"));
     assert_route(&router, Method::PUT, &admin_path("/v3/quota/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/quota-stats/test-bucket"));
+    assert_route(&router, Method::POST, &admin_path("/v3/quota-migration"));
     assert_route(&router, Method::PUT, &admin_path("/v3/bucket-durability/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/bucket-durability/test-bucket"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/bucket-durability/test-bucket"));
@@ -1351,6 +1442,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/export-bucket-metadata"));
     assert_route(&router, Method::PUT, &admin_path("/import-bucket-metadata"));
     assert_route(&router, Method::PUT, &admin_path("/v3/import-bucket-metadata"));
+    assert_route(&router, Method::POST, &admin_path("/v3/recover-orphaned-bucket/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/list-remote-targets"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-remote-target"));
     assert_route(&router, Method::POST, &admin_path("/v3/replication/diff"));
@@ -1436,6 +1528,8 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::POST, compat_admin_alias_path("/v3/heal/test-bucket")),
         (Method::POST, compat_admin_alias_path("/v3/heal/test-bucket/prefix")),
         (Method::POST, compat_admin_alias_path("/v3/background-heal/status")),
+        (Method::GET, compat_admin_alias_path("/v4/heal/mrf/responsibilities")),
+        (Method::POST, compat_admin_alias_path("/v4/heal/mrf/responsibilities/actions")),
         (Method::GET, compat_admin_alias_path("/v3/tier/HOT")),
         (Method::GET, compat_admin_alias_path("/v3/export-bucket-metadata")),
         (Method::PUT, compat_admin_alias_path("/v3/import-bucket-metadata")),

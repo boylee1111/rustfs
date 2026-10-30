@@ -41,7 +41,7 @@ impl Debug for NamespaceLockFence {
 }
 
 impl NamespaceLockFence {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             signals: Arc::default(),
             #[cfg(test)]
@@ -144,6 +144,8 @@ pub(crate) fn namespace_lock_signal_test_fence_is_lost(signal: &Arc<rustfs_lock:
         .is_some_and(|(_, fence)| fence.is_lock_lost())
 }
 
+type FreshPutQuota = std::result::Result<(Option<crate::bucket::quota::BucketQuota>, Uuid, OffsetDateTime), String>;
+
 #[derive(Debug)]
 pub struct ObjectLockConfigSnapshot {
     store_id: Option<Uuid>,
@@ -153,7 +155,8 @@ pub struct ObjectLockConfigSnapshot {
     state: crate::bucket::metadata_sys::ObjectLockConfigState,
     lifecycle_fence: NamespaceLockFence,
     _lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
-    metadata_transaction_guard: Option<rustfs_lock::NamespaceLockGuard>,
+    metadata_transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
+    fresh_put_quota: std::sync::Mutex<Option<FreshPutQuota>>,
 }
 
 impl ObjectLockConfigSnapshot {
@@ -167,9 +170,11 @@ impl ObjectLockConfigSnapshot {
             lifecycle_fence: NamespaceLockFence::new(),
             _lifecycle_guard: None,
             metadata_transaction_guard: None,
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn for_store_bucket(
         store_id: Uuid,
         bucket: &str,
@@ -186,6 +191,7 @@ impl ObjectLockConfigSnapshot {
             lifecycle_fence: NamespaceLockFence::new(),
             _lifecycle_guard: None,
             metadata_transaction_guard: None,
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
     }
 
@@ -210,7 +216,8 @@ impl ObjectLockConfigSnapshot {
             state,
             lifecycle_fence,
             _lifecycle_guard: Some(lifecycle_guard),
-            metadata_transaction_guard: Some(metadata_transaction_guard),
+            metadata_transaction_guard: Some(Arc::new(metadata_transaction_guard)),
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
     }
 
@@ -221,7 +228,7 @@ impl ObjectLockConfigSnapshot {
         config_revision: OffsetDateTime,
         state: crate::bucket::metadata_sys::ObjectLockConfigState,
         lifecycle_fence: NamespaceLockFence,
-        metadata_transaction_guard: rustfs_lock::NamespaceLockGuard,
+        metadata_transaction_guard: Arc<rustfs_lock::NamespaceLockGuard>,
     ) -> Self {
         Self {
             store_id: Some(store_id),
@@ -232,7 +239,21 @@ impl ObjectLockConfigSnapshot {
             lifecycle_fence,
             _lifecycle_guard: None,
             metadata_transaction_guard: Some(metadata_transaction_guard),
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(crate) fn set_fresh_put_quota(&self, quota: FreshPutQuota) {
+        if self._lifecycle_guard.is_some() && self.metadata_transaction_guard.is_some() {
+            *self.fresh_put_quota.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(quota);
+        }
+    }
+
+    pub(crate) fn take_fresh_put_quota(&self) -> Option<FreshPutQuota> {
+        self.fresh_put_quota
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     #[allow(dead_code, reason = "snapshot-scope predicate asserted by this file's tests (backlog#1823)")]
@@ -263,6 +284,39 @@ impl ObjectLockConfigSnapshot {
                 .metadata_transaction_guard
                 .as_ref()
                 .is_some_and(|guard| !guard.is_lock_lost())
+    }
+
+    /// Share the held transaction lock without queuing another reader behind
+    /// a metadata writer that is itself waiting for this snapshot to drop.
+    pub(crate) fn metadata_transaction_guard_for(
+        &self,
+        store_id: Uuid,
+        bucket: &str,
+        expected_incarnation_id: Option<Uuid>,
+    ) -> Option<Arc<rustfs_lock::NamespaceLockGuard>> {
+        let bucket_incarnation_id = self.bucket_incarnation_id?;
+        if expected_incarnation_id.is_some_and(|expected| expected != bucket_incarnation_id)
+            || !self.is_valid_for_destructive_put(store_id, bucket, bucket_incarnation_id)
+        {
+            return None;
+        }
+        self.metadata_transaction_guard.clone()
+    }
+
+    /// Returns the snapshot's validated bucket incarnation ID only while both the
+    /// lifecycle read fence and the metadata-transaction guard remain active and
+    /// unreleased for `(store_id, bucket)`.
+    pub(crate) fn validated_bucket_incarnation_for(
+        &self,
+        store_id: Uuid,
+        bucket: &str,
+        expected_incarnation_id: Option<Uuid>,
+    ) -> Option<Uuid> {
+        let guard = self.metadata_transaction_guard_for(store_id, bucket, expected_incarnation_id)?;
+        if guard.is_released() {
+            return None;
+        }
+        self.bucket_incarnation_id
     }
 
     pub(crate) fn add_lock_fences(&self, opts: &mut ObjectOptions) {
@@ -880,6 +934,19 @@ pub enum WriteCompletion {
     /// Drain the rename fan-out before returning. Minority failures still heal
     /// after a successful quorum commit; this does not require every disk to succeed.
     TailDrained,
+    /// Drain the rename fan-out and return system-metadata repair to the
+    /// caller's existing deployment/transaction owner. This does not grant
+    /// write or heal authority and does not change the quorum requirement.
+    TailDrainedWithOwnerRepair,
+}
+
+/// Storage-owned write mode inherited by physical rewrites. This selects the
+/// destination format; the source reader must still validate every source byte.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardIntegrityWriteMode {
+    Legacy,
+    Protected,
 }
 
 #[derive(Default, Clone)]
@@ -895,6 +962,10 @@ pub struct ObjectOptions {
     /// Lifecycle-only staged purge request checked under the object write lock.
     #[doc(hidden)]
     pub lifecycle_delete_all: Option<LifecycleDeleteAllRequest>,
+    /// Policy observed by lifecycle evaluation, checked under the metadata
+    /// transaction lock before logical deletion. Not persisted or sent over RPC.
+    #[doc(hidden)]
+    pub lifecycle_expiry_policy: Option<rustfs_lifecycle::ExpiryPolicySnapshot>,
     #[doc(hidden)]
     pub lifecycle_delete_all_journal: Option<Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>>,
     /// Whole-operation authorization created only by consuming a validated
@@ -908,6 +979,24 @@ pub struct ObjectOptions {
     /// Persisted bucket incarnation observed before authorization.
     pub expected_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
+    /// Require complete participant observations for internal multipart size decisions.
+    /// This transient flag is never derived from client input or stored on disk.
+    #[doc(hidden)]
+    pub strict_multipart_part_sizes: bool,
+    /// A genuine target write guard; loss fences alone do not authorize a borrowed write.
+    #[doc(hidden)]
+    pub write_lock_context: Option<WriteLockContext>,
+    /// In-process delete ownership for late filesystem completion. Never
+    /// serialized or copied into object metadata.
+    #[doc(hidden)]
+    pub delete_mutation_owner: Option<Arc<dyn Send + Sync>>,
+    /// Pool-local generations for admitted current-object conditional actions.
+    /// Ordinary actions execute in a separate phase without this transient map.
+    /// This must never be populated from client metadata.
+    #[doc(hidden)]
+    pub conditional_delete_generations: Option<Arc<HashMap<String, crate::disk::CurrentDeleteGeneration>>>,
+    /// Internal read-only inspection must not enqueue metadata or payload repairs.
+    pub suppress_read_repair: bool,
     /// Control-plane writers that immediately read or CAS the same namespace
     /// key use TailDrained without changing namespace lock ownership.
     #[doc(hidden)]
@@ -942,6 +1031,16 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Data-movement source cleanup only: transitioned source versions whose
+    /// committed target copy now references their remote object. Deleting one
+    /// of them appends no tier free version. Storage-owned; callers outside
+    /// `ecstore` must leave it unset.
+    #[doc(hidden)]
+    pub data_movement_transferred_tier_versions: Option<crate::data_movement::TransferredTierVersions>,
+    /// Internal, in-memory protection context. Never populated from S3 metadata.
+    /// None selects the rollout default only for a new write, not for a rewrite.
+    #[doc(hidden)]
+    pub shard_integrity_write_mode: Option<ShardIntegrityWriteMode>,
     /// Durable reservation identity carried only by decommission writes. Other
     /// data-movement users, including rebalance, leave it unset. Keep this
     /// context boxed because `ObjectOptions` is passed by value through deep
@@ -966,6 +1065,10 @@ pub struct ObjectOptions {
     /// Proves an upper layer holds the bucket lifecycle sentinel. A separate
     /// fence avoids recursively acquiring the read lock behind a queued writer.
     pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
+    /// Retains the actual lifecycle guard for an owned multipart commit. A
+    /// lock-loss fence alone does not keep a cancelled caller's lock alive. The
+    /// owner also retains the continuous incarnation-validation coverage.
+    pub bucket_lifecycle_lock_owner: Option<Arc<crate::store::BucketIncarnationFenceGuard>>,
     pub replication_request: bool,
     /// True when the inbound request carried the
     /// `{x-rustfs-,x-minio-}source-proxy-request` header family with the
@@ -1043,6 +1146,25 @@ pub enum ReplicationStatusWritebackMode {
 }
 
 impl ObjectOptions {
+    pub(crate) fn shard_integrity_write_enabled(&self) -> bool {
+        match self.shard_integrity_write_mode {
+            Some(ShardIntegrityWriteMode::Protected) => true,
+            Some(ShardIntegrityWriteMode::Legacy) => false,
+            None if self.data_movement => false,
+            None => {
+                rustfs_utils::get_env_bool(rustfs_config::ENV_SHARD_INTEGRITY_WRITE, rustfs_config::DEFAULT_SHARD_INTEGRITY_WRITE)
+                    && rustfs_utils::get_env_bool(
+                        rustfs_config::ENV_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                        rustfs_config::DEFAULT_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                    )
+            }
+        }
+    }
+
+    pub(crate) fn inherit_shard_integrity(&mut self, source: &ObjectInfo) {
+        self.shard_integrity_write_mode = Some(source.shard_integrity_write_mode());
+    }
+
     pub(crate) fn with_capacity_expected_data_bytes(expected_data_bytes: Option<usize>) -> Self {
         Self {
             decommission_capacity: expected_data_bytes.map(|expected_data_bytes| {
@@ -1095,6 +1217,7 @@ impl std::fmt::Debug for ObjectOptions {
             .field("scanner_publication_commit_scope", &self.scanner_publication_commit_scope)
             .field("data_movement", &self.data_movement)
             .field("raw_data_movement_read", &self.raw_data_movement_read)
+            .field("data_movement_transferred_tier_versions", &self.data_movement_transferred_tier_versions)
             .field("include_part_checksums", &self.include_part_checksums)
             .field("src_pool_idx", &self.src_pool_idx)
             .field("user_defined_count", &self.user_defined.len())
@@ -1103,8 +1226,11 @@ impl std::fmt::Debug for ObjectOptions {
             .field("http_preconditions", &self.http_preconditions.is_some())
             .field("delete_replication", &self.delete_replication.is_some())
             .field("delete_replication_config_snapshot", &self.delete_replication_config_snapshot)
+            .field("delete_mutation_owner", &self.delete_mutation_owner.is_some())
+            .field("conditional_delete_generations", &self.conditional_delete_generations.is_some())
             .field("namespace_lock_fence", &self.namespace_lock_fence.is_some())
             .field("bucket_lifecycle_lock_fence", &self.bucket_lifecycle_lock_fence.is_some())
+            .field("bucket_lifecycle_lock_owner", &self.bucket_lifecycle_lock_owner.is_some())
             .field("replication_request", &self.replication_request)
             .field("proxy_request", &self.proxy_request)
             .field("proxy_header_set", &self.proxy_header_set)
@@ -1182,7 +1308,8 @@ impl ObjectOptions {
         self.version_id.is_some() || !self.versioned || self.version_suspended
     }
 
-    pub(crate) fn add_namespace_lock_lost_signal(&mut self, signal: Arc<rustfs_lock::distributed_lock::LockLostSignal>) {
+    #[doc(hidden)]
+    pub fn add_namespace_lock_lost_signal(&mut self, signal: Arc<rustfs_lock::distributed_lock::LockLostSignal>) {
         #[cfg(test)]
         let test_fence = NAMESPACE_LOCK_SIGNAL_TEST_FENCES
             .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -1350,7 +1477,27 @@ fn update_replication_fingerprint_optional_str(hasher: &mut Sha256, value: Optio
     }
 }
 
-#[derive(Debug, Default)]
+static EMPTY_USER_DEFINED: std::sync::LazyLock<Arc<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| Arc::new(HashMap::new()));
+static EMPTY_USER_TAGS: std::sync::LazyLock<Arc<String>> = std::sync::LazyLock::new(|| Arc::new(String::new()));
+static EMPTY_PARTS: std::sync::LazyLock<Arc<Vec<ObjectPartInfo>>> = std::sync::LazyLock::new(|| Arc::new(Vec::new()));
+
+#[inline]
+fn empty_user_defined() -> Arc<HashMap<String, String>> {
+    Arc::clone(&EMPTY_USER_DEFINED)
+}
+
+#[inline]
+fn empty_user_tags() -> Arc<String> {
+    Arc::clone(&EMPTY_USER_TAGS)
+}
+
+#[inline]
+fn empty_parts() -> Arc<Vec<ObjectPartInfo>> {
+    Arc::clone(&EMPTY_PARTS)
+}
+
+#[derive(Debug)]
 pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
@@ -1392,6 +1539,54 @@ pub struct ObjectInfo {
     pub version_purge_status: VersionPurgeStatusType,
     pub replication_decision: String,
     pub checksum: Option<Bytes>,
+    /// True when this `CompleteMultipartUpload` result is the object already
+    /// published by the same upload. Callers must not repeat quota, replication,
+    /// lifecycle, or object-created side effects for that response.
+    pub multipart_completion_replayed: bool,
+}
+
+impl Default for ObjectInfo {
+    fn default() -> Self {
+        Self {
+            bucket: String::new(),
+            name: String::new(),
+            storage_class: None,
+            mod_time: None,
+            size: 0,
+            actual_size: 0,
+            is_dir: false,
+            user_defined: empty_user_defined(),
+            parity_blocks: 0,
+            data_blocks: 0,
+            version_id: None,
+            data_dir: None,
+            delete_marker: false,
+            transitioned_object: TransitionedObject::default(),
+            transition_version_state: rustfs_filemeta::TransitionVersionState::default(),
+            restore_ongoing: false,
+            restore_expires: None,
+            user_tags: empty_user_tags(),
+            parts: empty_parts(),
+            is_latest: false,
+            content_type: None,
+            content_encoding: None,
+            expires: None,
+            num_versions: 0,
+            successor_mod_time: None,
+            put_object_reader: None,
+            etag: None,
+            inlined: false,
+            metadata_only: false,
+            version_only: false,
+            replication_status_internal: None,
+            replication_status: ReplicationStatusType::default(),
+            version_purge_status_internal: None,
+            version_purge_status: VersionPurgeStatusType::default(),
+            replication_decision: String::new(),
+            checksum: None,
+            multipart_completion_replayed: false,
+        }
+    }
 }
 
 impl Clone for ObjectInfo {
@@ -1432,12 +1627,30 @@ impl Clone for ObjectInfo {
             version_purge_status: self.version_purge_status.clone(),
             replication_decision: self.replication_decision.clone(),
             checksum: self.checksum.clone(),
+            multipart_completion_replayed: self.multipart_completion_replayed,
             expires: self.expires,
         }
     }
 }
 
 impl ObjectInfo {
+    pub(crate) fn shard_integrity_write_mode(&self) -> ShardIntegrityWriteMode {
+        // Any declaration requires protection. Malformed declarations remain
+        // errors in the source reader and must never select the legacy path.
+        if self.parts.iter().any(|part| part.integrity.is_some())
+            || [
+                rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
+                rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
+            ]
+            .iter()
+            .any(|suffix| rustfs_utils::http::contains_key_str(&self.user_defined, suffix))
+        {
+            ShardIntegrityWriteMode::Protected
+        } else {
+            ShardIntegrityWriteMode::Legacy
+        }
+    }
+
     /// Capture the source mutation snapshot used by replication workers when
     /// publishing terminal status. The semantic fingerprint is recomputed at
     /// the storage CAS boundary, so an older writer that preserves an unknown
@@ -1725,8 +1938,45 @@ impl ObjectInfo {
         Self::from_file_info_with_version_id(fi, bucket, object, version_id)
     }
 
+    pub fn from_owned_file_info(mut fi: FileInfo, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
+        let mut version_id = fi.version_id;
+
+        if versioned && version_id.is_none() {
+            version_id = Some(Uuid::nil())
+        }
+
+        let inlined = fi.inline_data();
+        let free_version = fi.tier_free_version();
+        let metadata = std::mem::take(&mut fi.metadata);
+        let parts = std::mem::take(&mut fi.parts);
+        Self::from_file_info_parts(&fi, inlined, free_version, metadata, parts, bucket, object, version_id)
+    }
+
     pub(crate) fn from_file_info_with_version_id(
         fi: &FileInfo,
+        bucket: &str,
+        object: &str,
+        version_id: Option<Uuid>,
+    ) -> ObjectInfo {
+        Self::from_file_info_parts(
+            fi,
+            fi.inline_data(),
+            fi.tier_free_version(),
+            fi.metadata.clone(),
+            fi.parts.clone(),
+            bucket,
+            object,
+            version_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_file_info_parts(
+        fi: &FileInfo,
+        inlined: bool,
+        free_version: bool,
+        mut metadata: HashMap<String, String>,
+        parts: Vec<ObjectPartInfo>,
         bucket: &str,
         object: &str,
         version_id: Option<Uuid>,
@@ -1735,33 +1985,30 @@ impl ObjectInfo {
 
         // etag
         let (content_type, content_encoding, etag) = {
-            let content_type = fi.metadata.get("content-type").cloned();
-            let content_encoding = fi.metadata.get("content-encoding").cloned();
-            let etag = fi.metadata.get("etag").cloned();
+            let content_type = metadata.get("content-type").cloned();
+            let content_encoding = metadata.get("content-encoding").cloned();
+            let etag = metadata.remove("etag");
 
             (content_type, content_encoding, etag)
         };
 
         // tags
-        let user_tags: Arc<String> = fi
-            .metadata
-            .get(AMZ_OBJECT_TAGGING)
-            .map(|s| Arc::new(s.clone()))
-            .unwrap_or_default();
-
-        let inlined = fi.inline_data();
+        let user_tags: Arc<String> = metadata
+            .remove(AMZ_OBJECT_TAGGING)
+            .map(Arc::new)
+            .unwrap_or_else(empty_user_tags);
 
         // Parse expires from metadata (HTTP date format RFC 7231 or ISO 8601)
-        let expires = fi.metadata.get("expires").and_then(|s| {
+        let expires = metadata.remove("expires").and_then(|s| {
             // Try parsing as ISO 8601 first
-            OffsetDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
+            OffsetDateTime::parse(&s, &time::format_description::well_known::Iso8601::DEFAULT)
                 .or_else(|_| {
                     // Try RFC 2822 format
-                    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc2822)
+                    OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc2822)
                 })
                 .or_else(|_| {
                     // Try RFC 3339 format
-                    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                    OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339)
                 })
                 .ok()
         });
@@ -1782,7 +2029,7 @@ impl ObjectInfo {
 
         let mut replication_status = replication_status_from_filemeta(fi.replication_status());
         if replication_status.is_empty()
-            && let Some(status) = fi.metadata.get(metadata_keys::REPLICATION_STATUS).cloned()
+            && let Some(status) = metadata.get(metadata_keys::REPLICATION_STATUS)
             && status == ReplicationStatusType::Replica.as_str()
         {
             replication_status = ReplicationStatusType::Replica;
@@ -1798,19 +2045,15 @@ impl ObjectInfo {
                 .or_else(|| fi.transition_version_id.map(|version_id| version_id.to_string()))
                 .unwrap_or_default(),
             status: fi.transition_status.clone(),
-            free_version: fi.tier_free_version(),
+            free_version,
             tier: fi.transition_tier.clone(),
         };
 
-        let metadata = {
-            let mut v = fi.metadata.clone();
-            clean_metadata(&mut v);
-            v
-        };
+        clean_metadata(&mut metadata);
 
         let storage_class = Some(
             storageclass::effective_class(
-                fi.metadata.get(metadata_keys::STORAGE_CLASS).map(String::as_str),
+                metadata.get(metadata_keys::STORAGE_CLASS).map(String::as_str),
                 (fi.transition_status == rustfs_filemeta::TRANSITION_COMPLETE && !fi.transition_tier.is_empty())
                     .then_some(fi.transition_tier.as_str()),
             )
@@ -1819,28 +2062,19 @@ impl ObjectInfo {
 
         let mut restore_ongoing = false;
         let mut restore_expires = None;
-        if let Some(restore_status) = fi.metadata.get(metadata_keys::RESTORE).cloned()
-            && let Ok(restore_status) = parse_restore_obj_status(&restore_status)
+        if let Some(restore_status) = metadata.get(metadata_keys::RESTORE)
+            && let Ok(restore_status) = parse_restore_obj_status(restore_status)
         {
             restore_ongoing = restore_status.on_going();
             restore_expires = restore_status.expiry();
         }
 
-        // Convert parts from rustfs_filemeta::ObjectPartInfo to object_api::ObjectPartInfo
-        let parts = fi
-            .parts
-            .iter()
-            .map(|part| ObjectPartInfo {
-                etag: part.etag.clone(),
-                index: part.index.clone(),
-                size: part.size,
-                actual_size: part.actual_size,
-                mod_time: part.mod_time,
-                checksums: part.checksums.clone(),
-                number: part.number,
-                error: part.error.clone(),
-            })
-            .collect::<Vec<_>>();
+        let user_defined = if metadata.is_empty() {
+            empty_user_defined()
+        } else {
+            Arc::new(metadata)
+        };
+        let parts = if parts.is_empty() { empty_parts() } else { Arc::new(parts) };
 
         ObjectInfo {
             bucket: bucket.to_string(),
@@ -1853,7 +2087,7 @@ impl ObjectInfo {
             delete_marker: fi.deleted,
             mod_time: fi.mod_time,
             size: fi.size,
-            parts: Arc::new(parts),
+            parts,
             is_latest: fi.is_latest,
             user_tags,
             content_type,
@@ -1863,7 +2097,7 @@ impl ObjectInfo {
             successor_mod_time: fi.successor_mod_time,
             etag,
             inlined,
-            user_defined: Arc::new(metadata),
+            user_defined,
             transitioned_object,
             transition_version_state: fi.transition_version_state,
             checksum: fi.checksum.clone(),
@@ -1983,7 +2217,7 @@ impl ObjectInfo {
                     }
                 }
 
-                let file_infos = match entry.file_info_versions(bucket) {
+                let mut file_infos = match entry.file_info_versions(bucket) {
                     Ok(res) => res,
                     Err(err) => {
                         if fail_on_decode_error {
@@ -1994,19 +2228,18 @@ impl ObjectInfo {
                     }
                 };
 
-                let versions = if let Some(marker) = after_version_marker.take() {
-                    versions_after_marker(&file_infos, marker)
-                } else {
-                    &file_infos.versions
-                };
+                let start_idx = after_version_marker
+                    .take()
+                    .and_then(|marker| version_marker_index(&file_infos, marker))
+                    .map_or(0, |idx| idx + 1);
+                let versioned = vcfg.as_ref().is_some_and(|(v, _)| v.versioned(&entry.name));
 
-                for fi in versions.iter() {
+                for fi in file_infos.versions.drain(start_idx..) {
                     if !include_version_purge && !fi.version_purge_status().is_empty() {
                         continue;
                     }
 
-                    let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
-                    objects.push(ObjectInfo::from_file_info(fi, bucket, &entry.name, versioned));
+                    objects.push(ObjectInfo::from_owned_file_info(fi, bucket, &entry.name, versioned));
                 }
                 continue;
             }
@@ -2054,43 +2287,55 @@ impl ObjectInfo {
         let mut prev_prefix = "";
         for entry in entries.entries() {
             if entry.is_object() {
-                if let Some(delimiter) = &delimiter {
+                let matched_delimiter = delimiter.as_ref().and_then(|delimiter| {
                     let remaining = if entry.name.starts_with(prefix) {
                         &entry.name[prefix.len()..]
                     } else {
                         entry.name.as_str()
                     };
-                    if let Some(idx) = remaining.find(delimiter.as_str()) {
+                    remaining.find(delimiter.as_str()).map(|idx| {
                         let idx = prefix.len() + idx + delimiter.len();
-                        if let Some(curr_prefix) = entry.name.get(0..idx) {
-                            if curr_prefix == prev_prefix {
-                                continue;
-                            }
-
-                            prev_prefix = curr_prefix;
-
-                            objects.push(ObjectInfo {
-                                is_dir: true,
-                                bucket: bucket.to_owned(),
-                                name: curr_prefix.to_owned(),
-                                ..Default::default()
-                            });
-                        }
-                        continue;
-                    }
+                        entry.name.get(0..idx)
+                    })
+                });
+                if let Some(Some(curr_prefix)) = matched_delimiter
+                    && curr_prefix == prev_prefix
+                {
+                    continue;
                 }
 
                 let fi = match entry.to_fileinfo(bucket) {
-                    Ok(res) => res,
+                    Ok(res) => Some(res),
                     Err(err) => {
                         warn!("file_info_versions err {:?}", err);
-                        continue;
+                        None
                     }
                 };
 
-                // TODO(backlog): handle VersionPurgeStatus in object listing
-                let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
-                objects.push(ObjectInfo::from_file_info(&fi, bucket, &entry.name, versioned));
+                if fi.as_ref().is_some_and(|fi| !fi.version_purge_status().is_empty()) {
+                    continue;
+                }
+
+                if let Some(maybe_prefix) = matched_delimiter {
+                    if let Some(curr_prefix) = maybe_prefix {
+                        prev_prefix = curr_prefix;
+
+                        objects.push(ObjectInfo {
+                            is_dir: true,
+                            bucket: bucket.to_owned(),
+                            name: curr_prefix.to_owned(),
+                            ..Default::default()
+                        });
+                    }
+                    continue;
+                }
+
+                let Some(fi) = fi else {
+                    continue;
+                };
+
+                let versioned = vcfg.as_ref().is_some_and(|(v, _)| v.versioned(&entry.name));
+                objects.push(ObjectInfo::from_owned_file_info(fi, bucket, &entry.name, versioned));
 
                 continue;
             }
@@ -2193,13 +2438,16 @@ impl ObjectInfo {
     }
 }
 
-fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker: VersionMarker) -> &[FileInfo] {
-    let marker_idx = match marker {
+fn version_marker_index(file_infos: &rustfs_filemeta::FileInfoVersions, marker: VersionMarker) -> Option<usize> {
+    match marker {
         VersionMarker::Null => file_infos.versions.iter().position(|version| version.version_id.is_none()),
         VersionMarker::Version(vid) => file_infos.find_version_index(vid),
-    };
+    }
+}
 
-    marker_idx
+#[cfg(test)]
+fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker: VersionMarker) -> &[FileInfo] {
+    version_marker_index(file_infos, marker)
         .map(|idx| &file_infos.versions[idx + 1..])
         .unwrap_or(&file_infos.versions)
 }
@@ -2619,6 +2867,66 @@ mod tests {
                 .any(|object| object.version_purge_status == VersionPurgeStatusType::Pending)
         );
         assert!(lifecycle_objects.iter().all(|object| object.num_versions == 2));
+    }
+
+    #[tokio::test]
+    async fn list_objects_v2_hides_objects_pending_version_purge() {
+        let purge_version_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+        let object = "folder/object";
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: object.to_string(),
+            version_id: Some(purge_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("version pending purge should be added");
+        fm.delete_version(&FileInfo {
+            volume: "bucket".to_string(),
+            name: object.to_string(),
+            version_id: Some(purge_version_id),
+            replication_state_internal: Some(crate::bucket::replication::replication_state_to_filemeta(&ReplicationState {
+                version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("arn:target-a=PENDING;"),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .expect("version purge status should be persisted");
+
+        let entries = MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![Some(MetaCacheEntry {
+                name: object.to_string(),
+                metadata: fm.marshal_msg().expect("metadata should marshal"),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+
+        let list_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", None).await;
+        let delimiter_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_string())).await;
+        let public_versions = ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, "bucket", "", None, None).await;
+        let lifecycle_versions =
+            ObjectInfo::from_meta_cache_entries_sorted_versions_for_lifecycle(&entries, "bucket", "", None, None).await;
+
+        assert!(
+            list_objects.is_empty(),
+            "ListObjectsV2 must not publish a key hidden from public versions"
+        );
+        assert!(
+            delimiter_objects.is_empty(),
+            "delimiter ListObjectsV2 must not synthesize a prefix from a hidden key"
+        );
+        assert!(
+            public_versions.is_empty(),
+            "public ListObjectVersions hides pending version-purge records"
+        );
+        assert_eq!(lifecycle_versions.len(), 1, "lifecycle cleanup still needs the pending purge record");
+        assert_eq!(lifecycle_versions[0].version_purge_status, VersionPurgeStatusType::Pending);
     }
 
     #[test]
@@ -3439,5 +3747,79 @@ mod tests {
         assert!(opts.tier_free_version_receipt_sink.is_none());
         opts.ensure_lifecycle_delete_all_journal();
         assert!(opts.lifecycle_delete_all_journal().is_some());
+    }
+
+    #[tokio::test]
+    async fn from_owned_file_info_matches_borrowed_and_delimiter_skips_duplicate_prefix_decode() {
+        let valid_bytes = rustfs_filemeta::test_data::create_realistic_object_xlmeta().expect("realistic xl.meta");
+        let mut fi = rustfs_filemeta::FileMeta::load(&valid_bytes)
+            .expect("load realistic xl.meta")
+            .into_fileinfo("bucket", "photos/a.jpg", "", false, false, true)
+            .expect("decode fileinfo");
+        fi.metadata.insert("etag".to_string(), "etag-123".to_string());
+        fi.metadata.insert("md5Sum".to_string(), "md5-123".to_string());
+        fi.metadata.insert("expires".to_string(), "2024-01-16T10:30:00Z".to_string());
+        fi.metadata
+            .insert(AMZ_OBJECT_TAGGING.to_string(), "env=prod&team=storage".to_string());
+        fi.metadata
+            .insert(metadata_keys::STORAGE_CLASS.to_string(), "STANDARD".to_string());
+
+        fi.set_tier_free_version();
+        let borrowed = ObjectInfo::from_file_info(&fi, "bucket", "photos/a.jpg", true);
+        let owned = ObjectInfo::from_owned_file_info(fi, "bucket", "photos/a.jpg", true);
+        assert!(owned.inlined);
+        assert!(owned.transitioned_object.free_version);
+        assert_eq!(
+            (
+                &owned.bucket,
+                &owned.name,
+                owned.version_id,
+                owned.size,
+                owned.inlined,
+                owned.transitioned_object.free_version,
+                &owned.etag,
+                owned.expires,
+                &owned.user_tags,
+                &owned.user_defined,
+                &owned.parts,
+                &owned.storage_class
+            ),
+            (
+                &borrowed.bucket,
+                &borrowed.name,
+                borrowed.version_id,
+                borrowed.size,
+                borrowed.inlined,
+                borrowed.transitioned_object.free_version,
+                &borrowed.etag,
+                borrowed.expires,
+                &borrowed.user_tags,
+                &borrowed.user_defined,
+                &borrowed.parts,
+                &borrowed.storage_class
+            ),
+        );
+
+        let entries = MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![
+                Some(rustfs_filemeta::MetaCacheEntry {
+                    name: "photos/a.jpg".to_string(),
+                    metadata: valid_bytes,
+                    cached: None,
+                    reusable: false,
+                }),
+                Some(rustfs_filemeta::MetaCacheEntry {
+                    name: "photos/b.jpg".to_string(),
+                    metadata: b"corrupt-duplicate-prefix-entry".to_vec(),
+                    cached: None,
+                    reusable: false,
+                }),
+            ]),
+            ..Default::default()
+        };
+        let grouped = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_string())).await;
+        assert_eq!(grouped.len(), 1);
+        assert!(grouped[0].is_dir);
+        assert_eq!(grouped[0].name, "photos/");
     }
 }

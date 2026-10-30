@@ -24,6 +24,12 @@ pub const HEAL_DELETE_DANGLING: bool = true;
 pub const RUSTFS_RESERVED_BUCKET: &str = "rustfs";
 pub const RUSTFS_RESERVED_BUCKET_PATH: &str = "/rustfs";
 
+/// Detail attached to a completed deep heal when a healthy legacy object has
+/// no independent identity commitment. Durable MRF handling uses this exact
+/// reason to pause proofless retries without treating the object as repaired.
+pub const LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL: &str =
+    "Legacy object uses standard repair; independent object identity remains unverified";
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum HealItemType {
     Metadata,
@@ -225,12 +231,11 @@ pub struct HealOpts {
 pub enum HealAdmissionDropReason {
     QueueFull,
     PolicyDropped,
-    /// HS-06: an admin heal start overlaps (same bucket with mutually
-    /// containing prefixes, or the same erasure set) an already running or
-    /// queued task. Only produced when RUSTFS_HEAL_OVERLAP_POLICY=minio_error.
+    /// An admin target already has an incompatible or durable-only owner,
+    /// or an equivalent start was rejected by the `minio_error` policy.
     AlreadyRunning,
-    /// HS-06: same as [`Self::AlreadyRunning`] but for paths that merely
-    /// contain (or are contained by) the active task's path.
+    /// An admin scope intersects another owner's scope without being an
+    /// equivalent request. Produced by both overlap policies.
     OverlappingPaths,
 }
 
@@ -356,6 +361,9 @@ pub struct HealChannelRequest {
     pub object_prefix: Option<String>,
     /// Object version ID (optional)
     pub object_version_id: Option<String>,
+    /// Bucket incarnation observed by the object write that produced a local
+    /// durable partial-write responsibility.
+    pub expected_bucket_incarnation_id: Option<Uuid>,
     /// Force start heal
     pub force_start: bool,
     /// Priority
@@ -382,6 +390,16 @@ pub struct HealChannelRequest {
     pub timeout_seconds: Option<u64>,
     /// Origin of the request for operational status and queue accounting
     pub source: HealRequestSource,
+}
+
+impl HealChannelRequest {
+    /// Create a request with a stable identity before publishing it.
+    pub fn new() -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            ..Default::default()
+        }
+    }
 }
 
 /// Heal response from ahm to admin
@@ -583,6 +601,7 @@ pub fn create_heal_request(
         bucket,
         object_prefix,
         object_version_id: None,
+        expected_bucket_incarnation_id: None,
         force_start,
         priority: priority.unwrap_or_default(),
         pool_index: None,
@@ -615,6 +634,7 @@ pub fn create_heal_request_with_options(
         bucket,
         object_prefix,
         object_version_id: None,
+        expected_bucket_incarnation_id: None,
         force_start,
         priority: priority.unwrap_or_default(),
         pool_index,
@@ -646,6 +666,7 @@ fn create_auto_heal_disk_request(set_disk_id: String, priority: Option<HealChann
         disk: Some(set_disk_id),
         heal_endpoints: Vec::new(),
         object_version_id: None,
+        expected_bucket_incarnation_id: None,
         force_start: false,
         priority: priority.unwrap_or(HealChannelPriority::Low),
         pool_index: None,
@@ -662,14 +683,17 @@ fn create_auto_heal_disk_request(set_disk_id: String, priority: Option<HealChann
     }
 }
 
-fn create_auto_replacement_disk_request(
+/// Build one automatic replacement request for the verified targets of a set.
+pub fn create_auto_replacement_disks_request(
     pool_index: usize,
     set_index: usize,
-    replacement_endpoint: String,
+    mut replacement_endpoints: Vec<String>,
     priority: Option<HealChannelPriority>,
 ) -> HealChannelRequest {
+    replacement_endpoints.sort_unstable();
+    replacement_endpoints.dedup();
     let mut request = create_auto_heal_disk_request(format!("pool_{pool_index}_set_{set_index}"), priority);
-    request.heal_endpoints = vec![replacement_endpoint];
+    request.heal_endpoints = replacement_endpoints;
     request.pool_index = Some(pool_index);
     request.set_index = Some(set_index);
     request
@@ -690,10 +714,10 @@ pub async fn send_heal_replacement_disk(
     replacement_endpoint: String,
     priority: Option<HealChannelPriority>,
 ) -> Result<(), String> {
-    send_heal_request(create_auto_replacement_disk_request(
+    send_heal_request(create_auto_replacement_disks_request(
         pool_index,
         set_index,
-        replacement_endpoint,
+        vec![replacement_endpoint],
         priority,
     ))
     .await
@@ -705,13 +729,34 @@ mod auto_heal_disk_request_tests {
 
     #[test]
     fn replacement_disk_request_carries_its_exact_endpoint() {
-        let request =
-            create_auto_replacement_disk_request(2, 3, "http://node2:9000/drive3".to_string(), Some(HealChannelPriority::Normal));
+        let request = create_auto_replacement_disks_request(
+            2,
+            3,
+            vec!["http://node2:9000/drive3".to_string()],
+            Some(HealChannelPriority::Normal),
+        );
 
         assert_eq!(request.disk.as_deref(), Some("pool_2_set_3"));
         assert_eq!(request.heal_endpoints, ["http://node2:9000/drive3"]);
         assert_eq!(request.pool_index, Some(2));
         assert_eq!(request.set_index, Some(3));
+        assert_eq!(request.source, HealRequestSource::AutoHeal);
+    }
+
+    #[test]
+    fn replacement_disk_request_keeps_every_distinct_target() {
+        let request = create_auto_replacement_disks_request(
+            2,
+            3,
+            vec!["drive-b".to_string(), "drive-a".to_string(), "drive-b".to_string()],
+            Some(HealChannelPriority::Normal),
+        );
+
+        assert_eq!(request.disk.as_deref(), Some("pool_2_set_3"));
+        assert_eq!(request.heal_endpoints, ["drive-a", "drive-b"]);
+        assert_eq!(request.pool_index, Some(2));
+        assert_eq!(request.set_index, Some(3));
+        assert_eq!(request.priority, HealChannelPriority::Normal);
         assert_eq!(request.source, HealRequestSource::AutoHeal);
     }
 

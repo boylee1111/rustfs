@@ -16,8 +16,8 @@
 
 use super::storage_api::multipart_usecase::ECStore;
 use super::storage_api::multipart_usecase::access::{
-    apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, has_bypass_governance_header,
-    replication_request_authorized,
+    TableDataPlaneListAccess, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
+    has_bypass_governance_header, replication_request_authorized, retained_table_data_plane_publication_guards,
 };
 use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::multipart_usecase::bucket::{
@@ -40,7 +40,9 @@ use super::storage_api::multipart_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::multipart_usecase::data_usage::{
     quota_object_size, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
 };
-use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
+use super::storage_api::multipart_usecase::error::{
+    StorageError, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
+};
 use super::storage_api::multipart_usecase::helper::OperationHelper;
 #[cfg(test)]
 use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
@@ -70,19 +72,21 @@ use super::storage_api::multipart_usecase::{
 use super::trailer_adapter::trailer_source;
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
-    put_object_body_read_timeout, reject_oversize_single_upload,
+    put_object_body_read_timeout, reject_non_wildcard_write_if_none_match, reject_oversize_single_upload,
+    reject_veeam_sosapi_mutation,
 };
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
     invalidate_object_data_cache_before_mutation,
 };
 use crate::app::object_usecase::{
-    acquire_copy_bucket_lifecycle_locks, apply_quota_admission, build_put_like_object_lock_metadata, map_quota_check_outcome,
-    s3s_body_error_to_io, validate_existing_object_lock_for_write,
+    apply_quota_admission, build_put_like_object_lock_metadata, map_quota_check_outcome, s3s_body_error_to_io,
+    validate_existing_object_lock_for_write,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
+use crate::app::table_list_isolation;
 use crate::auth::{
     VerifiedPresignedRequest, VerifiedSigV4Request, parse_presigned_multipart_max_total_object_size,
     reject_presigned_multipart_max_total_object_size_for_other_operation,
@@ -127,6 +131,36 @@ use tokio_util::io::StreamReader;
 use tracing::{instrument, warn};
 use urlencoding::encode;
 use uuid::Uuid;
+
+fn normalize_copy_source_version_id(version_id: Option<&str>) -> S3Result<Option<String>> {
+    match version_id {
+        Some(v) => {
+            let trimmed = v.trim();
+            if trimmed.eq_ignore_ascii_case("null") {
+                Ok(Some(Uuid::nil().to_string()))
+            } else if Uuid::parse_str(trimmed).is_ok() {
+                Ok(Some(trimmed.to_string()))
+            } else {
+                Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "Invalid version id specified in copy source",
+                ))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn format_copy_source_version_id(version_id: Option<Uuid>, src_versioned: bool, src_version_suspended: bool) -> Option<String> {
+    if src_versioned || src_version_suspended {
+        Some(match version_id {
+            Some(vid) if vid != Uuid::nil() => vid.to_string(),
+            _ => "null".to_string(),
+        })
+    } else {
+        None
+    }
+}
 
 #[cfg(test)]
 fn merge_part_encryption_metadata(
@@ -509,6 +543,8 @@ impl DefaultMultipartUsecase {
             bucket, key, upload_id, ..
         } = req.input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -545,7 +581,7 @@ impl DefaultMultipartUsecase {
     #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_complete_multipart_upload(
         &self,
-        req: S3Request<CompleteMultipartUploadInput>,
+        mut req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         reject_presigned_multipart_max_total_object_size_for_other_operation(
             &req.headers,
@@ -563,7 +599,7 @@ impl DefaultMultipartUsecase {
             S3Operation::CompleteMultipartUpload,
         );
         let replication_authorized = replication_request_authorized(&req);
-        let input = req.input.clone();
+        let input = std::mem::take(&mut req.input);
         let CompleteMultipartUploadInput {
             multipart_upload,
             bucket,
@@ -577,6 +613,8 @@ impl DefaultMultipartUsecase {
             ..
         } = input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+        reject_non_wildcard_write_if_none_match(if_none_match.as_ref(), &req.headers)?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         if if_match.is_some() || if_none_match.is_some() {
@@ -586,23 +624,22 @@ impl DefaultMultipartUsecase {
 
             match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
                 Ok(info) => {
-                    if !info.delete_marker {
-                        if let Some(ifmatch) = if_match
-                            && let Some(strong_etag) = ifmatch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) != strong_etag)
+                    if info.delete_marker {
+                        if if_match.is_some() {
+                            return Err(ApiError::from(StorageError::ObjectNotFound(bucket.clone(), key.clone())).into());
+                        }
+                    } else {
+                        if let Some(ifmatch) = &if_match
+                            && !ifmatch.is_any()
+                            && ifmatch
+                                .as_etag()
+                                .and_then(ETag::as_strong)
+                                .is_none_or(|expected| info.etag.as_deref() != Some(expected))
                         {
                             return Err(s3_error!(PreconditionFailed));
                         }
-                        if let Some(ifnonematch) = if_none_match
-                            && let Some(strong_etag) = ifnonematch.into_etag()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_some_and(|etag| ETag::Strong(etag.clone()) == strong_etag)
-                        {
+                        // The request guard permits only the wildcard here.
+                        if if_none_match.is_some() {
                             return Err(s3_error!(PreconditionFailed));
                         }
                     }
@@ -674,43 +711,40 @@ impl DefaultMultipartUsecase {
             }
         };
 
-        let multipart_info = store
-            .get_multipart_info(&bucket, &key, &upload_id, &opts)
-            .await
-            .map_err(ApiError::from)?;
+        // A lost Complete response retries the same upload id after staging is
+        // gone. `get_multipart_info` is NoSuchUpload in that case; completion
+        // below replays the committed object instead of failing the retry.
+        let multipart_info = match store.get_multipart_info(&bucket, &key, &upload_id, &opts).await {
+            Ok(info) => Some(info),
+            Err(err) if is_err_invalid_upload_id(&err) => None,
+            Err(err) => return Err(ApiError::from(err).into()),
+        };
         // A ciphertext-passthrough session stores encrypted parts verbatim and
         // completes without the customer key (the replication client has none),
         // so the SSE-C completion check must be skipped for it.
-        if !contains_key_str(&multipart_info.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT) {
-            EncryptionRequest {
-                bucket: &bucket,
-                key: &key,
-                server_side_encryption: None,
-                ssekms_key_id: None,
-                ssekms_context: None,
-                sse_customer_algorithm,
-                sse_customer_key,
-                sse_customer_key_md5,
-                content_size: 0,
-                principal: None,
+        if let Some(info) = multipart_info.as_ref() {
+            if !contains_key_str(&info.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT) {
+                EncryptionRequest {
+                    bucket: &bucket,
+                    key: &key,
+                    server_side_encryption: None,
+                    ssekms_key_id: None,
+                    ssekms_context: None,
+                    sse_customer_algorithm: sse_customer_algorithm.clone(),
+                    sse_customer_key: sse_customer_key.clone(),
+                    sse_customer_key_md5: sse_customer_key_md5.clone(),
+                    content_size: 0,
+                    principal: None,
+                }
+                .validate_complete_multipart_ssec(&info.user_defined)?;
             }
-            .validate_complete_multipart_ssec(&multipart_info.user_defined)?;
+            validate_complete_multipart_checksum_type(&req.headers, &info.user_defined)?;
         }
-        validate_complete_multipart_checksum_type(&req.headers, &multipart_info.user_defined)?;
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
-        let server_side_encryption = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption")
-            .map(|s| ServerSideEncryption::from(s.clone()));
-        let ssekms_key_id = match server_side_encryption.as_ref() {
-            Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => multipart_info
-                .user_defined
-                .get("x-amz-server-side-encryption-aws-kms-key-id")
-                .cloned(),
-            _ => None,
-        };
+        let upload_user_defined = multipart_info.as_ref().map(|info| info.user_defined.clone());
+        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
 
         let quota_metadata_sys = self.bucket_metadata_sys();
         let quota_tracking = quota_metadata_sys.is_some();
@@ -734,38 +768,44 @@ impl DefaultMultipartUsecase {
         // at multipart-session creation. Configuration and matching targets
         // can change while parts are uploaded, so persist the exact decision's
         // generation and PENDING set atomically with the completed object and
-        // reuse the same decision for scheduling below.
-        let completion_replication_decision = must_replicate_object(
-            &bucket,
-            &key,
-            &multipart_info.user_defined,
-            "".to_string(),
-            opts.delete_marker_replication_status(),
-            opts.clone(),
-        )
-        .await;
-        let mut completion_replication_metadata = HashMap::new();
-        if completion_replication_decision.replicate_any() {
-            insert_str(
-                &mut completion_replication_metadata,
-                SUFFIX_REPLICATION_GENERATION,
-                Uuid::new_v4().to_string(),
-            );
-            insert_str(
-                &mut completion_replication_metadata,
-                SUFFIX_REPLICATION_TIMESTAMP,
-                jiff::Zoned::now().to_string(),
-            );
-            insert_str(
-                &mut completion_replication_metadata,
-                SUFFIX_REPLICATION_STATUS,
-                completion_replication_decision.pending_status().unwrap_or_default(),
-            );
-        }
-        // `Some(empty)` deliberately means that completion re-evaluated the
-        // session as not admitted; storage removes stale Create-MPU admission
-        // metadata in the same final-object commit.
-        opts.eval_metadata = Some(completion_replication_metadata);
+        // reuse the same decision for scheduling below. A retry whose upload
+        // is already gone must not re-evaluate or rewrite that decision.
+        let completion_replication_decision = if let Some(user_defined) = upload_user_defined.as_ref() {
+            let completion_replication_decision = must_replicate_object(
+                &bucket,
+                &key,
+                user_defined,
+                "".to_string(),
+                opts.delete_marker_replication_status(),
+                opts.clone(),
+            )
+            .await;
+            let mut completion_replication_metadata = HashMap::new();
+            if completion_replication_decision.replicate_any() {
+                insert_str(
+                    &mut completion_replication_metadata,
+                    SUFFIX_REPLICATION_GENERATION,
+                    Uuid::new_v4().to_string(),
+                );
+                insert_str(
+                    &mut completion_replication_metadata,
+                    SUFFIX_REPLICATION_TIMESTAMP,
+                    jiff::Zoned::now().to_string(),
+                );
+                insert_str(
+                    &mut completion_replication_metadata,
+                    SUFFIX_REPLICATION_STATUS,
+                    completion_replication_decision.pending_status().unwrap_or_default(),
+                );
+            }
+            // `Some(empty)` deliberately means that completion re-evaluated the
+            // session as not admitted; storage removes stale Create-MPU admission
+            // metadata in the same final-object commit.
+            opts.eval_metadata = Some(completion_replication_metadata);
+            Some(completion_replication_decision)
+        } else {
+            None
+        };
 
         let complete_commit = spawn_traced_join({
             let store = Arc::clone(&store);
@@ -773,37 +813,47 @@ impl DefaultMultipartUsecase {
             let key = key.clone();
             let upload_id = upload_id.clone();
             let opts = opts.clone();
+            let table_data_plane_publication_guards = table_data_plane_publication_guards;
             async move {
+                let _table_data_plane_publication_guards = table_data_plane_publication_guards;
                 let obj_info = store
                     .clone()
                     .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
                     .await
                     .map_err(ApiError::from)?;
                 let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
+                // Staging reclaim on a replay can free bytes; the dirty mark is
+                // not a usage counter. Quota, replication, lifecycle, and the
+                // object-created scanner signal belong to the commit that
+                // published the object.
                 record_capacity_write(Some(capacity_scope_token)).await;
 
-                if quota_tracking {
-                    let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
+                if !obj_info.multipart_completion_replayed {
+                    if quota_tracking {
+                        let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
 
-                    if versioned {
-                        record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
-                    } else {
-                        record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                        if versioned {
+                            record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
+                        } else {
+                            record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                        }
                     }
+
+                    enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
+
+                    if let Some(decision) = completion_replication_decision
+                        && decision.replicate_any()
+                    {
+                        warn!("need multipart replication");
+                        schedule_object_replication(obj_info.clone(), store, decision).await;
+                    }
+
+                    rustfs_scanner::record_dirty_usage_object_from_producer(
+                        &bucket,
+                        &key,
+                        rustfs_scanner::SegmentInvalidationProducerIdentity::CompleteMultipartUpload,
+                    );
                 }
-
-                enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
-
-                if completion_replication_decision.replicate_any() {
-                    warn!("need multipart replication");
-                    schedule_object_replication(obj_info.clone(), store, completion_replication_decision).await;
-                }
-
-                rustfs_scanner::record_dirty_usage_object_from_producer(
-                    &bucket,
-                    &key,
-                    rustfs_scanner::SegmentInvalidationProducerIdentity::CompleteMultipartUpload,
-                );
                 Ok::<_, S3Error>(obj_info)
             }
         });
@@ -813,6 +863,42 @@ impl DefaultMultipartUsecase {
                 format!("complete multipart upload commit owner task failed: {err}"),
             )
         })??;
+
+        // The upload record is gone on a lost-response retry, so SSE-C is
+        // checked against the committed object instead of the staging metadata.
+        if upload_user_defined.is_none() && !contains_key_str(&obj_info.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT) {
+            EncryptionRequest {
+                bucket: &bucket,
+                key: &key,
+                server_side_encryption: None,
+                ssekms_key_id: None,
+                ssekms_context: None,
+                sse_customer_algorithm,
+                sse_customer_key,
+                sse_customer_key_md5,
+                content_size: 0,
+                principal: None,
+            }
+            .validate_complete_multipart_ssec(obj_info.user_defined.as_ref())?;
+        }
+
+        let encryption_metadata = upload_user_defined.as_ref().unwrap_or(obj_info.user_defined.as_ref());
+        let server_side_encryption = encryption_metadata
+            .get("x-amz-server-side-encryption")
+            .map(|s| ServerSideEncryption::from(s.clone()));
+        let ssekms_key_id = match server_side_encryption.as_ref() {
+            Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => encryption_metadata
+                .get("x-amz-server-side-encryption-aws-kms-key-id")
+                .cloned(),
+            _ => None,
+        };
+        let ssec_algorithm = encryption_metadata
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .cloned();
+        let ssec_key_md5 = encryption_metadata
+            .get("x-amz-server-side-encryption-customer-key-md5")
+            .cloned();
+        let replayed = obj_info.multipart_completion_replayed;
 
         let mpu_version = if versioned {
             obj_info.version_id.map(|v| v.to_string())
@@ -842,8 +928,8 @@ impl DefaultMultipartUsecase {
             key: Some(key.clone()),
             e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
             location: Some(location),
-            server_side_encryption: server_side_encryption.clone(),
-            ssekms_key_id: ssekms_key_id.clone(),
+            server_side_encryption,
+            ssekms_key_id,
             checksum_crc32,
             checksum_crc32c,
             checksum_sha1,
@@ -861,25 +947,24 @@ impl DefaultMultipartUsecase {
 
         let mut response = S3Response::new(output);
         crate::app::object_usecase::inject_additional_checksum_headers(&mut response.headers, &complete_extra_checksum_headers);
-        if let Some(algorithm) = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption-customer-algorithm")
-        {
+        if let Some(algorithm) = ssec_algorithm.as_deref() {
             let value = HeaderValue::from_str(algorithm)
                 .map_err(|_| s3_error!(InternalError, "Invalid stored SSE-C algorithm metadata"))?;
             response
                 .headers
                 .insert("x-amz-server-side-encryption-customer-algorithm", value);
         }
-        if let Some(key_md5) = multipart_info
-            .user_defined
-            .get("x-amz-server-side-encryption-customer-key-md5")
-        {
+        if let Some(key_md5) = ssec_key_md5.as_deref() {
             let value =
                 HeaderValue::from_str(key_md5).map_err(|_| s3_error!(InternalError, "Invalid stored SSE-C key metadata"))?;
             response
                 .headers
                 .insert("x-amz-server-side-encryption-customer-key-md5", value);
+        }
+        if replayed {
+            // The object-created event was emitted by the commit that published
+            // the version. The retry is still a successful API call.
+            helper = helper.suppress_event();
         }
         let result = Ok(response);
         let _ = helper.complete(&result);
@@ -939,6 +1024,7 @@ impl DefaultMultipartUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let Some(store) = self.object_store() else {
@@ -1073,9 +1159,11 @@ impl DefaultMultipartUsecase {
             );
         }
 
-        let current_opts: ObjectOptions = get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)
-            .await
-            .map_err(ApiError::from)?;
+        let current_opts: ObjectOptions = internal_object_info_lookup_opts(
+            get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)
+                .await
+                .map_err(ApiError::from)?,
+        );
         match store.get_object_info(&bucket, &key, &current_opts).await {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &opts)?
@@ -1160,6 +1248,7 @@ impl DefaultMultipartUsecase {
 
         let part_id = parse_upload_part_number(part_number)?;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         let size = resolve_upload_part_size(content_length, body.as_ref())?;
@@ -1181,10 +1270,10 @@ impl DefaultMultipartUsecase {
         {
             return Err(S3Error::new(S3ErrorCode::EntityTooLarge));
         }
-        let upload_part_admission = match self
-            .concurrency_manager()
-            .admit_multipart_part(size)
-            .await
+        let admission_wait_started = rustfs_io_metrics::put_stage_timer();
+        let admission = self.concurrency_manager().admit_multipart_part(size).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("multipart_admission_wait", admission_wait_started);
+        let upload_part_admission = match admission
             .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "foreground write admission closed"))?
         {
             ForegroundWriteAdmission::Disabled => None,
@@ -1384,11 +1473,13 @@ impl DefaultMultipartUsecase {
         }
 
         let _upload_part_admission = upload_part_admission;
-        let info = store
+        let store_write_started = rustfs_io_metrics::put_stage_timer();
+        let result = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
-            .await
-            .map_err(ApiError::from)?;
+            .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from("multipart_store_write", store_write_started);
         drop(_upload_part_admission);
+        let info = result.map_err(ApiError::from)?;
 
         let mut checksum_crc32 = input.checksum_crc32;
         let mut checksum_crc32c = input.checksum_crc32c;
@@ -1453,6 +1544,7 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        let table_list_access = req.extensions.get::<TableDataPlaneListAccess>().cloned();
         reject_presigned_multipart_max_total_object_size_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -1472,6 +1564,7 @@ impl DefaultMultipartUsecase {
             key_marker,
             upload_id_marker,
             max_uploads,
+            encoding_type,
             ..
         } = req.input;
 
@@ -1493,20 +1586,43 @@ impl DefaultMultipartUsecase {
             None => store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?,
         };
 
-        let result = store
-            .list_multipart_uploads_for_bucket_incarnation(
-                &bucket,
-                &prefix,
-                key_marker,
-                upload_id_marker,
-                delimiter,
-                max_uploads,
-                expected_incarnation_id,
-            )
-            .await
-            .map_err(ApiError::from)?;
+        let result = match table_list_access.as_ref() {
+            Some(access) => {
+                table_list_isolation::list_multipart_uploads(
+                    store.clone(),
+                    access,
+                    table_list_isolation::ListMultipartUploadsRequest {
+                        bucket: &bucket,
+                        prefix: &prefix,
+                        key_marker: key_marker.as_deref(),
+                        upload_id_marker: upload_id_marker.as_deref(),
+                        delimiter: delimiter.as_deref(),
+                        max_uploads,
+                        expected_incarnation_id,
+                    },
+                )
+                .await?
+            }
+            None => store
+                .list_multipart_uploads_for_bucket_incarnation(
+                    &bucket,
+                    &prefix,
+                    key_marker,
+                    upload_id_marker,
+                    delimiter,
+                    max_uploads,
+                    expected_incarnation_id,
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
-        Ok(S3Response::new(build_list_multipart_uploads_output(bucket, prefix, result)))
+        Ok(S3Response::new(build_list_multipart_uploads_output(
+            bucket,
+            prefix,
+            result,
+            encoding_type.as_ref(),
+        )))
     }
 
     pub async fn execute_list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
@@ -1531,6 +1647,7 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         let params = parse_list_parts_params(part_number_marker, max_parts)?;
 
         let Some(store) = self.object_store() else {
@@ -1592,7 +1709,8 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
-        let (src_bucket, src_key, src_version_id) = match copy_source {
+        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+        let (src_bucket, src_key, raw_src_version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Bucket {
@@ -1601,6 +1719,7 @@ impl DefaultMultipartUsecase {
                 version_id,
             } => (src_bucket.to_string(), src_key.to_string(), version_id.map(|v| v.to_string())),
         };
+        let src_version_id = normalize_copy_source_version_id(raw_src_version_id.as_deref())?;
 
         let rs = if let Some(range_str) = copy_source_range {
             Some(parse_copy_source_range(&range_str)?)
@@ -1616,23 +1735,20 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let (source_bucket_lifecycle_guard, destination_bucket_lifecycle_guard_storage) =
-            acquire_copy_bucket_lifecycle_locks(store.as_ref(), &src_bucket, &bucket).await?;
-        let current_source_incarnation_id = store
-            .bucket_incarnation_id_from_disk(&src_bucket)
+        let (
+            source_bucket_lifecycle_guard,
+            current_source_incarnation_id,
+            destination_bucket_lifecycle_guard_storage,
+            current_destination_incarnation_id,
+        ) = store
+            .acquire_copy_bucket_incarnation_fences(
+                &src_bucket,
+                expected_source_incarnation_id,
+                &bucket,
+                expected_destination_incarnation_id,
+            )
             .await
             .map_err(ApiError::from)?;
-        if expected_source_incarnation_id.is_some_and(|expected| expected != current_source_incarnation_id) {
-            return Err(ApiError::from(StorageError::BucketNotFound(src_bucket.clone())).into());
-        }
-        let current_destination_incarnation_id = if src_bucket == bucket {
-            current_source_incarnation_id
-        } else {
-            store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?
-        };
-        if expected_destination_incarnation_id.is_some_and(|expected| expected != current_destination_incarnation_id) {
-            return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
-        }
         let destination_bucket_lifecycle_guard = destination_bucket_lifecycle_guard_storage
             .as_ref()
             .unwrap_or(&source_bucket_lifecycle_guard);
@@ -1651,9 +1767,9 @@ impl DefaultMultipartUsecase {
             ..Default::default()
         };
         if src_bucket != bucket {
-            dst_opts.add_bucket_lifecycle_lock_guard(&source_bucket_lifecycle_guard);
+            source_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
         }
-        dst_opts.add_bucket_lifecycle_lock_guard(destination_bucket_lifecycle_guard);
+        destination_bucket_lifecycle_guard.attach_to_object_options(&mut dst_opts);
 
         let mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
@@ -1674,8 +1790,12 @@ impl DefaultMultipartUsecase {
         }
         .validate_multipart_ssec(&mp_info.user_defined)?;
 
+        let src_versioned = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await;
+        let src_version_suspended = BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
         let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
         src_opts.version_id = src_version_id.clone();
+        src_opts.versioned = src_versioned;
+        src_opts.version_suspended = src_version_suspended;
 
         let h = build_ssec_read_headers(
             copy_source_sse_customer_algorithm.as_ref(),
@@ -1700,25 +1820,26 @@ impl DefaultMultipartUsecase {
             .into());
         }
 
-        let (src_reader, _source_cancellation) = store
-            .get_object_reader_for_copy(&src_bucket, &src_key, rs.clone(), h, &get_opts)
+        let prepared_source = store
+            .prepare_get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
             .await
             .map_err(map_get_object_reader_error)?;
 
-        let src_info = src_reader.object_info;
+        let src_info = prepared_source.object_info();
+        if src_info.delete_marker {
+            let error = if src_opts.version_id.is_none() {
+                StorageError::ObjectNotFound(src_bucket.clone(), src_key.clone())
+            } else {
+                StorageError::MethodNotAllowed
+            };
+            return Err(map_get_object_reader_error(error).into());
+        }
 
         // Same shape as CopyObject: the part copy reads the source plaintext, and the source
         // read resolves its material inside the object layer, which carries no request identity.
         authorize_sse_kms_object_read(copy_principal.as_ref(), &src_info.user_defined).await?;
 
-        let src_stream = src_reader.stream;
-        let resolved_src_version_id = src_info.version_id.map(|version_id| {
-            if version_id == Uuid::nil() {
-                "null".to_string()
-            } else {
-                version_id.to_string()
-            }
-        });
+        let resolved_src_version_id = format_copy_source_version_id(src_info.version_id, src_versioned, src_version_suspended);
 
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
@@ -1742,12 +1863,13 @@ impl DefaultMultipartUsecase {
             return Err(s3_error!(PreconditionFailed));
         }
 
-        let source_logical_size = match src_info.get_actual_size() {
-            Ok(size) if size >= 0 => size,
-            Ok(_) | Err(_) if destination_size_limit.is_some() => {
+        let source_actual_size = src_info.get_actual_size().ok().filter(|size| *size >= 0);
+        let source_logical_size = match source_actual_size {
+            Some(size) => size,
+            None if destination_size_limit.is_some() => {
                 return Err(S3Error::new(S3ErrorCode::UnexpectedContent));
             }
-            Ok(_) | Err(_) => src_info.size,
+            None => src_info.size,
         };
 
         let (_start_offset, length) = if let Some(ref range_spec) = rs {
@@ -1762,6 +1884,26 @@ impl DefaultMultipartUsecase {
         } else {
             (0, source_logical_size)
         };
+
+        // Resolve the range under the prepared source's read lock, then try the
+        // shared budget without waiting while holding namespace/lifecycle locks.
+        // Keep both the budget and source cancellation alive through the write.
+        let admission_length = source_actual_size.map_or(-1, |_| length);
+        let _copy_admission = match self.concurrency_manager().try_admit_multipart_part_copy(admission_length) {
+            ForegroundWriteAdmission::Disabled => None,
+            ForegroundWriteAdmission::Admitted(permit) => Some(permit),
+            ForegroundWriteAdmission::Rejected => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate",
+                ));
+            }
+        };
+        let (src_reader, _source_cancellation) = prepared_source
+            .into_reader_for_copy()
+            .await
+            .map_err(map_get_object_reader_error)?;
+        let src_stream = src_reader.stream;
 
         let is_disk_compressed =
             rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
@@ -1966,6 +2108,7 @@ mod tests {
     use super::*;
 
     mod body_read_tests;
+    mod copy_admission_tests;
     use http::{Extensions, HeaderMap, Method, Uri, header::HeaderValue};
     use rustfs_filemeta::ObjectPartInfo;
     use rustfs_utils::http::{
@@ -2785,6 +2928,351 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn conditional_multipart_upload_if_none_match_returns_precondition_failed_when_object_exists() {
+        crate::app::gating_test_env::run_large_stack_test(
+            "conditional-mpu-if-none-match",
+            conditional_multipart_upload_if_none_match_returns_precondition_failed_when_object_exists_inner,
+        );
+    }
+
+    async fn conditional_multipart_upload_if_none_match_returns_precondition_failed_when_object_exists_inner() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::app::storage_api::test::contract::object::ObjectOperations as _;
+
+        let (store, bucket) =
+            crate::app::gating_test_env::durable_quota_test_bucket("conditional-mpu-if-none-match", 16_384).await;
+        let object = "conditional-object";
+        let usecase = DefaultMultipartUsecase::from_global();
+        let initial_body = b"initial multipart body";
+
+        let create_input = CreateMultipartUploadInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .expect("create multipart input should build");
+        let mut initial_create_req = build_request(create_input.clone(), Method::POST);
+        initial_create_req
+            .headers
+            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let first_upload_id = usecase
+            .execute_create_multipart_upload(initial_create_req)
+            .await
+            .expect("initial conditional create multipart upload should succeed")
+            .output
+            .upload_id
+            .expect("create response should contain upload id");
+
+        let mut reader = PutObjReader::from_vec(initial_body.to_vec());
+        let first_part = store
+            .put_object_part(&bucket, object, &first_upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("initial multipart part should be staged");
+        let first_complete_input = CompleteMultipartUploadInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .upload_id(first_upload_id)
+            .if_none_match(Some(s3s::dto::ETagCondition::Any))
+            .multipart_upload(Some(CompletedMultipartUpload {
+                parts: Some(vec![CompletedPart {
+                    part_number: Some(1),
+                    e_tag: first_part.etag.map(|etag| to_s3s_etag(&etag)),
+                    ..Default::default()
+                }]),
+            }))
+            .build()
+            .expect("initial complete multipart input should build");
+        let mut first_complete_req = build_request(first_complete_input, Method::POST);
+        first_complete_req
+            .headers
+            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        usecase
+            .execute_complete_multipart_upload(first_complete_req)
+            .await
+            .expect("initial conditional complete multipart upload should succeed");
+
+        let committed_info = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("committed object info should be readable");
+        let committed_etag = committed_info.etag.clone().expect("committed object should have an ETag");
+        assert_eq!(committed_info.size, initial_body.len() as i64);
+
+        let mut second_create_req = build_request(create_input.clone(), Method::POST);
+        second_create_req
+            .headers
+            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let create_err = usecase
+            .execute_create_multipart_upload(second_create_req)
+            .await
+            .expect_err("create multipart upload with If-None-Match: * on existing key must fail");
+        assert_eq!(create_err.code(), &S3ErrorCode::PreconditionFailed);
+
+        let second_upload_id = usecase
+            .execute_create_multipart_upload(build_request(create_input, Method::POST))
+            .await
+            .expect("unconditional create multipart upload should succeed")
+            .output
+            .upload_id
+            .expect("second create response should contain upload id");
+        let mut second_reader = PutObjReader::from_vec(b"replacement multipart body".to_vec());
+        let second_part = store
+            .put_object_part(&bucket, object, &second_upload_id, 1, &mut second_reader, &ObjectOptions::default())
+            .await
+            .expect("second multipart part should be staged");
+        let completed_parts = CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart {
+                part_number: Some(1),
+                e_tag: second_part.etag.map(|etag| to_s3s_etag(&etag)),
+                ..Default::default()
+            }]),
+        };
+
+        // DTO-only If-None-Match: * exercises the early precheck in execute_complete_multipart_upload.
+        let dto_only_complete_input = CompleteMultipartUploadInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .upload_id(second_upload_id.clone())
+            .if_none_match(Some(s3s::dto::ETagCondition::Any))
+            .multipart_upload(Some(completed_parts.clone()))
+            .build()
+            .expect("DTO-only complete multipart input should build");
+        let dto_complete_err = usecase
+            .execute_complete_multipart_upload(build_request(dto_only_complete_input, Method::POST))
+            .await
+            .expect_err("DTO-only If-None-Match: * on existing key must fail");
+        assert_eq!(dto_complete_err.code(), &S3ErrorCode::PreconditionFailed);
+
+        for condition in [ETag::Weak(committed_etag.clone()), ETag::Strong("different-etag".to_string())] {
+            let input = CompleteMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key(object.to_string())
+                .upload_id(second_upload_id.clone())
+                .if_match(Some(s3s::dto::ETagCondition::ETag(condition)))
+                .multipart_upload(Some(completed_parts.clone()))
+                .build()
+                .expect("If-Match complete input should build");
+            let err = usecase
+                .execute_complete_multipart_upload(build_request(input, Method::POST))
+                .await
+                .expect_err("weak or nonmatching If-Match must reject the overwrite");
+            assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+        }
+
+        // Write requests reject ETag-valued If-None-Match before checking object state.
+        let weak_if_none_match_input = CompleteMultipartUploadInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .upload_id(second_upload_id.clone())
+            .if_none_match(Some(s3s::dto::ETagCondition::ETag(ETag::Weak(committed_etag.clone()))))
+            .multipart_upload(Some(completed_parts.clone()))
+            .build()
+            .expect("weak If-None-Match complete multipart input should build");
+        let weak_complete_err = usecase
+            .execute_complete_multipart_upload(build_request(weak_if_none_match_input, Method::POST))
+            .await
+            .expect_err("weak If-None-Match ETag must be rejected as unsupported");
+        assert_eq!(weak_complete_err.code(), &S3ErrorCode::NotImplemented);
+
+        let second_complete_input = CompleteMultipartUploadInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .upload_id(second_upload_id)
+            .if_none_match(Some(s3s::dto::ETagCondition::Any))
+            .multipart_upload(Some(completed_parts))
+            .build()
+            .expect("second complete multipart input should build");
+        let mut second_complete_req = build_request(second_complete_input, Method::POST);
+        second_complete_req
+            .headers
+            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let complete_err = usecase
+            .execute_complete_multipart_upload(second_complete_req)
+            .await
+            .expect_err("complete multipart upload with If-None-Match: * on existing key must fail");
+        assert_eq!(complete_err.code(), &S3ErrorCode::PreconditionFailed);
+
+        let after_info = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("original object must remain readable after rejected conditional completions");
+        assert_eq!(after_info.etag.as_deref(), Some(committed_etag.as_str()));
+        assert_eq!(after_info.size, initial_body.len() as i64);
+
+        // Two-pool regression: when Pool 0 holds an incomplete multipart upload and Pool 1
+        // holds the committed object, conditional new_multipart_upload and complete_multipart_upload
+        // must still reject If-None-Match: * with PreconditionFailed.
+        let (_multi_temp_dir, _pool_paths, multi_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        let multi_bucket = format!("multi-pool-cond-mpu-{}", Uuid::new_v4().simple());
+        multi_store
+            .make_bucket(&multi_bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create multi-pool test bucket");
+        let multi_object = "cross-pool-conditional-object";
+        let staged_pool_0 = multi_store.pools[0]
+            .new_multipart_upload(&multi_bucket, multi_object, &ObjectOptions::default())
+            .await
+            .expect("stage incomplete upload in pool 0");
+        let mut pool0_part_reader = PutObjReader::from_vec(b"pool-0-staged-part".to_vec());
+        let pool0_part = multi_store.pools[0]
+            .put_object_part(
+                &multi_bucket,
+                multi_object,
+                &staged_pool_0.upload_id,
+                1,
+                &mut pool0_part_reader,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("write staged part in pool 0");
+        let mut pool1_reader = PutObjReader::from_vec(b"pool-1-committed-object".to_vec());
+        multi_store.pools[1]
+            .put_object(&multi_bucket, multi_object, &mut pool1_reader, &ObjectOptions::default())
+            .await
+            .expect("commit object in pool 1");
+
+        let multi_cond_opts = ObjectOptions {
+            http_preconditions: Some(HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let multi_create_err = multi_store
+            .new_multipart_upload(&multi_bucket, multi_object, &multi_cond_opts)
+            .await
+            .expect_err("multi-pool new_multipart_upload with If-None-Match: * must fail when object is in pool 1");
+        assert_eq!(multi_create_err, StorageError::PreconditionFailed);
+
+        let multi_complete_err = Arc::clone(&multi_store)
+            .complete_multipart_upload(
+                &multi_bucket,
+                multi_object,
+                &staged_pool_0.upload_id,
+                vec![CompletePart {
+                    part_num: 1,
+                    etag: pool0_part.etag,
+                    ..Default::default()
+                }],
+                &multi_cond_opts,
+            )
+            .await
+            .expect_err("multi-pool complete_multipart_upload with If-None-Match: * must fail when object is in pool 1");
+        assert_eq!(multi_complete_err, StorageError::PreconditionFailed);
+        metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        // Delete-marker regression: when the current version in a versioned bucket is a delete
+        // marker, If-Match must fail with NoSuchKey while If-None-Match: * succeeds.
+        let versioned_bucket = format!("versioned-cond-mpu-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(
+                &versioned_bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let mut v_reader = PutObjReader::from_vec(b"v1-body".to_vec());
+        store
+            .put_object(
+                &versioned_bucket,
+                object,
+                &mut v_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write initial versioned object");
+        let marker = store
+            .delete_object(
+                &versioned_bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete versioned object to create delete marker");
+        assert!(marker.delete_marker);
+
+        let dm_create_input = CreateMultipartUploadInput::builder()
+            .bucket(versioned_bucket.clone())
+            .key(object.to_string())
+            .build()
+            .expect("delete-marker create input");
+        let mut dm_create_req = build_request(dm_create_input, Method::POST);
+        dm_create_req
+            .headers
+            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let dm_upload_id = usecase
+            .execute_create_multipart_upload(dm_create_req)
+            .await
+            .expect("If-None-Match: * create must succeed past a delete marker")
+            .output
+            .upload_id
+            .expect("upload id");
+        let mut dm_part_reader = PutObjReader::from_vec(b"after-delete-marker".to_vec());
+        let dm_part = store
+            .put_object_part(
+                &versioned_bucket,
+                object,
+                &dm_upload_id,
+                1,
+                &mut dm_part_reader,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("stage part past delete marker");
+        let dm_parts = CompletedMultipartUpload {
+            parts: Some(vec![CompletedPart {
+                part_number: Some(1),
+                e_tag: dm_part.etag.map(|etag| to_s3s_etag(&etag)),
+                ..Default::default()
+            }]),
+        };
+
+        let dm_if_match_input = CompleteMultipartUploadInput::builder()
+            .bucket(versioned_bucket.clone())
+            .key(object.to_string())
+            .upload_id(dm_upload_id.clone())
+            .if_match(Some(s3s::dto::ETagCondition::Any))
+            .multipart_upload(Some(dm_parts.clone()))
+            .build()
+            .expect("delete-marker If-Match complete input");
+        let mut dm_if_match_req = build_request(dm_if_match_input, Method::POST);
+        dm_if_match_req
+            .headers
+            .insert(http::header::IF_MATCH, HeaderValue::from_static("*"));
+        let dm_if_match_err = usecase
+            .execute_complete_multipart_upload(dm_if_match_req)
+            .await
+            .expect_err("If-Match against a current delete marker must fail with NoSuchKey");
+        assert_eq!(dm_if_match_err.code(), &S3ErrorCode::NoSuchKey);
+
+        let dm_if_none_match_input = CompleteMultipartUploadInput::builder()
+            .bucket(versioned_bucket)
+            .key(object.to_string())
+            .upload_id(dm_upload_id)
+            .if_none_match(Some(s3s::dto::ETagCondition::Any))
+            .multipart_upload(Some(dm_parts))
+            .build()
+            .expect("delete-marker If-None-Match complete input");
+        let mut dm_if_none_match_req = build_request(dm_if_none_match_input, Method::POST);
+        dm_if_none_match_req
+            .headers
+            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        usecase
+            .execute_complete_multipart_upload(dm_if_none_match_req)
+            .await
+            .expect("If-None-Match: * completion must succeed past a delete marker");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn create_multipart_rejects_ciphertext_replication_before_parts_are_staged() {
@@ -2859,7 +3347,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn multipart_completion_rejects_rotated_quota_capability_before_rename() {
+    async fn multipart_completion_commits_after_quota_fleet_proof_loss_before_rename() {
         use crate::app::storage_api::test::set_disk::{MultipartCommitBarrier, MultipartCommitPause};
 
         let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("rotated-proof-mpu-quota", 4096).await;
@@ -2893,27 +3381,19 @@ mod tests {
                 .await
         });
         barrier.wait_until_paused().await;
-        assert!(
-            crate::storage::storage_api::ecstore_notification::rotate_cross_pool_fence_fleet_proof_for_test(),
-            "the gating environment must have a current fleet proof"
-        );
+        let _without_proof = crate::storage::storage_api::ecstore_notification::without_cross_pool_fence_fleet_proof_for_test();
+        assert!(crate::storage::storage_api::ecstore_notification::acquire_cross_pool_fence_fleet_proof().is_none());
         barrier.release();
 
-        let err = complete
+        complete
             .await
             .expect("completion task should not panic")
-            .expect_err("a replaced fleet proof must fence multipart rename");
-        assert!(matches!(
-            err,
-            StorageError::NamespaceLockQuorumUnavailable {
-                mode: "quota_reservation",
-                ..
-            }
-        ));
-        store
-            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .expect("fleet proof loss must not invalidate multipart quota reservation and disk fences");
+        let stored = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
             .await
-            .expect("proof rotation must preserve the multipart upload for retry");
+            .expect("completed multipart object must remain readable after fleet proof loss");
+        assert_eq!(stored.size, 4096);
     }
 
     #[tokio::test]
@@ -3534,5 +4014,26 @@ mod tests {
             .expect_err("full foreground write admission should reject before body ingest");
         assert_eq!(err.code(), &S3ErrorCode::SlowDown);
         drop(held);
+    }
+
+    #[test]
+    fn upload_part_copy_normalizes_and_formats_source_version_id() {
+        assert_eq!(normalize_copy_source_version_id(None).expect("missing version id"), None);
+        assert_eq!(
+            normalize_copy_source_version_id(Some(" null ")).expect("null version id"),
+            Some(Uuid::nil().to_string())
+        );
+        let valid = Uuid::new_v4();
+        assert_eq!(
+            normalize_copy_source_version_id(Some(&format!(" {valid} "))).expect("valid uuid"),
+            Some(valid.to_string())
+        );
+        let err = normalize_copy_source_version_id(Some("not-a-uuid")).expect_err("invalid uuid should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+
+        assert_eq!(format_copy_source_version_id(Some(Uuid::nil()), false, false), None);
+        assert_eq!(format_copy_source_version_id(None, true, false), Some("null".to_string()));
+        assert_eq!(format_copy_source_version_id(Some(Uuid::nil()), false, true), Some("null".to_string()));
+        assert_eq!(format_copy_source_version_id(Some(valid), true, false), Some(valid.to_string()));
     }
 }

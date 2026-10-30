@@ -28,7 +28,7 @@
 //! One surviving committed replica supports process restart recovery only;
 //! this reader does not establish a replication quorum or a power-loss policy.
 
-use super::{MRF_JOURNAL_PATH, MRF_SCOPED_JOURNAL_PATH, decode_journal};
+use super::{MRF_JOURNAL_PATH, MRF_SCOPED_JOURNAL_PATH, decode_journal, distinct_journal_disks, journal_disk_io};
 use crate::heal::RUSTFS_META_BUCKET;
 use crate::heal::storage_api::owner::{
     EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskStore,
@@ -61,6 +61,8 @@ pub enum SnapshotError {
     Conflict,
     #[error("MRF checkpoint has no writable replica")]
     NoWritableReplica,
+    #[error("MRF lifecycle writer capability is unavailable")]
+    WriterCapabilityUnavailable,
     #[error("MRF checkpoint storage is unavailable")]
     Disk(#[source] EcstoreDiskError),
     #[error("MRF checkpoint body could not be read")]
@@ -307,7 +309,7 @@ async fn read_committed_with_stats(
 async fn cas_replace(
     disk: &EcstoreDiskStore,
     path: &str,
-    replacement: &[u8],
+    replacement: EcstoreDiskBytes,
     limit: usize,
 ) -> Result<EcstoreConditionalFileUpdate, SnapshotError> {
     let expected = read_bounded(disk, path, limit).await?.map(EcstoreDiskBytes::from);
@@ -318,17 +320,11 @@ async fn cas_replace_expected(
     disk: &EcstoreDiskStore,
     path: &str,
     expected: Option<EcstoreDiskBytes>,
-    replacement: &[u8],
+    replacement: EcstoreDiskBytes,
 ) -> Result<EcstoreConditionalFileUpdate, SnapshotError> {
-    EcstoreDiskAPI::compare_and_update_file(
-        disk.as_ref(),
-        RUSTFS_META_BUCKET,
-        path,
-        expected,
-        Some(EcstoreDiskBytes::copy_from_slice(replacement)),
-    )
-    .await
-    .map_err(SnapshotError::Disk)
+    EcstoreDiskAPI::compare_and_update_file(disk.as_ref(), RUSTFS_META_BUCKET, path, expected, Some(replacement))
+        .await
+        .map_err(SnapshotError::Disk)
 }
 
 async fn cas_delete_expected(
@@ -366,6 +362,50 @@ pub async fn publish_committed_snapshot(
     payload: &[u8],
     limit: usize,
 ) -> Result<SnapshotPublication, SnapshotError> {
+    publish_committed_snapshot_with_companion(disks, owner, sequence, payload, limit, None).await
+}
+
+/// Publish a companion lifecycle record on the same disk before the commit
+/// manifest. A replica is committed only after both payloads have been stored.
+pub async fn publish_committed_snapshot_with_companion(
+    disks: &[EcstoreDiskStore],
+    owner: Uuid,
+    sequence: u64,
+    payload: &[u8],
+    limit: usize,
+    companion: Option<(&[&str; 2], &[u8], usize)>,
+) -> Result<SnapshotPublication, SnapshotError> {
+    publish_committed_snapshot_with_companion_guarded(disks, owner, sequence, payload, limit, companion, |_| {
+        std::future::ready(true)
+    })
+    .await
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum SnapshotPublicationStage {
+    Staging,
+    Manifest,
+}
+
+/// Revalidate format authority before staging and before each manifest CAS.
+/// The caller must retain that authority until all admitted disk I/O finishes,
+/// including when its own waiter is cancelled.
+pub(super) async fn publish_committed_snapshot_with_companion_guarded<G, F>(
+    disks: &[EcstoreDiskStore],
+    owner: Uuid,
+    sequence: u64,
+    payload: &[u8],
+    limit: usize,
+    companion: Option<(&[&str; 2], &[u8], usize)>,
+    commit_allowed: G,
+) -> Result<SnapshotPublication, SnapshotError>
+where
+    G: Fn(SnapshotPublicationStage) -> F + Sync,
+    F: std::future::Future<Output = bool>,
+{
+    if !commit_allowed(SnapshotPublicationStage::Staging).await {
+        return Err(SnapshotError::WriterCapabilityUnavailable);
+    }
     if disks.is_empty() {
         return Err(SnapshotError::NoWritableReplica);
     }
@@ -378,44 +418,62 @@ pub async fn publish_committed_snapshot(
     if decode_journal(payload).1 != 0 {
         return Err(SnapshotError::Corrupt);
     }
-    let current = read_committed(disks, limit).await?;
+    // Endpoint aliases can share the same canonical local root and CAS lock.
+    let disks = distinct_journal_disks(disks.iter());
+    let current = read_committed(&disks, limit).await?;
     if current.as_ref().is_some_and(|snapshot| snapshot.sequence() >= sequence) {
         return Err(SnapshotError::Conflict);
     }
     let slot = current.as_ref().map_or(0, |snapshot| 1usize.saturating_sub(snapshot.slot()));
-    let manifest = Manifest::encode(owner, sequence, payload)?;
+    let manifest = EcstoreDiskBytes::from(Manifest::encode(owner, sequence, payload)?);
+    let payload = EcstoreDiskBytes::copy_from_slice(payload);
+    let companion = companion.map(|(paths, bytes, limit)| (paths, EcstoreDiskBytes::copy_from_slice(bytes), limit));
+    // Share encoded bodies across replicas; parallel fsync must not multiply
+    // the large payload/lifecycle allocations. CAS steps stay ordered per disk.
+    let manifest = &manifest;
+    let payload = &payload;
+    let companion = &companion;
+    let commit_allowed = &commit_allowed;
+    let results = journal_disk_io(disks.into_iter().map(|disk| async move {
+        let mut payload_written = false;
+        let manifest_written: Result<bool, SnapshotError> = async {
+            let expected_manifest = read_bounded(&disk, MANIFEST_PATHS[slot], MANIFEST_LEN).await?;
+            validate_reusable_manifest_slot(expected_manifest.as_deref(), sequence, limit)?;
+            match cas_replace(&disk, PAYLOAD_PATHS[slot], payload.clone(), limit).await? {
+                EcstoreConditionalFileUpdate::Updated => payload_written = true,
+                EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch => return Ok(false),
+            }
+            if let Some((companion_paths, companion_bytes, companion_limit)) = companion {
+                match cas_replace(&disk, companion_paths[slot], companion_bytes.clone(), *companion_limit).await? {
+                    EcstoreConditionalFileUpdate::Updated => {}
+                    EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch => return Ok(false),
+                }
+            }
+            if !commit_allowed(SnapshotPublicationStage::Manifest).await {
+                return Err(SnapshotError::WriterCapabilityUnavailable);
+            }
+            Ok(matches!(
+                cas_replace_expected(
+                    &disk,
+                    MANIFEST_PATHS[slot],
+                    expected_manifest.map(EcstoreDiskBytes::from),
+                    manifest.clone(),
+                )
+                .await?,
+                EcstoreConditionalFileUpdate::Updated
+            ))
+        }
+        .await;
+        (payload_written, manifest_written)
+    }))
+    .await;
     let mut payload_replicas = 0usize;
     let mut manifest_replicas = 0usize;
     let mut first_error = None;
-    for disk in disks {
-        let expected_manifest = match read_bounded(disk, MANIFEST_PATHS[slot], MANIFEST_LEN).await {
-            Ok(expected) => expected,
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                continue;
-            }
-        };
-        if let Err(error) = validate_reusable_manifest_slot(expected_manifest.as_deref(), sequence, limit) {
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
-            continue;
-        }
-        match cas_replace(disk, PAYLOAD_PATHS[slot], payload, limit).await {
-            Ok(EcstoreConditionalFileUpdate::Updated) => payload_replicas += 1,
-            Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => continue,
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                continue;
-            }
-        }
-        match cas_replace_expected(disk, MANIFEST_PATHS[slot], expected_manifest.map(EcstoreDiskBytes::from), &manifest).await {
-            Ok(EcstoreConditionalFileUpdate::Updated) => manifest_replicas += 1,
-            Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => {}
+    for (payload_written, result) in results {
+        payload_replicas += usize::from(payload_written);
+        match result {
+            Ok(written) => manifest_replicas += usize::from(written),
             Err(error) => {
                 if first_error.is_none() {
                     first_error = Some(error);
@@ -434,6 +492,80 @@ pub async fn publish_committed_snapshot(
         payload_replicas,
         manifest_replicas,
     })
+}
+
+/// Read a companion only from replicas that also contain its matching
+/// committed checkpoint. Differing companions for the same checkpoint fail
+/// closed rather than selecting one replica arbitrarily.
+pub async fn read_committed_companion(
+    disks: &[EcstoreDiskStore],
+    owner: Uuid,
+    sequence: u64,
+    companion_paths: &[&str; 2],
+    checkpoint_limit: usize,
+    companion_limit: usize,
+) -> Result<Option<Vec<u8>>, SnapshotError> {
+    let mut selected: Option<Vec<u8>> = None;
+    let mut first_error = None;
+    for disk in disks {
+        let mut checkpoint_slot = None;
+        for (slot, (manifest_path, payload_path)) in MANIFEST_PATHS.into_iter().zip(PAYLOAD_PATHS).enumerate() {
+            let manifest_bytes = match read_bounded(disk, manifest_path, MANIFEST_LEN).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
+                Err(error @ SnapshotError::Unsupported) => return Err(error),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+            let manifest = match Manifest::decode(&manifest_bytes, checkpoint_limit) {
+                Ok(manifest) if manifest.owner == owner && manifest.sequence == sequence => manifest,
+                Ok(_) | Err(SnapshotError::Corrupt) | Err(SnapshotError::TooLarge) => continue,
+                Err(error) => return Err(error),
+            };
+            let payload = match read_bounded(disk, payload_path, manifest.payload_len).await {
+                Ok(Some(payload)) => payload,
+                Ok(None) => continue,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+            if CommittedSnapshot::decode(slot, &manifest_bytes, payload, checkpoint_limit).is_ok() {
+                checkpoint_slot = Some(slot);
+                break;
+            }
+        }
+        let Some(checkpoint_slot) = checkpoint_slot else {
+            continue;
+        };
+        let companion = match read_bounded(disk, companion_paths[checkpoint_slot], companion_limit).await {
+            Ok(Some(companion)) => companion,
+            Ok(None) => continue,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+        };
+        if selected.as_ref().is_some_and(|existing| existing != &companion) {
+            return Err(SnapshotError::Conflict);
+        }
+        selected = Some(companion);
+    }
+    if selected.is_some() {
+        Ok(selected)
+    } else if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Reclaim the slot superseded by an already committed checkpoint.
@@ -701,6 +833,7 @@ mod tests {
             object: Arc::from(object),
             version_id: None,
             kind: MrfKind::PartialWrite,
+            delete_marker_purge: None,
             scope: None,
             lease: None,
             enqueued_at_ms: 1234,
@@ -719,6 +852,7 @@ mod tests {
                 object: Arc::from(format!("o-{index:06}")),
                 version_id: None,
                 kind: MrfKind::PartialWrite,
+                delete_marker_purge: None,
                 scope: None,
                 lease: None,
                 enqueued_at_ms: 1234,
@@ -838,6 +972,81 @@ mod tests {
             assert_eq!(recovered.manifest.sequence, 2);
             assert_eq!(recovered.payload, payload("new"));
         }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_companion_is_read_only_with_its_matching_checkpoint_replica() {
+        let root = TempDir::new().expect("test directory");
+        let checkpoint_disk = disk(&root, "checkpoint").await;
+        let sidecar_disk = disk(&root, "sidecar").await;
+        let owner = Uuid::new_v4();
+        let checkpoint_payload = payload("responsibility");
+        let sidecar = b"lifecycle state";
+        commit(&checkpoint_disk, 0, owner, 7, &checkpoint_payload).await;
+        install(&sidecar_disk, ".heal-mrf-lifecycle.0.bin", sidecar).await;
+
+        let absent = read_committed_companion(
+            &[checkpoint_disk.clone(), sidecar_disk.clone()],
+            owner,
+            7,
+            &[".heal-mrf-lifecycle.0.bin", ".heal-mrf-lifecycle.1.bin"],
+            4096,
+            4096,
+        )
+        .await
+        .expect("unpaired lifecycle sidecar is ignored");
+        assert!(absent.is_none());
+
+        publish_committed_snapshot_with_companion(
+            &[checkpoint_disk.clone(), sidecar_disk.clone()],
+            owner,
+            8,
+            &checkpoint_payload,
+            4096,
+            Some((&[".heal-mrf-lifecycle.0.bin", ".heal-mrf-lifecycle.1.bin"], sidecar, 4096)),
+        )
+        .await
+        .expect("paired checkpoint and lifecycle state publish");
+        let paired = read_committed_companion(
+            &[checkpoint_disk, sidecar_disk],
+            owner,
+            8,
+            &[".heal-mrf-lifecycle.0.bin", ".heal-mrf-lifecycle.1.bin"],
+            4096,
+            4096,
+        )
+        .await
+        .expect("read paired lifecycle sidecar")
+        .expect("paired sidecar exists");
+        assert_eq!(paired, sidecar);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_companion_recovers_from_a_healthy_replica_after_peer_read_error() {
+        let root = TempDir::new().expect("test directory");
+        let failing_disk = disk(&root, "failing").await;
+        let healthy_disk = disk(&root, "healthy").await;
+        let owner = Uuid::new_v4();
+        let checkpoint_payload = payload("responsibility");
+        let sidecar = b"operator audit and source incarnation";
+        commit(&healthy_disk, 0, owner, 9, &checkpoint_payload).await;
+        install(&healthy_disk, ".heal-mrf-lifecycle.0.bin", sidecar).await;
+        std::fs::create_dir(root.path().join("failing").join(RUSTFS_META_BUCKET).join(MANIFEST_PATHS[0]))
+            .expect("simulate one replica read error");
+
+        let recovered = read_committed_companion(
+            &[failing_disk, healthy_disk],
+            owner,
+            9,
+            &[".heal-mrf-lifecycle.0.bin", ".heal-mrf-lifecycle.1.bin"],
+            4096,
+            4096,
+        )
+        .await
+        .expect("one unreadable replica must not hide a healthy paired sidecar")
+        .expect("healthy paired sidecar must be recovered");
+
+        assert_eq!(recovered, sidecar);
     }
 
     #[tokio::test]
@@ -1275,6 +1484,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_snapshot_writer_retains_payload_count_when_one_companion_fails() {
+        let root = TempDir::new().expect("test directory");
+        let first = disk(&root, "first").await;
+        let second = disk(&root, "second").await;
+        let paths = super::super::MRF_LIFECYCLE_PATHS;
+        std::fs::create_dir(EcstoreDiskAPI::path(first.as_ref()).join(RUSTFS_META_BUCKET).join(paths[0]))
+            .expect("block only the first replica's companion");
+        let owner = Uuid::new_v4();
+        let bytes = payload("healthy-companion-replica");
+        let disks = [first.clone(), second];
+        let publication =
+            publish_committed_snapshot_with_companion(&disks, owner, 1, &bytes, 4096, Some((&paths, b"lifecycle", 4096)))
+                .await
+                .expect("a failed companion must not stop another replica's commit");
+        assert_eq!(publication.payload_replicas, 2);
+        assert_eq!(publication.manifest_replicas, 1);
+        assert!(
+            read_bounded(&first, MANIFEST_PATHS[0], MANIFEST_LEN)
+                .await
+                .expect("read the failed replica's manifest")
+                .is_none(),
+            "a failed companion must not publish its commit manifest"
+        );
+        assert_eq!(
+            read_committed_companion(&disks, owner, 1, &paths, 4096, 4096)
+                .await
+                .expect("read the healthy committed companion")
+                .as_deref(),
+            Some(b"lifecycle".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_snapshot_writer_deduplicates_disk_roots_before_parallel_cas() {
+        let root = TempDir::new().expect("test directory");
+        let first = disk(&root, "first").await;
+        let alias = disk(&root, "first").await;
+        let second = disk(&root, "second").await;
+        let bytes = payload("distinct-replicas");
+        let disks = [first.clone(), first, alias, second];
+        let publication = publish_committed_snapshot(&disks, Uuid::new_v4(), 1, &bytes, 4096)
+            .await
+            .expect("duplicate handles must not contend with their own replica CAS");
+        assert_eq!(publication.payload_replicas, 2, "count canonical disk roots, not handles");
+        assert_eq!(publication.manifest_replicas, 2);
+        assert_eq!(
+            read_committed(&disks, 4096)
+                .await
+                .expect("read both independent replicas")
+                .expect("committed snapshot")
+                .payload(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
     async fn committed_snapshot_writer_publishes_100k_records_with_bounded_readback() {
         let root = TempDir::new().expect("test directory");
         let first = disk(&root, "first").await;
@@ -1332,6 +1597,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_writer_revocation_before_staging_or_manifest_retains_the_old_commit() {
+        const COMPANIONS: [&str; 2] = ["writer-lifecycle.0", "writer-lifecycle.1"];
+        for allowed_checks in [0, 1] {
+            let root = TempDir::new().expect("test directory");
+            let store = disk(&root, "disk").await;
+            let owner = Uuid::new_v4();
+            let old = payload("old");
+            let next = payload("next");
+            publish_committed_snapshot_with_companion(
+                std::slice::from_ref(&store),
+                owner,
+                1,
+                &old,
+                4096,
+                Some((&COMPANIONS, b"old-state", 4096)),
+            )
+            .await
+            .expect("old complete checkpoint");
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let result = publish_committed_snapshot_with_companion_guarded(
+                std::slice::from_ref(&store),
+                owner,
+                2,
+                &next,
+                4096,
+                Some((&COMPANIONS, b"new-state", 4096)),
+                |_| std::future::ready(calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < allowed_checks),
+            )
+            .await;
+            assert!(matches!(result, Err(SnapshotError::WriterCapabilityUnavailable)));
+            let reopened = disk(&root, "disk").await;
+            let recovered = read_committed(std::slice::from_ref(&reopened), 4096)
+                .await
+                .expect("read after interruption")
+                .expect("old commit survives");
+            assert_eq!(recovered.sequence(), 1);
+            assert_eq!(recovered.payload(), old.as_slice());
+            assert_eq!(
+                read_committed_companion(std::slice::from_ref(&reopened), owner, 1, &COMPANIONS, 4096, 4096,)
+                    .await
+                    .expect("old matching companion"),
+                Some(b"old-state".to_vec())
+            );
+            assert!(
+                EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[1])
+                    .await
+                    .is_err()
+            );
+            if allowed_checks == 1 {
+                assert_eq!(
+                    EcstoreDiskAPI::read_all(reopened.as_ref(), RUSTFS_META_BUCKET, COMPANIONS[1])
+                        .await
+                        .expect("staged companion remains evidence")
+                        .as_ref(),
+                    b"new-state"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_writer_partial_manifest_success_reports_only_committed_replicas() {
+        const COMPANIONS: [&str; 2] = ["writer-lifecycle.0", "writer-lifecycle.1"];
+        let root = TempDir::new().expect("test directory");
+        let disks = [disk(&root, "first").await, disk(&root, "second").await];
+        let owner = Uuid::new_v4();
+        let old = payload("old");
+        let next = payload("next");
+        publish_committed_snapshot_with_companion(&disks, owner, 1, &old, 4096, Some((&COMPANIONS, b"old-state", 4096)))
+            .await
+            .expect("old replicated checkpoint");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let published = publish_committed_snapshot_with_companion_guarded(
+            &disks,
+            owner,
+            2,
+            &next,
+            4096,
+            Some((&COMPANIONS, b"new-state", 4096)),
+            |_| std::future::ready(calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2),
+        )
+        .await
+        .expect("one complete replica preserves the owner's established contract");
+        assert_eq!(published.payload_replicas, 2);
+        assert_eq!(published.manifest_replicas, 1);
+        let mut actual_manifests = 0;
+        for store in &disks {
+            actual_manifests += usize::from(
+                EcstoreDiskAPI::read_all(store.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[1])
+                    .await
+                    .is_ok(),
+            );
+            assert_eq!(
+                EcstoreDiskAPI::read_all(store.as_ref(), RUSTFS_META_BUCKET, MANIFEST_PATHS[0])
+                    .await
+                    .expect("predecessor retained")
+                    .as_ref(),
+                manifest(owner, 1, &old)
+            );
+        }
+        assert_eq!(actual_manifests, 1);
+        let recovered = read_committed(&disks, 4096)
+            .await
+            .expect("recover partial publication")
+            .expect("complete successor");
+        assert_eq!(recovered.sequence(), 2);
+        assert_eq!(recovered.payload(), next.as_slice());
+        assert_eq!(
+            read_committed_companion(&disks, owner, 2, &COMPANIONS, 4096, 4096)
+                .await
+                .expect("companion from the committed replica"),
+            Some(b"new-state".to_vec())
+        );
+    }
+
+    #[tokio::test]
     async fn manifest_cas_failure_after_payload_write_keeps_previous_anchor() {
         let root = TempDir::new().expect("test directory");
         let store = disk(&root, "disk").await;
@@ -1345,16 +1726,17 @@ mod tests {
             .await
             .ok();
         assert_eq!(
-            cas_replace(&store, PAYLOAD_PATHS[1], &next, 4096)
+            cas_replace(&store, PAYLOAD_PATHS[1], EcstoreDiskBytes::copy_from_slice(&next), 4096)
                 .await
                 .expect("successor payload CAS"),
             EcstoreConditionalFileUpdate::Updated
         );
         install(&store, MANIFEST_PATHS[1], &damaged_manifest).await;
 
-        let manifest_update = cas_replace_expected(&store, MANIFEST_PATHS[1], expected_manifest, &manifest(owner, 2, &next))
-            .await
-            .expect("successor manifest CAS");
+        let manifest_update =
+            cas_replace_expected(&store, MANIFEST_PATHS[1], expected_manifest, manifest(owner, 2, &next).into())
+                .await
+                .expect("successor manifest CAS");
         assert_eq!(manifest_update, EcstoreConditionalFileUpdate::Mismatch);
 
         let reopened = disk(&root, "disk").await;
@@ -1699,6 +2081,7 @@ mod tests {
                 object: Arc::from("a"),
                 version_id: None,
                 kind: MrfKind::PartialWrite,
+                delete_marker_purge: None,
                 scope: Some(MrfScope {
                     pool_index: 0,
                     set_index,

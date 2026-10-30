@@ -19,9 +19,6 @@ no-default-features = false
 version = 2
 yanked = "deny"
 ignore = [
-    # `paste 1.0.15` — unmaintained. No direct dependency.
-    # owner: rustfs-maintainers  review: 2026-07
-    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive only; tracked for upgrade" },
     # `rsa` Marvin timing sidechannel (RUSTSEC-2023-0071). Pulled in via
     # `openidconnect` (transitive) and historically used directly. No upstream
     # fix is available yet. Tracked separately for follow-up; remove this
@@ -36,13 +33,16 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # Official s3s repository. Temporarily pinned to the merged generic REST
-    # SigV4 payload-checksum fix until it is available in a crates.io release.
-    # owner: marshawcoco  review: 2026-10
-    # "https://github.com/s3s-project/s3s.git",
-    # RustFS fork carrying presigned expiry and constant-time authentication fixes.
+    # Official s3s repository pinned for Iceberg SigV4 path encoding support.
+    # owner: GatewayJ  review: 2026-10
+    "https://github.com/s3s-project/s3s",
+    # Upstream OIDC/OAuth2 crypto migrations, pinned to reviewed PR commits.
     # owner: rustfs-maintainers  review: 2026-10
-    # "https://github.com/rustfs/s3s.git",
+    "https://github.com/ramosbugs/openidconnect-rs",
+    "https://github.com/ramosbugs/oauth2-rs",
+    # Completion ownership patch fixed to rustfs/uring#20.
+    # owner: overtrue  review: 2026-10
+    "https://github.com/rustfs/uring.git",
 ]
 
 [bans]

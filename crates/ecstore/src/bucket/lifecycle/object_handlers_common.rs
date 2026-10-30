@@ -33,9 +33,17 @@ pub async fn delete_object_versions(
     api: &Arc<ECStore>,
     bucket: &str,
     to_del: &[ObjectToDelete],
-    _lc_event: lifecycle::Event,
+    lc_event: lifecycle::Event,
     bucket_incarnation_id: Uuid,
 ) -> usize {
+    if to_del.is_empty() {
+        return 0;
+    }
+
+    let Some(expiry_policy) = lc_event.expiry_policy else {
+        return to_del.len();
+    };
+
     if to_del.iter().any(|target| {
         target.version_id.is_none()
             || (target.version_id.is_some_and(|version_id| version_id.is_nil()) && target.expected_identity.is_none())
@@ -52,6 +60,25 @@ pub async fn delete_object_versions(
         return to_del.len();
     }
 
+    let Some(publication_guard) = super::bucket_lifecycle_ops::lifecycle_expiry_publication_guard(
+        api,
+        bucket,
+        to_del[0].object_name.as_str(),
+        bucket_incarnation_id,
+    )
+    .await
+    else {
+        debug!(
+            event = EVENT_LIFECYCLE_CLEANUP_SKIPPED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            bucket,
+            target_count = to_del.len(),
+            reason = "publication_admission_rejected",
+            "Skipped lifecycle noncurrent version cleanup"
+        );
+        return to_del.len();
+    };
     let delete_config_snapshot = match ReplicationObjectBridge::delete_request_config(api, bucket).await {
         Ok(snapshot) => Arc::new(snapshot),
         Err(err) => {
@@ -78,17 +105,14 @@ pub async fn delete_object_versions(
             remaining = &[];
         }
 
-        let (mut deleted_objs, errors) = api
-            .delete_objects(
-                bucket,
-                to_del.to_vec(),
-                ObjectOptions {
-                    delete_replication_config_snapshot: Some(Arc::clone(&delete_config_snapshot)),
-                    expected_bucket_incarnation_id: Some(bucket_incarnation_id),
-                    ..Default::default()
-                },
-            )
-            .await;
+        let mut delete_options = ObjectOptions {
+            delete_replication_config_snapshot: Some(Arc::clone(&delete_config_snapshot)),
+            expected_bucket_incarnation_id: Some(bucket_incarnation_id),
+            lifecycle_expiry_policy: Some(expiry_policy.clone()),
+            ..Default::default()
+        };
+        delete_options.add_namespace_lock_guard(&publication_guard);
+        let (mut deleted_objs, errors) = api.delete_objects(bucket, to_del.to_vec(), delete_options).await;
         failed += errors.iter().filter(|err| err.is_some()).count();
 
         for (i, deleted_obj) in deleted_objs.iter_mut().enumerate() {
@@ -106,7 +130,11 @@ pub async fn delete_object_versions(
                 // already happened (backlog#2202).
                 emit_noncurrent_expiration_event(bucket, target, deleted_obj, false);
             }
-            if deleted_obj.replication_state.is_none() {
+            if !deleted_obj
+                .replication_state
+                .as_ref()
+                .is_some_and(|state| !state.targets.is_empty() || !state.purge_targets.is_empty())
+            {
                 continue;
             }
             replication_sink::schedule_delete(bucket.to_string(), deleted_obj.clone()).await;

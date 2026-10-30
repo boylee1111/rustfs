@@ -11,8 +11,48 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use super::disposition::record_task_disposition;
 /// The heal scheduler: queue consumption loop and its skip/metric helpers.
 use super::*;
+
+pub(super) fn retry_admission_delay(
+    grace_deadline: Option<u64>,
+    ordinary_delay: Duration,
+    grace_admission_backoff: Duration,
+    now: u64,
+) -> Option<Duration> {
+    let delay = match grace_deadline {
+        Some(deadline) if deadline > now => Duration::from_secs(deadline - now),
+        Some(_) => grace_admission_backoff,
+        None => ordinary_delay,
+    };
+    tokio::time::Instant::now().checked_add(delay)?;
+    Some(delay)
+}
+
+pub(super) fn running_mainline_pacer(
+    request: &HealRequest,
+    config: &HealConfig,
+    provider: &Option<WorkloadSnapshotProviderRef>,
+) -> Option<Arc<crate::heal::pacing::MainlinePacer>> {
+    let pace_running = request.source == HealRequestSource::Admin
+        || (request.source == HealRequestSource::AutoHeal
+            && matches!(&request.heal_type, HealType::ErasureSet { .. })
+            && !request.heal_endpoints.is_empty());
+    if !pace_running || !config.mainline_throttle_enable {
+        return None;
+    }
+    provider.as_ref().and_then(|provider| {
+        crate::heal::pacing::MainlinePacer::new(
+            provider.clone(),
+            config.mainline_read_utilization_high_percent,
+            config.mainline_write_utilization_high_percent,
+            config.mainline_max_sleep,
+            request.source,
+        )
+        .map(Arc::new)
+    })
+}
 
 impl HealManager {
     /// Start scheduler
@@ -32,8 +72,9 @@ impl HealManager {
         let storage = self.storage.clone();
         let notify = self.notify.clone();
         let workload_provider = self.workload_provider.clone();
+        let disposition_cache = self.disposition_cache.clone();
 
-        tokio::spawn(async move {
+        self.workers.spawn_fixed(0, move |parent| async move {
             let mut interval = interval(config.read().await.heal_interval);
 
             loop {
@@ -51,7 +92,7 @@ impl HealManager {
                         break;
                     }
                     _ = notify.notified(), if event_driven_scheduler_enable => {
-                        Self::process_heal_queue(HealQueueContext {
+                        Self::process_owned_heal_queue(HealQueueContext {
                             heal_queue: &heal_queue,
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
@@ -67,11 +108,12 @@ impl HealManager {
                             notify: &notify,
                             cancel_token: &cancel_token,
                             workload_provider: &workload_provider,
-                        })
+                            disposition_cache: &disposition_cache,
+                        }, &parent)
                         .await;
                     }
                     _ = interval.tick() => {
-                        Self::process_heal_queue(HealQueueContext {
+                        Self::process_owned_heal_queue(HealQueueContext {
                             heal_queue: &heal_queue,
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
@@ -87,19 +129,29 @@ impl HealManager {
                             notify: &notify,
                             cancel_token: &cancel_token,
                             workload_provider: &workload_provider,
-                        })
+                            disposition_cache: &disposition_cache,
+                        }, &parent)
                         .await;
                     }
                 }
             }
-        });
+        })?;
 
         Ok(())
     }
 
     /// Process heal queue
     /// Processes multiple tasks per cycle when capacity allows and queue has high-priority items
+    #[cfg(test)]
     pub(super) async fn process_heal_queue(context: HealQueueContext<'_>) {
+        Self::process_heal_queue_inner(context, None).await;
+    }
+
+    async fn process_owned_heal_queue(context: HealQueueContext<'_>, parent: &HealWork) {
+        Self::process_heal_queue_inner(context, Some(parent)).await;
+    }
+
+    async fn process_heal_queue_inner(context: HealQueueContext<'_>, parent: Option<&HealWork>) {
         let HealQueueContext {
             heal_queue,
             active_heals,
@@ -116,6 +168,7 @@ impl HealManager {
             notify,
             cancel_token,
             workload_provider,
+            disposition_cache,
         } = context;
 
         let config = config.read().await;
@@ -150,7 +203,7 @@ impl HealManager {
         for _ in 0..available_slots {
             let selected_request = if config.set_bulkhead_enable || mainline_pressure.is_some() {
                 let max_concurrent_per_set = config.max_concurrent_per_set;
-                let (selected_request, skipped_sets) = queue.pop_runnable_with_skips(
+                let (selected_request, skipped_sets) = queue.pop_runnable_with_fairness(
                     |request| {
                         let set_allowed = !config.set_bulkhead_enable
                             || can_schedule_request(request, &running_per_set, max_concurrent_per_set);
@@ -164,7 +217,7 @@ impl HealManager {
                 }
                 selected_request
             } else {
-                queue.pop_next()
+                queue.pop_runnable_with_fairness(|_| true, |_| None).0
             };
 
             if let Some(mut request) = selected_request {
@@ -182,22 +235,11 @@ impl HealManager {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .get(&request.id)
                     .cloned();
-                let mainline_pacer = if request.source == HealRequestSource::Admin && config.mainline_throttle_enable {
-                    workload_provider.as_ref().and_then(|provider| {
-                        crate::heal::pacing::MainlinePacer::new(
-                            provider.clone(),
-                            config.mainline_read_utilization_high_percent,
-                            config.mainline_write_utilization_high_percent,
-                            config.mainline_max_sleep,
-                        )
-                        .map(Arc::new)
-                    })
-                } else {
-                    None
-                };
+                let mainline_pacer = running_mainline_pacer(&request, &config, workload_provider);
                 let task = Arc::new(
                     HealTask::from_replacement_recovery_request(request, storage.clone(), replacement_resume_endpoint)
-                        .with_mainline_pacer(mainline_pacer),
+                        .with_mainline_pacer(mainline_pacer)
+                        .with_admin_recovery(root_recovery.clone()),
                 );
                 let task_id = task.id.clone();
                 active_heals_guard.insert(task_id.clone(), task.clone());
@@ -211,6 +253,7 @@ impl HealManager {
                 let retrying_heals_clone = retrying_heals.clone();
                 let mrf_repair_notice_targets_clone = mrf_repair_notice_targets.clone();
                 let replacement_recovery_anchors_clone = replacement_recovery_anchors.clone();
+                let disposition_cache_clone = disposition_cache.clone();
                 let statistics_clone = statistics.clone();
                 let notify_clone = notify.clone();
                 let root_recovery_clone = root_recovery.clone();
@@ -220,7 +263,7 @@ impl HealManager {
                 let config_for_spawn = config.clone();
 
                 // start heal task
-                tokio::spawn(async move {
+                spawn_heal_work(parent, move |parent| async move {
                     debug!(
                         target: "rustfs::heal::manager",
                         event = EVENT_HEAL_SCHEDULER_STATE,
@@ -233,8 +276,9 @@ impl HealManager {
                         state = "task_started",
                         "Heal scheduler task started"
                     );
-                    let result = task.execute().await;
+                    let result = task.execute_owned(parent.clone()).await;
                     let retry_request = retry_request_for_result_with_budget(task.as_ref(), &result).await;
+                    record_task_disposition(&disposition_cache_clone, task.as_ref(), &result, retry_request.is_some()).await;
                     match &result {
                         Ok(_) => {
                             debug!(
@@ -265,18 +309,17 @@ impl HealManager {
                                     "Heal scheduler task retrying"
                                 });
                             } else {
-                                error!(
-                                    target: "rustfs::heal::manager",
+                                demote_to_debug_when!(!task.should_log_failure(e), error, target: "rustfs::heal::manager", {
                                     event = EVENT_HEAL_SCHEDULER_STATE,
                                     component = LOG_COMPONENT_HEAL,
                                     subsystem = LOG_SUBSYSTEM_MANAGER,
+                                    state = "task_failed",
                                     task_id,
                                     heal_type = %task_type_label_for_spawn,
                                     set = %task_set_label_for_spawn,
-                                    state = "task_failed",
                                     error = %e,
                                     "Heal scheduler task failed"
-                                );
+                                });
                             }
                         }
                     }
@@ -302,8 +345,8 @@ impl HealManager {
                     tests::pause_completed_retention_before_publish(&task_id, &completed_status).await;
                     let mut active_heals_guard = active_heals_clone.lock().await;
                     let owns_completion = active_heals_guard.contains_key(&task_id);
-                    let cancelled_completion = if owns_completion {
-                        false
+                    let cancelled_snapshot = if owns_completion {
+                        None
                     } else {
                         // Cancellation can win while a finished worker waits
                         // for active ownership. It must not resurrect a retry
@@ -313,18 +356,21 @@ impl HealManager {
                             .lock()
                             .await
                             .get(&task_id)
-                            .is_some_and(|completed| completed.status == HealTaskStatus::Cancelled)
+                            .filter(|completed| completed.status == HealTaskStatus::Cancelled)
+                            .cloned()
                     };
-                    if cancelled_completion {
+                    let cancelled_completion = cancelled_snapshot.is_some();
+                    if let Some(cancelled) = &cancelled_snapshot {
                         completed_status = HealTaskStatus::Cancelled;
                         completed_status_entry.status = HealTaskStatus::Cancelled;
                         completed_status_entry.outcome = Some(Arc::new(task.get_outcome().await));
+                        completed_status_entry.completed_at = cancelled.completed_at;
                     }
                     let terminal_completion = matches!(
                         completed_status,
                         HealTaskStatus::Completed | HealTaskStatus::Cancelled | HealTaskStatus::Failed { .. }
                     );
-                    if owns_completion
+                    if (owns_completion || cancelled_completion)
                         && terminal_completion
                         && root_recovery::is_admin_heal_recovery(&task.heal_type, task.source)
                         && let Err(error) = root_recovery_clone
@@ -344,6 +390,24 @@ impl HealManager {
                             error = %error,
                             "Failed to publish heal terminal receipt"
                         );
+                        // A failed write can already have replaced the report.
+                        // Resolve it from disk instead of assuming the old snapshot won.
+                        if let Some(cancelled) = &cancelled_snapshot {
+                            completed_status_entry = match root_recovery_clone.completed(&task_id).await {
+                                Ok(Some(persisted)) => persisted,
+                                Ok(None) | Err(_) => {
+                                    let mut unavailable = (**cancelled).clone();
+                                    unavailable.outcome = None;
+                                    unavailable.progress = None;
+                                    unavailable.seqed_items = Vec::new();
+                                    unavailable.next_seq = 0;
+                                    unavailable.min_seq = 0;
+                                    unavailable.result_items_truncated = true;
+                                    unavailable.retained_bytes.take();
+                                    unavailable
+                                }
+                            };
+                        }
                     }
                     if owns_completion
                         && !terminal_completion
@@ -416,6 +480,7 @@ impl HealManager {
                             release_mrf_repair_notice_targets(&notice_targets);
                         }
                         publish_verified_mrf_repair_events(&notice_targets, &completed_status_for_verified_events);
+                        publish_unverified_legacy_mrf_events(&notice_targets, &completed_status_for_verified_events, &result);
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
@@ -435,6 +500,7 @@ impl HealManager {
                     if let (Some((retry_request, retry_delay, retry_error)), Some(retry_cancel_token)) =
                         (retry_request_for_queue, retry_cancel_token)
                     {
+                        let grace_deadline = automatic_replacement_grace_deadline(task.as_ref(), &result);
                         let retry_request_id = retry_request.id.clone();
                         let retry_attempt = retry_request.retry_attempts;
                         let retry_key = PriorityHealQueue::make_dedup_key(&retry_request);
@@ -449,8 +515,19 @@ impl HealManager {
                         let retry_notify = notify_clone.clone();
                         let retry_manager_cancel_token = manager_cancel_token.clone();
                         let retry_config = config_for_spawn.clone();
-                        tokio::spawn(async move {
+                        spawn_heal_work(parent.as_ref(), move |_parent| async move {
+                            let mut grace_admission_backoff = Duration::ZERO;
                             loop {
+                                let now = SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let Some(admission_delay) =
+                                    retry_admission_delay(grace_deadline, retry_delay, grace_admission_backoff, now)
+                                else {
+                                    retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                    return;
+                                };
                                 tokio::select! {
                                     _ = retry_cancel_token.cancelled() => {
                                         debug!(
@@ -470,7 +547,17 @@ impl HealManager {
                                         retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
                                         return;
                                     }
-                                    _ = sleep(retry_delay) => {}
+                                    _ = sleep(admission_delay) => {}
+                                }
+
+                                // A wall-clock rollback during the monotonic
+                                // wait must not admit work before its deadline.
+                                let now = SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                if grace_deadline.is_some_and(|deadline| deadline > now) {
+                                    continue;
                                 }
 
                                 {
@@ -505,9 +592,18 @@ impl HealManager {
                                     return;
                                 }
 
+                                #[cfg(test)]
+                                tests::admin_overlap::pause_before_retry_queue(&retry_request_id).await;
                                 let mut queue = retry_heal_queue.lock().await;
+                                let mut retrying = retrying_heals_for_spawn.lock().await;
+                                // Cancellation may win after the backoff checks but
+                                // before queue acquisition. Keep ownership through
+                                // publication so a cancelled retry cannot reappear.
+                                if retry_cancel_token.is_cancelled() || !retrying.contains_key(&retry_request_id) {
+                                    return;
+                                }
                                 let admission_decision =
-                                    Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry");
+                                    Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry", true);
                                 let admission = admission_decision.result;
                                 let should_notify = matches!(admission, HealAdmissionResult::Accepted)
                                     && retry_config.event_driven_scheduler_enable;
@@ -525,7 +621,8 @@ impl HealManager {
                                         // matching operations_snapshot's lock order.
                                         #[cfg(test)]
                                         pause_retry_ownership_transition(&retry_request_id, true).await;
-                                        retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        retrying.remove(&retry_request_id);
+                                        drop(retrying);
                                         let displaced_task_id = admission_decision.displaced_task_id().map(ToOwned::to_owned);
                                         drop(queue);
                                         if let (Some(displaced_task_id), Some(displaced_terminal)) =
@@ -549,12 +646,12 @@ impl HealManager {
                                             event = EVENT_HEAL_QUEUE_ADMISSION,
                                             component = LOG_COMPONENT_HEAL,
                                             subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            result = "retry_enqueued",
                                             request_id = %retry_request_id,
                                             priority = ?retry_priority,
                                             retry_attempt,
-                                            retry_delay_ms = retry_delay.as_millis(),
+                                            retry_delay_ms = admission_delay.as_millis(),
                                             error = %retry_error,
-                                            result = "retry_enqueued",
                                             "Heal retry admission decided"
                                         );
                                         if should_notify {
@@ -565,7 +662,8 @@ impl HealManager {
                                     HealAdmissionResult::Merged => {
                                         let merged_task_id =
                                             queue.queued_request_id_for_dedup_key(&retry_key).map(ToOwned::to_owned);
-                                        retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        retrying.remove(&retry_request_id);
+                                        drop(retrying);
                                         drop(queue);
                                         if let Some(merged_task_id) = merged_task_id {
                                             move_mrf_repair_notice_targets(
@@ -597,10 +695,11 @@ impl HealManager {
                                             event = EVENT_HEAL_QUEUE_ADMISSION,
                                             component = LOG_COMPONENT_HEAL,
                                             subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            result = "retry_rejected_full",
                                             request_id = %retry_request_id,
                                             priority = ?retry_priority,
                                             retry_attempt,
-                                            result = "retry_rejected_full",
+                                            retry_delay_ms = admission_delay.as_millis(),
                                             "Heal retry admission decided"
                                         );
                                     }
@@ -610,15 +709,20 @@ impl HealManager {
                                             event = EVENT_HEAL_QUEUE_ADMISSION,
                                             component = LOG_COMPONENT_HEAL,
                                             subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            result = "retry_dropped",
                                             request_id = %retry_request_id,
                                             priority = ?retry_priority,
                                             retry_attempt,
+                                            retry_delay_ms = admission_delay.as_millis(),
                                             reason = reason.as_str(),
-                                            result = "retry_dropped",
                                             "Heal retry admission decided"
                                         );
                                     }
                                 }
+                                // Once the storage deadline has passed, queue
+                                // pressure uses ordinary bounded admission
+                                // backoff instead of repeating the grace wait.
+                                grace_admission_backoff = recoverable_heal_retry_delay(retry_attempt);
                             }
                         });
                     }
@@ -640,7 +744,7 @@ impl HealManager {
 
         if delayed_by_mainline_throttle && let Some(pressure) = mainline_pressure {
             Self::record_mainline_throttle_delay(pressure, &config);
-            Self::schedule_mainline_throttle_recheck(notify.clone(), config.mainline_max_sleep);
+            Self::schedule_mainline_throttle_recheck(notify.clone(), config.mainline_max_sleep, parent, cancel_token.clone());
         }
 
         // Log queue status if items remain
@@ -778,6 +882,9 @@ pub(super) fn mrf_verified_repair_event_for_target(
     let disposition = match outcome.disposition {
         HealObjectDisposition::Repaired => MrfVerifiedRepairDisposition::Repaired,
         HealObjectDisposition::VerifiedHealthy => MrfVerifiedRepairDisposition::VerifiedHealthy,
+        HealObjectDisposition::MetadataHealthy if target.kind == MrfKind::MetadataCorruption => {
+            MrfVerifiedRepairDisposition::VerifiedHealthy
+        }
         HealObjectDisposition::AuthoritativelyAbsent => MrfVerifiedRepairDisposition::AuthoritativelyAbsent,
         _ => return None,
     };
@@ -785,6 +892,7 @@ pub(super) fn mrf_verified_repair_event_for_target(
         MrfKind::DecodeFailure => HealObjectKind::Decode,
         MrfKind::MetadataCorruption => HealObjectKind::Metadata,
         MrfKind::PartialWrite => HealObjectKind::Object,
+        MrfKind::DeleteMarkerPurge => HealObjectKind::DeleteMarkerPurge,
     };
     if outcome.identity.kind != expected_kind
         || outcome.identity.bucket.as_str() != target.bucket.as_ref()
@@ -815,6 +923,7 @@ pub(super) fn mrf_verified_repair_event_for_target(
         object: target.object.clone(),
         version_id,
         scope,
+        delete_marker_purge: target.delete_marker_purge,
         lease: target.lease,
         bucket_incarnation_id,
         disposition,
@@ -838,6 +947,69 @@ pub(super) fn publish_verified_mrf_repair_events(targets: &[MrfRepairNoticeTarge
             .find_map(|object| mrf_verified_repair_event_for_target(target, object))
         {
             rustfs_common::mrf_channel::note_mrf_verified_repair(event);
+        }
+    }
+}
+
+pub(super) fn unverified_legacy_mrf_event_for_target(
+    target: &MrfRepairNoticeTarget,
+    outcome: &crate::heal::outcome::HealObjectOutcome,
+) -> Option<rustfs_common::mrf_channel::MrfUnverifiedLegacyEvent> {
+    use crate::heal::outcome::{HealObjectDisposition, HealObjectKind};
+    use rustfs_common::mrf_channel::MrfKind;
+
+    let anchor = target.durable_anchor.as_ref()?;
+    if target.kind != MrfKind::PartialWrite || outcome.disposition != HealObjectDisposition::Unknown {
+        return None;
+    }
+    let version_id = target.version_id.filter(|bytes| *bytes != [0; 16]);
+    let expected_version = version_id.map(|bytes| uuid::Uuid::from_bytes(bytes).to_string());
+    let expected_pool = target.scope.and_then(|scope| usize::try_from(scope.pool_index).ok());
+    let expected_set = target.scope.and_then(|scope| usize::try_from(scope.set_index).ok());
+    if anchor.kind != target.kind
+        || anchor.bucket != target.bucket
+        || anchor.object != target.object
+        || anchor.version_id != version_id
+        || anchor.scope != target.scope
+        || Some(anchor.lease) != target.lease
+        || outcome.identity.kind != HealObjectKind::Object
+        || outcome.identity.bucket != target.bucket.as_ref()
+        || outcome.identity.object != target.object.as_ref()
+        || outcome.identity.version_id != expected_version
+        || outcome.identity.pool_index != expected_pool
+        || outcome.identity.set_index != expected_set
+        || outcome.identity.bucket_incarnation_id != Some(anchor.bucket_incarnation_id)
+    {
+        return None;
+    }
+    Some(rustfs_common::mrf_channel::MrfUnverifiedLegacyEvent { anchor: anchor.clone() })
+}
+
+pub(super) fn publish_unverified_legacy_mrf_events(
+    targets: &[MrfRepairNoticeTarget],
+    completed: &CompletedHealStatus,
+    result: &Result<()>,
+) {
+    use crate::heal::outcome::HealExecutionOutcome;
+
+    if !matches!(result, Err(Error::LegacyMrfUnverified { .. }))
+        || !matches!(completed.status, HealTaskStatus::Completed | HealTaskStatus::Failed { .. })
+    {
+        return;
+    }
+    let Some(outcome) = completed.outcome.as_ref() else {
+        return;
+    };
+    if outcome.execution != HealExecutionOutcome::Completed {
+        return;
+    }
+    for target in targets {
+        if let Some(event) = outcome
+            .objects
+            .iter()
+            .find_map(|object| unverified_legacy_mrf_event_for_target(target, object))
+        {
+            rustfs_common::mrf_channel::note_mrf_unverified_legacy(event);
         }
     }
 }

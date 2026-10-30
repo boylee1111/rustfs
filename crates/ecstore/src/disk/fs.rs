@@ -16,40 +16,15 @@ use std::{
     collections::HashMap,
     fs::Metadata,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::Mutex,
     time::{Duration, Instant},
 };
-use tokio::{
-    fs::{self, File},
-    io,
-};
+use tokio::{fs::File, io};
 
-static READONLY_OPTIONS: OnceLock<Arc<fs::OpenOptions>> = OnceLock::new();
-static WRITEONLY_OPTIONS: OnceLock<Arc<fs::OpenOptions>> = OnceLock::new();
-static READWRITE_OPTIONS: OnceLock<Arc<fs::OpenOptions>> = OnceLock::new();
-
-fn get_readonly_options() -> &'static Arc<fs::OpenOptions> {
-    READONLY_OPTIONS.get_or_init(|| {
-        let mut opts = fs::OpenOptions::new();
-        opts.read(true);
-        Arc::new(opts)
-    })
-}
-
-fn get_writeonly_options() -> &'static Arc<fs::OpenOptions> {
-    WRITEONLY_OPTIONS.get_or_init(|| {
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true);
-        Arc::new(opts)
-    })
-}
-
-fn get_readwrite_options() -> &'static Arc<fs::OpenOptions> {
-    READWRITE_OPTIONS.get_or_init(|| {
-        let mut opts = fs::OpenOptions::new();
-        opts.read(true).write(true);
-        Arc::new(opts)
-    })
+async fn native_io<T: Send + 'static>(operation: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<T> {
+    super::io_admission::spawn_blocking_with_resource_ownership(operation)
+        .await
+        .map_err(|_| io::Error::other("background task failed"))?
 }
 
 #[cfg(not(windows))]
@@ -117,33 +92,32 @@ pub const O_APPEND: FileMode = 0x00400;
 //     create_new: bool,
 
 pub async fn open_file(path: impl AsRef<Path>, mode: FileMode) -> io::Result<File> {
-    let base_opts = match mode & (O_RDONLY | O_WRONLY | O_RDWR) {
-        O_RDONLY => get_readonly_options(),
-        O_WRONLY => get_writeonly_options(),
-        O_RDWR => get_readwrite_options(),
-        _ => get_readonly_options(),
-    };
-
-    if (mode & (O_CREATE | O_APPEND | O_TRUNC)) != 0 {
-        let mut opts = (**base_opts).clone();
-        if mode & O_CREATE != 0 {
-            opts.create(true);
+    let path = path.as_ref().to_path_buf();
+    native_io(move || {
+        let mut options = std::fs::OpenOptions::new();
+        match mode & (O_RDONLY | O_WRONLY | O_RDWR) {
+            O_WRONLY => options.write(true),
+            O_RDWR => options.read(true).write(true),
+            _ => options.read(true),
         }
-        if mode & O_APPEND != 0 {
-            opts.append(true);
+        .create(mode & O_CREATE != 0)
+        .append(mode & O_APPEND != 0)
+        .truncate(mode & O_TRUNC != 0);
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        if mode == O_RDONLY {
+            super::os::prepared_publication_test_hooks::run(
+                super::os::prepared_publication_test_hooks::Stage::NativeReadOpen,
+                &path,
+            );
         }
-        if mode & O_TRUNC != 0 {
-            opts.truncate(true);
-        }
-        opts.open(path.as_ref()).await
-    } else {
-        base_opts.open(path.as_ref()).await
-    }
+        options.open(path).map(File::from_std)
+    })
+    .await
 }
 
 pub async fn access(path: impl AsRef<Path>) -> io::Result<()> {
-    fs::metadata(path).await?;
-    Ok(())
+    let path = path.as_ref().to_path_buf();
+    native_io(move || std::fs::metadata(path).map(|_| ())).await
 }
 
 pub fn access_std(path: impl AsRef<Path>) -> io::Result<()> {
@@ -152,15 +126,26 @@ pub fn access_std(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub async fn lstat(path: impl AsRef<Path>) -> io::Result<Metadata> {
-    fs::symlink_metadata(path).await
+    let path = path.as_ref().to_path_buf();
+    native_io(move || std::fs::symlink_metadata(path)).await
 }
 
 pub fn lstat_std(path: impl AsRef<Path>) -> io::Result<Metadata> {
     std::fs::symlink_metadata(path)
 }
 
+pub fn create_dir_all_std(path: &Path) -> io::Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(path),
+        Err(e) => Err(e),
+    }
+}
+
 pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
-    fs::create_dir_all(path.as_ref()).await
+    let path = path.as_ref().to_path_buf();
+    native_io(move || create_dir_all_std(&path)).await
 }
 
 fn is_dir_error(e: &io::Error) -> bool {
@@ -173,9 +158,13 @@ fn is_dir_error(e: &io::Error) -> bool {
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn remove(path: impl AsRef<Path>) -> io::Result<()> {
     // Try remove_file first; fall back to remove_dir if it's a directory
-    match fs::remove_file(path.as_ref()).await {
+    let file_path = path.as_ref().to_path_buf();
+    match native_io(move || std::fs::remove_file(file_path)).await {
         Ok(()) => Ok(()),
-        Err(e) if is_dir_error(&e) => fs::remove_dir(path.as_ref()).await,
+        Err(e) if is_dir_error(&e) => {
+            let path = path.as_ref().to_path_buf();
+            native_io(move || std::fs::remove_dir(path)).await
+        }
         Err(e) => Err(e),
     }
 }
@@ -183,9 +172,13 @@ pub async fn remove(path: impl AsRef<Path>) -> io::Result<()> {
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub async fn remove_all(path: impl AsRef<Path>) -> io::Result<()> {
     // Try remove_file first; fall back to remove_dir_all if it's a directory
-    match fs::remove_file(path.as_ref()).await {
+    let file_path = path.as_ref().to_path_buf();
+    match native_io(move || std::fs::remove_file(file_path)).await {
         Ok(()) => Ok(()),
-        Err(e) if is_dir_error(&e) => fs::remove_dir_all(path.as_ref()).await,
+        Err(e) if is_dir_error(&e) => {
+            let path = path.as_ref().to_path_buf();
+            native_io(move || std::fs::remove_dir_all(path)).await
+        }
         Err(e) => Err(e),
     }
 }
@@ -210,23 +203,21 @@ pub fn remove_all_std(path: impl AsRef<Path>) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
 pub async fn mkdir(path: impl AsRef<Path>) -> io::Result<()> {
-    fs::create_dir(path.as_ref()).await
+    let path = path.as_ref().to_path_buf();
+    native_io(move || std::fs::create_dir(path)).await
 }
 
 pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
-    fs::rename(from, to).await
+    let from = from.as_ref().to_path_buf();
+    let to = to.as_ref().to_path_buf();
+    native_io(move || std::fs::rename(from, to)).await
 }
 
 #[cfg(any(not(windows), test))]
 pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
     std::fs::rename(from, to)
-}
-
-#[cfg(any(not(windows), test))]
-#[tracing::instrument(level = "debug", skip_all)]
-pub async fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    fs::read(path.as_ref()).await
 }
 
 // Bucket existence cache - reduces statx syscalls for repeated bucket checks
@@ -245,7 +236,7 @@ impl BucketExistenceCache {
         }
     }
 
-    fn check_exists(&self, path: &PathBuf) -> Option<bool> {
+    fn check_exists(&self, path: &Path) -> Option<bool> {
         let mut cache = self.cache.lock().ok()?;
         if let Some((timestamp, exists)) = cache.get(path) {
             if timestamp.elapsed() < self.ttl {
@@ -262,7 +253,7 @@ impl BucketExistenceCache {
         }
     }
 
-    fn invalidate(&self, path: &PathBuf) {
+    fn invalidate(&self, path: &Path) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.remove(path);
         }
@@ -274,16 +265,17 @@ static BUCKET_EXISTENCE_CACHE: std::sync::LazyLock<BucketExistenceCache> =
 
 /// Cached access check - reduces statx syscalls
 pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
-    let path_buf = path.as_ref().to_path_buf();
+    let path = path.as_ref();
 
-    if let Some(exists) = BUCKET_EXISTENCE_CACHE.check_exists(&path_buf) {
+    if let Some(exists) = BUCKET_EXISTENCE_CACHE.check_exists(path) {
         if exists {
             return Ok(());
         }
         return Err(io::Error::new(io::ErrorKind::NotFound, "bucket not found (cached)"));
     }
 
-    let result = fs::metadata(&path_buf).await;
+    let path_buf = path.to_path_buf();
+    let result = access(&path_buf).await;
 
     match &result {
         Ok(_) => BUCKET_EXISTENCE_CACHE.record(path_buf, true),
@@ -298,7 +290,8 @@ pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub fn invalidate_bucket_cache(path: impl AsRef<Path>) {
-    BUCKET_EXISTENCE_CACHE.invalidate(&path.as_ref().to_path_buf());
+    crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+    BUCKET_EXISTENCE_CACHE.invalidate(path.as_ref());
 }
 
 #[cfg(test)]
@@ -306,6 +299,89 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn cancelled_filesystem_jobs_retain_physical_resources() {
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single native worker");
+        runtime.block_on(async {
+            let mut observations = Vec::new();
+            for count in 1..=2 {
+                for operation in [
+                    "access",
+                    "cached_access",
+                    "lstat",
+                    "mkdir",
+                    "make_dir_all",
+                    "remove",
+                    "remove_all",
+                    "rename",
+                    "open",
+                ] {
+                    let dir = TempDir::new().expect("filesystem ownership fixture");
+                    let source = dir.path().join("source");
+                    let target = dir.path().join("target");
+                    match operation {
+                        "mkdir" | "make_dir_all" | "open" => {}
+                        "remove_all" => {
+                            std::fs::create_dir(&source).expect("recursive removal directory");
+                            std::fs::write(source.join("child"), b"payload").expect("recursive removal child");
+                        }
+                        _ => std::fs::write(&source, b"payload").expect("existing file"),
+                    }
+                    let (resources, gates) = test_resource_units(count);
+                    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.recv();
+                    });
+                    started_rx.await.expect("native worker occupied");
+                    let mut future = Box::pin(with_optional_resource_unit(Some(resources), async {
+                        match operation {
+                            "access" => access(&source).await,
+                            "cached_access" => cached_access(&source).await,
+                            "lstat" => lstat(&source).await.map(|_| ()),
+                            "mkdir" => mkdir(&source).await,
+                            "make_dir_all" => make_dir_all(source.join("child")).await,
+                            "remove" => remove(&source).await,
+                            "remove_all" => remove_all(&source).await,
+                            "rename" => rename(&source, &target).await,
+                            "open" => open_file(&source, O_CREATE | O_WRONLY).await.map(|_| ()),
+                            _ => unreachable!("fixed operation list"),
+                        }
+                    }));
+                    assert!(futures::poll!(&mut future).is_pending(), "{operation}: native job queued");
+                    drop(future);
+                    let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+                    release_tx.send(()).expect("release native worker before assertions");
+                    blocker.await.expect("native blocker completed");
+                    tokio::task::spawn_blocking(|| ()).await.expect("native queue drained");
+                    assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
+                    match operation {
+                        "mkdir" => assert!(source.is_dir()),
+                        "make_dir_all" => assert!(source.join("child").is_dir()),
+                        "open" => assert!(source.is_file()),
+                        "remove" => assert!(!source.exists()),
+                        "rename" => {
+                            assert!(!source.exists());
+                            assert_eq!(std::fs::read(&target).expect("renamed file"), b"payload");
+                        }
+                        _ => {}
+                    }
+                    observations.push((count, operation, held));
+                }
+            }
+            for (count, operation, held) in observations {
+                assert_eq!(held, vec![1; count], "{operation}: queued native job keeps its physical resources");
+            }
+        });
+    }
 
     #[tokio::test]
     async fn test_file_mode_constants() {
@@ -612,28 +688,6 @@ mod tests {
         // Verify content preserved
         let content = std::fs::read_to_string(&new_path).unwrap();
         assert_eq!(content, "test content");
-    }
-
-    #[tokio::test]
-    async fn test_read_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("test_read.txt");
-
-        let test_content = b"This is test content for reading";
-        tokio::fs::write(&file_path, test_content).await.unwrap();
-
-        // Read file
-        let read_content = read_file(&file_path).await.unwrap();
-        assert_eq!(read_content, test_content);
-    }
-
-    #[tokio::test]
-    async fn test_read_file_nonexistent() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_path = temp_dir.path().join("nonexistent.txt");
-
-        // Should fail for non-existent file
-        assert!(read_file(&file_path).await.is_err());
     }
 
     #[tokio::test]

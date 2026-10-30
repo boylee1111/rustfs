@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use bytes::Bytes;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -132,6 +133,15 @@ impl DataUsageCache {
         let main = loaded.main_revision;
         *self = loaded.cache;
 
+        Ok(DataUsageCacheRevisions { main, backup })
+    }
+
+    pub(crate) async fn read_revisions<S: ScannerObjectIO>(store: Arc<S>, name: &str) -> StorageResult<DataUsageCacheRevisions> {
+        let main_path = path_join_buf(&[BUCKET_META_PREFIX, name]);
+        let backup_name = format!("{name}.bkp");
+        let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
+        let main = read_config_revision(store.clone(), &main_path).await?;
+        let backup = Some(read_config_revision(store, &backup_path).await?);
         Ok(DataUsageCacheRevisions { main, backup })
     }
 
@@ -360,6 +370,17 @@ impl DataUsageCache {
             }
         };
 
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let load_fut = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+            crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::DataUsageCacheRead,
+            async {
+                crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                    crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerCacheLoad,
+                );
+                load_fut.await
+            },
+        );
+
         match timeout(timeout_duration, load_fut).await {
             Ok(Ok((Some(cache), revision, _))) => Ok(DataUsageCacheLoadAttempt::Loaded {
                 cache: Box::new(cache),
@@ -376,16 +397,36 @@ impl DataUsageCache {
         crate::runtime_config::scanner_cache_save_timeout()
     }
 
-    pub(crate) fn persistence_timeout() -> Duration {
-        Self::cache_save_timeout()
+    pub(crate) fn publication_timeout() -> Duration {
+        // Aggregate statistics publication must fit its lease window rather
+        // than inherit the longer checkpoint save/reconciliation allowance.
+        let timeout_duration = Self::cache_save_timeout();
+        timeout_duration
             .saturating_mul(DATA_USAGE_CACHE_SAVE_RETRIES + 1)
             .saturating_add(DATA_USAGE_CACHE_SAVE_RETRY_BACKOFF_MAX)
-            .saturating_add(Self::backup_cache_save_timeout(Self::cache_save_timeout()))
+            .saturating_add(Self::backup_cache_save_timeout(timeout_duration, Duration::ZERO))
             .saturating_add(DATA_USAGE_CACHE_PERSISTENCE_MARGIN)
     }
 
-    fn backup_cache_save_timeout(timeout_duration: Duration) -> Duration {
-        timeout_duration.min(Duration::from_secs(DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX))
+    pub(crate) fn persistence_timeout() -> Duration {
+        // Each save attempt can be followed by a full read-after-error
+        // reconciliation attempt, including the best-effort backup.
+        Self::cache_save_timeout()
+            .saturating_mul(DATA_USAGE_CACHE_SAVE_RETRIES + DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES + 2)
+            .saturating_mul(2)
+            .saturating_add(DATA_USAGE_CACHE_SAVE_RETRY_BACKOFF_MAX)
+            .saturating_add(DATA_USAGE_CACHE_RECONCILE_BACKOFF_MAX)
+            .saturating_add(DATA_USAGE_CACHE_PERSISTENCE_MARGIN)
+    }
+
+    fn backup_cache_save_timeout(timeout_duration: Duration, primary_elapsed: Duration) -> Duration {
+        // Both copies write and verify the same body. Allow headroom over the
+        // observed primary cost without exceeding the configured attempt cap;
+        // fast checkpoints keep the short best-effort budget and zero retries.
+        primary_elapsed
+            .saturating_mul(2)
+            .max(Duration::from_secs(DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_BASE))
+            .min(timeout_duration)
     }
 
     fn record_save_attempt(path_type: &'static str, result: &'static str, duration: Duration) {
@@ -408,6 +449,9 @@ impl DataUsageCache {
             return false;
         }
         if is_cache_publication_epoch_changed(err) {
+            return false;
+        }
+        if matches!(err, StorageError::Io(error) if error.kind() == std::io::ErrorKind::Interrupted) {
             return false;
         }
         !matches!(
@@ -468,7 +512,7 @@ impl DataUsageCache {
     async fn save_path_with_retry<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         store: Arc<S>,
         path: &str,
-        buf: &[u8],
+        buf: &Bytes,
         timeout_duration: Duration,
         max_retries: u32,
         revision: Option<DataUsageCacheRevision>,
@@ -477,11 +521,15 @@ impl DataUsageCache {
         Self::ensure_cache_save_metrics_registered();
         let path_type = Self::cache_path_type(path);
         let path = path.to_string();
+        let sha256hex = (revision.is_some() && !buf.is_empty())
+            .then(|| hex_simd::encode_to_string(Sha256::digest(buf), hex_simd::AsciiCase::Lower));
 
+        let persist_started = Instant::now();
         let save_result = Self::retry_save_op(path_type, timeout_duration, max_retries, || {
             let store_clone = store.clone();
             let path_clone = path.clone();
-            let buf_clone = buf.to_vec();
+            let buf_clone = buf.clone();
+            let sha256hex = sha256hex.clone();
             let revision = revision.clone();
             async move {
                 let publication_admission = match expected_epoch {
@@ -495,15 +543,30 @@ impl DataUsageCache {
                         cache_publication_admission_unavailable()
                     });
                 };
+                // Count each admitted submission, not encoding, reconciliation,
+                // or physical I/O performed below the save interface.
+                counter!(METRIC_CACHE_SAVE_PAYLOAD_BYTES_TOTAL, "cache" => path_type)
+                    .increment(u64::try_from(buf_clone.len()).unwrap_or(u64::MAX));
                 if let Some(revision) = revision {
-                    save_config_with_preconditions(store_clone, &path_clone, buf_clone, revision.preconditions()).await?;
+                    crate::save_config_shared_with_preconditions_and_lease_fence_and_scope(
+                        store_clone,
+                        &path_clone,
+                        buf_clone,
+                        sha256hex,
+                        revision.preconditions(),
+                        None,
+                        None,
+                    )
+                    .await?;
                 } else {
-                    save_config(store_clone, &path_clone, buf_clone).await?;
+                    save_config(store_clone, &path_clone, buf_clone.to_vec()).await?;
                 }
                 Ok::<(), StorageError>(())
             }
         })
         .await;
+        histogram!("rustfs_scanner_cache_persist_attempt_seconds", "path_type" => path_type, "retry_result" => if save_result.is_ok() { "success" } else { "error" })
+            .record(persist_started.elapsed().as_secs_f64());
         let Err(save_err) = save_result else {
             return Ok(());
         };
@@ -530,7 +593,7 @@ impl DataUsageCache {
                         },
                     )
                     .await?;
-                Ok::<bool, StorageError>(reader.read_all().await? == buf)
+                Ok::<bool, StorageError>(reader.read_all().await?.as_slice() == buf.as_ref())
             })
             .await;
             if matches!(reconcile, Ok(Ok(true))) {
@@ -579,11 +642,17 @@ impl DataUsageCache {
         revisions: Option<&DataUsageCacheRevisions>,
         expected_epoch: Option<u64>,
     ) -> StorageResult<()> {
+        let serialize_started = Instant::now();
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
+        // Primary, backup, and retries read the same immutable encoded body.
+        let buf = Bytes::from(buf);
+        counter!("rustfs_scanner_cache_serialized_bytes_total").increment(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+        histogram!("rustfs_scanner_cache_serialize_seconds").record(serialize_started.elapsed().as_secs_f64());
         let timeout_duration = Self::cache_save_timeout();
 
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
+        let primary_save_started = Instant::now();
         Self::save_path_with_retry(
             store.clone(),
             &path,
@@ -597,7 +666,7 @@ impl DataUsageCache {
 
         let backup_name = format!("{name}.bkp");
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
-        let backup_timeout_duration = Self::backup_cache_save_timeout(timeout_duration);
+        let backup_timeout_duration = Self::backup_cache_save_timeout(timeout_duration, primary_save_started.elapsed());
         let backup_revision = revisions.and_then(|revisions| revisions.backup.clone());
         if revisions.is_some() && backup_revision.is_none() {
             return Ok(());
@@ -629,5 +698,41 @@ impl DataUsageCache {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_budget_tracks_cost_within_configured_cap() {
+        for (cap, cost, expected) in [
+            (Duration::ZERO, Duration::ZERO, Duration::ZERO),
+            (Duration::from_secs(14), Duration::ZERO, Duration::from_secs(5)),
+            (Duration::from_secs(14), Duration::from_millis(2499), Duration::from_secs(5)),
+            (Duration::from_secs(14), Duration::from_millis(2500), Duration::from_secs(5)),
+            (Duration::from_secs(14), Duration::from_millis(2501), Duration::from_millis(5002)),
+            (Duration::from_secs(14), Duration::from_secs(6), Duration::from_secs(12)),
+            (Duration::from_secs(14), Duration::from_secs(7), Duration::from_secs(14)),
+            (Duration::from_secs(14), Duration::from_secs(60), Duration::from_secs(14)),
+            (Duration::from_secs(2), Duration::from_secs(6), Duration::from_secs(2)),
+            (Duration::MAX, Duration::MAX, Duration::MAX),
+        ] {
+            assert_eq!(
+                DataUsageCache::backup_cache_save_timeout(cap, cost),
+                expected,
+                "cap={cap:?}, cost={cost:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_checkpoint_admission_is_not_retried() {
+        let error = StorageError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled while queued"));
+        assert!(
+            !DataUsageCache::should_retry_save_error(&error),
+            "a cancelled background admission must stop before retry backoff"
+        );
     }
 }

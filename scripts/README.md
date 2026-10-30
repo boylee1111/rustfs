@@ -37,7 +37,7 @@ their issue closes.
 | `check_no_tokio_io_uring.sh` | ci-gate | Keeps tokio's io-uring backend disabled | ci.yml Quick Checks |
 | `check_s3s_footprint.sh` | ci-gate | Lower-only ratchet freezing the direct s3s surface ahead of the s3gate migration | ci.yml Quick Checks; `make pre-commit` |
 | `check_unsafe_code_allowances.sh` | ci-gate | Unsafe-code allowance ledger guard | ci.yml Quick Checks |
-| `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | arch-checks skill |
+| `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | [Architecture guard troubleshooting](../docs/operations/architecture-guard-troubleshooting.md) |
 | `static.sh` | ci-gate | Static-build helper executed inside image builds | `Dockerfile.source`, `Dockerfile.decommission-local` |
 | `helm_chart_version.sh` | ci-gate | Keeps the Helm chart version in sync with the release | helm-package.yml |
 | `test_helm_templates.sh` | ci-gate | Helm template rendering test | helm-package.yml |
@@ -47,7 +47,10 @@ their issue closes.
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
 | `diagnose_scanner_enumeration_restart.py` | dev-tool | Strict fixed raw-entry-budget scanner-worker restart diagnostic | [Checkpoint fixture](../docs/testing/scanner-checkpoint-fixture.md) |
+| `prepare_replacement_migration.py` | dev-tool | Prepares digest-bound schema 5/6 replacement maintenance approvals | [Replacement recovery](../docs/operations/replacement-generation-recovery.md) |
+| `test_prepare_replacement_migration.py` | dev-tool | Verifies maintenance approval scope, publication, and stopped-writer assertion | Python unittest; same runbook |
 | `test_diagnose_scanner_enumeration_restart.py` | dev-tool | Driver report validation and positive convergence oracle tests | Python unittest; same guide |
+| `test_object_generation_protocol_model.py` | dev-tool | Bounded single-slot, four-voter promise/accept design model and recovery/retirement examples; no production runtime evidence | `python3 scripts/test_object_generation_protocol_model.py`; [Generation contract](../docs/architecture/unified-object-generation.md#executable-design-model-and-acceptance-mapping) |
 | `e2e-run.sh` | ci-gate | Boots a rustfs server and runs the `s3s-e2e` black-box conformance tool against it | ci.yml `e2e-tests` jobs; `docs/testing/README.md` |
 | `run_ecstore_validation_suite.sh` | dev-tool | ecstore black-box validation suite (`quick`/`full`/`destructive`/`fuzz` profiles) | `docs/testing/README.md`, `docs/testing/ecstore-validation-suite-design.md` |
 | `run_e2e_tests.sh` | dev-tool | Local `e2e_test` crate runner (starts a server, applies filters, cleans up) | `crates/e2e_test/README.md` |
@@ -55,6 +58,8 @@ their issue closes.
 | `run.ps1` | dev-tool | Windows counterpart of `run.sh` | — |
 | `probe.sh` | dev-tool | Probe-style e2e run | `make probe-e2e` |
 | `run_scanner_validation_harness.sh` | dev-tool | Scanner validation harness | `docs/operations/scanner-benchmark-runbook.md` |
+| `scanner_memory_acceptance.py` | dev-tool | Owned S3 scanner-memory and scanner-off burst acceptance phases | [Memory acceptance](../docs/testing/scanner-memory-acceptance.md) |
+| `test_scanner_memory_acceptance.py` | dev-tool | Dataset, ownership, telemetry and acceptance-oracle tests | Python unittest; same guide |
 | `check_test_wiring.py` | dev-tool | Validates test wiring and assembles one or more measured Scanner/Heal release descriptors into a single release evidence bundle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --self-test` |
 | `run_scanner_heal_evidence_case.sh` | dev-tool | Runs one Scanner/Heal release-evidence registry case and checks the produced receipt/oracle | `.config/scanner-heal-required-tests.json`; `check_test_wiring.py --check-scanner-heal` |
 | `run_scanner_heal_authority_evidence.py` | dev-tool | Assembles measured Scanner/Heal G01 root/quota authority release descriptors from operator-collected authority artifacts | `.config/scanner-heal-required-tests.json`; `test_scanner_heal_authority_evidence.sh` |
@@ -84,10 +89,16 @@ their issue closes.
 | `test_scanner_heal_w16_recovery_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal W16 recovery evidence runner | — |
 | `test_scanner_heal_w13_mrf_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal W13 MRF evidence runner | — |
 | `scanner_abba.py` | dev-tool | Scanner/heal ABBA orchestration and evidence gates via `run_scanner_validation_harness.sh --abba` | `docs/operations/scanner-benchmark-runbook.md` |
+| `scanner_client_trace.py` | dev-tool | Reconcile client request ledgers and calculate per-window exact sample percentiles | `scanner_abba.py` |
 | `test_scanner_abba.py` | dev-tool | Synthetic ABBA adapter and failure-path tests | `test_scanner_validation_harness.sh` |
+| `test_scanner_client_trace.py` | dev-tool | Client ledger reconciliation and fail-closed tests | `test_scanner_validation_harness.sh` |
+| `test_summarize_scanner_heal_perf.py` | dev-tool | Scanner/heal summary and provenance tests | `test_scanner_validation_harness.sh` |
+| `test_scanner_heal_scheduler_pressure_evidence.py` | dev-tool | Scheduler-pressure evidence fail-closed tests | `test_scanner_heal_scheduler_pressure_evidence.sh` |
+| `test_scanner_heal_linux_evidence_plan.py` | dev-tool | Linux evidence plan coverage tests | `test_scanner_heal_linux_evidence_plan.sh` |
 | `test_build_rustfs_options.sh` | dev-tool | Shell test for rustfs build-option wiring | `make test` (script-tests) |
 | `test_entrypoint_credentials.sh` | dev-tool | Container entrypoint credential-handling test | `make test` (script-tests) |
 | `test_helm_chart_version.sh` | dev-tool | Test for `helm_chart_version.sh` | — |
+| `test_package_service_scripts.sh` | ci-gate | Verifies DEB/RPM install, upgrade, removal, and service restart scriptlets | audit.yml `workflow-pin-report` |
 | `test_package_versions.sh` | ci-gate | Exact-output and fail-closed tests for DEB/RPM package version normalization | audit.yml `workflow-pin-report`; package.yml RPM build |
 | `windows-sftp-listener-smoke.sh` | dev-tool | Confirms `rustfs.exe --features sftp` binds an SFTP listener on Windows | — |
 
@@ -96,7 +107,7 @@ their issue closes.
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
 | `run_hotpath_warp_ab.sh` | dev-tool | Linux warp A/B rig for the hotpath series (quick local A/B) | `docs/operations/hotpath-warp-ab-runbook.md` |
-| `run_hotpath_warp_abba.sh` | ci-gate | Formal ABBA warp runner (baseline/candidate interleaved, `--rounds >= 3`); the runner performance-ab.yml executes | performance-ab.yml (scheduled); `docs/operations/hotpath-warp-ab-runbook.md` |
+| `run_hotpath_warp_abba.sh` | dev-tool | Formal ABBA warp runner (baseline/candidate interleaved, `--rounds >= 3`) | `docs/operations/hotpath-warp-ab-runbook.md` |
 | `hotpath_warp_ab_gate.sh` | dev-tool | Relative-budget gate evaluated over the warp A/B results | used by `run_hotpath_warp_ab.sh`; hotpath runbook |
 | `run_internode_grpc_ab_bench.sh` | dev-tool | One-click A/B driver for the internode gRPC optimization stages | `docs/operations/internode-grpc-benchmark-runbook.md` |
 | `run_internode_transport_baseline.sh` | dev-tool | Internode transport baseline runner | internode runbook; `crates/io-metrics/README.md` |
@@ -104,6 +115,9 @@ their issue closes.
 | `run_object_batch_bench.sh` | dev-tool | Batch object benchmark runner (warp/s3bench) | internode + scanner runbooks |
 | `run_object_batch_bench_enhanced.sh` | dev-tool | Enhanced batch benchmark runner; hub used by the smoke rigs | hotpath runbook |
 | `run_pinned_paired_abba_bench.sh` | dev-tool | Pinned RustFS/MinIO paired ABBA benchmark orchestrator for backlog#1432 | `test_pinned_paired_abba_bench.sh` |
+| `prepare_conditional_read_baseline.py` | dev-tool | Installs only the matching conditional-read benchmark harness in a clean detached baseline | `docs/testing/conditional-read-benchmark.md` |
+| `run_conditional_read_abba.py` | dev-tool | Serial ordinary/hit/miss GET ABBA with cache/slow-disk controls and drift/regression gates | `docs/testing/conditional-read-benchmark.md` |
+| `test_conditional_read_abba.py` | dev-tool | Parser, drift rejection, and throughput/lock regression tests for conditional-read evidence | `run_conditional_read_abba.py` |
 | `run_get_codec_streaming_smoke.sh` | dev-tool | Local GET benchmark harness for the codec streaming read path | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_get_1mib_abba_stage_metrics.sh` | dev-tool | Exact-1MiB isolated-host GET ABBA/stage-metrics harness for backlog#1434 | `test_get_1mib_abba_stage_metrics.sh` |
 | `issue_2007_coalescer_prometheus_report.py` | dev-tool | Read-only Prometheus report for GET metadata coalescer delay cost validation; usage in the module docstring | `test_issue_2007_coalescer_prometheus_report.sh` |
@@ -135,6 +149,7 @@ their issue closes.
 | `manual_transition_nightly_stress_runbook.sh` | dev-tool | Nightly stress entrypoint with failure snapshot templates | — |
 | `install-flatc.sh` | dev-tool | Local flatc installer (macOS) | — |
 | `install-protoc.sh` | dev-tool | Local protoc installer (macOS/Linux) | — |
+| `cargo_publish_workspace.sh` | dev-tool | Generates the workspace crate publish order, checks existing registry versions, and optionally runs ordered `cargo publish` dry-runs or publication | `docs/operations/cargo-publish-workspace.md` |
 | `makefile-header.sh` | dev-tool | Generates the `## —— section ——` header lines used in `.config/make/*.mak` | — |
 | `tls_gen.md` | dev-tool (doc) | Notes on generating local TLS certificates | — |
 
@@ -181,7 +196,6 @@ referenced only by other scripts in this same archived set. Reasons:
 | `prepare_gt1g_get_test_objects.sh` | >1 GiB GET investigation one-shot fixture prep |
 | `run_gt1g_multipart_put_server_path_focus.sh` | >1 GiB PUT investigation one-shot focus run |
 | `run_get_metrics_gate_smoke.sh` | One-shot GET metrics-gate smoke |
-| `run_listobjects_verified_bench.sh` | One-shot verified list-objects bench |
 | `run_object_batch_bench_abc.sh` | One-shot capacity/object profile A/B/C controller |
 | `run_object_data_cache_bench.sh` | One-shot GET bench for the object-data-cache rollout gate |
 | `setup-test-binaries.sh` | One-shot Docker-build test binary fixture |

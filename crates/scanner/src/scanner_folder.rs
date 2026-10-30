@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::data_usage_define::clone_cache_value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::FileType;
 use std::io::ErrorKind;
@@ -20,12 +22,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{
-    DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap,
-    DataUsageRawEnumerationCursor, DataUsageScanCheckpoint, DataUsageScanCheckpointReason, PendingScannerHeal,
-    PendingScannerHealKind, ScannerSizeSummaryExt, SizeReconciliationEntry, SizeSummary, hash_path,
+    DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageCacheInfo, DataUsageCacheSource, DataUsageEntry, DataUsageHash,
+    DataUsageHashMap, DataUsageRawEnumerationCursor, DataUsageScanCheckpoint, DataUsageScanCheckpointReason,
+    MAX_DATA_USAGE_CACHE_DEPTH, PendingScannerHeal, PendingScannerHealKind, ScannerSizeSummaryExt, SizeReconciliationEntry,
+    SizeSummary, hash_path, scan_frontier_covers_path,
 };
 use crate::error::ScannerError;
-use crate::raw_page_index::{RawEnumerationPageIndex, RawEnumerationPageIndexError};
+use crate::raw_page_index::{RawEnumerationPageIndex, RawEnumerationPageWriter};
 use crate::runtime_config::{
     scanner_alert_excess_folders, scanner_alert_excess_version_size, scanner_alert_excess_versions, scanner_yield_every_n_objects,
 };
@@ -33,7 +36,7 @@ use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetReason};
 use crate::scanner_io::{
     SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
 };
-use crate::sleeper::DynamicSleeper;
+use crate::sleeper::{DynamicSleeper, PacingDebt};
 use crate::storage_api::owner::{
     EcstoreBucketLifecycleConfiguration as BucketLifecycleConfiguration, EcstoreEventArgs,
     EcstoreLifecycleRuleFilter as LifecycleRuleFilter, EcstoreObjectLockConfiguration as ObjectLockConfiguration,
@@ -41,6 +44,7 @@ use crate::storage_api::owner::{
 };
 #[cfg(test)]
 use crate::storage_api::owner::{EcstoreExpirationStatus as ExpirationStatus, EcstoreLifecycleRule as LifecycleRule};
+use crate::workload_admission::{run_scanner_metadata_operation, run_scanner_node_operation};
 use metrics::{counter, describe_counter};
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
 use rustfs_filemeta::{
@@ -49,7 +53,7 @@ use rustfs_filemeta::{
 };
 use rustfs_heal_contracts::heal_channel::{
     HEAL_DELETE_DANGLING, HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest,
-    HealRequestSource, HealScanMode, send_heal_request_with_admission,
+    HealRequestSource, HealScanMode, send_heal_request_with_receipt,
 };
 use rustfs_scanner_metrics::metrics::{
     CloseDiskGuard, IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource,
@@ -91,10 +95,12 @@ const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
 const SCANNER_LIST_PATH_RAW_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const SCANNER_ENTRY_PROGRESS_BATCH: u64 = 32;
 const SCANNER_ENTRY_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+const SCANNER_CHECKPOINT_OBJECT_INTERVAL: u64 = 1024;
+const SCANNER_CHECKPOINT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+const SCANNER_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 const SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT: usize = 128;
-const SCANNER_RAW_ENUMERATION_PAGE_BUILD_BUDGET: usize = 1;
-// Erasure data directories contain direct part.N files; keep namespace probes bounded.
-const ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT: usize = 64;
+// Bound cooperative directory work without treating a batch boundary as EOF.
+const SCANNER_DIRECTORY_BATCH_ENTRIES: usize = 64;
 const DEFAULT_HEAL_OBJECT_SELECT_PROB: u32 = 1024;
 const ENV_DATA_USAGE_UPDATE_DIR_CYCLES: &str = "RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES";
 const ENV_HEAL_OBJECT_SELECT_PROB: &str = "RUSTFS_HEAL_OBJECT_SELECT_PROB";
@@ -118,6 +124,14 @@ const MAX_PENDING_SCANNER_HEAL_RETRIES_PER_BUCKET: usize = 128;
 const MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET: usize = 10_000;
 const MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET: usize = 8 * 1024 * 1024;
 const MAX_SIZE_RECONCILIATION_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn checkpoint_interval_for_build_time(build_time: Duration) -> Duration {
+    // Aim to spend at most a tenth of the interval building snapshots, while
+    // preserving the existing upper bound on periodic checkpoint attempts.
+    build_time
+        .saturating_mul(10)
+        .clamp(SCANNER_CHECKPOINT_MIN_INTERVAL, SCANNER_CHECKPOINT_INTERVAL)
+}
 
 // --- scanner excess alerts as S3 notification events (rustfs/backlog#1868) --
 //
@@ -408,6 +422,25 @@ enum FolderScanSource {
     Existing,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FolderScanMode {
+    Namespace,
+    ErasureCandidate { reuse_namespace: bool },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FolderScanOutcome {
+    Namespace,
+    ErasureData,
+    Vanished,
+}
+
+fn is_erasure_candidate(name: &str) -> bool {
+    name.rsplit('/')
+        .next()
+        .is_some_and(|name| uuid::Uuid::parse_str(name).is_ok_and(|id| !id.is_nil()))
+}
+
 #[derive(Clone, Debug)]
 struct QueuedFolder {
     folder: CachedFolder,
@@ -470,17 +503,30 @@ fn checkpoint_reason_from_budget(reason: Option<ScannerCycleBudgetReason>) -> Da
     }
 }
 
+// Cache entry failures survive diagnostic retry-cache TTL and capacity eviction.
+// Index once per scan; resumed subtree checks must not flatten histograms repeatedly.
+fn failed_scan_paths(cache: &DataUsageCache) -> Vec<String> {
+    let mut paths = cache
+        .cache
+        .iter()
+        .filter(|(_, entry)| entry.failed_objects > 0)
+        .map(|(path, _)| clone_cache_value(path))
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths
+}
+
 fn data_usage_entry_has_progress(entry: &DataUsageEntry) -> bool {
     data_usage_root_has_progress(entry)
 }
 
 fn set_scan_checkpoint(cache: &mut DataUsageCache, reason: DataUsageScanCheckpointReason) {
-    let resume_after = cache.info.scan_resume_after.clone().or_else(|| {
+    let resume_after = clone_cache_value(&cache.info.scan_resume_after).or_else(|| {
         cache
             .info
             .scan_checkpoint
             .as_ref()
-            .map(|checkpoint| checkpoint.resume_after.clone())
+            .map(|checkpoint| clone_cache_value(&checkpoint.resume_after))
     });
 
     if let Some(resume_after) = resume_after {
@@ -702,11 +748,42 @@ impl ScannerBucketPrefixScanScope {
 }
 
 /// Folder scanner for scanning directory structures
+#[derive(Default)]
+struct ScannerCheckpointAncestor {
+    hash: DataUsageHash,
+    entry: DataUsageEntry,
+}
+
+struct ScannerUsageUpdates {
+    sender: mpsc::Sender<DataUsageEntry>,
+    cache: DataUsageCache,
+    last_update: SystemTime,
+}
+
+impl ScannerUsageUpdates {
+    fn new(sender: mpsc::Sender<DataUsageEntry>, bucket: String) -> Self {
+        Self {
+            sender,
+            cache: DataUsageCache {
+                info: DataUsageCacheInfo {
+                    name: bucket,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            last_update: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn is_due(&self) -> bool {
+        self.last_update.elapsed().unwrap_or(Duration::ZERO) >= Duration::from_secs(60)
+    }
+}
+
 pub struct FolderScanner {
     root: String,
     old_cache: DataUsageCache,
     new_cache: DataUsageCache,
-    update_cache: DataUsageCache,
 
     data_usage_scanner_debug: bool,
     heal_object_select: u32,
@@ -716,14 +793,27 @@ pub struct FolderScanner {
 
     failed_object_ttl_secs: u64,
     failed_objects_max: usize,
+    failed_object_paths_seen: HashSet<String>,
+    resolved_failed_object_paths: HashSet<String>,
 
     sleeper: DynamicSleeper,
+    pacing_debt: PacingDebt,
+    node_admission: Option<Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
     // should_heal: Arc<dyn Fn() -> bool + Send + Sync>,
     disks: Vec<Arc<Disk>>,
     disks_quorum: usize,
 
-    updates: Option<mpsc::Sender<DataUsageEntry>>,
-    last_update: SystemTime,
+    usage_updates: Option<ScannerUsageUpdates>,
+    checkpoint_tx: Option<mpsc::Sender<DataUsageCache>>,
+    checkpoint_ancestors: Vec<ScannerCheckpointAncestor>,
+    checkpoint_depth: usize,
+    checkpoint_objects: u64,
+    object_metadata_visits: metrics::Counter,
+    #[cfg(feature = "diagnostic-prefix-attribution")]
+    prefix_attribution: Option<prefix_attribution::VisitAttribution>,
+    last_checkpoint_objects: u64,
+    last_checkpoint_at: Instant,
+    last_checkpoint_build_time: Duration,
 
     update_current_path: UpdateCurrentPathFn,
 
@@ -736,17 +826,20 @@ pub struct FolderScanner {
     pending_heals_changed: bool,
     coverage_frontier: Option<String>,
     resume_frontier: Option<String>,
+    resume_failed_paths: Vec<String>,
     coverage_gap: bool,
     raw_enumeration_progress: Vec<RawEnumerationProgress>,
-    pending_heal_sync_deferred: bool,
-    pending_heal_batch_dirty: bool,
-    #[cfg(test)]
-    pending_heal_sync_count: usize,
     pending_size_reconciliation_keys: HashSet<String>,
     pending_size_reconciliation_scopes: HashSet<String>,
     pending_size_reconciliation_truncated: bool,
     #[cfg(test)]
     list_path_raw_options_observer: Option<mpsc::UnboundedSender<ListPathRawTimeoutSnapshot>>,
+    #[cfg(test)]
+    defer_abandoned_entries_until_finished: bool,
+    #[cfg(test)]
+    partial_heal_candidate_limit: Option<usize>,
+    #[cfg(test)]
+    partial_heal_discovery_observer: Option<mpsc::UnboundedSender<(usize, usize)>>,
 }
 
 struct RawEnumerationProgress {
@@ -754,33 +847,21 @@ struct RawEnumerationProgress {
     last_entry: Option<String>,
     entries_seen: u64,
     digest: Sha256,
-    observed_entries: Vec<String>,
-    revalidate_after_entries: usize,
-    page_index: Option<RawEnumerationPageIndex>,
+    page_index: Option<RawEnumerationPageWriter>,
 }
 
 impl RawEnumerationProgress {
     fn new(parent: &str, page_index: Option<RawEnumerationPageIndex>) -> Self {
         let mut digest = Sha256::new();
         update_raw_enumeration_digest(&mut digest, b"parent", parent.as_bytes());
-        let mut revalidate_after_entries = 0;
-        let page_index = match page_index {
-            Some(index) => match index.indexed_entries() {
-                Ok(entries) => {
-                    revalidate_after_entries = entries.len();
-                    Some(index)
-                }
-                Err(_) => None,
-            },
-            None => RawEnumerationPageIndex::new(parent, SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT).ok(),
-        };
+        let page_index = page_index
+            .or_else(|| RawEnumerationPageIndex::new(parent, SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT).ok())
+            .and_then(|index| RawEnumerationPageWriter::new(index).ok());
         Self {
             parent: parent.to_string(),
             last_entry: None,
             entries_seen: 0,
             digest,
-            observed_entries: Vec::new(),
-            revalidate_after_entries,
             page_index,
         }
     }
@@ -789,34 +870,10 @@ impl RawEnumerationProgress {
         update_raw_enumeration_digest(&mut self.digest, b"entry", entry.as_bytes());
         self.last_entry = Some(entry.to_string());
         self.entries_seen = self.entries_seen.saturating_add(1);
-        self.observed_entries.push(entry.to_string());
-        if let Some(index) = &mut self.page_index {
-            if self.observed_entries.len() < self.revalidate_after_entries {
-                return;
-            }
-            let result = index
-                .generation()
-                .ok_or(RawEnumerationPageIndexError::Unsupported)
-                .and_then(|generation| {
-                    index.ingest_partial_owner_entries(
-                        self.observed_entries.clone(),
-                        SCANNER_RAW_ENUMERATION_PAGE_BUILD_BUDGET,
-                        generation,
-                    )
-                });
-            match result {
-                Ok(outcome) if outcome.ready_to_commit => {
-                    if let Some(generation) = index.generation()
-                        && index.commit_building_page(generation).is_err()
-                    {
-                        self.page_index = None;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    self.page_index = None;
-                }
-            }
+        if let Some(index) = &mut self.page_index
+            && index.record_entry(entry).is_err()
+        {
+            self.page_index = None;
         }
     }
 
@@ -825,36 +882,28 @@ impl RawEnumerationProgress {
             return None;
         }
         Some(DataUsageRawEnumerationCursor::new(
-            self.parent.clone(),
-            self.last_entry.clone(),
+            clone_cache_value(&self.parent),
+            clone_cache_value(&self.last_entry),
             self.entries_seen,
             self.digest.clone().finalize().into(),
         ))
     }
 
     fn page_index(&self) -> Option<RawEnumerationPageIndex> {
-        self.page_index.clone().and_then(|mut index| {
-            if let Some(generation) = index.generation()
-                && matches!(index.status(), crate::raw_page_index::RawEnumerationPageOwnerStatus::Building { .. })
-                && index.commit_building_page(generation).is_err()
-            {
-                return None;
-            }
-            match index.indexed_entries() {
-                Ok(entries) if !entries.is_empty() => Some(index),
-                _ => None,
-            }
-        })
+        self.page_index
+            .as_ref()
+            .filter(|index| index.indexed_entry_count() > 0)
+            .and_then(|index| index.checkpoint().ok())
     }
 
     fn has_checkpointable_page_index(&self) -> bool {
-        self.page_index().is_some()
+        self.checkpointable_entry_count() > 0
     }
 
     fn checkpointable_entry_count(&self) -> usize {
-        self.page_index()
-            .and_then(|index| index.indexed_entries().ok())
-            .map_or(0, |entries| entries.len())
+        self.page_index
+            .as_ref()
+            .map_or(0, RawEnumerationPageWriter::indexed_entry_count)
     }
 }
 
@@ -908,12 +957,73 @@ fn prune_size_reconciliation(info: &mut DataUsageCacheInfo, now: u64) {
             .min_by(|(left_key, left), (right_key, right)| {
                 left.first_seen.cmp(&right.first_seen).then_with(|| left_key.cmp(right_key))
             })
-            .map(|(key, _)| key.clone());
+            .map(|(key, _)| clone_cache_value(key));
         let Some(oldest) = oldest else {
             break;
         };
         info.size_reconciliation.remove(&oldest);
     }
+}
+
+async fn wait_for_scanner_io<T>(ctx: &CancellationToken, wait: impl std::future::Future<Output = T>) -> Result<T, ScannerError> {
+    select! {
+        biased;
+        _ = ctx.cancelled() => Err(ScannerError::Other("Operation cancelled".to_string())),
+        result = wait => Ok(result),
+    }
+}
+
+struct ScannerDirectory {
+    reader: native_io::ReadDir,
+    batch_entries: usize,
+    #[cfg(test)]
+    ordered: Option<tests::erasure_probe::OrderedEntries>,
+}
+
+impl ScannerDirectory {
+    async fn open(path: &str) -> std::io::Result<Self> {
+        let reader = native_io::ReadDir::open(path).await?;
+        #[cfg(test)]
+        let (reader, ordered) = {
+            let mut reader = reader;
+            let ordered = tests::erasure_probe::ordered_entries(path, &mut reader).await?;
+            (reader, ordered)
+        };
+        Ok(Self {
+            reader,
+            batch_entries: 0,
+            #[cfg(test)]
+            ordered,
+        })
+    }
+
+    async fn next_entry(&mut self) -> std::io::Result<Option<native_io::DirEntry>> {
+        #[cfg(test)]
+        if let Some(entries) = &mut self.ordered {
+            return entries.pop_front().transpose();
+        }
+        self.reader.next_entry().await
+    }
+}
+
+async fn next_scanner_dir_entry(
+    ctx: &CancellationToken,
+    sleeper: &DynamicSleeper,
+    entries: &mut ScannerDirectory,
+    admission: Option<&Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
+) -> Result<Option<native_io::DirEntry>, ScannerError> {
+    if entries.batch_entries == SCANNER_DIRECTORY_BATCH_ENTRIES {
+        wait_for_scanner_io(ctx, tokio::task::yield_now()).await?;
+        entries.batch_entries = 0;
+    }
+    let entry = wait_for_scanner_io(ctx, run_scanner_node_operation(admission, ctx, entries.next_entry())).await???;
+    if entry.is_some() {
+        // Tokio prefetches bounded chunks. Pacing consumption also paces the
+        // next refill, without charging an extra entry for EOF.
+        wait_for_scanner_io(ctx, sleeper.admit_disk_io(1, 0)).await?;
+        entries.batch_entries += 1;
+    }
+    Ok(entry)
 }
 
 impl FolderScanner {
@@ -943,7 +1053,7 @@ impl FolderScanner {
             || folder.parent.is_some()
             || folder.name != self.old_cache.info.name
             || into.compacted
-            || !abandoned_children.contains(&child_hash.key())
+            || !abandoned_children.contains(&clone_cache_value(&child_hash.0))
         {
             return false;
         }
@@ -960,12 +1070,13 @@ impl FolderScanner {
 
     fn reuse_clean_root_child(&mut self, child: &CachedFolder, child_hash: &DataUsageHash, into: &mut DataUsageEntry) {
         self.new_cache.copy_with_children(&self.old_cache, child_hash, &child.parent);
-        self.update_cache
-            .copy_with_children(&self.old_cache, child_hash, &child.parent);
+        if let Some(updates) = &mut self.usage_updates {
+            updates.cache.copy_with_children(&self.old_cache, child_hash, &child.parent);
+        }
         into.add_child(child_hash);
     }
 
-    fn should_skip_failed(&self, path: &str) -> bool {
+    fn failed_retry_suppressed(&self, path: &str) -> bool {
         let ttl = self.failed_object_ttl_secs;
         if ttl == 0 {
             return false;
@@ -985,6 +1096,7 @@ impl FolderScanner {
             return;
         }
 
+        self.resolved_failed_object_paths.remove(path);
         let now = Self::now_secs();
         self.new_cache.info.failed_objects.insert(path.to_string(), now);
 
@@ -992,6 +1104,43 @@ impl FolderScanner {
         if max_entries > 0 && self.new_cache.info.failed_objects.len() > max_entries {
             self.prune_failed_objects(now, ttl);
         }
+        if self.new_cache.info.failed_objects.contains_key(path) {
+            self.failed_object_paths_seen.insert(path.to_string());
+        }
+    }
+
+    fn mark_failed_path_seen(&mut self, path: &str) -> bool {
+        if self.new_cache.info.failed_objects.contains_key(path) {
+            return !self.failed_object_paths_seen.insert(path.to_string());
+        }
+        false
+    }
+
+    fn clear_failed_path(&mut self, path: &str) {
+        if self.new_cache.info.failed_objects.contains_key(path) {
+            self.resolved_failed_object_paths.insert(path.to_string());
+        }
+        self.failed_object_paths_seen.remove(path);
+    }
+
+    fn reconcile_failed_objects_after_full_scan(&mut self) {
+        self.new_cache
+            .info
+            .failed_objects
+            .retain(|path, _| !self.resolved_failed_object_paths.contains(path));
+        self.resolved_failed_object_paths.clear();
+
+        let mixed_coverage = self
+            .new_cache
+            .info
+            .scan_progress
+            .is_some_and(|progress| progress.started_plan != progress.requested_plan);
+        if self.prefix_scan_scope.is_some() || self.resume_frontier.is_some() || self.coverage_gap || mixed_coverage {
+            return;
+        }
+
+        let seen = &self.failed_object_paths_seen;
+        self.new_cache.info.failed_objects.retain(|path, _| seen.contains(path));
     }
 
     fn prune_failed_objects_cache(&mut self) {
@@ -1021,7 +1170,7 @@ impl FolderScanner {
             return;
         }
 
-        let mut entries: Vec<(String, u64)> = failed.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut entries: Vec<(String, u64)> = failed.iter().map(|(k, v)| (clone_cache_value(k), *v)).collect();
         entries.sort_by(|(k1, ts1), (k2, ts2)| ts1.cmp(ts2).then_with(|| k1.cmp(k2)));
 
         let remove_count = failed.len().saturating_sub(max_entries);
@@ -1031,12 +1180,12 @@ impl FolderScanner {
     }
 
     /// Apply the per-object size-resolution ledger updates in one place. The
-    /// scanner cache is the durable boundary; both working copies are updated
-    /// so an incremental publication cannot lose a debt or its resolution.
+    /// scanner cache is the durable boundary; progress updates contain only
+    /// usage totals and never own a copy of the reconciliation ledger.
     fn apply_size_reconciliation(&mut self, summary: &SizeSummary) {
         let now = Self::now_secs();
         self.pending_size_reconciliation_keys
-            .extend(summary.size_reconciliation.iter().map(|entry| entry.key.clone()));
+            .extend(summary.size_reconciliation.iter().map(|entry| clone_cache_value(&entry.key)));
         self.pending_size_reconciliation_scopes.extend(
             summary
                 .reconciliation_scopes
@@ -1045,26 +1194,25 @@ impl FolderScanner {
         );
         self.pending_size_reconciliation_truncated |= summary.size_reconciliation_truncated;
 
-        for info in [&mut self.new_cache.info, &mut self.update_cache.info] {
-            for incoming in &summary.size_reconciliation {
-                if let Some(existing) = info.size_reconciliation.get_mut(&incoming.key) {
-                    existing.reason = incoming.reason.clone();
-                    existing.physical_size = incoming.physical_size;
-                    existing.generation = incoming.generation.clone();
-                    existing.version_id = incoming.version_id.clone();
-                    existing.attempts = existing.attempts.saturating_add(1);
-                    continue;
-                }
-
-                if size_reconciliation_entry_bytes(incoming) > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET {
-                    continue;
-                }
-
-                let mut entry = incoming.clone();
-                entry.first_seen = now;
-                entry.attempts = 1;
-                info.size_reconciliation.insert(entry.key.clone(), entry);
+        let info = &mut self.new_cache.info;
+        for incoming in &summary.size_reconciliation {
+            if let Some(existing) = info.size_reconciliation.get_mut(&incoming.key) {
+                existing.reason = clone_cache_value(&incoming.reason);
+                existing.physical_size = incoming.physical_size;
+                existing.generation = clone_cache_value(&incoming.generation);
+                existing.version_id = clone_cache_value(&incoming.version_id);
+                existing.attempts = existing.attempts.saturating_add(1);
+                continue;
             }
+
+            if size_reconciliation_entry_bytes(incoming) > MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET {
+                continue;
+            }
+
+            let mut entry = clone_cache_value(incoming);
+            entry.first_seen = now;
+            entry.attempts = 1;
+            info.size_reconciliation.insert(clone_cache_value(&entry.key), entry);
         }
     }
 
@@ -1074,37 +1222,72 @@ impl FolderScanner {
         let scopes = std::mem::take(&mut self.pending_size_reconciliation_scopes);
         let truncated = std::mem::replace(&mut self.pending_size_reconciliation_truncated, false);
 
-        for info in [&mut self.new_cache.info, &mut self.update_cache.info] {
-            if !truncated {
-                info.size_reconciliation.retain(|key, entry| {
-                    !scopes.contains(&size_reconciliation_scope_key(&entry.bucket, &entry.object)) || current_keys.contains(key)
-                });
-            }
-            prune_size_reconciliation(info, now);
+        let info = &mut self.new_cache.info;
+        if !truncated {
+            info.size_reconciliation.retain(|key, entry| {
+                !scopes.contains(&size_reconciliation_scope_key(&entry.bucket, &entry.object)) || current_keys.contains(key)
+            });
         }
+        prune_size_reconciliation(info, now);
     }
 
     fn record_scan_resume_hint(&mut self, folder: &str) {
-        self.new_cache.info.scan_resume_after = Some(folder.to_string());
-        self.update_cache.info.scan_resume_after = Some(folder.to_string());
-        let checkpoint = DataUsageScanCheckpoint::new(folder.to_string(), DataUsageScanCheckpointReason::Unknown);
+        self.record_scan_resume_hint_with(folder, str::to_owned);
+    }
+
+    fn record_scan_resume_hint_with(&mut self, folder: &str, copy: impl Fn(&str) -> String) {
+        self.new_cache.info.scan_resume_after = Some(copy(folder));
+        let checkpoint = DataUsageScanCheckpoint::new(copy(folder), DataUsageScanCheckpointReason::Unknown);
         global_metrics().record_scanner_checkpoint_set(
             checkpoint.version,
             checkpoint.resume_after.clone(),
             checkpoint.reason.as_str(),
         );
-        self.new_cache.info.scan_checkpoint = Some(checkpoint.clone());
-        self.update_cache.info.scan_checkpoint = Some(checkpoint);
+        self.new_cache.info.scan_checkpoint = Some(checkpoint);
     }
 
-    fn record_completed_child(&mut self, folder: &str, healthy: bool) {
-        if self.old_cache.info.scan_progress.is_some() {
-            self.coverage_gap |= !healthy;
-            if !self.coverage_gap {
-                self.coverage_frontier = Some(folder.to_owned());
-            }
+    fn record_completed_child(&mut self, folder: &str) {
+        if self.old_cache.info.scan_progress.is_some()
+            && !self.coverage_gap
+            && !self
+                .coverage_frontier
+                .as_deref()
+                .is_some_and(|frontier| scan_frontier_covers_path(folder, frontier))
+        {
+            self.coverage_frontier = Some(folder.to_owned());
         }
         self.record_scan_resume_hint(folder);
+    }
+
+    fn can_reuse_covered_namespace(&self, name: &str, compacted: bool) -> bool {
+        self.old_cache.info.scan_progress.is_some()
+            && !compacted
+            && self
+                .resume_frontier
+                .as_deref()
+                .is_some_and(|frontier| scan_frontier_covers_path(name, frontier))
+            && self.old_cache.find(name).is_some()
+            && !self.resume_subtree_has_failures(name)
+    }
+
+    fn resume_subtree_has_failures(&self, folder: &str) -> bool {
+        if self.resume_failed_paths.is_empty() {
+            return false;
+        }
+        if self
+            .resume_failed_paths
+            .binary_search_by(|path| path.as_str().cmp(folder))
+            .is_ok()
+        {
+            return true;
+        }
+        let prefix = format!("{folder}/");
+        let index = self
+            .resume_failed_paths
+            .partition_point(|path| path.as_str() < prefix.as_str());
+        self.resume_failed_paths
+            .get(index)
+            .is_some_and(|path| path.starts_with(&prefix))
     }
 
     fn record_scan_resume_hint_if_not_ancestor(&mut self, folder: &str) {
@@ -1115,7 +1298,7 @@ impl FolderScanner {
             .as_deref()
             .is_some_and(|existing| matches!(folder_resume_match(folder, existing), Some(FolderResumeMatch::Descendant)));
         if !keep_existing {
-            self.record_scan_resume_hint(folder);
+            self.record_scan_resume_hint_with(folder, clone_cache_value::<str>);
         }
     }
 
@@ -1123,19 +1306,6 @@ impl FolderScanner {
         if self.old_cache.info.scan_progress.is_none() {
             return;
         }
-        let page_index = self
-            .old_cache
-            .validated_raw_enumeration_page_index()
-            .filter(|index| match index.status() {
-                crate::raw_page_index::RawEnumerationPageOwnerStatus::Building {
-                    parent: index_parent, ..
-                }
-                | crate::raw_page_index::RawEnumerationPageOwnerStatus::Ready {
-                    parent: index_parent, ..
-                } => index_parent == parent,
-                crate::raw_page_index::RawEnumerationPageOwnerStatus::Unsupported => false,
-            })
-            .cloned();
         if let Some(position) = self
             .raw_enumeration_progress
             .iter()
@@ -1143,6 +1313,7 @@ impl FolderScanner {
         {
             self.raw_enumeration_progress.truncate(position + 1);
         } else {
+            let page_index = self.raw_enumeration_page_index_for_parent(parent).map(clone_cache_value);
             self.raw_enumeration_progress
                 .push(RawEnumerationProgress::new(parent, page_index));
         }
@@ -1151,8 +1322,17 @@ impl FolderScanner {
         }
     }
 
+    fn raw_enumeration_page_index_for_parent(&self, parent: &str) -> Option<&RawEnumerationPageIndex> {
+        self.old_cache
+            .info
+            .scan_raw_enumeration_page_index
+            .as_ref()
+            .filter(|index| index.parent() == Some(parent))?;
+        self.old_cache.validated_raw_enumeration_page_index()
+    }
+
     fn raw_enumeration_committed_entry_oracle(&self, parent: &str) -> HashSet<String> {
-        let Some(index) = self.old_cache.validated_raw_enumeration_page_index() else {
+        let Some(index) = self.raw_enumeration_page_index_for_parent(parent) else {
             return HashSet::new();
         };
         let generation_matches_parent = match index.status() {
@@ -1204,17 +1384,131 @@ impl FolderScanner {
         (progress.cursor(), progress.page_index())
     }
 
+    fn peek_raw_enumeration_resume_state(&self) -> (Option<DataUsageRawEnumerationCursor>, Option<RawEnumerationPageIndex>) {
+        self.raw_enumeration_progress
+            .iter()
+            .max_by_key(|progress| progress.checkpointable_entry_count())
+            .map_or((None, None), |progress| (progress.cursor(), progress.page_index()))
+    }
+
+    async fn scan_child_folder(
+        &mut self,
+        ctx: CancellationToken,
+        folder: CachedFolder,
+        parent_hash: &mut DataUsageHash,
+        parent_entry: &mut DataUsageEntry,
+        child_entry: &mut DataUsageEntry,
+        mode: FolderScanMode,
+    ) -> Result<FolderScanOutcome, ScannerError> {
+        if self.checkpoint_tx.is_none() || self.old_cache.info.scan_progress.is_none() {
+            return Box::pin(self.scan_folder_inner(ctx, folder, child_entry, mode)).await;
+        }
+        let depth = self.checkpoint_depth;
+        if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
+            return Err(ScannerError::Other("scanner checkpoint ancestor depth limit exceeded".to_string()));
+        }
+        if self.checkpoint_ancestors.len() == depth {
+            self.checkpoint_ancestors.push(ScannerCheckpointAncestor::default());
+        }
+        // Reuse the empty frame slots: moving suspended accumulators avoids
+        // cloning a growing child set or allocating histogram vectors per child.
+        std::mem::swap(parent_hash, &mut self.checkpoint_ancestors[depth].hash);
+        std::mem::swap(parent_entry, &mut self.checkpoint_ancestors[depth].entry);
+        self.checkpoint_depth += 1;
+        let result = Box::pin(self.scan_folder_inner(ctx, folder, child_entry, mode)).await;
+        self.checkpoint_depth -= 1;
+        // Restore the parent before cancellation/error handling stitches partial work.
+        std::mem::swap(parent_hash, &mut self.checkpoint_ancestors[depth].hash);
+        std::mem::swap(parent_entry, &mut self.checkpoint_ancestors[depth].entry);
+        result
+    }
+
+    fn maybe_send_checkpoint(&mut self, folder: &CachedFolder, hash: &DataUsageHash, into: &DataUsageEntry) {
+        let Some(checkpoint_tx) = self.checkpoint_tx.clone() else { return };
+        let elapsed = self.last_checkpoint_at.elapsed();
+        if into.compacted
+            || self.new_cache.info.scan_progress.is_none()
+            || elapsed < checkpoint_interval_for_build_time(self.last_checkpoint_build_time)
+            || (self.checkpoint_objects.saturating_sub(self.last_checkpoint_objects) < SCANNER_CHECKPOINT_OBJECT_INTERVAL
+                && elapsed < SCANNER_CHECKPOINT_INTERVAL)
+        {
+            return;
+        }
+        if self.new_cache.root().is_none() && self.raw_enumeration_progress.is_empty() {
+            return;
+        }
+
+        // Reserve the bounded queue slot before cloning the growing cache.
+        // When persistence is slower than traversal, constructing snapshots
+        // that can only be rejected by a full channel creates repeated O(N)
+        // allocations without improving restart progress.
+        if checkpoint_tx.is_closed() {
+            return;
+        }
+        let Ok(permit) = checkpoint_tx.try_reserve() else { return };
+
+        // Invalid partial graphs must not trigger a fresh O(N) clone on every object.
+        self.last_checkpoint_objects = self.checkpoint_objects;
+        self.last_checkpoint_at = Instant::now();
+        let snapshot = self.checkpoint_snapshot(folder, hash, into);
+        self.last_checkpoint_build_time = self.last_checkpoint_at.elapsed();
+        if let Some(snapshot) = snapshot {
+            permit.send(snapshot);
+        }
+    }
+
+    fn checkpoint_snapshot(&self, folder: &CachedFolder, hash: &DataUsageHash, into: &DataUsageEntry) -> Option<DataUsageCache> {
+        // Heal revisits are not sorted with the forward sweep. An unfinished
+        // earlier subtree, including a suspended ancestor, must not be signed
+        // as completed prefix coverage.
+        if self.coverage_frontier.as_deref().is_some_and(|frontier| {
+            scan_frontier_covers_path(&folder.name, frontier)
+                || self.checkpoint_ancestors[..self.checkpoint_depth]
+                    .iter()
+                    .any(|ancestor| scan_frontier_covers_path(&ancestor.hash.0, frontier))
+        }) {
+            return None;
+        }
+        let mut snapshot = clone_cache_value(&self.new_cache);
+        let mut parent = None;
+        for ancestor in &self.checkpoint_ancestors[..self.checkpoint_depth] {
+            snapshot.replace_hashed(&ancestor.hash, &parent, &ancestor.entry);
+            parent = Some(clone_cache_value(&ancestor.hash));
+        }
+        snapshot.replace_hashed(hash, &folder.parent, into);
+        snapshot.checked_flatten_complete_scope(&snapshot.info.name)?;
+        snapshot.info.last_update = Some(SystemTime::now());
+        snapshot.info.snapshot_complete = false;
+        let (cursor, page_index) = self.peek_raw_enumeration_resume_state();
+        snapshot.info.scan_raw_enumeration_cursor = cursor;
+        snapshot.info.scan_raw_enumeration_page_index = page_index;
+        snapshot.seal_scan_frontier(self.coverage_frontier.as_deref()).ok()?;
+        // A resumed readdir can run before covered subtrees are copied. Keep
+        // its durable receipt until this snapshot can represent that coverage.
+        if self.coverage_frontier.is_some() && snapshot.info.scan_coverage_receipt.is_none() {
+            return None;
+        }
+        // The receipt was just sealed from this snapshot; do not hash it twice.
+        if snapshot.info.scan_raw_enumeration_cursor.is_none()
+            && snapshot.info.scan_raw_enumeration_page_index.is_none()
+            && snapshot.info.scan_coverage_receipt.is_none()
+        {
+            return None;
+        }
+        Some(snapshot)
+    }
+
     fn carry_forward_old_children(&mut self, parent_hash: &DataUsageHash, entry: &mut DataUsageEntry) {
         if entry.compacted {
             // Compacted entries store child totals directly; child links would be flattened twice.
             return;
         }
 
-        let Some(old_entry) = self.old_cache.cache.get(&parent_hash.key()) else {
+        let Some(old_entry) = self.old_cache.cache.get(&clone_cache_value(&parent_hash.0)) else {
             return;
         };
 
-        let old_children = old_entry.children.iter().cloned().collect::<Vec<_>>();
+        let old_children = old_entry.children.iter().map(clone_cache_value).collect::<Vec<_>>();
         for child in old_children {
             if entry.children.contains(&child) {
                 continue;
@@ -1223,9 +1517,9 @@ impl FolderScanner {
                 continue;
             }
 
-            let child_hash = DataUsageHash(child.clone());
+            let child_hash = DataUsageHash(clone_cache_value(&child));
             self.new_cache
-                .copy_with_children(&self.old_cache, &child_hash, &Some(parent_hash.clone()));
+                .copy_with_children(&self.old_cache, &child_hash, &Some(clone_cache_value(parent_hash)));
             entry.children.insert(child);
         }
     }
@@ -1238,13 +1532,21 @@ impl FolderScanner {
         child_entry: &DataUsageEntry,
     ) {
         if data_usage_entry_has_progress(child_entry) {
-            let mut child_entry = child_entry.clone();
+            // A cancelled out-of-order heal revisit is not completed prefix work.
+            if self
+                .coverage_frontier
+                .as_deref()
+                .is_some_and(|frontier| scan_frontier_covers_path(&child_hash.0, frontier))
+            {
+                self.coverage_frontier = None;
+                self.coverage_gap = true;
+            }
+            let mut child_entry = clone_cache_value(child_entry);
             self.carry_forward_old_children(child_hash, &mut child_entry);
-            self.record_scan_resume_hint_if_not_ancestor(&child_hash.key());
+            self.record_scan_resume_hint_if_not_ancestor(&clone_cache_value(&child_hash.0));
             parent_entry.add_child(child_hash);
             self.new_cache.replace_hashed(child_hash, parent, &child_entry);
-            self.update_cache.delete_recursive(child_hash);
-            self.update_cache.copy_with_children(&self.new_cache, child_hash, parent);
+            self.refresh_usage_subtree(child_hash, parent);
             self.send_update().await;
         }
     }
@@ -1318,33 +1620,34 @@ impl FolderScanner {
         let candidate_type = pending_scanner_heal_candidate_type(kind);
         let priority = request.priority;
         let scan_mode = request.scan_mode.unwrap_or(self.scan_mode);
-        let result = match send_scanner_heal_request(candidate_type, request).await {
-            Ok(result) => result,
-            Err(err) => {
-                self.update_pending_scanner_heal_after_admission(
-                    kind,
-                    &bucket,
-                    object.as_deref(),
-                    version_id.as_deref(),
-                    scan_mode,
-                    HealAdmissionResult::Full,
-                );
-                error!(
-                    target: "rustfs::scanner::folder",
-                    event = EVENT_SCANNER_HEAL_ADMISSION,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_HEAL,
-                    candidate_type,
-                    bucket = %bucket,
-                    object = object.as_deref().unwrap_or(""),
-                    priority = heal_priority_label(priority),
-                    state = "heal_channel_error",
-                    error = %err,
-                    "Scanner deferred heal request after channel error"
-                );
-                return Ok(HealAdmissionResult::Full);
-            }
-        };
+        let result =
+            match send_scanner_heal_request(candidate_type, request, None, scanner_disk_heal_scope(&self.local_disk)).await {
+                Ok(result) => result,
+                Err(err) => {
+                    self.update_pending_scanner_heal_after_admission(
+                        kind,
+                        &bucket,
+                        object.as_deref(),
+                        version_id.as_deref(),
+                        scan_mode,
+                        HealAdmissionResult::Full,
+                    );
+                    error!(
+                        target: "rustfs::scanner::folder",
+                        event = EVENT_SCANNER_HEAL_ADMISSION,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_HEAL,
+                        candidate_type,
+                        bucket = %bucket,
+                        object = object.as_deref().unwrap_or(""),
+                        priority = heal_priority_label(priority),
+                        state = "heal_channel_error",
+                        error = %err,
+                        "Scanner deferred heal request after channel error"
+                    );
+                    return Ok(HealAdmissionResult::Full);
+                }
+            };
         self.update_pending_scanner_heal_after_admission(
             kind,
             &bucket,
@@ -1387,29 +1690,75 @@ impl FolderScanner {
         self.data_usage_scanner_debug = debug;
     }
 
-    /// Send update if enough time has passed
-    /// Should be called on a regular basis when the new_cache contains more recent total than previously.
-    /// May or may not send an update upstream.
-    fn should_send_update(&self) -> bool {
-        if self.updates.is_none() {
-            return false;
+    fn compact_completed_folder(&mut self, folder: &CachedFolder, hash: &DataUsageHash, entry: &DataUsageEntry) {
+        // Completed healthy subtrees can keep aggregate usage. Coverage gaps
+        // and failed-object debt still need child entries for precise resume
+        // and to avoid rereading healthy siblings on a retry.
+        let forward_sweep = self.old_cache.info.scan_progress.is_some();
+        if entry.compacted || self.new_cache.info.name == folder.name || (forward_sweep && self.coverage_gap) {
+            return;
         }
-
-        let elapsed = self.last_update.elapsed().unwrap_or(Duration::from_secs(0));
-        elapsed >= Duration::from_secs(60)
+        let summary = if entry.children.is_empty() {
+            Cow::Borrowed(entry)
+        } else if let Some(flat) = self.new_cache.size_recursive(&hash.0) {
+            Cow::Owned(flat)
+        } else {
+            return;
+        };
+        if forward_sweep && summary.failed_objects != 0 {
+            return;
+        }
+        let should_compact = summary.objects < DATA_SCANNER_COMPACT_LEAST_OBJECT
+            || entry.children.iter().all(|key| {
+                self.new_cache
+                    .cache
+                    .get(key)
+                    .is_none_or(|child| child.children.is_empty() && child.objects <= 1)
+            });
+        if !should_compact {
+            return;
+        }
+        // Heal revisits also reach this path without a parent advancing
+        // coverage. Keep the endpoint addressable when its completed
+        // subtree is replaced by an aggregate.
+        if self.coverage_frontier.as_deref().is_some_and(|frontier| {
+            frontier
+                .strip_prefix(&folder.name)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            self.record_completed_child(&folder.name);
+        }
+        match summary {
+            Cow::Borrowed(_) => {
+                // The leaf is already cached; only its sampling mode changes.
+                if let Some(cached) = self.new_cache.cache.get_mut(&hash.0) {
+                    cached.compacted = true;
+                }
+            }
+            Cow::Owned(mut flat) => {
+                flat.compacted = true;
+                self.new_cache.delete_recursive(hash);
+                self.new_cache.replace_hashed(hash, &folder.parent, &flat);
+            }
+        }
     }
 
+    fn refresh_usage_subtree(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>) {
+        if let Some(updates) = &mut self.usage_updates {
+            updates.cache.delete_recursive(hash);
+            updates.cache.copy_with_children(&self.new_cache, hash, parent);
+        }
+    }
+
+    /// Send at most one aggregate per minute when a caller requested progress.
     pub async fn send_update(&mut self) {
-        // Send at most an update every minute.
-        if !self.should_send_update() {
+        let Some(updates) = &mut self.usage_updates else { return };
+        if !updates.is_due() {
             return;
         }
 
-        if let Some(flat) = self.update_cache.size_recursive(&self.new_cache.info.name)
-            && let Some(ref updates) = self.updates
-        {
-            // Try to send without blocking
-            if let Err(e) = updates.send(flat.clone()).await {
+        if let Some(flat) = updates.cache.size_recursive(&self.new_cache.info.name) {
+            if let Err(e) = updates.sender.send(flat).await {
                 error!(
                     target: "rustfs::scanner::folder",
                     event = EVENT_SCANNER_FOLDER_STATE,
@@ -1421,44 +1770,100 @@ impl FolderScanner {
                     "Scanner folder update send failed"
                 );
             }
-            self.last_update = SystemTime::now();
+            updates.last_update = SystemTime::now();
         }
     }
 
     async fn send_update_for_entry(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>, entry: &DataUsageEntry) {
-        if !self.should_send_update() {
-            return;
+        if let Some(updates) = &mut self.usage_updates
+            && updates.is_due()
+        {
+            updates.cache.replace_hashed(hash, parent, entry);
+            self.send_update().await;
+        }
+    }
+
+    async fn record_missing_erasure_metadata(
+        &mut self,
+        folder: &CachedFolder,
+        into: &mut DataUsageEntry,
+    ) -> Result<(), ScannerError> {
+        let metadata_path = path_join_buf(&[&self.root, &folder.name, STORAGE_FORMAT_FILE]);
+        self.mark_failed_path_seen(&metadata_path);
+        let retry_suppressed = self.failed_retry_suppressed(&metadata_path);
+
+        into.failed_objects = into.failed_objects.saturating_add(1);
+        if !retry_suppressed {
+            self.record_failed(&metadata_path);
+
+            let failed_cache_entries = self.new_cache.info.failed_objects.len();
+            if failed_cache_entries > 0 && should_log_failed_object(failed_cache_entries) {
+                warn!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_FOLDER_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                    path = %metadata_path,
+                    failed_objects = failed_cache_entries,
+                    state = "object_metadata_missing",
+                    "Scanner found erasure object data without metadata"
+                );
+            }
         }
 
-        self.update_cache.replace_hashed(hash, parent, entry);
-        self.send_update().await;
+        if !retry_suppressed {
+            let (bucket, object) = path2_bucket_object_with_base_path(&self.root, &folder.name);
+            if !bucket.is_empty() && !object.is_empty() {
+                self.send_required_scanner_heal_request(
+                    PendingScannerHealKind::Object,
+                    bucket.clone(),
+                    Some(object.clone()),
+                    None,
+                    build_non_destructive_object_heal_request(bucket, object, self.scan_mode, HealChannelPriority::High),
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Scan a folder recursively
     /// Files found in the folders will be added to new_cache.
-    #[allow(clippy::never_loop)]
-    #[allow(unused_assignments)]
     pub async fn scan_folder(
         &mut self,
         ctx: CancellationToken,
         folder: CachedFolder,
         into: &mut DataUsageEntry,
     ) -> Result<(), ScannerError> {
+        self.scan_folder_inner(ctx, folder, into, FolderScanMode::Namespace)
+            .await
+            .map(|_| ())
+    }
+
+    #[allow(clippy::never_loop)]
+    #[allow(unused_assignments)]
+    async fn scan_folder_inner(
+        &mut self,
+        ctx: CancellationToken,
+        folder: CachedFolder,
+        into: &mut DataUsageEntry,
+        mode: FolderScanMode,
+    ) -> Result<FolderScanOutcome, ScannerError> {
         let done_folder = Metrics::time(Metric::ScanFolder);
         let trace_started_at = trace_start_instant();
 
         if ctx.is_cancelled() {
             return Err(ScannerError::Other("Operation cancelled".to_string()));
         }
-        if !self.budget.try_start_directory() {
+        if mode == FolderScanMode::Namespace && !self.budget.try_start_directory() {
             return Err(ScannerError::Other("Operation cancelled".to_string()));
         }
 
-        let this_hash = hash_path(&folder.name);
+        let mut this_hash = hash_path(&folder.name);
         // Store initial compaction state.
         let was_compacted = into.compacted;
 
-        loop {
+        'scan: loop {
             if ctx.is_cancelled() {
                 return Err(ScannerError::Other("Operation cancelled".to_string()));
             }
@@ -1467,7 +1872,7 @@ impl FolderScanner {
 
             let mut abandoned_children: DataUsageHashMap = HashSet::new();
             if !into.compacted {
-                abandoned_children = self.old_cache.find_children_copy(this_hash.clone());
+                abandoned_children = self.old_cache.find_children_copy(&this_hash);
             }
 
             debug!(
@@ -1507,12 +1912,15 @@ impl FolderScanner {
             };
             let active_object_lock = self.old_cache.info.object_lock.clone();
 
-            self.sleeper.sleep_folder().await;
+            if mode != FolderScanMode::Namespace {
+                // A candidate may be object payload rather than a namespace.
+                wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
+            } else {
+                wait_for_scanner_io(&ctx, self.sleeper.sleep_folder_paced(&mut self.pacing_debt)).await?;
+            }
 
-            let mut existing_folders: Vec<CachedFolder> = Vec::new();
-            let mut new_folders: Vec<CachedFolder> = Vec::new();
+            let mut queued_folders: Vec<QueuedFolder> = Vec::new();
             let mut found_object_metadata = false;
-            let mut erasure_data_directory_candidates: Vec<(CachedFolder, bool, String)> = Vec::new();
             let mut object_count: u64 = 0;
             let yield_every_objects = scanner_yield_every_n_objects();
 
@@ -1528,8 +1936,40 @@ impl FolderScanner {
                 "Scanner folder state updated"
             );
 
-            let mut dir_reader = match tokio::fs::read_dir(&dir_path).await {
-                Ok(dir_reader) => dir_reader,
+            // A child prefix can be removed after its parent listed it and before
+            // it is opened here (e.g. concurrent object deletes). Treat it like a
+            // directory that vanished during iteration instead of failing the
+            // whole parent subtree. The bucket root (no parent) still propagates
+            // NotFound so namespace removal is detected by the caller.
+            let mut dir_reader = match wait_for_scanner_io(
+                &ctx,
+                run_scanner_node_operation(self.node_admission.as_ref(), &ctx, ScannerDirectory::open(&dir_path)),
+            )
+            .await??
+            {
+                Ok(dir_reader) => Some(dir_reader),
+                Err(e)
+                    if folder.parent.is_some()
+                        && (e.kind() == ErrorKind::NotFound
+                            || (mode != FolderScanMode::Namespace && e.kind() == ErrorKind::NotADirectory)) =>
+                {
+                    debug!(
+                        target: "rustfs::scanner::folder",
+                        event = EVENT_SCANNER_FOLDER_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                        dir_path = %dir_path,
+                        state = "dir_missing_before_open",
+                        error = %e,
+                        "Scanner folder state updated"
+                    );
+                    if mode != FolderScanMode::Namespace {
+                        self.coverage_gap |= e.kind() == ErrorKind::NotADirectory && self.old_cache.info.scan_progress.is_some();
+                        done_folder();
+                        return Ok(FolderScanOutcome::Vanished);
+                    }
+                    None
+                }
                 Err(e) => return Err(ScannerError::Io(e)),
             };
             let mut pending_entry_progress = 0_u64;
@@ -1537,62 +1977,111 @@ impl FolderScanner {
             let mut raw_enumeration_complete = false;
             let raw_enumeration_committed_entries = self.raw_enumeration_committed_entry_oracle(&folder.name);
 
+            let mut candidate_unclassified = mode != FolderScanMode::Namespace;
+            let mut deferred_metadata = None;
+
             loop {
-                let entry = match dir_reader.next_entry().await {
-                    Ok(Some(entry)) => entry,
-                    Ok(None) => {
-                        raw_enumeration_complete = true;
-                        break;
+                // Hold at most one metadata entry until a candidate reaches
+                // EOF: a later part must not leave object accounting or ILM work.
+                let (entry, replayed_metadata) = if let Some(reader) = dir_reader.as_mut() {
+                    let entry = match next_scanner_dir_entry(&ctx, &self.sleeper, reader, self.node_admission.as_ref()).await {
+                        Ok(Some(entry)) => entry,
+                        Ok(None) => {
+                            raw_enumeration_complete = true;
+                            dir_reader = None;
+                            continue;
+                        }
+                        Err(ScannerError::Io(e))
+                            if candidate_unclassified && matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+                        {
+                            return Err(ScannerError::Io(e));
+                        }
+                        Err(ScannerError::Io(e)) if e.kind() == ErrorKind::NotFound => {
+                            debug!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_FOLDER_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                dir_path = %dir_path,
+                                state = "dir_missing_during_iteration",
+                                error = %e,
+                                "Scanner folder state updated"
+                            );
+                            raw_enumeration_complete = true;
+                            dir_reader = None;
+                            continue;
+                        }
+                        Err(ScannerError::Io(e)) if e.kind() == ErrorKind::NotADirectory => {
+                            warn!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_FOLDER_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                dir_path = %dir_path,
+                                state = "dir_became_non_directory",
+                                error = %e,
+                                "Scanner folder state updated"
+                            );
+                            raw_enumeration_complete = true;
+                            dir_reader = None;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    (entry, false)
+                } else {
+                    raw_enumeration_complete = true;
+                    if candidate_unclassified {
+                        // Apply namespace reuse only after the current listing
+                        // proves there is no direct erasure part.
+                        if let FolderScanMode::ErasureCandidate { reuse_namespace: true } = mode
+                            && !into.compacted
+                            && self.old_cache.find(&folder.name).is_some()
+                        {
+                            // The caller stitches this cached child into its
+                            // parent; do not clone a growing child set into the
+                            // unused provisional accumulator as well.
+                            self.new_cache.copy_with_children(&self.old_cache, &this_hash, &folder.parent);
+                            self.budget.record_entries_visited(pending_entry_progress);
+                            self.finish_raw_enumeration_parent(&folder.name);
+                            done_folder();
+                            return Ok(FolderScanOutcome::Namespace);
+                        }
+                        candidate_unclassified = false;
+                        if !self.budget.try_start_directory() {
+                            return Err(ScannerError::Other("Operation cancelled".to_string()));
+                        }
+                        wait_for_scanner_io(&ctx, self.sleeper.sleep_folder_preset()).await?;
                     }
-                    Err(e) if e.kind() == ErrorKind::NotFound => {
-                        debug!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_FOLDER_STATE,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                            dir_path = %dir_path,
-                            state = "dir_missing_during_iteration",
-                            error = %e,
-                            "Scanner folder state updated"
-                        );
-                        raw_enumeration_complete = true;
-                        break;
-                    }
-                    Err(e) if e.kind() == ErrorKind::NotADirectory => {
-                        warn!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_FOLDER_STATE,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                            dir_path = %dir_path,
-                            state = "dir_became_non_directory",
-                            error = %e,
-                            "Scanner folder state updated"
-                        );
-                        raw_enumeration_complete = true;
-                        break;
-                    }
-                    Err(e) => return Err(ScannerError::Io(e)),
+                    let Some(entry) = deferred_metadata.take() else { break };
+                    (entry, true)
                 };
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if file_name.is_empty() || file_name == "." || file_name == ".." {
                     continue;
                 }
-                let raw_entry_consumed_by_owner_index = raw_enumeration_committed_entries.contains(&file_name);
-                if !raw_entry_consumed_by_owner_index {
-                    #[cfg(test)]
-                    tests::enumeration_restart::observe_raw_entry(&dir_path, &entry.file_name(), &self.budget);
-                    pending_entry_progress = pending_entry_progress.saturating_add(1);
-                    if pending_entry_progress >= SCANNER_ENTRY_PROGRESS_BATCH
-                        || last_entry_progress.elapsed() >= SCANNER_ENTRY_PROGRESS_INTERVAL
-                    {
-                        self.budget.record_entries_visited(pending_entry_progress);
-                        pending_entry_progress = 0;
-                        last_entry_progress = Instant::now();
+                if !replayed_metadata {
+                    let raw_entry_consumed_by_owner_index = raw_enumeration_committed_entries.contains(&file_name);
+                    if !raw_entry_consumed_by_owner_index {
+                        #[cfg(test)]
+                        tests::enumeration_restart::observe_raw_entry(&dir_path, &entry.file_name(), &self.budget);
+                        pending_entry_progress = pending_entry_progress.saturating_add(1);
+                        if pending_entry_progress >= SCANNER_ENTRY_PROGRESS_BATCH
+                            || last_entry_progress.elapsed() >= SCANNER_ENTRY_PROGRESS_INTERVAL
+                        {
+                            self.budget.record_entries_visited(pending_entry_progress);
+                            pending_entry_progress = 0;
+                            last_entry_progress = Instant::now();
+                        }
                     }
+                    self.record_raw_enumeration_entry(&folder.name, &file_name);
+                    self.maybe_send_checkpoint(&folder, &this_hash, into);
                 }
-                self.record_raw_enumeration_entry(&folder.name, &file_name);
                 let is_storage_format_entry = file_name == STORAGE_FORMAT_FILE;
+                if candidate_unclassified && is_storage_format_entry {
+                    deferred_metadata = Some(entry);
+                    continue;
+                }
 
                 let file_path = entry.path().to_string_lossy().to_string();
 
@@ -1606,7 +2095,12 @@ impl FolderScanner {
 
                 // Ignore entries that disappeared during traversal or hit symlink
                 // loops, but propagate other walk errors.
-                let mut entry_type = match entry.file_type().await {
+                let mut entry_type = match wait_for_scanner_io(
+                    &ctx,
+                    run_scanner_node_operation(self.node_admission.as_ref(), &ctx, entry.file_type()),
+                )
+                .await??
+                {
                     Ok(entry_type) => entry_type,
                     Err(e) if e.kind() == ErrorKind::NotFound => {
                         debug!(
@@ -1637,6 +2131,15 @@ impl FolderScanner {
                     Err(e) => return Err(ScannerError::Io(e)),
                 };
 
+                if candidate_unclassified && entry_type.is_file() && is_erasure_part_name(&file_name) {
+                    self.budget.record_entries_visited(pending_entry_progress);
+                    // Positive data evidence completes classification, not raw
+                    // namespace coverage. Discard its provisional resume owner.
+                    self.finish_raw_enumeration_parent(&folder.name);
+                    done_folder();
+                    return Ok(FolderScanOutcome::ErasureData);
+                }
+
                 // Metadata presence establishes an erasure object boundary;
                 // parsing failures still belong to accounting and healing. A
                 // directory named `xl.meta` remains a valid namespace prefix,
@@ -1645,8 +2148,15 @@ impl FolderScanner {
                     found_object_metadata = true;
                 }
 
+                let mut entry_metadata_len = None;
                 if entry_type.is_symlink() {
-                    let metadata = match tokio::fs::metadata(&file_path).await {
+                    wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
+                    let metadata = match wait_for_scanner_io(
+                        &ctx,
+                        run_scanner_node_operation(self.node_admission.as_ref(), &ctx, native_io::metadata(&file_path)),
+                    )
+                    .await??
+                    {
                         Ok(metadata) => metadata,
                         Err(e) if e.kind() == ErrorKind::NotFound => {
                             debug!(
@@ -1691,6 +2201,7 @@ impl FolderScanner {
                     }
 
                     entry_type = metadata.file_type();
+                    entry_metadata_len = Some(metadata.len());
                     if is_storage_format_entry {
                         found_object_metadata = true;
                     }
@@ -1718,7 +2229,7 @@ impl FolderScanner {
                         continue;
                     }
 
-                    let exists = self.old_cache.cache.contains_key(&h.key());
+                    let exists = self.old_cache.cache.contains_key(&clone_cache_value(&h.0));
 
                     let this = CachedFolder {
                         name: entry_name.clone(),
@@ -1726,27 +2237,37 @@ impl FolderScanner {
                         object_heal_prob_div: folder.object_heal_prob_div,
                     };
 
-                    if self.is_erasure_mode && uuid::Uuid::parse_str(&file_name).is_ok_and(|data_dir_id| !data_dir_id.is_nil()) {
-                        erasure_data_directory_candidates.push((this, exists, file_path));
-                        continue;
-                    }
-
                     if exists && self.should_reuse_clean_root_child(&folder, into, &this, &h, &abandoned_children) {
-                        abandoned_children.remove(&h.key());
+                        abandoned_children.remove(&clone_cache_value(&h.0));
                         self.reuse_clean_root_child(&this, &h, into);
                     } else if exists {
-                        abandoned_children.remove(&h.key());
-                        existing_folders.push(this);
-                        self.update_cache
-                            .copy_with_children(&self.old_cache, &h, &Some(this_hash.clone()));
+                        abandoned_children.remove(&clone_cache_value(&h.0));
+                        queued_folders.push(QueuedFolder {
+                            folder: this,
+                            source: FolderScanSource::Existing,
+                        });
+                        if let Some(updates) = &mut self.usage_updates {
+                            updates
+                                .cache
+                                .copy_with_children(&self.old_cache, &h, &Some(clone_cache_value(&this_hash)));
+                        }
                     } else {
-                        abandoned_children.remove(&h.key());
-                        new_folders.push(this);
+                        abandoned_children.remove(&clone_cache_value(&h.0));
+                        queued_folders.push(QueuedFolder {
+                            folder: this,
+                            source: FolderScanSource::New,
+                        });
                     }
                     continue;
                 }
 
-                let timer = self.sleeper.timer();
+                // Only xl.meta contributes object accounting. Payload files
+                // must not incur a size stat or a metadata-read reservation.
+                if !is_storage_format_entry {
+                    continue;
+                }
+
+                let work_started = tokio::time::Instant::now();
 
                 let heal_enabled = this_hash.mod_alt(
                     self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
@@ -1761,38 +2282,81 @@ impl FolderScanner {
                     lifecycle: active_life_cycle.clone(),
                     object_lock: active_object_lock.clone(),
                     replication: active_replication.clone(),
+                    heal_scope: None,
                     heal_enabled,
                     heal_bitrot: self.scan_mode == HealScanMode::Deep,
                     debug: self.data_usage_scanner_debug,
                     file_type: entry_type,
                 };
 
-                // If this path is already known as failed, just skip it.
-                // We intentionally do NOT call `record_failed` or bump `failed_objects` here,
-                // because the failure was recorded when the original error occurred
-                // (e.g. in the get_size error branch below). This branch only accounts
-                // for subsequent skips of already-failed paths.
-                if self.should_skip_failed(&item.path) {
-                    self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
+                // Keep failed paths visible to this scan so repair success can
+                // clear stale failure state and a complete walk can discard
+                // paths that were removed since the previous cycle.
+                let repeated_failed_path = self.mark_failed_path_seen(&item.path);
+                if repeated_failed_path && self.failed_retry_suppressed(&item.path) {
+                    // A new FolderScanner starts with an empty seen set, so
+                    // cached paths are still rechecked once per cycle. Skip
+                    // duplicate listings within this same scanner pass.
+                    into.failed_objects = into.failed_objects.max(1);
                     continue;
                 }
 
-                let sz = match self
-                    .local_disk
-                    .get_size_with_tier_names(item.clone(), &self.tier_registry.names)
-                    .await
-                {
+                // Reuse a resolved symlink's size; otherwise admit the size
+                // stat only when the byte budget needs it.
+                let budgeted_bytes = if self.sleeper.budgets_disk_io_bytes() {
+                    if let Some(len) = entry_metadata_len {
+                        len
+                    } else {
+                        wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
+                        wait_for_scanner_io(
+                            &ctx,
+                            run_scanner_node_operation(self.node_admission.as_ref(), &ctx, native_io::metadata(&item.path)),
+                        )
+                        .await??
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0)
+                    }
+                } else {
+                    0
+                };
+                wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, budgeted_bytes)).await?;
+
+                let size_result = run_scanner_metadata_operation(self.node_admission.as_ref(), &ctx, async {
+                    self.object_metadata_visits.increment(1);
+                    #[cfg(feature = "diagnostic-prefix-attribution")]
+                    if let Some(attribution) = &self.prefix_attribution {
+                        attribution.record(&item.bucket, &item.prefix);
+                    }
+                    let result = self
+                        .local_disk
+                        .get_size_with_tier_names(item.clone(), &self.tier_registry.names)
+                        .await;
+                    #[cfg(feature = "diagnostic-prefix-attribution")]
+                    if result.is_ok()
+                        && let Some(attribution) = &self.prefix_attribution
+                    {
+                        attribution.record_success(&item.bucket, &item.prefix);
+                    }
+                    result
+                })
+                .await?;
+                if self.node_admission.is_some() && ctx.is_cancelled() {
+                    return Err(ScannerError::Other("Operation cancelled".to_string()));
+                }
+                let sz = match size_result {
                     Ok(sz) => sz,
                     Err(e) => {
                         let failure_action = classify_get_size_failure(&item, &e);
+                        let retry_suppressed = self.failed_retry_suppressed(&item.path);
 
                         if failure_action != GetSizeFailureAction::Skip {
-                            self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
-                            // Track failed objects to prevent infinite retry loops
-                            into.failed_objects += 1;
-                            self.record_failed(&item.path);
+                            self.resolved_failed_object_paths.remove(&item.path);
+                            into.failed_objects = into.failed_objects.saturating_add(1);
+                            if !retry_suppressed {
+                                self.record_failed(&item.path);
+                            }
 
-                            if should_log_failed_object(into.failed_objects) {
+                            if !retry_suppressed && should_log_failed_object(into.failed_objects) {
                                 if let GetSizeFailureAction::HealMetadata { object } = &failure_action {
                                     error!(
                                         target: "rustfs::scanner::folder",
@@ -1822,9 +2386,13 @@ impl FolderScanner {
                                     );
                                 }
                             }
+                        } else {
+                            self.clear_failed_path(&item.path);
                         }
 
-                        if let GetSizeFailureAction::HealMetadata { object } = failure_action {
+                        if let GetSizeFailureAction::HealMetadata { object } = failure_action
+                            && !retry_suppressed
+                        {
                             // Single-flight (backlog#1894 axis A) — the
                             // recording mode and its guarantees are pinned by
                             // corrupt_metadata_recording below.
@@ -1868,11 +2436,13 @@ impl FolderScanner {
                             }
                         }
 
-                        timer.sleep().await;
+                        wait_for_scanner_io(&ctx, self.sleeper.pace_object(&mut self.pacing_debt, work_started.elapsed()))
+                            .await?;
                         continue;
                     }
                 };
 
+                self.clear_failed_path(&item.path);
                 found_object_metadata = true;
 
                 item.transform_meta_dir();
@@ -1887,8 +2457,10 @@ impl FolderScanner {
                 into.objects += 1;
                 object_count += 1;
                 self.budget.record_object_scanned();
+                self.checkpoint_objects = self.checkpoint_objects.saturating_add(1);
+                self.maybe_send_checkpoint(&folder, &this_hash, into);
 
-                timer.sleep().await;
+                wait_for_scanner_io(&ctx, self.sleeper.pace_object(&mut self.pacing_debt, work_started.elapsed())).await?;
 
                 if ctx.is_cancelled() {
                     return Err(ScannerError::Other("Operation cancelled".to_string()));
@@ -1904,70 +2476,6 @@ impl FolderScanner {
             self.budget.record_entries_visited(pending_entry_progress);
             if raw_enumeration_complete {
                 self.finish_raw_enumeration_parent(&folder.name);
-            }
-
-            let mut found_erasure_data_directory = false;
-            if self.is_erasure_mode && !found_object_metadata {
-                for (_, _, path) in &erasure_data_directory_candidates {
-                    if contains_erasure_part_file(path).await? {
-                        found_erasure_data_directory = true;
-                        break;
-                    }
-                }
-            }
-
-            if !found_object_metadata && !found_erasure_data_directory {
-                for (candidate, exists, _) in erasure_data_directory_candidates {
-                    let h = hash_path(&candidate.name);
-                    if exists && self.should_reuse_clean_root_child(&folder, into, &candidate, &h, &abandoned_children) {
-                        abandoned_children.remove(&h.key());
-                        self.reuse_clean_root_child(&candidate, &h, into);
-                    } else if exists {
-                        abandoned_children.remove(&h.key());
-                        self.update_cache.copy_with_children(&self.old_cache, &h, &candidate.parent);
-                        existing_folders.push(candidate);
-                    } else {
-                        abandoned_children.remove(&h.key());
-                        new_folders.push(candidate);
-                    }
-                }
-            }
-
-            if self.is_erasure_mode && found_erasure_data_directory && !found_object_metadata {
-                self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
-                found_object_metadata = true;
-                let metadata_path = path_join_buf(&[&dir_path, STORAGE_FORMAT_FILE]);
-
-                if !self.should_skip_failed(&metadata_path) {
-                    into.failed_objects = into.failed_objects.saturating_add(1);
-                    self.record_failed(&metadata_path);
-
-                    let failed_cache_entries = self.new_cache.info.failed_objects.len();
-                    if failed_cache_entries > 0 && should_log_failed_object(failed_cache_entries) {
-                        warn!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_FOLDER_STATE,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                            path = %metadata_path,
-                            failed_objects = failed_cache_entries,
-                            state = "object_metadata_missing",
-                            "Scanner found erasure object data without metadata"
-                        );
-                    }
-
-                    let (bucket, object) = path2_bucket_object_with_base_path(&self.root, &folder.name);
-                    if !bucket.is_empty() && !object.is_empty() {
-                        self.send_required_scanner_heal_request(
-                            PendingScannerHealKind::Object,
-                            bucket.clone(),
-                            Some(object.clone()),
-                            None,
-                            build_non_destructive_object_heal_request(bucket, object, self.scan_mode, HealChannelPriority::High),
-                        )
-                        .await?;
-                    }
-                }
             }
 
             if ctx.is_cancelled() {
@@ -1988,19 +2496,21 @@ impl FolderScanner {
                 break;
             }
 
-            // If we have many subfolders, compact ourself.
+            // Checkpointed sweeps need child entries to validate their resume
+            // frontier. Keep the emergency compaction limit for large trees.
             let should_compact = (self.new_cache.info.name != folder.name
-                && existing_folders.len() + new_folders.len() >= DATA_SCANNER_COMPACT_AT_FOLDERS)
-                || existing_folders.len() + new_folders.len() >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS;
+                && self.old_cache.info.scan_progress.is_none()
+                && queued_folders.len() >= DATA_SCANNER_COMPACT_AT_FOLDERS)
+                || queued_folders.len() >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS;
 
-            let total_folders = existing_folders.len() + new_folders.len();
+            let total_folders = queued_folders.len();
             self.alert_excessive_folders(&folder.name, total_folders);
 
             if !into.compacted && should_compact {
                 into.compacted = true;
-                new_folders.append(&mut existing_folders);
-
-                existing_folders.clear();
+                for queued in &mut queued_folders {
+                    queued.source = FolderScanSource::New;
+                }
 
                 if self.data_usage_scanner_debug {
                     debug!(
@@ -2009,17 +2519,10 @@ impl FolderScanner {
                         component = LOG_COMPONENT_SCANNER,
                         subsystem = LOG_SUBSYSTEM_FOLDER,
                         folder = %folder.name,
-                        entry_count = new_folders.len(),
+                        entry_count = queued_folders.len(),
                         state = "preemptive_compaction",
                         "Scanner folder switched to compacted mode"
                     );
-                }
-            }
-
-            if !into.compacted {
-                for folder_item in &existing_folders {
-                    let h = hash_path(&folder_item.name);
-                    self.update_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
                 }
             }
 
@@ -2046,18 +2549,8 @@ impl FolderScanner {
                 .and_then(|resume_after| folder_resume_match(&folder.name, resume_after))
                 .is_some_and(|resume_match| matches!(resume_match, FolderResumeMatch::Descendant));
             let scan_resume_after = checkpoint_resume_after.or(self.old_cache.info.scan_resume_after.as_deref());
-            let mut queued_folders = Vec::with_capacity(new_folders.len() + existing_folders.len());
-            queued_folders.extend(new_folders.into_iter().map(|folder| QueuedFolder {
-                folder,
-                source: FolderScanSource::New,
-            }));
-            queued_folders.extend(existing_folders.into_iter().map(|folder| QueuedFolder {
-                folder,
-                source: FolderScanSource::Existing,
-            }));
             let has_queued_folders = !queued_folders.is_empty();
             let forward_sweep = self.old_cache.info.scan_progress.is_some();
-            let forward_resume_after = self.resume_frontier.clone();
             let resume_order = if forward_sweep {
                 order_queued_folders_for_resume(&mut queued_folders, None)
             } else {
@@ -2079,14 +2572,15 @@ impl FolderScanner {
 
                 let mut folder_item = queued_folder.folder;
                 let h = hash_path(&folder_item.name);
-                if forward_sweep
-                    && !into.compacted
-                    && forward_resume_after.as_deref().is_some_and(|resume| {
-                        folder_item.name.as_str() <= resume
-                            && !matches!(folder_resume_match(&folder_item.name, resume), Some(FolderResumeMatch::Descendant))
-                    })
-                    && self.old_cache.find(&folder_item.name).is_some()
-                {
+                let reuse_covered = self.can_reuse_covered_namespace(&folder_item.name, into.compacted);
+                let mut child_mode = if self.is_erasure_mode && is_erasure_candidate(&folder_item.name) {
+                    FolderScanMode::ErasureCandidate {
+                        reuse_namespace: reuse_covered,
+                    }
+                } else {
+                    FolderScanMode::Namespace
+                };
+                if child_mode == FolderScanMode::Namespace && reuse_covered {
                     self.new_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
                     into.add_child(&h);
                     continue;
@@ -2095,19 +2589,21 @@ impl FolderScanner {
                 match queued_folder.source {
                     FolderScanSource::New => {
                         // Add new folders to the update tree so totals update for these.
-                        if !into.compacted {
+                        if !into.compacted
+                            && let Some(updates) = &mut self.usage_updates
+                        {
                             let mut found_any = false;
-                            let mut parent = this_hash.clone();
-                            let update_cache_name_hash = hash_path(&self.update_cache.info.name);
+                            let mut parent = clone_cache_value(&this_hash);
+                            let update_root_hash = hash_path(&updates.cache.info.name);
 
-                            while parent != update_cache_name_hash {
-                                let parent_key = parent.key();
-                                let e = self.update_cache.find(&parent_key);
+                            while parent != update_root_hash {
+                                let parent_key = clone_cache_value(&parent.0);
+                                let e = updates.cache.find(&parent_key);
                                 if e.is_none_or(|v| v.compacted) {
                                     found_any = true;
                                     break;
                                 }
-                                if let Some(next) = self.update_cache.search_parent(&parent) {
+                                if let Some(next) = updates.cache.search_parent(&parent) {
                                     parent = next;
                                 } else {
                                     found_any = true;
@@ -2116,8 +2612,11 @@ impl FolderScanner {
                             }
                             if !found_any {
                                 // Add non-compacted empty entry.
-                                self.update_cache
-                                    .replace_hashed(&h, &Some(this_hash.clone()), &DataUsageEntry::default());
+                                updates.cache.replace_hashed(
+                                    &h,
+                                    &Some(clone_cache_value(&this_hash)),
+                                    &DataUsageEntry::default(),
+                                );
                             }
                         }
                     }
@@ -2125,74 +2624,107 @@ impl FolderScanner {
                         // Usage sampling is not proof that a Deep check ran.
                         if self.scan_mode != HealScanMode::Deep
                             && !forward_sweep
+                            && !self
+                                .old_cache
+                                .info
+                                .replication
+                                .as_ref()
+                                .is_some_and(|config| config.has_active_rules("", true))
                             && !into.compacted
                             && self.old_cache.is_compacted(&h)
                         {
                             let next_cycle = self.old_cache.info.next_cycle as u32;
                             if !h.mod_(next_cycle, data_usage_update_dir_cycles()) {
-                                // Transfer and add as child...
-                                self.new_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
-                                into.add_child(&h);
-                                self.record_scan_resume_hint(&folder_item.name);
-                                continue;
+                                if child_mode == FolderScanMode::Namespace {
+                                    self.new_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
+                                    into.add_child(&h);
+                                    self.record_scan_resume_hint(&folder_item.name);
+                                    continue;
+                                }
+                                // Sampling may skip namespace work, never the
+                                // classification that protects its parent object.
+                                child_mode = FolderScanMode::ErasureCandidate { reuse_namespace: true };
+                            } else {
+                                folder_item.object_heal_prob_div = data_usage_update_dir_cycles();
                             }
-
-                            folder_item.object_heal_prob_div = data_usage_update_dir_cycles();
                         }
                     }
                 }
 
                 (self.update_current_path)(&folder_item.name).await;
 
+                let outcome = if into.compacted {
+                    Box::pin(self.scan_folder_inner(ctx.clone(), folder_item.clone(), into, child_mode)).await?
+                } else {
+                    let mut dst = DataUsageEntry::default();
+                    match self
+                        .scan_child_folder(ctx.clone(), folder_item.clone(), &mut this_hash, into, &mut dst, child_mode)
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
+                                self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
+                                    .await;
+                                return Err(e);
+                            }
+                            if child_mode != FolderScanMode::Namespace {
+                                return Err(e);
+                            }
+                            warn!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_FOLDER_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                folder = %folder.name,
+                                child_folder = %folder_item.name,
+                                state = "child_scan_failed",
+                                error = %e,
+                                "Scanner child folder scan failed"
+                            );
+                            self.coverage_gap |= forward_sweep;
+                            continue;
+                        }
+                    }
+                };
+                if outcome == FolderScanOutcome::Vanished {
+                    self.new_cache.delete_recursive(&h);
+                    if let Some(updates) = &mut self.usage_updates {
+                        updates.cache.delete_recursive(&h);
+                    }
+                    into.children.remove(&clone_cache_value(&h.0));
+                    continue;
+                }
+                if outcome == FolderScanOutcome::ErasureData {
+                    self.new_cache.delete_recursive(&h);
+                    if let Some(updates) = &mut self.usage_updates {
+                        updates.cache.delete_recursive(&h);
+                    }
+                    into.children.remove(&clone_cache_value(&h.0));
+                    // Earlier namespace siblings may have completed, but none
+                    // can certify coverage of this unresolved parent object.
+                    self.coverage_gap |= forward_sweep;
+                    if self.coverage_frontier.as_deref().is_some_and(|frontier| {
+                        frontier
+                            .strip_prefix(&folder.name)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                    }) {
+                        self.coverage_frontier = None;
+                    }
+                    self.record_missing_erasure_metadata(&folder, into).await?;
+                    break 'scan;
+                }
                 if into.compacted {
-                    // In compacted mode child totals are accumulated directly into the parent entry.
-                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
-                    fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
-                    self.record_completed_child(&folder_item.name, into.failed_objects == 0);
+                    self.record_completed_child(&folder_item.name);
                     self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                     tokio::task::yield_now().await;
                 } else {
-                    let mut dst = DataUsageEntry::default();
-
-                    // Use Box::pin for recursive async call
-                    let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                    if let Err(e) = fut.await {
-                        if ctx.is_cancelled() {
-                            self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
-                                .await;
-                            return Err(e);
-                        }
-                        warn!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_FOLDER_STATE,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                            folder = %folder.name,
-                            child_folder = %folder_item.name,
-                            state = "child_scan_failed",
-                            error = %e,
-                            "Scanner child folder scan failed"
-                        );
-                        self.coverage_gap |= forward_sweep;
-                        continue;
-                    }
-                    tokio::task::yield_now().await;
-
                     into.add_child(&h);
-                    self.record_completed_child(&folder_item.name, dst.failed_objects == 0);
-                    // We scanned a folder, optionally send update.
-                    self.update_cache.delete_recursive(&h);
-                    self.update_cache.copy_with_children(&self.new_cache, &h, &folder_item.parent);
+                    self.record_completed_child(&folder_item.name);
+                    tokio::task::yield_now().await;
+                    self.maybe_send_checkpoint(&folder, &this_hash, into);
+                    self.refresh_usage_subtree(&h, &folder_item.parent);
                     self.send_update().await;
-                }
-
-                if queued_folder.source == FolderScanSource::New
-                    && !into.compacted
-                    && self.update_cache.find(&this_hash.key()).is_some_and(|v| !v.compacted)
-                {
-                    self.update_cache.delete_recursive(&h);
-                    self.update_cache
-                        .copy_with_children(&self.new_cache, &h, &Some(this_hash.clone()));
                 }
             }
 
@@ -2284,6 +2816,7 @@ impl FolderScanner {
                                         "Scanner list_path_raw agreed callback failed"
                                     );
                                 }
+                                Ok(())
                             })
                         })),
                         partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
@@ -2329,7 +2862,12 @@ impl FolderScanner {
                             options.walkdir_stall_timeout,
                         ));
                     }
-                    if let Err(e) = list_path_raw(child_ctx_clone.clone(), options).await {
+                    if let Err(e) = crate::storage_api::ecstore_with_background_disk_io(
+                        child_ctx_clone.clone(),
+                        list_path_raw(child_ctx_clone.clone(), options),
+                    )
+                    .await
+                    {
                         if is_missing_path_disk_error(&e) {
                             debug!(
                                 target: "rustfs::scanner::folder",
@@ -2366,19 +2904,23 @@ impl FolderScanner {
                 let mut seen_truncated_objects: HashSet<String> = HashSet::new();
 
                 loop {
-                    if agreed_closed && partial_closed && finished_closed {
+                    if child_ctx.is_cancelled() || (agreed_closed && partial_closed && finished_closed) {
                         break;
                     }
+                    #[cfg(test)]
+                    let defer_entries = self.defer_abandoned_entries_until_finished && !finished_closed;
+                    #[cfg(not(test))]
+                    let defer_entries = false;
 
                     select! {
-                        entry_name = agreed_rx.recv(), if !agreed_closed => {
+                        entry_name = agreed_rx.recv(), if !agreed_closed && !defer_entries => {
                             let Some(entry_name) = entry_name else {
                                 agreed_closed = true;
                                 continue;
                             };
                             (self.update_current_path)(&entry_name).await;
                         }
-                        entries = partial_rx.recv(), if !partial_closed => {
+                        entries = partial_rx.recv(), if !partial_closed && !defer_entries => {
                             let Some(entries) = entries else {
                                 partial_closed = true;
                                 continue;
@@ -2388,7 +2930,15 @@ impl FolderScanner {
                                 break;
                             }
 
-                            let discovery = entries.discover_heal_candidates(&bucket, MAX_META_CACHE_HEAL_CANDIDATES);
+                            #[cfg(test)]
+                            let candidate_limit = self.partial_heal_candidate_limit.unwrap_or(MAX_META_CACHE_HEAL_CANDIDATES);
+                            #[cfg(not(test))]
+                            let candidate_limit = MAX_META_CACHE_HEAL_CANDIDATES;
+                            let discovery = entries.discover_heal_candidates(&bucket, candidate_limit);
+                            #[cfg(test)]
+                            if let Some(observer) = &self.partial_heal_discovery_observer {
+                                let _ = observer.send((discovery.candidates.len(), discovery.truncated_candidates.len()));
+                            }
                             counter!(METRIC_SCANNER_HEAL_DISCOVERY_CANDIDATES_TOTAL)
                                 .increment(u64::try_from(discovery.candidates.len()).unwrap_or(u64::MAX));
                             counter!(METRIC_SCANNER_HEAL_DISCOVERY_SUB_QUORUM_TOTAL).increment(
@@ -2474,13 +3024,22 @@ impl FolderScanner {
                                 if !seen_heal_candidates.insert(identity) {
                                     continue;
                                 }
-                                let request = build_object_heal_request(
-                                    bucket.clone(),
-                                    candidate.object.clone(),
-                                    version_id.clone(),
-                                    self.scan_mode,
-                                    HealChannelPriority::High,
-                                );
+                                let request = if candidate.is_unversioned() {
+                                    build_non_destructive_object_heal_request(
+                                        bucket.clone(),
+                                        candidate.object.clone(),
+                                        self.scan_mode,
+                                        HealChannelPriority::High,
+                                    )
+                                } else {
+                                    build_object_heal_request(
+                                        bucket.clone(),
+                                        candidate.object.clone(),
+                                        version_id.clone(),
+                                        self.scan_mode,
+                                        HealChannelPriority::High,
+                                    )
+                                };
                                 (self.update_current_path)(&candidate.object).await;
                                 let admission = self
                                     .send_required_scanner_heal_request(
@@ -2504,6 +3063,7 @@ impl FolderScanner {
                                 finished_closed = true;
                                 continue;
                             };
+                            finished_closed = true;
                             if disk_errors_are_only_missing_paths(&errs) {
                                 debug!(
                                     target: "rustfs::scanner::folder",
@@ -2525,7 +3085,9 @@ impl FolderScanner {
                                     "Scanner list_path_raw finished with disk errors"
                                 );
                             }
-                            child_ctx.cancel();
+                            // The producer awaited callback sends, not their
+                            // consumption. Drain the remaining candidate and
+                            // agreed frames before closing this child walk.
                         }
                         _ = child_ctx.cancelled() => {
                             break;
@@ -2543,7 +3105,10 @@ impl FolderScanner {
                     if into.compacted {
                         // In compacted mode child totals are accumulated directly into the parent entry.
                         let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
-                        fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
+                        fut.await.map_err(|error| match error {
+                            ScannerError::ResourceDeferred => ScannerError::ResourceDeferred,
+                            other => ScannerError::Other(other.to_string()),
+                        })?;
                         self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                         tokio::task::yield_now().await;
                     } else {
@@ -2551,9 +3116,18 @@ impl FolderScanner {
                         let h = hash_path(&folder_item.name);
 
                         // Use Box::pin for recursive async call
-                        let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
-                        if let Err(e) = fut.await {
-                            if ctx.is_cancelled() {
+                        if let Err(e) = self
+                            .scan_child_folder(
+                                ctx.clone(),
+                                folder_item.clone(),
+                                &mut this_hash,
+                                into,
+                                &mut dst,
+                                FolderScanMode::Namespace,
+                            )
+                            .await
+                        {
+                            if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
                                 self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
                                     .await;
                                 return Err(e);
@@ -2575,9 +3149,9 @@ impl FolderScanner {
 
                         into.add_child(&h);
                         // We scanned a folder, optionally send update.
-                        self.update_cache.delete_recursive(&h);
-                        self.update_cache.copy_with_children(&self.new_cache, &h, &folder_item.parent);
+                        self.refresh_usage_subtree(&h, &folder_item.parent);
                         self.send_update().await;
+                        self.maybe_send_checkpoint(&folder, &this_hash, into);
                     }
                 }
             }
@@ -2589,36 +3163,7 @@ impl FolderScanner {
             self.new_cache.replace_hashed(&this_hash, &folder.parent, into);
         }
 
-        // Keep independently accounted children while the sweep cursor may
-        // reference them; the hard cardinality compaction below still applies.
-        if !into.compacted
-            && self.old_cache.info.scan_progress.is_none()
-            && self.new_cache.info.name != folder.name
-            && let Some(mut flat) = self.new_cache.size_recursive(&this_hash.key())
-        {
-            flat.compacted = true;
-            let mut should_compact = false;
-
-            if flat.objects < DATA_SCANNER_COMPACT_LEAST_OBJECT {
-                should_compact = true;
-            } else {
-                // Compact if we only have objects as children...
-                should_compact = true;
-                for k in &into.children {
-                    if let Some(v) = self.new_cache.cache.get(k)
-                        && (!v.children.is_empty() || v.objects > 1)
-                    {
-                        should_compact = false;
-                        break;
-                    }
-                }
-            }
-
-            if should_compact {
-                self.new_cache.delete_recursive(&this_hash);
-                self.new_cache.replace_hashed(&this_hash, &folder.parent, &flat);
-            }
-        }
+        self.compact_completed_folder(&folder, &this_hash, into);
 
         // Compact if too many children...
         if !into.compacted {
@@ -2631,20 +3176,24 @@ impl FolderScanner {
             done_compact();
         }
 
-        if self.update_cache.cache.contains_key(&this_hash.key()) && !was_compacted {
-            // Replace if existed before.
-            if let Some(flat) = self.new_cache.size_recursive(&this_hash.key()) {
-                self.update_cache.delete_recursive(&this_hash);
-                self.update_cache.replace_hashed(&this_hash, &folder.parent, &flat);
-            }
+        if !was_compacted
+            && let Some(updates) = &mut self.usage_updates
+            && updates.cache.cache.contains_key(&clone_cache_value(&this_hash.0))
+            && let Some(flat) = self.new_cache.size_recursive(&clone_cache_value(&this_hash.0))
+        {
+            updates.cache.delete_recursive(&this_hash);
+            updates.cache.replace_hashed(&this_hash, &folder.parent, &flat);
         }
 
+        if folder.parent.is_none() {
+            wait_for_scanner_io(&ctx, self.sleeper.flush_pacing(&mut self.pacing_debt)).await?;
+        }
         self.finish_size_reconciliation_batch();
         done_folder();
         let scanned_objects = u64::try_from(into.objects).unwrap_or(u64::MAX);
         emit_scanner_folder_trace(&self.root, &folder.name, scanned_objects, trace_started_at, "completed");
 
-        Ok(())
+        Ok(FolderScanOutcome::Namespace)
     }
 
     pub fn as_mut_new_cache(&mut self) -> &mut DataUsageCache {
@@ -2668,7 +3217,7 @@ pub async fn scan_data_folder(
     scan_mode: HealScanMode,
     sleeper: DynamicSleeper,
 ) -> Result<DataUsageCache, ScannerError> {
-    scan_data_folder_scoped(ctx, budget, disks, local_disk, cache, updates, scan_mode, sleeper, None).await
+    scan_data_folder_scoped(ctx, budget, disks, local_disk, cache, updates, scan_mode, sleeper, None, None).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2682,6 +3231,7 @@ pub(crate) async fn scan_data_folder_scoped(
     scan_mode: HealScanMode,
     sleeper: DynamicSleeper,
     prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
+    checkpoint_tx: Option<mpsc::Sender<DataUsageCache>>,
 ) -> Result<DataUsageCache, ScannerError> {
     use crate::data_usage_define::DATA_USAGE_ROOT;
 
@@ -2716,19 +3266,40 @@ pub(crate) async fn scan_data_folder_scoped(
     cache.fold_retired_tiers(&tier_registry.names);
     cache.info.tier_registry_generation = Some(tier_registry.generation);
 
-    let resume_frontier = cache.validated_scan_frontier().map(str::to_owned);
+    let resume_frontier = cache.validated_scan_frontier().map(clone_cache_value);
+    if resume_frontier.is_some() {
+        global_metrics().record_scanner_checkpoint_used();
+    }
+    let bucket_name = clone_cache_value(&cache.info.name);
+    let object_metadata_visits = metrics::counter!(
+        "rustfs_scanner_object_metadata_visits_total",
+        "bucket" => bucket_name.clone(),
+        "disk" => base_path.clone()
+    );
+    #[cfg(feature = "diagnostic-prefix-attribution")]
+    let prefix_attribution = prefix_attribution::configured_for(&bucket_name, &base_path);
+    #[cfg(feature = "diagnostic-prefix-attribution")]
+    if prefix_attribution.is_some() {
+        object_metadata_visits.increment(0);
+    }
+    let next_cycle = cache.info.next_cycle;
+    let resume_position_on_entry = cache.has_scan_position();
+    let had_scan_checkpoint = cache.info.scan_checkpoint.is_some();
+    let new_cache = DataUsageCache {
+        info: clone_cache_value(&cache.info),
+        ..Default::default()
+    };
+    let usage_updates = updates.map(|sender| ScannerUsageUpdates::new(sender, bucket_name.clone()));
+    let resume_failed_paths = if resume_frontier.is_some() {
+        failed_scan_paths(&cache)
+    } else {
+        Vec::new()
+    };
     // Create folder scanner
     let mut scanner = FolderScanner {
         root: base_path,
-        old_cache: cache.clone(),
-        new_cache: DataUsageCache {
-            info: cache.info.clone(),
-            ..Default::default()
-        },
-        update_cache: DataUsageCache {
-            info: cache.info.clone(),
-            ..Default::default()
-        },
+        old_cache: cache,
+        new_cache,
         data_usage_scanner_debug: false,
         heal_object_select,
         scan_mode,
@@ -2736,35 +3307,50 @@ pub(crate) async fn scan_data_folder_scoped(
         prefix_scan_scope,
         failed_object_ttl_secs: failed_object_ttl,
         failed_objects_max,
+        failed_object_paths_seen: HashSet::new(),
+        resolved_failed_object_paths: HashSet::new(),
         sleeper,
+        pacing_debt: PacingDebt::default(),
+        node_admission: crate::workload_admission::scanner_node_admission(),
         disks,
         disks_quorum,
-        updates,
-        last_update: SystemTime::UNIX_EPOCH,
+        usage_updates,
+        checkpoint_tx,
+        checkpoint_ancestors: Vec::new(),
+        checkpoint_depth: 0,
+        checkpoint_objects: 0,
+        object_metadata_visits,
+        #[cfg(feature = "diagnostic-prefix-attribution")]
+        prefix_attribution,
+        last_checkpoint_objects: 0,
+        last_checkpoint_at: Instant::now(),
+        last_checkpoint_build_time: Duration::ZERO,
         update_current_path,
         budget: budget.clone(),
         skip_heal,
         local_disk,
         tier_registry,
         pending_heals_changed: false,
-        coverage_frontier: resume_frontier.clone(),
+        coverage_frontier: clone_cache_value(&resume_frontier),
         resume_frontier,
+        resume_failed_paths,
         coverage_gap: false,
-        pending_heal_sync_deferred: false,
-        pending_heal_batch_dirty: false,
         raw_enumeration_progress: Vec::new(),
-        #[cfg(test)]
-        pending_heal_sync_count: 0,
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
         #[cfg(test)]
         list_path_raw_options_observer: None,
+        #[cfg(test)]
+        defer_abandoned_entries_until_finished: false,
+        #[cfg(test)]
+        partial_heal_candidate_limit: None,
+        #[cfg(test)]
+        partial_heal_discovery_observer: None,
     };
 
     let now = FolderScanner::now_secs();
     prune_size_reconciliation(&mut scanner.new_cache.info, now);
-    prune_size_reconciliation(&mut scanner.update_cache.info, now);
 
     // Check if context is cancelled
     if ctx.is_cancelled() {
@@ -2776,22 +3362,26 @@ pub(crate) async fn scan_data_folder_scoped(
     // Read top level in bucket
     let mut root = DataUsageEntry::default();
     let folder = CachedFolder {
-        name: cache.info.name.clone(),
+        name: bucket_name.clone(),
         parent: None,
         object_heal_prob_div: 1,
     };
 
     // Scan the folder
-    match scanner.scan_folder(ctx.clone(), folder, &mut root).await {
+    let physical = scanner.local_disk.physical_admission();
+    match crate::workload_admission::with_scanner_physical_disk(physical, scanner.scan_folder(ctx.clone(), folder, &mut root))
+        .await
+    {
         Ok(()) => {
             // Get the new cache and finalize it
             let coverage_gap = scanner.coverage_gap;
+            scanner.reconcile_failed_objects_after_full_scan();
             let new_cache = scanner.as_mut_new_cache();
             new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
             new_cache.info.last_update = Some(SystemTime::now());
-            new_cache.info.next_cycle = cache.info.next_cycle;
+            new_cache.info.next_cycle = next_cycle;
             let unresolved_objects = coverage_gap
-                || root.failed_objects > 0
+                || new_cache.cache.values().any(|entry| entry.failed_objects > 0)
                 || !new_cache.info.failed_objects.is_empty()
                 || !new_cache.info.size_reconciliation.is_empty();
             let mixed_coverage = new_cache
@@ -2810,7 +3400,7 @@ pub(crate) async fn scan_data_folder_scoped(
                     new_cache.info.scan_plan_digest = None;
                 }
             }
-            let had_scan_checkpoint = cache.info.scan_checkpoint.is_some() || new_cache.info.scan_checkpoint.is_some();
+            let had_scan_checkpoint = had_scan_checkpoint || new_cache.info.scan_checkpoint.is_some();
             new_cache.info.scan_resume_after = None;
             new_cache.info.scan_checkpoint = None;
             new_cache.info.scan_raw_enumeration_cursor = None;
@@ -2822,24 +3412,45 @@ pub(crate) async fn scan_data_folder_scoped(
 
             close_disk_guard.close().await;
             if unresolved_objects || mixed_coverage {
-                Err(ScannerError::PartialCache(Box::new(new_cache.clone())))
+                debug!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_FOLDER_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                    state = "bucket_sweep_incomplete",
+                    bucket = %bucket_name,
+                    pool = new_cache.info.source.map(|source| source.pool_index),
+                    set = new_cache.info.source.map(|source| source.set_index),
+                    cycle = next_cycle,
+                    leader_epoch = new_cache.info.leader_epoch,
+                    resume_position_on_entry,
+                    resume_position = new_cache.has_scan_position(),
+                    coverage_gap,
+                    unresolved_objects,
+                    root_failed_objects = root.failed_objects,
+                    failed_objects = new_cache.info.failed_objects.len(),
+                    size_reconciliation_entries = new_cache.info.size_reconciliation.len(),
+                    mixed_coverage,
+                    "Scanner bucket sweep requires another verification pass"
+                );
+                Err(ScannerError::PartialCache(Box::new(std::mem::take(new_cache))))
             } else {
-                Ok(new_cache.clone())
+                Ok(std::mem::take(new_cache))
             }
         }
         Err(e) => {
-            if ctx.is_cancelled() {
-                let root_hash = hash_path(&cache.info.name);
+            if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
+                let root_hash = hash_path(&bucket_name);
                 let root_has_progress = data_usage_root_has_progress(&root);
                 let pending_heals_changed = scanner.pending_heals_changed;
                 let (raw_enumeration_cursor, raw_enumeration_page_index) = scanner.take_raw_enumeration_resume_state();
                 let carry_forward_cache = ((raw_enumeration_cursor.is_some() || raw_enumeration_page_index.is_some())
                     && !root_has_progress)
-                    .then(|| scanner.old_cache.cache.clone());
+                    .then(|| std::mem::take(&mut scanner.old_cache.cache));
                 if root_has_progress {
                     scanner.carry_forward_old_children(&root_hash, &mut root);
                 }
-                let coverage_frontier = scanner.coverage_frontier.clone();
+                let coverage_frontier = clone_cache_value(&scanner.coverage_frontier);
                 let new_cache = scanner.as_mut_new_cache();
                 if root_has_progress {
                     new_cache.replace_hashed(&root_hash, &None, &root);
@@ -2867,7 +3478,7 @@ pub(crate) async fn scan_data_folder_scoped(
                         new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
                     }
                     new_cache.info.last_update = Some(SystemTime::now());
-                    new_cache.info.next_cycle = cache.info.next_cycle;
+                    new_cache.info.next_cycle = next_cycle;
                     new_cache.info.snapshot_complete = false;
                     if root_has_progress {
                         set_scan_checkpoint(new_cache, checkpoint_reason_from_budget(budget.reason()));
@@ -2885,16 +3496,36 @@ pub(crate) async fn scan_data_folder_scoped(
                         }
                     }
                     close_disk_guard.close().await;
-                    return Err(ScannerError::PartialCache(Box::new(new_cache.clone())));
+                    return Err(ScannerError::PartialCache(Box::new(std::mem::take(new_cache))));
                 }
             }
             if matches!(&e, ScannerError::Io(io) if io.kind() == ErrorKind::NotFound) {
-                let mut partial_cache = scanner.old_cache.clone();
+                let mut partial_cache = scanner.old_cache;
+                // An empty input still needs a root for the non-publishable
+                // partial result; retain nonempty durable caches unchanged.
+                if partial_cache.cache.is_empty() {
+                    partial_cache
+                        .cache
+                        .insert(hash_path(&bucket_name).0, DataUsageEntry::default());
+                }
                 partial_cache.info.last_update = Some(SystemTime::now());
-                partial_cache.info.next_cycle = cache.info.next_cycle;
+                partial_cache.info.next_cycle = next_cycle;
                 partial_cache.info.snapshot_complete = false;
                 close_disk_guard.close().await;
                 return Err(ScannerError::NamespaceNotFoundCache(Box::new(partial_cache)));
+            }
+            if matches!(&e, ScannerError::ResourceDeferred) {
+                // Admission pressure is not disk failure or an empty census.
+                // Keep the previous tree when no new useful progress exists.
+                let mut partial_cache = scanner.old_cache;
+                if partial_cache.cache.is_empty() {
+                    partial_cache
+                        .cache
+                        .insert(hash_path(&bucket_name).0, DataUsageEntry::default());
+                }
+                partial_cache.info.snapshot_complete = false;
+                close_disk_guard.close().await;
+                return Err(ScannerError::PartialCache(Box::new(partial_cache)));
             }
             close_disk_guard.close().await;
             // No useful information, return original cache
@@ -2905,10 +3536,29 @@ pub(crate) async fn scan_data_folder_scoped(
 
 mod item_actions;
 mod ledger;
+mod native_io;
+#[cfg(feature = "diagnostic-prefix-attribution")]
+mod prefix_attribution;
 
+pub(crate) use item_actions::scanner_disk_heal_scope;
 use item_actions::*;
 pub use item_actions::{GetSizeFn, ScannerItem};
 use ledger::*;
 
 #[cfg(test)]
+pub(crate) use tests::checkpoint_fixture::run_checkpoint_fixture;
+
+#[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_SIZE_DISPATCH_BOUNDARIES: tokio::sync::mpsc::UnboundedSender<&'static str>;
+}
+
+#[cfg(test)]
+pub(crate) fn observe_test_size_dispatch_boundary(stage: &'static str) -> bool {
+    TEST_SIZE_DISPATCH_BOUNDARIES
+        .try_with(|sender| sender.send(stage).is_ok())
+        .unwrap_or(false)
+}

@@ -104,6 +104,8 @@ const TIER_REMOTE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const TIER_MUTATION_PEER_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const TIER_MUTATION_PEER_FANOUT_TIMEOUT: Duration = Duration::from_secs(30);
 const TIER_MUTATION_PEER_FANOUT_CONCURRENCY: usize = 4;
+const TIER_DELETION_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+const TIER_DELETION_CHECK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const TIER_REFERENCE_PROOF_LIST_LIMIT: i32 = 1000;
 const TIER_REFERENCE_PROOF_PHYSICAL_WALK_CONCURRENCY: usize = 4;
 const TIER_MUTATION_INTENT_RECOVERY_SCAN_LIMIT: usize = 1000;
@@ -115,6 +117,70 @@ const TIER_MUTATION_REFRESH_RETRY_CAP: Duration = Duration::from_secs(30);
 const EVENT_TIER_CONFIG_REFRESH: &str = "tier_config_refresh";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_TIER: &str = "tier";
+
+/// Advisory local evidence only; DELETE always reruns its authoritative proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TierDeletionCheck {
+    pub tier_name: String,
+    pub proof_complete: bool,
+    pub scan_status: TierDeletionScanStatus,
+    pub reasons: Vec<TierDeletionReason>,
+    pub remote: TierDeletionRemote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierDeletionScanStatus {
+    Complete,
+    StoppedAfterBlocker,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TierDeletionReason {
+    pub kind: TierDeletionReasonKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TierDeletionReasonKind {
+    LifecycleReference,
+    LiveTransitionedVersion,
+    CleanupPending,
+    TransitionPending,
+    ProofIncomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TierDeletionRemote {
+    pub state: TierDeletionRemoteState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierDeletionRemoteState {
+    NotChecked,
+}
+
+impl TierDeletionCheck {
+    fn from_evidence(tier_name: &str, evidence: Result<Option<TierDeletionReasonKind>>) -> Self {
+        let (scan_status, reason) = match evidence {
+            Ok(None) => (TierDeletionScanStatus::Complete, None),
+            Ok(Some(reason)) => (TierDeletionScanStatus::StoppedAfterBlocker, Some(reason)),
+            Err(_) => (TierDeletionScanStatus::Incomplete, Some(TierDeletionReasonKind::ProofIncomplete)),
+        };
+        Self {
+            tier_name: tier_name.to_string(),
+            proof_complete: scan_status == TierDeletionScanStatus::Complete,
+            scan_status,
+            reasons: reason.into_iter().map(|kind| TierDeletionReason { kind }).collect(),
+            remote: TierDeletionRemote {
+                state: TierDeletionRemoteState::NotChecked,
+            },
+        }
+    }
+}
 
 type TierReferenceProofWalkOptions = StorageWalkOptions<fn(&rustfs_filemeta::FileInfo) -> bool>;
 
@@ -1038,6 +1104,19 @@ trait TierReferenceProofStore:
 
     async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>>;
 
+    async fn walk_bucket_for_deletion_check(
+        self: Arc<Self>,
+        cancellation: tokio_util::sync::CancellationToken,
+        bucket: &str,
+        result: tokio::sync::mpsc::Sender<StorageObjectInfoOrErr<ObjectInfo, Error>>,
+        opts: TierReferenceProofWalkOptions,
+    ) -> Result<()>
+    where
+        Self: Sized,
+    {
+        self.walk(cancellation, bucket, "", result, opts).await
+    }
+
     async fn authoritative_bucket_tier_reference(
         self: Arc<Self>,
         bucket: &str,
@@ -1084,12 +1163,229 @@ impl TierReferenceProofStore for ECStore {
         }
     }
 
+    async fn walk_bucket_for_deletion_check(
+        self: Arc<Self>,
+        cancellation: tokio_util::sync::CancellationToken,
+        bucket: &str,
+        result: tokio::sync::mpsc::Sender<StorageObjectInfoOrErr<ObjectInfo, Error>>,
+        opts: TierReferenceProofWalkOptions,
+    ) -> Result<()> {
+        // Keep the same physical-set completeness boundary as the DELETE proof.
+        let mut walks = Vec::new();
+        for pool in &self.pools {
+            for set in &pool.disk_set {
+                let set = set.clone();
+                let cancellation = cancellation.clone();
+                let result = result.clone();
+                let opts = opts.clone();
+                walks.push(async move {
+                    if cancellation.is_cancelled() {
+                        return Err(Error::other("tier deletion check cancelled"));
+                    }
+                    let outcome = set.walk(cancellation.clone(), bucket, "", result, opts).await;
+                    if outcome.is_err() {
+                        cancellation.cancel();
+                    }
+                    outcome
+                });
+            }
+        }
+        let outcomes = futures::stream::iter(walks)
+            .buffer_unordered(TIER_REFERENCE_PROOF_PHYSICAL_WALK_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        // Await every started walk even after an error or cancellation.
+        outcomes.into_iter().collect::<Result<Vec<_>>>().map(|_| ())
+    }
+
     async fn authoritative_bucket_tier_reference(
         self: Arc<Self>,
         bucket: &str,
         targets: &[TierMutationIntentTarget],
     ) -> std::result::Result<Option<ObjectInfo>, AdminError> {
         find_authoritative_bucket_tier_reference_on_physical_sets(self, bucket, targets).await
+    }
+}
+
+async fn tier_deletion_check_references<S>(
+    api: Arc<S>,
+    tier_name: &str,
+    cancellation: &tokio_util::sync::CancellationToken,
+    deadline: Instant,
+) -> Result<Option<TierDeletionReasonKind>>
+where
+    S: TierReferenceProofStore + 'static,
+{
+    let target = TierMutationIntentTarget {
+        tier_name: tier_name.to_string(),
+        old_backend_identity: None,
+        new_backend_identity: None,
+    };
+    let buckets = timeout_at(deadline, api.authoritative_buckets_for_reference_proof())
+        .await
+        .map_err(Error::other)??;
+    for bucket in buckets {
+        let config = timeout_at(deadline, api.lifecycle_config_for_reference_proof(&bucket.name))
+            .await
+            .map_err(Error::other)??;
+        if config
+            .as_ref()
+            .is_some_and(|config| lifecycle_config_target_reference(config, std::slice::from_ref(&target)).is_some())
+        {
+            return Ok(Some(TierDeletionReasonKind::LifecycleReference));
+        }
+        if let Some(reason) = tier_deletion_check_bucket(api.clone(), &bucket.name, &target, cancellation, deadline).await? {
+            return Ok(Some(reason));
+        }
+    }
+    if tier_deletion_check_persisted(api.clone(), TIER_DELETE_JOURNAL_PREFIX, deadline, |_object, data| {
+        let journal = decode_tier_delete_journal_entry(data).map_err(Error::other)?;
+        Ok(journal.tier_name == tier_name)
+    })
+    .await?
+    {
+        return Ok(Some(TierDeletionReasonKind::CleanupPending));
+    }
+    if tier_deletion_check_persisted(api, TRANSITION_TRANSACTION_RECORD_PREFIX, deadline, |object, data| {
+        let transaction = decode_transition_transaction_record(object, data).map_err(Error::other)?;
+        Ok(transaction.tier_name == tier_name)
+    })
+    .await?
+    {
+        return Ok(Some(TierDeletionReasonKind::TransitionPending));
+    }
+    Ok(None)
+}
+
+async fn tier_deletion_check_bucket<S>(
+    api: Arc<S>,
+    bucket: &str,
+    target: &TierMutationIntentTarget,
+    cancellation: &tokio_util::sync::CancellationToken,
+    deadline: Instant,
+) -> Result<Option<TierDeletionReasonKind>>
+where
+    S: TierReferenceProofStore + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    // Own the walk task so cancellation can be followed by a bounded, awaited
+    // shutdown even when a metadata reader does not respond to cancellation.
+    let mut walks = tokio::task::JoinSet::new();
+    let walk_cancellation = cancellation.clone();
+    let bucket = bucket.to_string();
+    walks.spawn(async move {
+        api.walk_bucket_for_deletion_check(
+            walk_cancellation,
+            &bucket,
+            tx,
+            TierReferenceProofWalkOptions {
+                include_free_versions: true,
+                walkdir_timeout: Some(deadline.saturating_duration_since(Instant::now())),
+                ..Default::default()
+            },
+        )
+        .await
+    });
+    let collect = async {
+        let evidence = async {
+            loop {
+                let entry = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(Error::other("tier deletion check cancelled")),
+                    entry = timeout_at(deadline, rx.recv()) => entry.map_err(Error::other)?,
+                };
+                let Some(entry) = entry else { return Ok(None) };
+                if let Some(err) = entry.err {
+                    return Err(err);
+                }
+                let object = entry.item.ok_or(Error::CorruptedFormat)?;
+                if tier_object_blocks_any_target_rebind(&object, std::slice::from_ref(target))? {
+                    return Ok(Some(if object.transitioned_object.free_version {
+                        TierDeletionReasonKind::CleanupPending
+                    } else {
+                        TierDeletionReasonKind::LiveTransitionedVersion
+                    }));
+                }
+                if object.transitioned_object.tier == target.tier_name {
+                    // Pending metadata can precede a completed transition. Unknown status
+                    // or a corrupt identity cannot establish absence of a reference.
+                    tier_destination_id_from_metadata(&object.user_defined)?;
+                    if object.transitioned_object.status == rustfs_filemeta::TRANSITION_PENDING {
+                        return Ok(Some(TierDeletionReasonKind::TransitionPending));
+                    }
+                    return Err(Error::CorruptedFormat);
+                }
+            }
+        }
+        .await;
+        rx.close();
+        drop(rx);
+        if !matches!(evidence, Ok(None)) {
+            cancellation.cancel();
+        }
+        evidence
+    };
+    let evidence = collect.await;
+    let walk_result = match timeout_at(Instant::now() + TIER_DELETION_CHECK_SHUTDOWN_TIMEOUT, walks.join_next()).await {
+        Ok(Some(result)) => result.map_err(|_| Error::other("tier deletion check walk task failed"))?,
+        Ok(None) => return Err(Error::other("tier deletion check walk task missing")),
+        Err(_) => {
+            cancellation.cancel();
+            walks.abort_all();
+            while walks.join_next().await.is_some() {}
+            return Err(Error::other("tier deletion check walk shutdown timed out"));
+        }
+    };
+    if Instant::now() >= deadline {
+        return Err(Error::other("tier deletion check deadline elapsed"));
+    }
+    match evidence? {
+        Some(reason) => Ok(Some(reason)),
+        None => {
+            walk_result?;
+            Ok(None)
+        }
+    }
+}
+
+async fn tier_deletion_check_persisted<S, F>(api: Arc<S>, prefix: &str, deadline: Instant, references_tier: F) -> Result<bool>
+where
+    S: TierReferenceProofStore,
+    F: Fn(&str, &[u8]) -> Result<bool>,
+{
+    let mut marker: Option<String> = None;
+    loop {
+        let page = timeout_at(
+            deadline,
+            api.clone().list_objects_v2(
+                RUSTFS_META_BUCKET,
+                prefix,
+                marker.clone(),
+                None,
+                TIER_REFERENCE_PROOF_LIST_LIMIT,
+                false,
+                None,
+                false,
+            ),
+        )
+        .await
+        .map_err(Error::other)??;
+        for object in &page.objects {
+            let data = timeout_at(deadline, read_config(api.clone(), &object.name))
+                .await
+                .map_err(Error::other)??;
+            if references_tier(&object.name, &data)? {
+                return Ok(true);
+            }
+        }
+        if !page.is_truncated {
+            return Ok(false);
+        }
+        let next = page.next_continuation_token.ok_or(Error::CorruptedFormat)?;
+        if next.is_empty() || marker.as_ref().is_some_and(|previous| next <= *previous) {
+            return Err(Error::CorruptedFormat);
+        }
+        marker = Some(next);
     }
 }
 
@@ -2270,7 +2566,7 @@ pub(crate) fn tier_destination_id_from_metadata(metadata: &HashMap<String, Strin
         }
         return Ok(None);
     };
-    if encoded.len() != 64 {
+    if encoded.len() != 64 || !encoded.is_ascii() {
         return Err(io::Error::other("transition tier backend identity has an invalid length"));
     }
     let mut identity = [0_u8; 32];
@@ -3399,12 +3695,15 @@ impl TierConfigMgr {
 
     pub async fn remove(&mut self, tier_name: &str, force: bool) -> std::result::Result<(), AdminError> {
         self.ensure_generation_is_idle(tier_name)?;
-        let driver = match self.get_driver(tier_name).await {
-            Ok(driver) => driver,
-            Err(err) if err.code == ERR_TIER_NOT_FOUND.code => return Ok(()),
-            Err(err) => return Err(err),
-        };
+        if force && !self.tiers.contains_key(tier_name) {
+            return Ok(());
+        }
         if !force {
+            let driver = match self.get_driver(tier_name).await {
+                Ok(driver) => driver,
+                Err(err) if err.code == ERR_TIER_NOT_FOUND.code => return Ok(()),
+                Err(err) => return Err(err),
+            };
             match driver.in_use().await {
                 Err(err) => {
                     let mut e = ERR_TIER_PERM_ERR.clone();
@@ -4721,6 +5020,23 @@ impl TierConfigMgr {
             + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
             + ListOperations<Error = Error, ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>>,
     {
+        // Periodic and committed-mutation refreshes call this shared entry directly.
+        let reload = Self::reload_handle_inner(handle, api);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let reload = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::TierConfigReload,
+            reload,
+        );
+        reload.await
+    }
+
+    async fn reload_handle_inner<S>(handle: &Arc<RwLock<Self>>, api: Arc<S>) -> io::Result<()>
+    where
+        S: EcstoreObjectIO
+            + EcstoreObjectOperations
+            + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+            + ListOperations<Error = Error, ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>>,
+    {
         // Lock order matches update_candidate_with_config_lock: namespace tier-config lock before admin_updates.
         let mut config_lock: Option<rustfs_lock::NamespaceLockGuard> = None;
         let (snapshot, candidate, recovery_plan, update) = loop {
@@ -5888,6 +6204,44 @@ impl TierConfigMgr {
             None,
         )
         .await
+    }
+
+    /// Inspect local deletion blockers without remote probes, fences, or writes.
+    /// A complete response is advisory; removal always performs a fresh proof.
+    pub async fn deletion_check(
+        handle: &Arc<RwLock<Self>>,
+        api: Arc<ECStore>,
+        tier_name: &str,
+    ) -> std::result::Result<TierDeletionCheck, AdminError> {
+        Self::deletion_check_with(handle, api, tier_name, Instant::now() + TIER_DELETION_CHECK_TIMEOUT).await
+    }
+
+    async fn deletion_check_with<S>(
+        handle: &Arc<RwLock<Self>>,
+        api: Arc<S>,
+        tier_name: &str,
+        deadline: Instant,
+    ) -> std::result::Result<TierDeletionCheck, AdminError>
+    where
+        S: TierReferenceProofStore + 'static,
+    {
+        let exists = match timeout_at(deadline, handle.read()).await {
+            Ok(manager) => manager.tiers.contains_key(tier_name),
+            Err(err) => return Ok(TierDeletionCheck::from_evidence(tier_name, Err(Error::other(err)))),
+        };
+        if !exists {
+            return Err(ERR_TIER_NOT_FOUND.clone());
+        }
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_drop = cancellation.clone().drop_guard();
+        let evidence = tier_deletion_check_references(api, tier_name, &cancellation, deadline).await;
+        cancellation.cancel();
+        let evidence = if Instant::now() >= deadline {
+            Err(Error::other("tier deletion check deadline elapsed"))
+        } else {
+            evidence
+        };
+        Ok(TierDeletionCheck::from_evidence(tier_name, evidence))
     }
 
     pub async fn remove_and_save(
@@ -8802,8 +9156,9 @@ mod tests {
     #[tokio::test]
     async fn test_remove_unknown_tier_is_idempotent() {
         let mut mgr = empty_mgr();
-        // Unknown tier: get_driver returns NotFound, which `remove` swallows.
-        mgr.remove("NOPE", false).await.expect("removing an unknown tier is a no-op");
+        for force in [false, true] {
+            mgr.remove("NOPE", force).await.expect("removing an unknown tier is a no-op");
+        }
     }
 
     #[tokio::test]
@@ -8866,6 +9221,68 @@ mod tests {
         mgr.remove("COLD-A", true).await.expect("force remove must not probe in_use");
         assert!(!mgr.tiers.contains_key("COLD-A"));
         assert!(!mgr.driver_cache.contains_key("COLD-A"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_force_skips_uncached_driver_construction() {
+        let mut mgr = empty_mgr();
+        let mut tier = build_s3_tier("COLD-A");
+        tier.s3.as_mut().expect("S3 fixture must have a backend").endpoint = "https://169.254.169.254".to_string();
+        mgr.tiers.insert("COLD-A".to_string(), tier);
+        assert!(mgr.driver_cache.is_empty());
+
+        let err = mgr
+            .remove("COLD-A", false)
+            .await
+            .expect_err("non-force removal must retain endpoint validation");
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert!(err.message.contains("tier endpoint is not allowed"), "{}", err.message);
+        assert!(mgr.tiers.contains_key("COLD-A"));
+        assert!(mgr.driver_cache.is_empty());
+
+        mgr.remove("COLD-A", true)
+            .await
+            .expect("force removal must not construct a driver for the forbidden endpoint");
+        assert!(!mgr.tiers.contains_key("COLD-A"));
+        assert!(mgr.driver_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persisted_private_tiers_rebuild_uncached_drivers_without_rebinding() {
+        let endpoint = "https://192.168.10.200:9000";
+        for provider in ["s3", "minio", "rustfs"] {
+            let tier: TierConfig = serde_json::from_value(serde_json::json!({
+                "type": provider,
+                "name": "COLD-A",
+                (provider): {
+                    "name": "COLD-A",
+                    "endpoint": endpoint,
+                    "accessKey": "access",
+                    "secretKey": "secret",
+                    "bucket": "tier-bucket",
+                    "prefix": "archive",
+                    "region": "us-east-1"
+                }
+            }))
+            .expect("private tier fixture must decode");
+            let identity = tier_backend_identity(&tier).expect("private tier identity must encode");
+            let mut persisted = empty_mgr();
+            persisted.tiers.insert("COLD-A".to_string(), tier);
+            let blob = encode_external_tiering_config_blob(&persisted).expect("private tier config must persist");
+            let mut loaded = decode_external_tiering_config_blob(&blob).expect("private tier config must reload");
+            assert!(loaded.driver_cache.is_empty(), "{provider} reload must start with a cold cache");
+
+            loaded
+                .get_driver("COLD-A")
+                .await
+                .expect("a persisted private tier must construct its driver without editing its endpoint");
+            assert!(loaded.driver_cache.contains_key("COLD-A"));
+            let config = &loaded.tiers["COLD-A"];
+            assert_eq!(config.name, "COLD-A");
+            assert_eq!(tier_backend_identity(config).expect("reloaded identity must encode"), identity);
+            let wire = serde_json::to_value(config).expect("reloaded tier must serialize");
+            assert_eq!(wire[provider]["endpoint"], endpoint, "{provider} endpoint must remain unchanged");
+        }
     }
 
     #[tokio::test]
@@ -12533,6 +12950,51 @@ mod tests {
         assert!(reloaded.iter().any(|intent| intent.mutation_id == prepared_id));
     }
 
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_reload_shared_entry_preserves_source_and_api() {
+        use crate::api::diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, with_isolated_s3_http_operation_context,
+        };
+
+        let store = Arc::new(CasConfigStore::default());
+        empty_mgr()
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("empty tier config fixture should persist");
+        let mut request = S3HttpRequestGuard::new("GET");
+        let get = request.in_scope(|| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+            current_s3_http_operation_context().expect("GetObject context should be captured")
+        });
+
+        for (earlier, api) in [(None, None), (Some(ReadVersionEntrySource::ConfigRead), Some(get))] {
+            store.reload_contexts.lock().expect("context recorder").clear();
+            let handle = TierConfigMgr::new();
+            with_isolated_s3_http_operation_context(api, async {
+                let reload = TierConfigMgr::reload_handle_with(&handle, store.clone());
+                if let Some(source) = earlier {
+                    with_read_version_entry(source, reload).await
+                } else {
+                    reload.await
+                }
+            })
+            .await
+            .expect("shared reload entry should load config and scan intents");
+
+            let observed = store.reload_contexts.lock().expect("context recorder");
+            assert!(observed.iter().any(|(boundary, _, _)| *boundary == "reader"));
+            assert!(observed.iter().any(|(boundary, _, _)| *boundary == "list"));
+            let expected = earlier.unwrap_or(ReadVersionEntrySource::TierConfigReload);
+            assert!(observed.iter().all(|(_, source, operation)| {
+                *source == Some(expected) && *operation == api.map(|context| context.operation_name())
+            }));
+            assert_eq!(current_read_version_entry_source(), None);
+            assert_eq!(current_s3_http_operation_context(), None);
+        }
+    }
+
     #[tokio::test]
     async fn reload_handle_keeps_committed_block_until_publish_swaps_generation() {
         let store = Arc::new(CasConfigStore::default());
@@ -14725,8 +15187,46 @@ mod tests {
         release: tokio::sync::Notify,
     }
 
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    type ReloadDiagnosticObservation = (
+        &'static str,
+        Option<rustfs_io_metrics::internode_metrics::ReadVersionEntrySource>,
+        Option<&'static str>,
+    );
+
+    #[derive(Debug)]
+    struct CasReferenceWalkBarrier {
+        arrived: Notify,
+        cancelled: Notify,
+        release: tokio::sync::Semaphore,
+        finished: AtomicBool,
+        entry: Option<ObjectInfo>,
+    }
+
+    struct CasReferenceWalkCompletion(Arc<CasReferenceWalkBarrier>);
+
+    impl Drop for CasReferenceWalkCompletion {
+        fn drop(&mut self) {
+            self.0.finished.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Default for CasReferenceWalkBarrier {
+        fn default() -> Self {
+            Self {
+                arrived: Notify::new(),
+                cancelled: Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+                finished: AtomicBool::new(false),
+                entry: None,
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct CasConfigStore {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        reload_contexts: Mutex<Vec<ReloadDiagnosticObservation>>,
         objects: tokio::sync::Mutex<HashMap<String, (Vec<u8>, String)>>,
         legacy_state: tokio::sync::Mutex<Option<Vec<u8>>>,
         if_match_race_rewrite: tokio::sync::Mutex<std::collections::VecDeque<(String, Vec<u8>)>>,
@@ -14740,6 +15240,10 @@ mod tests {
         coordinator_commit_barrier: tokio::sync::Mutex<Option<Arc<CasCoordinatorCommitBarrier>>>,
         intent_list_calls: AtomicUsize,
         fail_reference_walk: AtomicBool,
+        reference_topology_incomplete: AtomicBool,
+        reference_lifecycle_error: AtomicBool,
+        reference_list_incomplete: AtomicBool,
+        reference_walk_barrier: Mutex<Option<Arc<CasReferenceWalkBarrier>>>,
         reference_walk_send_count: AtomicUsize,
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         lock_requests: Mutex<Vec<(String, String)>>,
@@ -14750,6 +15254,8 @@ mod tests {
     impl Default for CasConfigStore {
         fn default() -> Self {
             Self {
+                #[cfg(feature = "diagnostic-read-version-caller")]
+                reload_contexts: Mutex::new(Vec::new()),
                 objects: tokio::sync::Mutex::new(HashMap::new()),
                 legacy_state: tokio::sync::Mutex::new(None),
                 if_match_race_rewrite: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -14763,6 +15269,10 @@ mod tests {
                 coordinator_commit_barrier: tokio::sync::Mutex::new(None),
                 intent_list_calls: AtomicUsize::new(0),
                 fail_reference_walk: AtomicBool::new(false),
+                reference_topology_incomplete: AtomicBool::new(false),
+                reference_lifecycle_error: AtomicBool::new(false),
+                reference_list_incomplete: AtomicBool::new(false),
+                reference_walk_barrier: Mutex::new(None),
                 reference_walk_send_count: AtomicUsize::new(0),
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
                 lock_requests: Mutex::new(Vec::new()),
@@ -14904,6 +15414,12 @@ mod tests {
             _headers: Self::HeaderMap,
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::GetObjectReader> {
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            self.reload_contexts.lock().expect("context recorder").push((
+                "reader",
+                crate::api::diagnostic::current_read_version_entry_source(),
+                rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+            ));
             let legacy_config_path = tier_config_path(TIER_CONFIG_LEGACY_FILE);
             let (data, etag) = if object == legacy_config_path {
                 let state = self.legacy_state.lock().await;
@@ -15259,12 +15775,25 @@ mod tests {
             _start_after: Option<String>,
             _incl_deleted: bool,
         ) -> Result<Self::ListObjectsV2Info> {
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            self.reload_contexts.lock().expect("context recorder").push((
+                "list",
+                crate::api::diagnostic::current_read_version_entry_source(),
+                rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+            ));
             if matches!(
                 prefix,
                 crate::services::tier::tier_mutation_intent::TIER_MUTATION_INTENT_RECORD_PREFIX
                     | crate::services::tier::tier_mutation_intent::TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX
             ) {
                 self.intent_list_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            if self.reference_list_incomplete.load(Ordering::SeqCst) {
+                return Ok(StorageListObjectsV2Info {
+                    is_truncated: true,
+                    next_continuation_token: None,
+                    ..Default::default()
+                });
             }
             let list_barrier = self.list_barrier.lock().await.clone();
             if let Some(barrier) = list_barrier
@@ -15375,6 +15904,32 @@ mod tests {
             result: Self::WalkResultSender,
             opts: Self::WalkOptions,
         ) -> Result<()> {
+            let barrier = self
+                .reference_walk_barrier
+                .lock()
+                .expect("walk barrier should not poison")
+                .clone();
+            if let Some(barrier) = barrier {
+                let _completion = CasReferenceWalkCompletion(barrier.clone());
+                barrier.arrived.notify_one();
+                if let Some(object) = &barrier.entry {
+                    let _ = result
+                        .send(StorageObjectInfoOrErr {
+                            item: Some(object.clone()),
+                            err: None,
+                        })
+                        .await;
+                }
+                rx.cancelled().await;
+                barrier.cancelled.notify_one();
+                barrier
+                    .release
+                    .acquire()
+                    .await
+                    .expect("walk shutdown barrier should stay open")
+                    .forget();
+                return Err(Error::other("cancelled fixture walk finished"));
+            }
             if self.fail_reference_walk.load(Ordering::SeqCst)
                 && result
                     .send(StorageObjectInfoOrErr {
@@ -15479,7 +16034,24 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TierReferenceProofStore for CasConfigStore {
+        async fn authoritative_buckets_for_reference_proof(
+            &self,
+        ) -> Result<Vec<crate::storage_api_contracts::bucket::BucketInfo>> {
+            if self.reference_topology_incomplete.load(Ordering::SeqCst) {
+                return Err(Error::other("incomplete physical-set topology"));
+            }
+            self.list_bucket(&crate::storage_api_contracts::bucket::BucketOptions {
+                deleted: true,
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+        }
+
         async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+            if self.reference_lifecycle_error.load(Ordering::SeqCst) {
+                return Err(Error::CorruptedFormat);
+            }
             Ok(self
                 .lifecycle_configs
                 .lock()
@@ -16018,6 +16590,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_remove_uncached_invalid_endpoint_preserves_persisted_reference_proof() {
+        for has_free_version in [false, true] {
+            let store = Arc::new(CasConfigStore::default());
+            let mut tier = build_rustfs_tier("COLD-A");
+            tier.rustfs.as_mut().expect("RustFS fixture must have a backend").endpoint = "https://169.254.169.254".to_string();
+            let identity = tier_backend_identity(&tier).expect("forbidden endpoint must retain a valid backend identity");
+            let mut persisted = empty_mgr();
+            persisted.tiers.insert("COLD-A".to_string(), tier.clone_with_credentials());
+            persisted
+                .save_tiering_config_if_current(store.clone(), None)
+                .await
+                .expect("cold-cache remove fixture must persist");
+            let (_, original_version) = load_tier_config_for_update(store.clone())
+                .await
+                .expect("original config version must load");
+            if has_free_version {
+                let mut object = transitioned_tier_object("photos", "free-version.jpg", "COLD-A", Some(identity));
+                object.transitioned_object.status = "pending".to_string();
+                object.transitioned_object.free_version = true;
+                store.add_listed_version(object);
+            }
+            let manager = TierConfigMgr::new();
+            manager.write().await.tiers.insert("COLD-A".to_string(), tier);
+            assert!(manager.read().await.driver_cache.is_empty());
+
+            let result = TierConfigMgr::remove_and_save_with(&manager, store.clone(), "COLD-A", true).await;
+            if has_free_version {
+                match result.expect_err("a free-version reference must block force removal without constructing a driver") {
+                    TierConfigUpdateError::Publish(err) => {
+                        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+                        assert!(err.message.contains("photos/free-version.jpg"), "{}", err.message);
+                    }
+                    other => panic!("reference proof must surface as a publish error: {other:?}"),
+                }
+            } else {
+                result.expect("force removal without references must persist despite a forbidden endpoint");
+            }
+
+            {
+                let live = manager.read().await;
+                assert_eq!(live.tiers.contains_key("COLD-A"), has_free_version);
+                assert!(live.driver_cache.is_empty());
+            }
+            let (loaded, current_version) = load_tier_config_for_update(store)
+                .await
+                .expect("post-removal config must reload");
+            assert_eq!(loaded.tiers.contains_key("COLD-A"), has_free_version);
+            if has_free_version {
+                assert_eq!(current_version, original_version, "blocked removal must not save the candidate");
+                assert_eq!(
+                    tier_backend_identity(&loaded.tiers["COLD-A"]).expect("preserved tier identity must encode"),
+                    identity
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn zero_reference_proof_blocks_remove_before_config_save() {
         let store = Arc::new(CasConfigStore::default());
         let tier = build_rustfs_tier("COLD-A");
@@ -16344,6 +16974,698 @@ mod tests {
             .0;
         assert!(reloaded.tiers.contains_key("COLD-A"));
         assert!(reloaded.tiers.contains_key("COLD-B"));
+    }
+
+    async fn tier_deletion_fixture() -> (Arc<RwLock<TierConfigMgr>>, Arc<CasConfigStore>) {
+        let manager = TierConfigMgr::new();
+        manager
+            .write()
+            .await
+            .tiers
+            .insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        (manager, Arc::new(CasConfigStore::default()))
+    }
+
+    async fn check_tier_deletion(manager: &Arc<RwLock<TierConfigMgr>>, store: Arc<CasConfigStore>) -> TierDeletionCheck {
+        TierConfigMgr::deletion_check_with(manager, store, "COLD-A", Instant::now() + TIER_DELETION_CHECK_TIMEOUT)
+            .await
+            .expect("known tier should return typed diagnostic evidence")
+    }
+
+    fn assert_tier_deletion_reason(check: &TierDeletionCheck, kind: TierDeletionReasonKind) {
+        assert!(!check.proof_complete);
+        assert_eq!(check.remote.state, TierDeletionRemoteState::NotChecked);
+        assert_eq!(check.reasons, vec![TierDeletionReason { kind }]);
+        assert_eq!(
+            check.scan_status,
+            if kind == TierDeletionReasonKind::ProofIncomplete {
+                TierDeletionScanStatus::Incomplete
+            } else {
+                TierDeletionScanStatus::StoppedAfterBlocker
+            }
+        );
+    }
+
+    // Match the isolated local-disk fixtures used by the authoritative proof,
+    // while keeping these production-walk checks in the tier module.
+    async fn tier_deletion_physical_fixture() -> (tempfile::TempDir, Arc<ECStore>, tokio_util::sync::DropGuard) {
+        let root = tempfile::tempdir().expect("physical diagnostic fixture should create disks");
+        let mut pools = Vec::new();
+        for pool in 0..2 {
+            let mut endpoints = Vec::new();
+            for set in 0..2 {
+                for disk in 0..4 {
+                    let path = root.path().join(format!("pool{pool}/set{set}/disk{disk}"));
+                    tokio::fs::create_dir_all(&path).await.expect("disk directory should exist");
+                    let mut endpoint = Endpoint::try_from(path.to_str().expect("disk path should be UTF-8"))
+                        .expect("disk endpoint should parse");
+                    endpoint.set_pool_index(pool);
+                    endpoint.set_set_index(set);
+                    endpoint.set_disk_index(disk);
+                    endpoints.push(endpoint);
+                }
+            }
+            pools.push(PoolEndpoints {
+                legacy: false,
+                set_count: 2,
+                drives_per_set: 4,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: format!("tier-deletion-physical-{pool}"),
+                platform: "test".to_string(),
+            });
+        }
+        let endpoints = EndpointServerPools(pools);
+        crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        crate::store::init_local_disks_with_instance_ctx(&ctx, endpoints.clone())
+            .await
+            .expect("fixture disks should initialize");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let cancel_on_drop = shutdown.clone().drop_guard();
+        let store = temp_env::async_with_vars(
+            [
+                (crate::config::storageclass::STANDARD_ENV, None),
+                (crate::config::storageclass::RRS_ENV, None),
+                (crate::config::storageclass::OPTIMIZE_ENV, None),
+                (crate::config::storageclass::INLINE_BLOCK_ENV, None),
+                ("RUSTFS_TIER_FREE_VERSION_RECOVERY_ENABLED", Some("false")),
+            ],
+            ECStore::new_with_instance_ctx("127.0.0.1:0".parse().expect("test address"), endpoints, shutdown, ctx),
+        )
+        .await
+        .expect("real physical store should initialize");
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        (root, store, cancel_on_drop)
+    }
+
+    async fn make_tier_deletion_physical_bucket(store: &ECStore, bucket: &str) {
+        use crate::disk::DiskAPI;
+
+        // The production walker reads physical volumes directly. Avoid the
+        // unrelated bucket-configuration write path in this isolated fixture.
+        for pool in &store.pools {
+            for set in &pool.disk_set {
+                let disks = set.disks.read().await.clone();
+                for disk in disks.into_iter().flatten() {
+                    disk.make_volume(bucket).await.expect("physical fixture volume should exist");
+                }
+            }
+        }
+    }
+
+    async fn seed_tier_deletion_physical_metadata(
+        root: &std::path::Path,
+        pool: usize,
+        set: usize,
+        bucket: &str,
+        object: &str,
+        transitioned: bool,
+    ) {
+        // All replicas of a version must agree to form a metadata quorum.
+        let mod_time = OffsetDateTime::now_utc() + time::Duration::hours(if transitioned { 0 } else { 1 });
+        for disk in 0..4 {
+            let mut info = FileInfo::new(object, 2, 2);
+            info.volume = bucket.to_string();
+            info.name = object.to_string();
+            info.mod_time = Some(mod_time);
+            info.erasure.index = disk + 1;
+            info.data_dir = Some(uuid::Uuid::from_u128(0x1234));
+            info.size = 1;
+            info.parts = vec![rustfs_filemeta::ObjectPartInfo {
+                number: 1,
+                size: 1,
+                actual_size: 1,
+                ..Default::default()
+            }];
+            info.metadata.insert("etag".to_string(), "diagnostic-fixture".to_string());
+            info.data = Some(Bytes::from_static(b"x"));
+            info.set_inline_data();
+            if transitioned {
+                info.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+                info.transition_tier = "COLD-A".to_string();
+                info.transitioned_objname = "private-remote-key".to_string();
+                info.transition_version = Some("private-provider-version".to_string());
+                info.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+            }
+            info.validate_for_metadata_read().expect("fixture metadata should validate");
+            let mut metadata = rustfs_filemeta::FileMeta::new();
+            metadata.add_version(info).expect("fixture version should encode");
+            let directory = root.join(format!("pool{pool}/set{set}/disk{disk}/{bucket}/{object}"));
+            tokio::fs::create_dir_all(&directory)
+                .await
+                .expect("object directory should exist");
+            tokio::fs::write(
+                directory.join(crate::disk::STORAGE_FORMAT_FILE),
+                metadata.marshal_msg().expect("fixture xl.meta should encode"),
+            )
+            .await
+            .expect("real metadata should persist");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_deletion_check_production_walk_finds_references_in_every_physical_set() {
+        let (root, store, _shutdown) = tier_deletion_physical_fixture().await;
+        let bucket = "tier-diagnostic-cross-set";
+        let object = "same-key";
+        make_tier_deletion_physical_bucket(&store, bucket).await;
+        let target = TierMutationIntentTarget {
+            tier_name: "COLD-A".to_string(),
+            old_backend_identity: None,
+            new_backend_identity: None,
+        };
+        for pool in 0..2 {
+            for set in 0..2 {
+                seed_tier_deletion_physical_metadata(root.path(), pool, set, bucket, object, false).await;
+            }
+        }
+        for pool in 0..2 {
+            for set in 0..2 {
+                seed_tier_deletion_physical_metadata(root.path(), pool, set, bucket, object, true).await;
+                let evidence = tier_deletion_check_bucket(
+                    store.clone(),
+                    bucket,
+                    &target,
+                    &tokio_util::sync::CancellationToken::new(),
+                    Instant::now() + TIER_DELETION_CHECK_TIMEOUT,
+                )
+                .await
+                .expect("each real physical set should decode fixture metadata with quorum");
+                assert_tier_deletion_reason(
+                    &TierDeletionCheck::from_evidence("COLD-A", Ok(evidence)),
+                    TierDeletionReasonKind::LiveTransitionedVersion,
+                );
+                seed_tier_deletion_physical_metadata(root.path(), pool, set, bucket, object, false).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_deletion_check_production_walk_and_topology_errors_are_incomplete() {
+        let (_root, store, _shutdown) = tier_deletion_physical_fixture().await;
+        let bucket = "tier-diagnostic-failed-set";
+        make_tier_deletion_physical_bucket(&store, bucket).await;
+        let target = TierMutationIntentTarget {
+            tier_name: "COLD-A".to_string(),
+            old_backend_identity: None,
+            new_backend_identity: None,
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let scan = || {
+            tier_deletion_check_bucket(
+                store.clone(),
+                bucket,
+                &target,
+                &cancellation,
+                Instant::now() + TIER_DELETION_CHECK_TIMEOUT,
+            )
+        };
+        // A healthy empty physical walk establishes the baseline before fault injection.
+        assert!(scan().await.expect("all physical sets should scan").is_none());
+        store.pools[1].disk_set[1].disks.write().await.fill(None);
+        assert_tier_deletion_reason(
+            &TierDeletionCheck::from_evidence("COLD-A", scan().await),
+            TierDeletionReasonKind::ProofIncomplete,
+        );
+        let (manager, _) = tier_deletion_fixture().await;
+        let check = TierConfigMgr::deletion_check(&manager, store, "COLD-A")
+            .await
+            .expect("known tier should return diagnostic evidence");
+        assert_tier_deletion_reason(&check, TierDeletionReasonKind::ProofIncomplete);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_deletion_check_production_walk_cancellation_awaits_channel_shutdown() {
+        let (root, store, _shutdown) = tier_deletion_physical_fixture().await;
+        let bucket = "tier-diagnostic-cancel";
+        make_tier_deletion_physical_bucket(&store, bucket).await;
+        for pool in 0..2 {
+            for set in 0..2 {
+                for object in ["first", "second", "third"] {
+                    seed_tier_deletion_physical_metadata(root.path(), pool, set, bucket, object, false).await;
+                }
+            }
+        }
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let walk_cancellation = cancellation.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut walk = tokio::spawn(async move {
+            store
+                .walk_bucket_for_deletion_check(walk_cancellation, bucket, tx, TierReferenceProofWalkOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rx.is_empty() {
+                tokio::select! {
+                    result = &mut walk => panic!("real walk ended before producing fixture metadata: {result:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        })
+        .await
+        .expect("real walk should reach result backpressure");
+        assert!(!walk.is_finished(), "full result channel must keep the real walk active");
+        cancellation.cancel();
+        let _ = tokio::time::timeout(TIER_DELETION_CHECK_SHUTDOWN_TIMEOUT, walk)
+            .await
+            .expect("cancelled production walk should shut down")
+            .expect("production walk task should join");
+        tokio::time::timeout(Duration::from_secs(1), async { while rx.recv().await.is_some() {} })
+            .await
+            .expect("every result sender must close after the production walk joins");
+    }
+
+    #[tokio::test]
+    async fn tier_deletion_check_serializes_only_the_agreed_advisory_schema() {
+        let (manager, store) = tier_deletion_fixture().await;
+        let complete = check_tier_deletion(&manager, store.clone()).await;
+        assert_eq!(
+            serde_json::to_value(&complete).expect("diagnostic should serialize"),
+            serde_json::json!({
+                "tierName": "COLD-A", "proofComplete": true, "scanStatus": "complete",
+                "reasons": [], "remote": {"state": "not_checked"}
+            })
+        );
+        store.add_listed_version(transitioned_tier_object("private-bucket", "private-object", "COLD-A", None));
+        let blocked = check_tier_deletion(&manager, store).await;
+        assert_eq!(
+            serde_json::to_value(&blocked).expect("blocker should serialize"),
+            serde_json::json!({
+                "tierName": "COLD-A", "proofComplete": false, "scanStatus": "stopped_after_blocker",
+                "reasons": [{"kind": "LIVE_TRANSITIONED_VERSION"}], "remote": {"state": "not_checked"}
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_deletion_check_reports_live_historical_free_and_pending_versions() {
+        for (free_version, status, reason) in [
+            (
+                false,
+                rustfs_filemeta::TRANSITION_COMPLETE,
+                TierDeletionReasonKind::LiveTransitionedVersion,
+            ),
+            (true, rustfs_filemeta::TRANSITION_PENDING, TierDeletionReasonKind::CleanupPending),
+            (false, rustfs_filemeta::TRANSITION_PENDING, TierDeletionReasonKind::TransitionPending),
+        ] {
+            let (manager, store) = tier_deletion_fixture().await;
+            let mut version = transitioned_tier_object("private-bucket", "history", "COLD-A", None);
+            version.version_id = Some(uuid::Uuid::new_v4());
+            version.is_latest = false;
+            version.transitioned_object.free_version = free_version;
+            version.transitioned_object.status = status.to_string();
+            store.add_listed_version(version);
+            // A first blocker says nothing about later corrupt or unrelated records.
+            store
+                .insert_config_object(format!("{TIER_DELETE_JOURNAL_PREFIX}corrupt"), b"broken".to_vec())
+                .await;
+            assert_tier_deletion_reason(&check_tier_deletion(&manager, store).await, reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_deletion_check_reports_current_and_noncurrent_lifecycle_references() {
+        for noncurrent in [false, true] {
+            let (manager, store) = tier_deletion_fixture().await;
+            store.add_listed_version(ObjectInfo {
+                bucket: "private-bucket".to_string(),
+                ..Default::default()
+            });
+            store.add_lifecycle_config(
+                "private-bucket",
+                BucketLifecycleConfiguration {
+                    expiry_updated_at: None,
+                    rules: vec![LifecycleRule {
+                        status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                        id: Some("private-rule".to_string()),
+                        noncurrent_version_transitions: noncurrent.then(|| {
+                            vec![NoncurrentVersionTransition {
+                                noncurrent_days: Some(1),
+                                newer_noncurrent_versions: None,
+                                storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                            }]
+                        }),
+                        transitions: (!noncurrent).then(|| {
+                            vec![Transition {
+                                days: Some(1),
+                                date: None,
+                                storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                            }]
+                        }),
+                        expiration: None,
+                        abort_incomplete_multipart_upload: None,
+                        del_marker_expiration: None,
+                        filter: None,
+                        noncurrent_version_expiration: None,
+                        prefix: None,
+                    }],
+                },
+            );
+            let result = check_tier_deletion(&manager, store).await;
+            assert_tier_deletion_reason(&result, TierDeletionReasonKind::LifecycleReference);
+            assert_eq!(
+                serde_json::to_value(result).expect("lifecycle reason should serialize")["reasons"],
+                serde_json::json!([{"kind": "LIFECYCLE_REFERENCE"}])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_deletion_check_reports_journals_and_transition_transactions() {
+        use crate::bucket::lifecycle::{
+            tier_delete_journal::{encode_tier_delete_journal_entry, tier_delete_journal_object_name},
+            tier_sweeper::{Jentry, TierDeleteJournalState},
+            transition_transaction::{
+                TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction, TransitionTransactionInit,
+                transition_transaction_record_object_name,
+            },
+        };
+        let journal = Jentry {
+            persisted_version: 0,
+            obj_name: "private-remote-object".to_string(),
+            version_id: "private-version".to_string(),
+            tier_name: "COLD-A".to_string(),
+            backend_identity: Some([7; 32]),
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: TierDeleteJournalState::Committed,
+            source: None,
+            dispatch: None,
+        };
+        let transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: uuid::Uuid::new_v4(),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "private-bucket".to_string(),
+                object: "private-object".to_string(),
+                version_id: None,
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1,
+                size: 1,
+                etag: "private-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Unversioned,
+            },
+            tier_name: "COLD-A".to_string(),
+            backend_fingerprint: [8; 32],
+            not_after_unix_nanos: 2,
+        })
+        .expect("transition transaction fixture should initialize");
+        for (object, data, reason, wire_kind) in [
+            (
+                tier_delete_journal_object_name(&journal),
+                encode_tier_delete_journal_entry(&journal).expect("journal should encode"),
+                TierDeletionReasonKind::CleanupPending,
+                "CLEANUP_PENDING",
+            ),
+            (
+                transition_transaction_record_object_name(transaction.transaction_id).expect("transaction path should build"),
+                transaction.encode().expect("transaction should encode"),
+                TierDeletionReasonKind::TransitionPending,
+                "TRANSITION_PENDING",
+            ),
+        ] {
+            let (manager, store) = tier_deletion_fixture().await;
+            store.insert_config_object(object, data).await;
+            let check = check_tier_deletion(&manager, store).await;
+            assert_tier_deletion_reason(&check, reason);
+            assert_eq!(
+                serde_json::to_value(check).expect("record reason should serialize")["reasons"],
+                serde_json::json!([{"kind": wire_kind}])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_deletion_check_corruption_and_incomplete_evidence_fail_closed() {
+        for prefix in [TIER_DELETE_JOURNAL_PREFIX, TRANSITION_TRANSACTION_RECORD_PREFIX] {
+            for data in [Vec::new(), b"{malformed-private-persistence".to_vec()] {
+                let (manager, store) = tier_deletion_fixture().await;
+                store.insert_config_object(format!("{prefix}broken"), data).await;
+                let check = check_tier_deletion(&manager, store).await;
+                assert_tier_deletion_reason(&check, TierDeletionReasonKind::ProofIncomplete);
+                assert_eq!(
+                    serde_json::to_value(check).expect("incomplete should serialize")["reasons"],
+                    serde_json::json!([{"kind": "PROOF_INCOMPLETE"}])
+                );
+            }
+        }
+        for failure in ["walk", "topology", "lifecycle", "listing", "identity", "status"] {
+            let (manager, store) = tier_deletion_fixture().await;
+            let mut object = transitioned_tier_object("private-bucket", "private-object", "OTHER-TIER", None);
+            match failure {
+                "walk" => store.fail_reference_walk(),
+                "topology" => store.reference_topology_incomplete.store(true, Ordering::SeqCst),
+                "lifecycle" => store.reference_lifecycle_error.store(true, Ordering::SeqCst),
+                "listing" => store.reference_list_incomplete.store(true, Ordering::SeqCst),
+                "identity" => {
+                    object.transitioned_object.tier = "COLD-A".to_string();
+                    let mut metadata = HashMap::new();
+                    rustfs_utils::http::metadata_compat::insert_str(
+                        &mut metadata,
+                        rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                        "malformed-private-identity".to_string(),
+                    );
+                    object.user_defined = Arc::new(metadata);
+                }
+                "status" => {
+                    object.transitioned_object.tier = "COLD-A".to_string();
+                    object.transitioned_object.status = "invalid-status".to_string();
+                }
+                _ => unreachable!("closed fixture cases"),
+            }
+            store.add_listed_version(object);
+            assert_tier_deletion_reason(&check_tier_deletion(&manager, store).await, TierDeletionReasonKind::ProofIncomplete);
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_deletion_check_is_read_only_and_never_contacts_remote() {
+        let (manager, store) = tier_deletion_fixture().await;
+        let backend = RecordingWarmBackend::new();
+        TierConfigMgr::install_test_driver_in(&manager, "COLD-A", Box::new(backend.clone()))
+            .await
+            .expect("recording driver and generation runtime should install");
+        manager
+            .read()
+            .await
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("config fixture should save");
+        let before_config = manager.read().await.marshal().expect("manager should serialize");
+        let before_objects = store.objects.lock().await.clone();
+        let before_etag = store.next_etag.load(Ordering::SeqCst);
+        let runtime = registered_tier_driver_runtime(&*manager.read().await).expect("driver runtime should exist");
+        let generation = lock_unpoisoned(&runtime).generations["COLD-A"].generation;
+        // Unrelated versions and records cannot become a target blocker.
+        store.add_listed_version(transitioned_tier_object("private-bucket", "private-object", "OTHER-TIER", None));
+        let never_build: TierDriverTestFactory = Arc::new(|_| panic!("diagnostics must not construct a remote driver"));
+        let check = TIER_DRIVER_TEST_FACTORY
+            .scope(never_build, check_tier_deletion(&manager, store.clone()))
+            .await;
+        assert!(check.proof_complete);
+        assert_eq!(manager.read().await.marshal().expect("manager should remain serializable"), before_config);
+        assert_eq!(*store.objects.lock().await, before_objects);
+        assert_eq!(store.next_etag.load(Ordering::SeqCst), before_etag);
+        assert!(store.delete_log().await.is_empty());
+        assert!(
+            store
+                .lock_requests
+                .lock()
+                .expect("lock requests should not poison")
+                .is_empty()
+        );
+        assert_eq!(store.intent_list_calls(), 0);
+        assert!(backend.op_log().await.is_empty(), "no remote operations, including in_use, are allowed");
+        let runtime = lock_unpoisoned(&runtime);
+        assert_eq!(runtime.generations["COLD-A"].generation, generation);
+        assert!(runtime.draining.is_empty());
+        assert!(runtime.prepared_mutation_blocks.is_empty());
+        assert!(runtime.committed_mutation_blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tier_deletion_check_unknown_tier_retains_normal_not_found_error() {
+        let manager = TierConfigMgr::new();
+        let store = Arc::new(CasConfigStore::default());
+        let err =
+            TierConfigMgr::deletion_check_with(&manager, store.clone(), "MISSING", Instant::now() + TIER_DELETION_CHECK_TIMEOUT)
+                .await
+                .expect_err("unknown tier must retain its existing admin error");
+        assert_eq!(err.code, ERR_TIER_NOT_FOUND.code);
+        assert_eq!(store.reference_walk_send_count(), 0);
+        assert!(store.objects.lock().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_deletion_check_deadline_cancels_and_awaits_walk_shutdown() {
+        let (manager, store) = tier_deletion_fixture().await;
+        store.add_listed_version(ObjectInfo {
+            bucket: "private-bucket".to_string(),
+            ..Default::default()
+        });
+        let barrier = Arc::new(CasReferenceWalkBarrier::default());
+        *store.reference_walk_barrier.lock().expect("walk barrier should not poison") = Some(barrier.clone());
+        let check = check_tier_deletion(&manager, store);
+        tokio::pin!(check);
+        tokio::select! {
+            _ = barrier.arrived.notified() => {},
+            result = &mut check => panic!("walk must start before returning: {result:?}"),
+        }
+        tokio::time::advance(TIER_DELETION_CHECK_TIMEOUT).await;
+        tokio::select! {
+            _ = barrier.cancelled.notified() => {},
+            result = &mut check => panic!("must await cancelled walk shutdown: {result:?}"),
+        }
+        assert!(!barrier.finished.load(Ordering::SeqCst));
+        assert!((&mut check).now_or_never().is_none(), "diagnostic must still await shutdown");
+        barrier.release.add_permits(1);
+        assert_tier_deletion_reason(&check.await, TierDeletionReasonKind::ProofIncomplete);
+        assert!(barrier.finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_deletion_check_shutdown_aborts_and_awaits_unresponsive_walk() {
+        for has_blocker in [false, true] {
+            let (manager, store) = tier_deletion_fixture().await;
+            store.add_listed_version(ObjectInfo {
+                bucket: "private-bucket".to_string(),
+                ..Default::default()
+            });
+            let barrier = Arc::new(CasReferenceWalkBarrier {
+                entry: has_blocker.then(|| transitioned_tier_object("private-bucket", "private-object", "COLD-A", None)),
+                ..Default::default()
+            });
+            *store.reference_walk_barrier.lock().expect("walk barrier should not poison") = Some(barrier.clone());
+            let check = check_tier_deletion(&manager, store);
+            tokio::pin!(check);
+            tokio::select! {
+                _ = barrier.arrived.notified() => {},
+                result = &mut check => panic!("walk must start before returning: {result:?}"),
+            }
+            if !has_blocker {
+                tokio::time::advance(TIER_DELETION_CHECK_TIMEOUT).await;
+            }
+            tokio::select! {
+                _ = barrier.cancelled.notified() => {},
+                result = &mut check => panic!("must allow cooperative shutdown before aborting: {result:?}"),
+            }
+            assert!(!barrier.finished.load(Ordering::SeqCst));
+            assert!((&mut check).now_or_never().is_none());
+            tokio::time::advance(TIER_DELETION_CHECK_SHUTDOWN_TIMEOUT).await;
+            assert_tier_deletion_reason(&check.await, TierDeletionReasonKind::ProofIncomplete);
+            assert!(barrier.finished.load(Ordering::SeqCst), "aborted walk must be joined before return");
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_deletion_check_explicit_cancellation_awaits_walk_shutdown() {
+        let (_, store) = tier_deletion_fixture().await;
+        let barrier = Arc::new(CasReferenceWalkBarrier::default());
+        *store.reference_walk_barrier.lock().expect("walk barrier should not poison") = Some(barrier.clone());
+        let target = TierMutationIntentTarget {
+            tier_name: "COLD-A".to_string(),
+            old_backend_identity: None,
+            new_backend_identity: None,
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let walk = tier_deletion_check_bucket(
+            store,
+            "private-bucket",
+            &target,
+            &cancellation,
+            Instant::now() + TIER_DELETION_CHECK_TIMEOUT,
+        );
+        tokio::pin!(walk);
+        tokio::select! {
+            _ = barrier.arrived.notified() => {},
+            result = &mut walk => panic!("walk must start before cancellation: {result:?}"),
+        }
+        cancellation.cancel();
+        tokio::select! {
+            _ = barrier.cancelled.notified() => {},
+            result = &mut walk => panic!("must await shutdown after explicit cancellation: {result:?}"),
+        }
+        assert!((&mut walk).now_or_never().is_none());
+        barrier.release.add_permits(1);
+        assert!(walk.await.is_err());
+        assert!(barrier.finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_deletion_check_deadline_bounds_persisted_listing_and_manager_lock() {
+        let (manager, store) = tier_deletion_fixture().await;
+        let barrier = store.pause_next_list_with_prefix(TIER_DELETE_JOURNAL_PREFIX).await;
+        let check = check_tier_deletion(&manager, store.clone());
+        tokio::pin!(check);
+        tokio::select! {
+            _ = barrier.arrived.notified() => {},
+            result = &mut check => panic!("must start listing before deadline: {result:?}"),
+        }
+        tokio::time::advance(TIER_DELETION_CHECK_TIMEOUT).await;
+        assert_tier_deletion_reason(&check.await, TierDeletionReasonKind::ProofIncomplete);
+        let _manager_guard = manager.write().await;
+        let check = check_tier_deletion(&manager, store);
+        tokio::pin!(check);
+        assert!((&mut check).now_or_never().is_none());
+        tokio::time::advance(TIER_DELETION_CHECK_TIMEOUT).await;
+        assert_tier_deletion_reason(&check.await, TierDeletionReasonKind::ProofIncomplete);
+    }
+
+    #[tokio::test]
+    async fn tier_deletion_check_releases_manager_and_delete_reruns_proof_after_advisory_success() {
+        let (manager, store) = tier_deletion_fixture().await;
+        let barrier = store.pause_next_list_with_prefix(TIER_DELETE_JOURNAL_PREFIX).await;
+        let check = check_tier_deletion(&manager, store.clone());
+        tokio::pin!(check);
+        tokio::select! {
+            _ = barrier.arrived.notified() => {},
+            result = &mut check => panic!("must reach I/O before config change: {result:?}"),
+        }
+        {
+            let mut config = manager.try_write().expect("diagnostics must not hold the manager across I/O");
+            config
+                .tiers
+                .get_mut("COLD-A")
+                .expect("tier should exist")
+                .rustfs
+                .as_mut()
+                .expect("payload should exist")
+                .prefix = "changed-during-diagnostic".to_string();
+        }
+        barrier.release.add_permits(1);
+        assert!(
+            check.await.proof_complete,
+            "a local evidence scan remains advisory when configuration changes"
+        );
+        manager
+            .read()
+            .await
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("changed configuration should persist");
+        let version = transitioned_tier_object("private-bucket", "arrived-after-check", "COLD-A", None);
+        store.add_listed_version(version);
+        let err = TierConfigMgr::remove_and_save_with(&manager, store.clone(), "COLD-A", true)
+            .await
+            .expect_err("forced DELETE must rerun the authoritative proof after a successful diagnostic");
+        let TierConfigUpdateError::Publish(err) = err else {
+            panic!("DELETE must fail at its proof: {err:?}")
+        };
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+        assert!(manager.read().await.tiers.contains_key("COLD-A"));
+        assert!(
+            load_tier_config_for_update(store)
+                .await
+                .expect("blocked tier config should reload")
+                .0
+                .tiers
+                .contains_key("COLD-A")
+        );
     }
 
     #[tokio::test]
@@ -17623,7 +18945,10 @@ mod tests {
                             TierConfigMgr::update_candidate_with_config_lock(
                                 &manager,
                                 store,
-                                TierCandidateMutation::Remove("COLD-A".to_string(), true),
+                                // Non-force removal still validates the remote driver before
+                                // entering reference proof; force removal intentionally skips
+                                // that construction so an invalid endpoint can be removed.
+                                TierCandidateMutation::Remove("COLD-A".to_string(), false),
                             ),
                         ),
                     ),

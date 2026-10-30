@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::NodeService;
+use super::{LocalMutationTarget, NodeService};
 use crate::storage::storage_api::rpc_consumer::node_service::contract::bucket::{
     BucketOptions, DeleteBucketOptions, MakeBucketOptions,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    DiskError, StoragePeerS3ClientExt as _, decode_heal_bucket_rpc_options, reload_bucket_metadata, remove_bucket_metadata,
+    DiskError, StoragePeerS3ClientExt as _, decode_heal_bucket_rpc_options, reload_bucket_metadata,
+    remove_bucket_metadata_if_absent,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use tonic::{Request, Response, Status};
 use tracing::debug;
+use uuid::Uuid;
 
 impl NodeService {
     pub(super) async fn handle_delete_bucket_metadata(
@@ -37,9 +39,16 @@ impl NodeService {
             }));
         }
 
-        // Drop the bucket's cached metadata on this peer so it stops serving
-        // stale configuration after the bucket has been deleted.
-        match remove_bucket_metadata(&bucket).await {
+        // Drop the bucket's cached metadata only if the namespace is still
+        // absent. A delayed delete notification must not erase metadata for a
+        // same-name bucket that has already been recreated.
+        let Some(store) = self.resolve_object_store() else {
+            return Ok(Response::new(DeleteBucketMetadataResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        };
+        match remove_bucket_metadata_if_absent(store, &bucket).await {
             Ok(_) => Ok(Response::new(DeleteBucketMetadataResponse {
                 success: true,
                 error_info: None,
@@ -252,11 +261,30 @@ impl NodeService {
             }
         };
 
-        match self
-            .local_peer
-            .heal_bucket_with_fence(&request.bucket, &options, &fenced_pools)
-            .await
-        {
+        let result = if request.bucket_incarnation_id.is_empty() {
+            self.local_peer
+                .heal_bucket_with_fence(&request.bucket, &options, &fenced_pools)
+                .await
+        } else {
+            let expected = Uuid::from_slice(&request.bucket_incarnation_id)
+                .ok()
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
+            let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+                return Err(Status::failed_precondition("bucket heal requires a ready storage instance"));
+            };
+            store
+                .heal_local_bucket_at_incarnation(
+                    &request.bucket,
+                    expected,
+                    &options,
+                    fenced_pools,
+                    self.local_peer.pools.clone(),
+                )
+                .await
+                .map_err(|error| DiskError::other(error.to_string()))
+        };
+        match result {
             Ok(_) => Ok(Response::new(HealBucketResponse {
                 success: true,
                 error: None,

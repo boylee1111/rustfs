@@ -16,11 +16,11 @@ use crate::app::object_data_cache::ObjectDataCacheAdapter;
 #[cfg(test)]
 use crate::app::storage_api::runtime_sources::TierConfigMgr;
 use crate::runtime_sources as root_runtime_sources;
-#[cfg(test)]
 pub(crate) use crate::runtime_sources::ServerContextSlot;
 pub(crate) use crate::runtime_sources::{
     AppContext, current_encryption_service, current_endpoints_handle, current_notification_system,
-    current_object_data_cache_handle_for_context, current_object_store_handle_for_context,
+    current_notification_system_for_context, current_object_data_cache_handle_for_context,
+    current_object_store_handle_for_context,
 };
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use s3s::dto::SelectObjectContentInput;

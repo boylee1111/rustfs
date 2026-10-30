@@ -13,12 +13,15 @@
 // limitations under the License.
 
 use crate::last_minute::{AccElem, LastMinuteLatency};
+use crate::usage_candidate::{
+    ScannerUsageCandidateCount, ScannerUsageCandidateKind, ScannerUsageCandidateOutcome, USAGE_CANDIDATE_COUNTER_SLOTS,
+};
 use chrono::{DateTime, Utc};
 use jiff::Timestamp;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Display,
     future::Future,
     pin::Pin,
@@ -880,15 +883,136 @@ pub struct TierRequestCount {
 
 const TIER_REQUEST_COUNTER_SLOTS: usize = TierRequestOperation::ALL.len() * TierRequestOutcome::ALL.len();
 
+/// Remote work belongs to one cycle; retained worker handles cannot update a later cycle.
+#[derive(Default)]
+pub struct RemoteScanProgress {
+    objects: AtomicU64,
+    directories: AtomicU64,
+}
+
+impl RemoteScanProgress {
+    /// Record authenticated per-walk deltas without changing process-local operation counters.
+    pub fn record(&self, objects: u64, directories: u64) {
+        for (counter, delta) in [(&self.objects, objects), (&self.directories, directories)] {
+            if delta != 0 {
+                let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_add(delta)));
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScannerUsagePublicationClass {
+    #[default]
+    Unknown,
+    ProgressOnly,
+    Observational,
+    CompletePending,
+    CompleteConverged,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScannerUsagePublicationOutcome {
+    #[default]
+    Unknown,
+    Running,
+    NoUpdate,
+    Saved,
+    AlreadyDurable,
+    PriorCycleDurable,
+    Current,
+    Deferred,
+    Failed,
+    Interrupted,
+}
+
+/// One node-local publication attempt, independent of cycle completion and heal integrity.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScannerUsagePublicationStatus {
+    pub scanner_epoch: Option<u64>,
+    pub cycle: Option<u64>,
+    pub class: ScannerUsagePublicationClass,
+    pub outcome: ScannerUsagePublicationOutcome,
+    /// Count from the confirmed authoritative snapshot, never the live dirty map.
+    pub pending_bucket_count: Option<u64>,
+    pub snapshot_updated_at_unix_secs: Option<u64>,
+    pub observed_at_unix_secs: Option<u64>,
+}
+
+/// Replacing this handle fences late updates from an earlier attempt, including retries of the same cycle.
+#[derive(Default)]
+pub struct ScannerUsagePublicationObservation {
+    status: Mutex<ScannerUsagePublicationStatus>,
+}
+
+impl ScannerUsagePublicationObservation {
+    pub fn new(scanner_epoch: u64, cycle: u64) -> Self {
+        Self {
+            status: Mutex::new(ScannerUsagePublicationStatus {
+                scanner_epoch: Some(scanner_epoch),
+                cycle: Some(cycle),
+                outcome: ScannerUsagePublicationOutcome::Running,
+                observed_at_unix_secs: Some(unix_now_secs()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    pub fn record(&self, mut status: ScannerUsagePublicationStatus) {
+        let mut current = self.status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if status.scanner_epoch != current.scanner_epoch || status.cycle != current.cycle {
+            status = ScannerUsagePublicationStatus {
+                scanner_epoch: current.scanner_epoch,
+                cycle: current.cycle,
+                ..Default::default()
+            };
+        }
+        status.observed_at_unix_secs = Some(unix_now_secs());
+        *current = status;
+    }
+
+    pub fn finish(&self) {
+        let mut status = self.status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if status.outcome == ScannerUsagePublicationOutcome::Running {
+            status.outcome = ScannerUsagePublicationOutcome::Unknown;
+            status.observed_at_unix_secs = Some(unix_now_secs());
+        }
+    }
+
+    pub fn interrupt(&self) {
+        let mut status = self.status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *status = ScannerUsagePublicationStatus {
+            scanner_epoch: status.scanner_epoch,
+            cycle: status.cycle,
+            outcome: ScannerUsagePublicationOutcome::Interrupted,
+            observed_at_unix_secs: Some(unix_now_secs()),
+            ..Default::default()
+        };
+    }
+
+    fn snapshot(&self) -> ScannerUsagePublicationStatus {
+        self.status.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+}
+
 pub struct Metrics {
+    startup: crate::startup::ScannerStartupObservation,
     operations: Vec<AtomicU64>,
     latency: Vec<LockedLastMinuteLatency>,
     actions: Vec<AtomicU64>,
     actions_latency: Vec<LockedLastMinuteLatency>,
     current_paths: Arc<RwLock<HashMap<String, Arc<CurrentPathTracker>>>>,
     cycle_info: Arc<RwLock<Option<CurrentCycle>>>,
+    // Lock order: cycle_info, usage_publication, then the observation's status. No awaits under either mutex.
+    usage_publication: Mutex<Arc<ScannerUsagePublicationObservation>>,
     current_scan_mode: AtomicU8,
     current_scan_cycle_work_active: AtomicBool,
+    // Cycle transitions and reports lock cycle_info before remote_scan_progress.
+    // Cycle transitions take cycle_info before this lock; never hold it across awaits
+    // or while acquiring another metrics lock. Workers update their own handle directly.
+    remote_scan_progress: Mutex<Arc<RemoteScanProgress>>,
     current_scan_cycle_objects_start: AtomicU64,
     current_scan_cycle_directories_start: AtomicU64,
     current_scan_cycle_bucket_drive_scans_start: AtomicU64,
@@ -897,6 +1021,8 @@ pub struct Metrics {
     current_scan_cycle_yield_duration_millis_start: AtomicU64,
     current_scan_cycle_throttle_sleep_events_start: AtomicU64,
     current_scan_cycle_throttle_sleep_duration_millis_start: AtomicU64,
+    current_scan_cycle_disk_io_budget_wait_events_start: AtomicU64,
+    current_scan_cycle_disk_io_budget_wait_duration_millis_start: AtomicU64,
     current_scan_cycle_ilm_actions_start: AtomicU64,
     current_scan_cycle_lifecycle_expiry_actions_start: AtomicU64,
     current_scan_cycle_lifecycle_transition_actions_start: AtomicU64,
@@ -934,6 +1060,8 @@ pub struct Metrics {
     last_scan_cycle_yield_duration_millis: AtomicU64,
     last_scan_cycle_throttle_sleep_events: AtomicU64,
     last_scan_cycle_throttle_sleep_duration_millis: AtomicU64,
+    last_scan_cycle_disk_io_budget_wait_events: AtomicU64,
+    last_scan_cycle_disk_io_budget_wait_duration_millis: AtomicU64,
     last_scan_cycle_ilm_actions: AtomicU64,
     last_scan_cycle_lifecycle_expiry_actions: AtomicU64,
     last_scan_cycle_lifecycle_transition_actions: AtomicU64,
@@ -949,6 +1077,9 @@ pub struct Metrics {
     partial_scan_cycles_by_source: Vec<AtomicU64>,
     scanner_yield_duration_millis: AtomicU64,
     scanner_throttle_sleep_duration_millis: AtomicU64,
+    scanner_disk_io_budget_wait_events: AtomicU64,
+    scanner_disk_io_budget_wait_duration_millis: AtomicU64,
+    scanner_disk_io_budget_last_wait_unix_secs: AtomicU64,
     scanner_ilm_actions: AtomicU64,
     scanner_lifecycle_expiry_actions: AtomicU64,
     scanner_lifecycle_transition_actions: AtomicU64,
@@ -994,6 +1125,8 @@ pub struct Metrics {
     scanner_bitrot_cycle_enabled: AtomicBool,
     scanner_bitrot_cycle_millis: AtomicU64,
     scanner_checkpoint: Mutex<Option<ScannerCheckpointReport>>,
+    scanner_checkpoints_persisted: Mutex<BTreeMap<(usize, usize), ScannerPersistedCheckpointReport>>,
+    scanner_checkpoint_save_failures: AtomicU64,
     scanner_checkpoint_used: AtomicU64,
     scanner_checkpoint_cleared: AtomicU64,
     scanner_checkpoint_ignored: AtomicU64,
@@ -1003,11 +1136,18 @@ pub struct Metrics {
     scanner_dirty_usage_last_clear_unix_secs: AtomicU64,
     scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64,
     scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64,
+    usage_candidates: [AtomicU64; USAGE_CANDIDATE_COUNTER_SLOTS],
     scanner_usage_last_save_unix_secs: AtomicU64,
     scanner_usage_last_durable_success_unix_secs: AtomicU64,
     scanner_usage_last_publication_unix_secs: AtomicU64,
     scanner_usage_last_publication_state: Mutex<String>,
     scanner_usage_last_publication_reason: Mutex<String>,
+    scanner_guardrail_veto_total: AtomicU64,
+    scanner_guardrail_last_veto_unix_secs: AtomicU64,
+    scanner_guardrail_last_veto_reason: Mutex<String>,
+    scanner_scope_fallback_total: AtomicU64,
+    scanner_scope_fallback_last_unix_secs: AtomicU64,
+    scanner_scope_fallback_last_reason: Mutex<String>,
     scanner_usage_last_save_result: AtomicU8,
     scanner_usage_deferred_pending: AtomicBool,
     scanner_usage_deferred_total: AtomicU64,
@@ -1114,6 +1254,8 @@ pub struct ScanCycleWorkSnapshot {
     yield_duration_millis: u64,
     throttle_sleep_events: u64,
     throttle_sleep_duration_millis: u64,
+    disk_io_budget_wait_events: u64,
+    disk_io_budget_wait_duration_millis: u64,
     ilm_actions: u64,
     lifecycle_expiry_actions: u64,
     lifecycle_transition_actions: u64,
@@ -1135,6 +1277,15 @@ pub struct ScannerCheckpointReport {
     pub resume_after: String,
     pub reason: String,
     pub last_event: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerPersistedCheckpointReport {
+    pub pool_index: usize,
+    pub set_index: usize,
+    pub bucket: String,
+    pub saved_unix_secs: u64,
+    pub checkpoint: Option<ScannerCheckpointReport>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1225,6 +1376,8 @@ pub struct ScannerPacingPressureSnapshot {
     pub last_cycle_budget_limited: bool,
     pub last_cycle_pause_observed: bool,
     pub last_cycle_throttle_sleep_ratio: f64,
+    #[serde(default)]
+    pub last_cycle_disk_io_budget_wait_ratio: f64,
     pub last_cycle_yield_ratio: f64,
     pub last_cycle_total_pause_ratio: f64,
 }
@@ -1238,6 +1391,7 @@ impl Default for ScannerPacingPressureSnapshot {
             last_cycle_budget_limited: false,
             last_cycle_pause_observed: false,
             last_cycle_throttle_sleep_ratio: 0.0,
+            last_cycle_disk_io_budget_wait_ratio: 0.0,
             last_cycle_yield_ratio: 0.0,
             last_cycle_total_pause_ratio: 0.0,
         }
@@ -1326,6 +1480,30 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_deferred_unix_secs: u64,
     #[serde(default)]
     pub last_deferred_reason: String,
+    /// Guardrail vetoes attributed as `<field>@<host>`; a phase-2 peer
+    /// dirty-usage fallback is reported through the same fields.
+    #[serde(default)]
+    pub guardrail_veto_total: u64,
+    #[serde(default)]
+    pub last_guardrail_veto_unix_secs: u64,
+    #[serde(default)]
+    pub last_guardrail_veto_reason: String,
+    /// Cycles eligible for a dirty-bucket scope that walked the whole
+    /// namespace instead, with the reason of the last one.
+    #[serde(default)]
+    pub scope_fallback_total: u64,
+    #[serde(default)]
+    pub last_scope_fallback_unix_secs: u64,
+    #[serde(default)]
+    pub last_scope_fallback_reason: String,
+    /// Waits imposed by the per-disk background I/O budget; sustained waits
+    /// explain slow usage freshness on a budgeted disk.
+    #[serde(default)]
+    pub disk_io_budget_wait_events: u64,
+    #[serde(default)]
+    pub disk_io_budget_wait_millis: u64,
+    #[serde(default)]
+    pub last_disk_io_budget_wait_unix_secs: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1338,6 +1516,8 @@ pub struct ScannerLastMinute {
 pub struct ScannerMetricsReport {
     pub collected_at: Timestamp,
     pub current_cycle: u64,
+    #[serde(default)]
+    pub usage_publication: ScannerUsagePublicationStatus,
     #[serde(default)]
     pub current_cycle_active: bool,
     pub current_started: Timestamp,
@@ -1394,6 +1574,10 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub current_cycle_throttle_sleep_duration_seconds: f64,
     #[serde(default)]
+    pub current_cycle_disk_io_budget_wait_events: u64,
+    #[serde(default)]
+    pub current_cycle_disk_io_budget_wait_duration_seconds: f64,
+    #[serde(default)]
     pub current_cycle_ilm_actions: u64,
     #[serde(default)]
     pub current_cycle_lifecycle_expiry_actions: u64,
@@ -1433,6 +1617,10 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub last_cycle_throttle_sleep_duration_seconds: f64,
     #[serde(default)]
+    pub last_cycle_disk_io_budget_wait_events: u64,
+    #[serde(default)]
+    pub last_cycle_disk_io_budget_wait_duration_seconds: f64,
+    #[serde(default)]
     pub last_cycle_ilm_actions: u64,
     #[serde(default)]
     pub last_cycle_lifecycle_expiry_actions: u64,
@@ -1465,6 +1653,10 @@ pub struct ScannerMetricsReport {
     pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
     #[serde(default)]
     pub usage_freshness: ScannerUsageFreshnessSnapshot,
+    /// Process-lifetime candidate-construction results. Missing on older reports
+    /// means unobserved, not accepted or healthy. Publication is tracked separately.
+    #[serde(default)]
+    pub usage_candidates: Vec<ScannerUsageCandidateCount>,
     #[serde(default)]
     pub maintenance_control: ScannerMaintenanceControlSnapshot,
     #[serde(default)]
@@ -1499,6 +1691,10 @@ pub struct ScannerMetricsReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_checkpoint: Option<ScannerCheckpointReport>,
     #[serde(default)]
+    pub scan_checkpoints_persisted: Vec<ScannerPersistedCheckpointReport>,
+    #[serde(default)]
+    pub scan_checkpoint_save_failures: u64,
+    #[serde(default)]
     pub scan_checkpoint_used: u64,
     #[serde(default)]
     pub scan_checkpoint_cleared: u64,
@@ -1520,6 +1716,8 @@ pub struct ScannerMetricsReport {
     pub last_cycle_replication_repair: Vec<ScannerReplicationRepairSnapshot>,
     #[serde(default)]
     pub partial_cycles: u64,
+    #[serde(default)]
+    pub startup: crate::startup::ScannerStartupStatus,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1575,7 +1773,7 @@ fn scanner_ratio(numerator: f64, denominator: f64) -> f64 {
     }
 }
 
-fn unix_now_secs() -> u64 {
+pub(crate) fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1590,6 +1788,7 @@ fn scanner_primary_pressure(
     current_queued_scans: u64,
     current_active_scans: u64,
     last_cycle_budget_limited: bool,
+    last_cycle_disk_io_budget_wait_events: u64,
     last_cycle_throttle_sleep_events: u64,
     last_cycle_yield_events: u64,
 ) -> &'static str {
@@ -1597,6 +1796,8 @@ fn scanner_primary_pressure(
         "queued_scans"
     } else if last_cycle_budget_limited {
         "cycle_budget"
+    } else if last_cycle_disk_io_budget_wait_events > 0 {
+        "disk_io_budget"
     } else if last_cycle_throttle_sleep_events > 0 || last_cycle_yield_events > 0 {
         "throttle_pause"
     } else if current_active_scans > 0 {
@@ -1616,12 +1817,20 @@ fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPress
         .max(usize_to_u64_saturated(metrics.active_scan_paths));
     let last_cycle_budget_limited =
         scanner_last_cycle_budget_limited(metrics.last_cycle_result_code, metrics.last_cycle_partial_reason.as_str());
-    let last_cycle_pause_observed = metrics.last_cycle_throttle_sleep_events > 0 || metrics.last_cycle_yield_events > 0;
+    let last_cycle_pause_observed = metrics.last_cycle_throttle_sleep_events > 0
+        || metrics.last_cycle_disk_io_budget_wait_events > 0
+        || metrics.last_cycle_yield_events > 0;
     let last_cycle_throttle_sleep_ratio =
         scanner_ratio(metrics.last_cycle_throttle_sleep_duration_seconds, metrics.last_cycle_duration_seconds);
+    let last_cycle_disk_io_budget_wait_ratio = scanner_ratio(
+        metrics.last_cycle_disk_io_budget_wait_duration_seconds,
+        metrics.last_cycle_duration_seconds,
+    );
     let last_cycle_yield_ratio = scanner_ratio(metrics.last_cycle_yield_duration_seconds, metrics.last_cycle_duration_seconds);
     let last_cycle_total_pause_ratio = scanner_ratio(
-        metrics.last_cycle_throttle_sleep_duration_seconds.max(0.0) + metrics.last_cycle_yield_duration_seconds.max(0.0),
+        metrics.last_cycle_throttle_sleep_duration_seconds.max(0.0)
+            + metrics.last_cycle_disk_io_budget_wait_duration_seconds.max(0.0)
+            + metrics.last_cycle_yield_duration_seconds.max(0.0),
         metrics.last_cycle_duration_seconds,
     );
 
@@ -1630,6 +1839,7 @@ fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPress
             current_queued_scans,
             current_active_scans,
             last_cycle_budget_limited,
+            metrics.last_cycle_disk_io_budget_wait_events,
             metrics.last_cycle_throttle_sleep_events,
             metrics.last_cycle_yield_events,
         )
@@ -1639,6 +1849,7 @@ fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPress
         last_cycle_budget_limited,
         last_cycle_pause_observed,
         last_cycle_throttle_sleep_ratio,
+        last_cycle_disk_io_budget_wait_ratio,
         last_cycle_yield_ratio,
         last_cycle_total_pause_ratio,
     }
@@ -1932,8 +2143,13 @@ pub fn emit_scan_bucket_drive_partial(_source: ScannerWorkSource, bucket: &str, 
 }
 
 impl Metrics {
+    pub fn startup(&self) -> &crate::startup::ScannerStartupObservation {
+        &self.startup
+    }
+
     pub fn new() -> Self {
         Self {
+            startup: crate::startup::ScannerStartupObservation::default(),
             operations: (0..Metric::Last as usize).map(|_| AtomicU64::new(0)).collect(),
             // Each slot gets its own fresh LockedLastMinuteLatency so that
             // different metrics never accidentally share state.
@@ -1946,8 +2162,10 @@ impl Metrics {
                 .collect(),
             current_paths: Arc::new(RwLock::new(HashMap::new())),
             cycle_info: Arc::new(RwLock::new(None)),
+            usage_publication: Mutex::new(Arc::new(ScannerUsagePublicationObservation::default())),
             current_scan_mode: AtomicU8::new(HealScanMode::Unknown as u8),
             current_scan_cycle_work_active: AtomicBool::new(false),
+            remote_scan_progress: Mutex::new(Arc::new(RemoteScanProgress::default())),
             current_scan_cycle_objects_start: AtomicU64::new(0),
             current_scan_cycle_directories_start: AtomicU64::new(0),
             current_scan_cycle_bucket_drive_scans_start: AtomicU64::new(0),
@@ -1956,6 +2174,8 @@ impl Metrics {
             current_scan_cycle_yield_duration_millis_start: AtomicU64::new(0),
             current_scan_cycle_throttle_sleep_events_start: AtomicU64::new(0),
             current_scan_cycle_throttle_sleep_duration_millis_start: AtomicU64::new(0),
+            current_scan_cycle_disk_io_budget_wait_events_start: AtomicU64::new(0),
+            current_scan_cycle_disk_io_budget_wait_duration_millis_start: AtomicU64::new(0),
             current_scan_cycle_ilm_actions_start: AtomicU64::new(0),
             current_scan_cycle_lifecycle_expiry_actions_start: AtomicU64::new(0),
             current_scan_cycle_lifecycle_transition_actions_start: AtomicU64::new(0),
@@ -1989,6 +2209,8 @@ impl Metrics {
             last_scan_cycle_yield_duration_millis: AtomicU64::new(0),
             last_scan_cycle_throttle_sleep_events: AtomicU64::new(0),
             last_scan_cycle_throttle_sleep_duration_millis: AtomicU64::new(0),
+            last_scan_cycle_disk_io_budget_wait_events: AtomicU64::new(0),
+            last_scan_cycle_disk_io_budget_wait_duration_millis: AtomicU64::new(0),
             last_scan_cycle_ilm_actions: AtomicU64::new(0),
             last_scan_cycle_lifecycle_expiry_actions: AtomicU64::new(0),
             last_scan_cycle_lifecycle_transition_actions: AtomicU64::new(0),
@@ -2004,6 +2226,9 @@ impl Metrics {
             partial_scan_cycles_by_source: ScannerWorkSource::all().iter().map(|_| AtomicU64::new(0)).collect(),
             scanner_yield_duration_millis: AtomicU64::new(0),
             scanner_throttle_sleep_duration_millis: AtomicU64::new(0),
+            scanner_disk_io_budget_wait_events: AtomicU64::new(0),
+            scanner_disk_io_budget_wait_duration_millis: AtomicU64::new(0),
+            scanner_disk_io_budget_last_wait_unix_secs: AtomicU64::new(0),
             scanner_ilm_actions: AtomicU64::new(0),
             scanner_lifecycle_expiry_actions: AtomicU64::new(0),
             scanner_lifecycle_transition_actions: AtomicU64::new(0),
@@ -2046,6 +2271,8 @@ impl Metrics {
             scanner_bitrot_cycle_enabled: AtomicBool::new(false),
             scanner_bitrot_cycle_millis: AtomicU64::new(0),
             scanner_checkpoint: Mutex::new(None),
+            scanner_checkpoints_persisted: Mutex::new(BTreeMap::new()),
+            scanner_checkpoint_save_failures: AtomicU64::new(0),
             scanner_checkpoint_used: AtomicU64::new(0),
             scanner_checkpoint_cleared: AtomicU64::new(0),
             scanner_checkpoint_ignored: AtomicU64::new(0),
@@ -2055,11 +2282,18 @@ impl Metrics {
             scanner_dirty_usage_last_clear_unix_secs: AtomicU64::new(0),
             scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64::new(0),
             scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64::new(0),
+            usage_candidates: std::array::from_fn(|_| AtomicU64::new(0)),
             scanner_usage_last_save_unix_secs: AtomicU64::new(0),
             scanner_usage_last_durable_success_unix_secs: AtomicU64::new(0),
             scanner_usage_last_publication_unix_secs: AtomicU64::new(0),
             scanner_usage_last_publication_state: Mutex::new(String::new()),
             scanner_usage_last_publication_reason: Mutex::new(String::new()),
+            scanner_guardrail_veto_total: AtomicU64::new(0),
+            scanner_guardrail_last_veto_unix_secs: AtomicU64::new(0),
+            scanner_guardrail_last_veto_reason: Mutex::new(String::new()),
+            scanner_scope_fallback_total: AtomicU64::new(0),
+            scanner_scope_fallback_last_unix_secs: AtomicU64::new(0),
+            scanner_scope_fallback_last_reason: Mutex::new(String::new()),
             scanner_usage_last_save_result: AtomicU8::new(ScannerUsageSaveResult::Unknown as u8),
             scanner_usage_deferred_pending: AtomicBool::new(false),
             scanner_usage_deferred_total: AtomicU64::new(0),
@@ -2222,6 +2456,19 @@ impl Metrics {
             });
     }
 
+    /// Record one wait imposed by a per-disk background I/O budget.
+    pub fn record_scanner_disk_io_budget_wait(&self, duration: Duration) {
+        self.scanner_disk_io_budget_wait_events.fetch_add(1, Ordering::Relaxed);
+        let duration_millis = duration_millis_saturated(duration);
+        let _ = self
+            .scanner_disk_io_budget_wait_duration_millis
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(duration_millis))
+            });
+        self.scanner_disk_io_budget_last_wait_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+    }
+
     pub fn record_scanner_ilm_action(&self, count: u64) {
         self.scanner_ilm_actions.fetch_add(count, Ordering::Relaxed);
         self.record_scanner_source_executed(ScannerWorkSource::Lifecycle, count);
@@ -2353,6 +2600,34 @@ impl Metrics {
         }
     }
 
+    /// Keep only the latest confirmed periodic save per set on this process.
+    pub fn record_scanner_checkpoint_saved(
+        &self,
+        pool_index: usize,
+        set_index: usize,
+        bucket: &str,
+        checkpoint: Option<ScannerCheckpointReport>,
+    ) {
+        let mut saved = self
+            .scanner_checkpoints_persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        saved.insert(
+            (pool_index, set_index),
+            ScannerPersistedCheckpointReport {
+                pool_index,
+                set_index,
+                bucket: bucket.to_string(),
+                saved_unix_secs: unix_now_secs(),
+                checkpoint,
+            },
+        );
+    }
+
+    pub fn record_scanner_checkpoint_save_failed(&self) {
+        self.scanner_checkpoint_save_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_scanner_checkpoint_used(&self) {
         self.scanner_checkpoint_used.fetch_add(1, Ordering::Relaxed);
         self.update_scanner_checkpoint_event(SCANNER_CHECKPOINT_EVENT_USED);
@@ -2410,6 +2685,37 @@ impl Metrics {
         }
     }
 
+    /// Record exactly one normal return from a candidate builder. Accepted does
+    /// not mean published or durable. Like other scanner metrics, the local
+    /// report remains available when no OTEL recorder is installed.
+    pub fn record_usage_candidate(&self, kind: ScannerUsageCandidateKind, outcome: ScannerUsageCandidateOutcome) {
+        let slot = kind.index() * ScannerUsageCandidateOutcome::ALL.len() + outcome.index();
+        self.usage_candidates[slot].fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(
+            "rustfs_scanner_usage_candidates_total",
+            "kind" => kind.as_label(),
+            "outcome" => outcome.as_label()
+        )
+        .increment(1);
+    }
+
+    /// Read the bounded counters without resetting them. Cells are loaded
+    /// independently and do not form a transactional snapshot.
+    pub fn usage_candidate_counts(&self) -> Vec<ScannerUsageCandidateCount> {
+        let mut counts = Vec::with_capacity(USAGE_CANDIDATE_COUNTER_SLOTS);
+        for kind in ScannerUsageCandidateKind::ALL {
+            for outcome in ScannerUsageCandidateOutcome::ALL {
+                let slot = kind.index() * ScannerUsageCandidateOutcome::ALL.len() + outcome.index();
+                counts.push(ScannerUsageCandidateCount {
+                    kind,
+                    outcome,
+                    count: self.usage_candidates[slot].load(Ordering::Relaxed),
+                });
+            }
+        }
+        counts
+    }
+
     pub fn record_scanner_usage_save_result(&self, result: ScannerUsageSaveResult) {
         self.scanner_usage_last_save_result.store(result as u8, Ordering::Relaxed);
         self.scanner_usage_last_save_unix_secs
@@ -2430,6 +2736,33 @@ impl Metrics {
             Err(poisoned) => poisoned.into_inner(),
         };
         *last_reason = reason;
+    }
+
+    /// Record an attributed cluster-activity guardrail veto (`<field>@<host>`)
+    /// so an operator can tell a rebalance or a PUT tail from a broken probe.
+    pub fn record_scanner_guardrail_veto(&self, reason: impl Into<String>) {
+        self.scanner_guardrail_veto_total.fetch_add(1, Ordering::Relaxed);
+        self.scanner_guardrail_last_veto_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+        let mut last_reason = match self.scanner_guardrail_last_veto_reason.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_reason = reason.into();
+    }
+
+    /// Record a cycle that could have been scoped to its dirty buckets but
+    /// walked the whole namespace, so an operator can tell why scoped
+    /// convergence is not happening.
+    pub fn record_scanner_scope_fallback(&self, reason: impl Into<String>) {
+        self.scanner_scope_fallback_total.fetch_add(1, Ordering::Relaxed);
+        self.scanner_scope_fallback_last_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+        let mut last_reason = match self.scanner_scope_fallback_last_reason.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_reason = reason.into();
     }
 
     pub fn record_scanner_usage_durable_success(&self) {
@@ -2615,10 +2948,6 @@ impl Metrics {
             .store(cycle_max_objects.unwrap_or_default(), Ordering::Relaxed);
         self.scanner_cycle_max_directories
             .store(cycle_max_directories.unwrap_or_default(), Ordering::Relaxed);
-        self.scanner_leader_lease_without_progress.store(false, Ordering::Relaxed);
-        self.scanner_cycle_last_progress_age_seconds.store(0, Ordering::Relaxed);
-        metrics::gauge!(OTEL_SCANNER_LEADER_LEASE_WITHOUT_PROGRESS).set(0.0);
-        metrics::gauge!(OTEL_SCANNER_CYCLE_LAST_PROGRESS_AGE).set(0.0);
         self.scanner_bitrot_cycle_enabled
             .store(bitrot_cycle.is_some(), Ordering::Relaxed);
         self.scanner_bitrot_cycle_millis
@@ -2744,13 +3073,50 @@ impl Metrics {
 
     /// Replace the current cycle record.
     pub async fn set_cycle(&self, cycle: Option<CurrentCycle>) {
-        *self.cycle_info.write().await = cycle;
+        let mut current_cycle = self.cycle_info.write().await;
+        if cycle.is_none() {
+            self.invalidate_usage_publication();
+        }
+        *current_cycle = cycle;
+    }
+
+    /// Reset/recovery changed the persisted baseline; an old attempt cannot restore its observation.
+    /// This takes only the observation pointer lock, so storage ownership checks need no intervening await.
+    pub fn invalidate_usage_publication(&self) {
+        *self.usage_publication.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Arc::new(ScannerUsagePublicationObservation::default());
     }
 
     /// Publish a scanner cycle and its work-accounting baseline as one state transition.
     pub async fn start_scan_cycle_work_with_cycle(&self, cycle: CurrentCycle) -> ScanCycleWorkSnapshot {
+        self.start_scan_cycle_work_with_cycle_and_remote_progress(cycle, Arc::new(RemoteScanProgress::default()))
+            .await
+    }
+
+    /// Install the cycle's remote work handle together with its cycle identity.
+    pub async fn start_scan_cycle_work_with_cycle_and_remote_progress(
+        &self,
+        cycle: CurrentCycle,
+        remote_progress: Arc<RemoteScanProgress>,
+    ) -> ScanCycleWorkSnapshot {
+        self.start_scan_cycle_work_with_publication(
+            cycle,
+            remote_progress,
+            Arc::new(ScannerUsagePublicationObservation::default()),
+        )
+        .await
+    }
+
+    /// Install publication and work observations under the same cycle transition.
+    pub async fn start_scan_cycle_work_with_publication(
+        &self,
+        cycle: CurrentCycle,
+        remote_progress: Arc<RemoteScanProgress>,
+        publication: Arc<ScannerUsagePublicationObservation>,
+    ) -> ScanCycleWorkSnapshot {
         let mut current_cycle = self.cycle_info.write().await;
-        let snapshot = self.start_scan_cycle_work();
+        let snapshot = self.begin_scan_cycle_work(remote_progress);
+        *self.usage_publication.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = publication;
         *current_cycle = Some(cycle);
         snapshot
     }
@@ -2865,6 +3231,19 @@ impl Metrics {
     }
 
     pub fn start_scan_cycle_work(&self) -> ScanCycleWorkSnapshot {
+        self.begin_scan_cycle_work(Arc::new(RemoteScanProgress::default()))
+    }
+
+    fn begin_scan_cycle_work(&self, remote_progress: Arc<RemoteScanProgress>) -> ScanCycleWorkSnapshot {
+        self.scanner_leader_lease_without_progress.store(false, Ordering::Relaxed);
+        self.scanner_cycle_last_progress_age_seconds.store(0, Ordering::Relaxed);
+        metrics::gauge!(OTEL_SCANNER_LEADER_LEASE_WITHOUT_PROGRESS).set(0.0);
+        metrics::gauge!(OTEL_SCANNER_CYCLE_LAST_PROGRESS_AGE).set(0.0);
+        // The cycle transition serializes replacement; workers keep their own Arc.
+        *self
+            .remote_scan_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = remote_progress;
         let snapshot = self.scan_cycle_work_snapshot();
         let source_snapshot = self.scanner_source_work_values();
         let replication_repair_snapshot = self.scanner_replication_repair_work_values();
@@ -2884,6 +3263,10 @@ impl Metrics {
             .store(snapshot.throttle_sleep_events, Ordering::Relaxed);
         self.current_scan_cycle_throttle_sleep_duration_millis_start
             .store(snapshot.throttle_sleep_duration_millis, Ordering::Relaxed);
+        self.current_scan_cycle_disk_io_budget_wait_events_start
+            .store(snapshot.disk_io_budget_wait_events, Ordering::Relaxed);
+        self.current_scan_cycle_disk_io_budget_wait_duration_millis_start
+            .store(snapshot.disk_io_budget_wait_duration_millis, Ordering::Relaxed);
         self.current_scan_cycle_ilm_actions_start
             .store(snapshot.ilm_actions, Ordering::Relaxed);
         self.current_scan_cycle_lifecycle_expiry_actions_start
@@ -2948,6 +3331,8 @@ impl Metrics {
             yield_duration_millis: self.scanner_yield_duration_millis.load(Ordering::Relaxed),
             throttle_sleep_events: self.lifetime(Metric::ThrottleSleep),
             throttle_sleep_duration_millis: self.scanner_throttle_sleep_duration_millis.load(Ordering::Relaxed),
+            disk_io_budget_wait_events: self.scanner_disk_io_budget_wait_events.load(Ordering::Relaxed),
+            disk_io_budget_wait_duration_millis: self.scanner_disk_io_budget_wait_duration_millis.load(Ordering::Relaxed),
             ilm_actions: self.scanner_ilm_actions.load(Ordering::Relaxed),
             lifecycle_expiry_actions: self.scanner_lifecycle_expiry_actions.load(Ordering::Relaxed),
             lifecycle_transition_actions: self.scanner_lifecycle_transition_actions.load(Ordering::Relaxed),
@@ -2969,6 +3354,12 @@ impl Metrics {
             throttle_sleep_duration_millis: self
                 .current_scan_cycle_throttle_sleep_duration_millis_start
                 .load(Ordering::Relaxed),
+            disk_io_budget_wait_events: self
+                .current_scan_cycle_disk_io_budget_wait_events_start
+                .load(Ordering::Relaxed),
+            disk_io_budget_wait_duration_millis: self
+                .current_scan_cycle_disk_io_budget_wait_duration_millis_start
+                .load(Ordering::Relaxed),
             ilm_actions: self.current_scan_cycle_ilm_actions_start.load(Ordering::Relaxed),
             lifecycle_expiry_actions: self.current_scan_cycle_lifecycle_expiry_actions_start.load(Ordering::Relaxed),
             lifecycle_transition_actions: self
@@ -2982,9 +3373,22 @@ impl Metrics {
 
     fn scan_cycle_work_since(&self, start: ScanCycleWorkSnapshot) -> ScanCycleWorkSnapshot {
         let current = self.scan_cycle_work_snapshot();
+        let (remote_objects, remote_directories) = {
+            let remote = self
+                .remote_scan_progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (remote.objects.load(Ordering::Relaxed), remote.directories.load(Ordering::Relaxed))
+        };
         ScanCycleWorkSnapshot {
-            objects_scanned: current.objects_scanned.saturating_sub(start.objects_scanned),
-            directories_scanned: current.directories_scanned.saturating_sub(start.directories_scanned),
+            objects_scanned: current
+                .objects_scanned
+                .saturating_sub(start.objects_scanned)
+                .saturating_add(remote_objects),
+            directories_scanned: current
+                .directories_scanned
+                .saturating_sub(start.directories_scanned)
+                .saturating_add(remote_directories),
             bucket_drive_scans: current.bucket_drive_scans.saturating_sub(start.bucket_drive_scans),
             bucket_drive_failures: current.bucket_drive_failures.saturating_sub(start.bucket_drive_failures),
             yield_events: current.yield_events.saturating_sub(start.yield_events),
@@ -2993,6 +3397,12 @@ impl Metrics {
             throttle_sleep_duration_millis: current
                 .throttle_sleep_duration_millis
                 .saturating_sub(start.throttle_sleep_duration_millis),
+            disk_io_budget_wait_events: current
+                .disk_io_budget_wait_events
+                .saturating_sub(start.disk_io_budget_wait_events),
+            disk_io_budget_wait_duration_millis: current
+                .disk_io_budget_wait_duration_millis
+                .saturating_sub(start.disk_io_budget_wait_duration_millis),
             ilm_actions: current.ilm_actions.saturating_sub(start.ilm_actions),
             lifecycle_expiry_actions: current
                 .lifecycle_expiry_actions
@@ -3266,6 +3676,10 @@ impl Metrics {
             .store(work.throttle_sleep_events, Ordering::Relaxed);
         self.last_scan_cycle_throttle_sleep_duration_millis
             .store(work.throttle_sleep_duration_millis, Ordering::Relaxed);
+        self.last_scan_cycle_disk_io_budget_wait_events
+            .store(work.disk_io_budget_wait_events, Ordering::Relaxed);
+        self.last_scan_cycle_disk_io_budget_wait_duration_millis
+            .store(work.disk_io_budget_wait_duration_millis, Ordering::Relaxed);
         self.last_scan_cycle_ilm_actions.store(work.ilm_actions, Ordering::Relaxed);
         self.last_scan_cycle_lifecycle_expiry_actions
             .store(work.lifecycle_expiry_actions, Ordering::Relaxed);
@@ -3315,11 +3729,19 @@ impl Metrics {
     }
 
     pub async fn report_with_runtime_details(&self) -> (ScannerMetricsReport, ScannerRuntimeDetailsReport) {
-        let mut m = ScannerMetricsReport::default();
+        let mut m = ScannerMetricsReport {
+            startup: self.startup.snapshot(),
+            ..Default::default()
+        };
         let runtime_details;
 
         let has_cycle = {
             let cycle = self.cycle_info.read().await;
+            m.usage_publication = self
+                .usage_publication
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .snapshot();
             let has_cycle = if let Some(cycle) = cycle.as_ref() {
                 m.current_cycle = cycle.current;
                 m.cycles_completed_at = cycle.cycle_completed.iter().copied().map(chrono_to_jiff_timestamp).collect();
@@ -3343,6 +3765,9 @@ impl Metrics {
                 m.current_cycle_yield_duration_seconds = current_work.yield_duration_millis as f64 / 1000.0;
                 m.current_cycle_throttle_sleep_events = current_work.throttle_sleep_events;
                 m.current_cycle_throttle_sleep_duration_seconds = current_work.throttle_sleep_duration_millis as f64 / 1000.0;
+                m.current_cycle_disk_io_budget_wait_events = current_work.disk_io_budget_wait_events;
+                m.current_cycle_disk_io_budget_wait_duration_seconds =
+                    current_work.disk_io_budget_wait_duration_millis as f64 / 1000.0;
                 m.current_cycle_ilm_actions = current_work.ilm_actions;
                 m.current_cycle_lifecycle_expiry_actions = current_work.lifecycle_expiry_actions;
                 m.current_cycle_lifecycle_transition_actions = current_work.lifecycle_transition_actions;
@@ -3413,6 +3838,11 @@ impl Metrics {
         m.last_cycle_throttle_sleep_events = self.last_scan_cycle_throttle_sleep_events.load(Ordering::Relaxed);
         m.last_cycle_throttle_sleep_duration_seconds =
             self.last_scan_cycle_throttle_sleep_duration_millis.load(Ordering::Relaxed) as f64 / 1000.0;
+        m.last_cycle_disk_io_budget_wait_events = self.last_scan_cycle_disk_io_budget_wait_events.load(Ordering::Relaxed);
+        m.last_cycle_disk_io_budget_wait_duration_seconds = self
+            .last_scan_cycle_disk_io_budget_wait_duration_millis
+            .load(Ordering::Relaxed) as f64
+            / 1000.0;
         m.last_cycle_ilm_actions = self.last_scan_cycle_ilm_actions.load(Ordering::Relaxed);
         m.last_cycle_lifecycle_expiry_actions = self.last_scan_cycle_lifecycle_expiry_actions.load(Ordering::Relaxed);
         m.last_cycle_lifecycle_transition_actions = self.last_scan_cycle_lifecycle_transition_actions.load(Ordering::Relaxed);
@@ -3466,6 +3896,7 @@ impl Metrics {
             completed: self.scanner_transition_completed.load(Ordering::Relaxed),
             failed: self.scanner_transition_failed.load(Ordering::Relaxed),
         };
+        m.usage_candidates = self.usage_candidate_counts();
         let usage_save_result = ScannerUsageSaveResult::from_code(self.scanner_usage_last_save_result.load(Ordering::Relaxed));
         m.usage_freshness = ScannerUsageFreshnessSnapshot {
             dirty_pending_buckets: self.scanner_dirty_usage_pending_buckets.load(Ordering::Relaxed),
@@ -3493,6 +3924,21 @@ impl Metrics {
                 Ok(reason) => reason.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
             },
+            guardrail_veto_total: self.scanner_guardrail_veto_total.load(Ordering::Relaxed),
+            disk_io_budget_wait_events: self.scanner_disk_io_budget_wait_events.load(Ordering::Relaxed),
+            disk_io_budget_wait_millis: self.scanner_disk_io_budget_wait_duration_millis.load(Ordering::Relaxed),
+            last_disk_io_budget_wait_unix_secs: self.scanner_disk_io_budget_last_wait_unix_secs.load(Ordering::Relaxed),
+            last_guardrail_veto_unix_secs: self.scanner_guardrail_last_veto_unix_secs.load(Ordering::Relaxed),
+            last_guardrail_veto_reason: match self.scanner_guardrail_last_veto_reason.lock() {
+                Ok(reason) => reason.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            },
+            scope_fallback_total: self.scanner_scope_fallback_total.load(Ordering::Relaxed),
+            last_scope_fallback_unix_secs: self.scanner_scope_fallback_last_unix_secs.load(Ordering::Relaxed),
+            last_scope_fallback_reason: match self.scanner_scope_fallback_last_reason.lock() {
+                Ok(reason) => reason.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            },
         };
         m.throttle_idle_mode_enabled = self.scanner_throttle_idle_mode_enabled.load(Ordering::Relaxed);
         m.throttle_sleep_factor = self.scanner_throttle_sleep_factor_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
@@ -3512,6 +3958,14 @@ impl Metrics {
             Ok(checkpoint) => checkpoint.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
+        m.scan_checkpoints_persisted = self
+            .scanner_checkpoints_persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        m.scan_checkpoint_save_failures = self.scanner_checkpoint_save_failures.load(Ordering::Relaxed);
         m.scan_checkpoint_used = self.scanner_checkpoint_used.load(Ordering::Relaxed);
         m.scan_checkpoint_cleared = self.scanner_checkpoint_cleared.load(Ordering::Relaxed);
         m.scan_checkpoint_ignored = self.scanner_checkpoint_ignored.load(Ordering::Relaxed);
@@ -3597,14 +4051,18 @@ pub type CloseDiskFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> 
 /// Register a new disk in the global path tracker and return two callbacks:
 /// one to update the current path and one to deregister the disk when done.
 pub async fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPathFn, CloseDiskFn) {
+    register_current_path(&global_metrics().current_paths, disk, initial).await
+}
+
+async fn register_current_path(
+    current_paths: &Arc<RwLock<HashMap<String, Arc<CurrentPathTracker>>>>,
+    disk: &str,
+    initial: &str,
+) -> (UpdateCurrentPathFn, CloseDiskFn) {
     let tracker = Arc::new(CurrentPathTracker::new(initial.to_string()));
     let disk_name = disk.to_string();
 
-    global_metrics()
-        .current_paths
-        .write()
-        .await
-        .insert(disk_name.clone(), Arc::clone(&tracker));
+    current_paths.write().await.insert(disk_name.clone(), Arc::clone(&tracker));
 
     let update_fn: UpdateCurrentPathFn = {
         let tracker = Arc::clone(&tracker);
@@ -3617,10 +4075,17 @@ pub async fn current_path_updater(disk: &str, initial: &str) -> (UpdateCurrentPa
 
     let done_fn: CloseDiskFn = {
         let disk = disk_name;
+        let current_paths = Arc::clone(current_paths);
+        let tracker = Arc::clone(&tracker);
         Arc::new(move || {
             let disk = disk.clone();
+            let current_paths = Arc::clone(&current_paths);
+            let tracker = Arc::clone(&tracker);
             Box::pin(async move {
-                global_metrics().current_paths.write().await.remove(&disk);
+                let mut paths = current_paths.write().await;
+                if paths.get(&disk).is_some_and(|current| Arc::ptr_eq(current, &tracker)) {
+                    paths.remove(&disk);
+                }
             })
         })
     };
@@ -3805,6 +4270,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_path_cleanup_preserves_a_replacement_scan() {
+        let metrics = Metrics::new();
+        let (_, close_first) = register_current_path(&metrics.current_paths, "remote-node/disk", "first-bucket").await;
+        let (_, close_second) = register_current_path(&metrics.current_paths, "remote-node/disk", "second-bucket").await;
+        close_first().await;
+        assert_eq!(metrics.get_current_paths().await, vec!["remote-node/disk/second-bucket"]);
+        close_second().await;
+        assert!(metrics.get_current_paths().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_path_guard_cleans_up_its_remote_scan() {
+        let metrics = Metrics::new();
+        let (_, close_path) = register_current_path(&metrics.current_paths, "remote-node/disk", "bucket").await;
+        let guard = CloseDiskGuard::new(close_path);
+        assert_eq!(metrics.report().await.active_paths, vec!["remote-node/disk/bucket"]);
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !metrics.get_current_paths().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled remote path guard must remove its registration");
+    }
+
+    #[tokio::test]
     async fn report_counts_active_scan_paths() {
         let metrics = Metrics::new();
         let updated_at = Timestamp::now() - jiff::SignedDuration::from_secs(12);
@@ -3920,6 +4412,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn report_includes_disk_io_budget_waits_in_pacing_and_freshness() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_disk_io_budget_wait(Duration::from_millis(250));
+        metrics.record_scanner_disk_io_budget_wait(Duration::from_millis(750));
+        metrics.record_scan_cycle_complete(true, Duration::from_secs(10));
+        metrics.record_scan_cycle_work(ScanCycleWorkSnapshot {
+            disk_io_budget_wait_events: 2,
+            disk_io_budget_wait_duration_millis: 1_000,
+            ..Default::default()
+        });
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.usage_freshness.disk_io_budget_wait_events, 2);
+        assert_eq!(report.usage_freshness.disk_io_budget_wait_millis, 1_000);
+        assert!(report.usage_freshness.last_disk_io_budget_wait_unix_secs > 0);
+        assert_eq!(report.last_cycle_disk_io_budget_wait_events, 2);
+        assert_eq!(report.last_cycle_disk_io_budget_wait_duration_seconds, 1.0);
+        assert_eq!(report.pacing_pressure.primary_pressure, "disk_io_budget");
+        assert!(report.pacing_pressure.last_cycle_pause_observed);
+        assert_eq!(report.pacing_pressure.last_cycle_disk_io_budget_wait_ratio, 0.1);
+        assert_eq!(report.pacing_pressure.last_cycle_total_pause_ratio, 0.1);
+        assert_eq!(report.pacing_pressure.last_cycle_throttle_sleep_ratio, 0.0);
+    }
+
+    #[tokio::test]
     async fn report_derives_scanner_pacing_pressure() {
         let metrics = Metrics::new();
         metrics.record_scanner_set_scan_state(Some(2), Some(3), Some(1));
@@ -3973,6 +4491,37 @@ mod tests {
         assert_eq!(report.scan_checkpoint_used, 1);
         assert_eq!(report.scan_checkpoint_stale, 1);
         assert_eq!(report.scan_checkpoint_cleared, 1);
+    }
+
+    #[tokio::test]
+    async fn report_distinguishes_persisted_checkpoints_from_memory_and_failures() {
+        let metrics = Metrics::new();
+        let saved = ScannerCheckpointReport {
+            version: 1,
+            resume_after: "bucket/first".to_string(),
+            reason: "objects".to_string(),
+            last_event: "saved".to_string(),
+        };
+        metrics.record_scanner_checkpoint_saved(0, 1, "bucket", Some(saved.clone()));
+        metrics.record_scanner_checkpoint_set(1, "bucket/second", "objects");
+        metrics.record_scanner_checkpoint_save_failed();
+        let report = metrics.report().await;
+        assert_eq!(report.scan_checkpoint_save_failures, 1);
+        assert_eq!(report.scan_checkpoint.expect("in-memory cursor").resume_after, "bucket/second");
+        assert_eq!(report.scan_checkpoints_persisted.len(), 1);
+        assert_eq!(report.scan_checkpoints_persisted[0].checkpoint, Some(saved));
+        assert_eq!(report.scan_checkpoints_persisted[0].set_index, 1);
+        assert!(report.scan_checkpoints_persisted[0].saved_unix_secs > 0);
+        metrics.record_scanner_checkpoint_saved(0, 1, "other-bucket", None);
+        metrics.record_scanner_checkpoint_saved(0, 2, "bucket", None);
+        let report = metrics.report().await;
+        assert_eq!(
+            report.scan_checkpoints_persisted.len(),
+            2,
+            "retain at most one save per set, not per bucket"
+        );
+        assert_eq!(report.scan_checkpoints_persisted[0].bucket, "other-bucket");
+        assert!(report.scan_checkpoints_persisted[0].checkpoint.is_none());
     }
 
     #[tokio::test]
@@ -4977,6 +5526,86 @@ mod tests {
         assert_eq!(report.usage_freshness.last_cycle_cleared_dirty_buckets, 0);
     }
 
+    #[test]
+    fn remote_scan_progress_saturates_instead_of_wrapping() {
+        let remote = RemoteScanProgress::default();
+        remote.record(u64::MAX - 1, u64::MAX - 2);
+        remote.record(3, 4);
+        remote.record(0, 0);
+        assert_eq!(remote.objects.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(remote.directories.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn saturated_remote_cycle_does_not_hide_later_remote_and_local_work() {
+        let metrics = Metrics::new();
+        let old_remote = Arc::new(RemoteScanProgress::default());
+        let previous = metrics
+            .start_scan_cycle_work_with_cycle_and_remote_progress(CurrentCycle::default(), old_remote.clone())
+            .await;
+        old_remote.record(u64::MAX, u64::MAX);
+        metrics.finish_scan_cycle_work(previous);
+
+        let remote = Arc::new(RemoteScanProgress::default());
+        let next = metrics
+            .start_scan_cycle_work_with_cycle_and_remote_progress(CurrentCycle::default(), remote.clone())
+            .await;
+        old_remote.record(9, 7);
+        let empty = metrics.report().await;
+        assert_eq!(empty.current_cycle_objects_scanned, 0);
+        assert_eq!(empty.current_cycle_directories_scanned, 0);
+        remote.record(2, 1);
+        metrics.operations[Metric::ScanObject as usize].fetch_add(3, Ordering::Relaxed);
+        metrics.operations[Metric::ScanFolder as usize].fetch_add(2, Ordering::Relaxed);
+        let active = metrics.report().await;
+        assert_eq!(active.current_cycle_objects_scanned, 5);
+        assert_eq!(active.current_cycle_directories_scanned, 3);
+        metrics.finish_scan_cycle_work(next);
+        let finished = metrics.report().await;
+        assert_eq!(finished.last_cycle_objects_scanned, 5);
+        assert_eq!(finished.last_cycle_directories_scanned, 3);
+    }
+
+    #[tokio::test]
+    async fn cycle_work_combines_local_and_remote_progress_without_changing_local_operations() {
+        let metrics = Metrics::new();
+        metrics.operations[Metric::ScanObject as usize].store(10, Ordering::Relaxed);
+        metrics.operations[Metric::ScanFolder as usize].store(5, Ordering::Relaxed);
+        let remote = Arc::new(RemoteScanProgress::default());
+        let start = metrics
+            .start_scan_cycle_work_with_cycle_and_remote_progress(CurrentCycle::default(), remote.clone())
+            .await;
+        metrics.operations[Metric::ScanObject as usize].fetch_add(3, Ordering::Relaxed);
+        metrics.operations[Metric::ScanFolder as usize].fetch_add(2, Ordering::Relaxed);
+        remote.record(7, 4);
+        let active = metrics.report().await;
+        assert_eq!(active.current_cycle_objects_scanned, 10);
+        assert_eq!(active.current_cycle_directories_scanned, 6);
+        assert_eq!(metrics.lifetime(Metric::ScanObject), 13);
+        assert_eq!(metrics.lifetime(Metric::ScanFolder), 7);
+        metrics.finish_scan_cycle_work(start);
+        let finished = metrics.report().await;
+        assert_eq!(finished.current_cycle_objects_scanned, 0);
+        assert_eq!(finished.current_cycle_directories_scanned, 0);
+        assert_eq!(finished.last_cycle_objects_scanned, 10);
+        assert_eq!(finished.last_cycle_directories_scanned, 6);
+
+        remote.record(9, 3);
+        let next_remote = Arc::new(RemoteScanProgress::default());
+        let next = metrics
+            .start_scan_cycle_work_with_cycle_and_remote_progress(CurrentCycle::default(), next_remote.clone())
+            .await;
+        let empty = metrics.report().await;
+        assert_eq!(empty.current_cycle_objects_scanned, 0);
+        assert_eq!(empty.current_cycle_directories_scanned, 0);
+        remote.record(11, 5);
+        next_remote.record(2, 1);
+        metrics.finish_scan_cycle_work(next);
+        let finished = metrics.report().await;
+        assert_eq!(finished.last_cycle_objects_scanned, 2);
+        assert_eq!(finished.last_cycle_directories_scanned, 1);
+    }
+
     #[tokio::test]
     async fn report_includes_active_scan_cycle_work() {
         let metrics = Metrics::new();
@@ -5265,9 +5894,202 @@ mod tests {
         assert!(timed_out.leader_lease_without_progress);
 
         metrics.record_scanner_cycle_config(Duration::from_secs(60), None, Some(Duration::from_secs(1)), None, None);
+        let configured = metrics.report().await;
+        assert_eq!(configured.cycle_last_progress_age, 17);
+        assert!(configured.leader_lease_without_progress);
+
+        metrics.start_scan_cycle_work_with_cycle(CurrentCycle::default()).await;
         let current = metrics.report().await;
         assert_eq!(current.cycle_timeout_total, 1);
         assert_eq!(current.cycle_last_progress_age, 0);
         assert!(!current.leader_lease_without_progress);
+    }
+    #[tokio::test]
+    async fn usage_candidate_report_survives_disabled_export_and_preserves_legacy_unknown() {
+        let metrics = Metrics::new();
+        assert!(metrics.usage_candidate_counts().iter().all(|row| row.count == 0));
+        metrics::with_local_recorder(&metrics::NoopRecorder, || {
+            for kind in ScannerUsageCandidateKind::ALL {
+                for outcome in ScannerUsageCandidateOutcome::ALL {
+                    metrics.record_usage_candidate(kind, outcome);
+                }
+            }
+            metrics.record_usage_candidate(
+                ScannerUsageCandidateKind::Observational,
+                ScannerUsageCandidateOutcome::NoUsableSnapshots,
+            );
+        });
+        let report = metrics.report().await;
+        assert_eq!(report.usage_candidates.len(), 38);
+        for row in &report.usage_candidates {
+            let expected = if row.kind == ScannerUsageCandidateKind::Observational
+                && row.outcome == ScannerUsageCandidateOutcome::NoUsableSnapshots
+            {
+                2
+            } else {
+                1
+            };
+            assert_eq!(row.count, expected, "{row:?}");
+        }
+        let mut legacy = serde_json::to_value(&report).expect("serialize scanner report");
+        legacy
+            .as_object_mut()
+            .expect("scanner report object")
+            .remove("usage_candidates");
+        let legacy: ScannerMetricsReport = serde_json::from_value(legacy).expect("read a pre-candidate-metrics report");
+        assert!(
+            legacy.usage_candidates.is_empty(),
+            "missing telemetry must remain unknown, not a synthetic accepted bucket"
+        );
+        let roundtrip: ScannerMetricsReport =
+            serde_json::from_slice(&serde_json::to_vec(&report).expect("encode report")).expect("decode report");
+        assert_eq!(roundtrip.usage_candidates, report.usage_candidates);
+    }
+
+    #[tokio::test]
+    async fn usage_publication_keeps_snapshot_pending_and_fences_retried_attempts() {
+        let metrics = Metrics::new();
+        assert_eq!(metrics.report().await.usage_publication, ScannerUsagePublicationStatus::default());
+        let cycle = CurrentCycle {
+            current: 12,
+            next: 13,
+            ..Default::default()
+        };
+        let first = Arc::new(ScannerUsagePublicationObservation::new(8, 12));
+        let start = metrics
+            .start_scan_cycle_work_with_publication(cycle.clone(), Arc::new(RemoteScanProgress::default()), first.clone())
+            .await;
+        let running = metrics.report().await.usage_publication;
+        assert_eq!((running.scanner_epoch, running.cycle), (Some(8), Some(12)));
+        assert_eq!(running.outcome, ScannerUsagePublicationOutcome::Running);
+        assert_eq!(running.pending_bucket_count, None);
+
+        let saved = ScannerUsagePublicationStatus {
+            scanner_epoch: Some(8),
+            cycle: Some(12),
+            class: ScannerUsagePublicationClass::CompletePending,
+            outcome: ScannerUsagePublicationOutcome::Saved,
+            pending_bucket_count: Some(7),
+            snapshot_updated_at_unix_secs: Some(20),
+            ..Default::default()
+        };
+        first.record(saved.clone());
+        for live_pending in [0, 99] {
+            metrics.record_scanner_dirty_usage_pending(live_pending);
+            let report = metrics.report().await;
+            assert_eq!(report.usage_publication.pending_bucket_count, Some(7));
+        }
+        first.finish();
+        metrics
+            .finish_scan_cycle_work_with_cycle(
+                start,
+                CurrentCycle {
+                    current: 0,
+                    ..cycle.clone()
+                },
+            )
+            .await;
+        let idle = metrics.report().await;
+        assert_eq!(idle.current_cycle, 0);
+        assert_eq!(idle.usage_publication.cycle, Some(12));
+
+        let retry = Arc::new(ScannerUsagePublicationObservation::new(8, 12));
+        metrics
+            .start_scan_cycle_work_with_publication(cycle, Arc::new(RemoteScanProgress::default()), retry.clone())
+            .await;
+        first.record(saved.clone());
+        let current = metrics.report().await.usage_publication;
+        assert_eq!(current.outcome, ScannerUsagePublicationOutcome::Running);
+        assert_eq!(current.class, ScannerUsagePublicationClass::Unknown);
+        assert_eq!(current.pending_bucket_count, None);
+
+        metrics.invalidate_usage_publication();
+        retry.record(saved);
+        assert_eq!(metrics.report().await.usage_publication, ScannerUsagePublicationStatus::default());
+    }
+
+    #[tokio::test]
+    async fn usage_publication_loss_restart_and_legacy_reports_remain_unknown() {
+        let metrics = Metrics::new();
+        let observation = Arc::new(ScannerUsagePublicationObservation::new(8, 12));
+        metrics
+            .start_scan_cycle_work_with_publication(
+                CurrentCycle {
+                    current: 12,
+                    ..Default::default()
+                },
+                Arc::new(RemoteScanProgress::default()),
+                observation.clone(),
+            )
+            .await;
+        observation.record(ScannerUsagePublicationStatus {
+            scanner_epoch: Some(8),
+            cycle: Some(12),
+            class: ScannerUsagePublicationClass::CompleteConverged,
+            outcome: ScannerUsagePublicationOutcome::Saved,
+            pending_bucket_count: Some(0),
+            ..Default::default()
+        });
+        observation.interrupt();
+        let interrupted = metrics.report().await.usage_publication;
+        assert_eq!(interrupted.outcome, ScannerUsagePublicationOutcome::Interrupted);
+        assert_eq!(interrupted.class, ScannerUsagePublicationClass::Unknown);
+        assert_eq!(interrupted.pending_bucket_count, None);
+
+        metrics.set_cycle(None).await;
+        observation.finish();
+        assert_eq!(metrics.report().await.usage_publication, ScannerUsagePublicationStatus::default());
+        let report = Metrics::new().report().await;
+        assert_eq!(report.usage_publication.pending_bucket_count, None);
+        let mut legacy = serde_json::to_value(report).expect("serialize scanner report");
+        legacy.as_object_mut().expect("report object").remove("usage_publication");
+        let legacy: ScannerMetricsReport = serde_json::from_value(legacy).expect("decode legacy report");
+        assert_eq!(legacy.usage_publication, ScannerUsagePublicationStatus::default());
+    }
+
+    #[test]
+    fn usage_publication_rejects_snapshot_from_another_cycle() {
+        let observation = ScannerUsagePublicationObservation::new(8, 12);
+        observation.record(ScannerUsagePublicationStatus {
+            scanner_epoch: Some(8),
+            cycle: Some(13),
+            class: ScannerUsagePublicationClass::CompleteConverged,
+            outcome: ScannerUsagePublicationOutcome::Saved,
+            pending_bucket_count: Some(0),
+            ..Default::default()
+        });
+        let status = observation.snapshot();
+        assert_eq!((status.scanner_epoch, status.cycle), (Some(8), Some(12)));
+        assert_eq!(status.class, ScannerUsagePublicationClass::Unknown);
+        assert_eq!(status.pending_bucket_count, None);
+        let unfinished = ScannerUsagePublicationObservation::new(8, 13);
+        unfinished.finish();
+        assert_eq!(unfinished.snapshot().outcome, ScannerUsagePublicationOutcome::Unknown);
+    }
+
+    #[test]
+    fn usage_candidate_buckets_preserve_concurrent_updates() {
+        let metrics = Arc::new(Metrics::new());
+        let threads = (0..4)
+            .map(|_| {
+                let metrics = metrics.clone();
+                std::thread::spawn(move || {
+                    metrics::with_local_recorder(&metrics::NoopRecorder, || {
+                        for _ in 0..1000 {
+                            metrics.record_usage_candidate(
+                                ScannerUsageCandidateKind::Completed,
+                                ScannerUsageCandidateOutcome::Merge,
+                            );
+                        }
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("candidate counter thread");
+        }
+        let rows = metrics.usage_candidate_counts();
+        assert_eq!(rows.iter().map(|row| row.count).sum::<u64>(), 4000);
+        assert_eq!(rows.iter().find(|row| row.kind == ScannerUsageCandidateKind::Completed && row.outcome == ScannerUsageCandidateOutcome::Merge).expect("merge bucket").count, 4000);
     }
 }

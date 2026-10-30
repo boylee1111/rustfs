@@ -85,7 +85,17 @@ async fn real_local_write_read_is_measured_and_scratch_is_removed() {
         .await
         .expect("real drive benchmark");
 
-    assert_eq!(measurement.result.outcome(), DriveOutcome::Succeeded);
+    assert_eq!(
+        measurement.result.outcome(),
+        DriveOutcome::Succeeded,
+        "drive measurement: result_reason={:?}, target_reason={:?}, duration_millis={}, read_bytes={}, write_bytes={}, io_count={}",
+        measurement.result.reason_code(),
+        measurement.target.reason_code,
+        measurement.target.duration_millis,
+        measurement.target.read_bytes,
+        measurement.target.write_bytes,
+        measurement.target.io_count,
+    );
     assert_eq!(measurement.result.reason_code(), DriveReasonCode::Complete);
     let data = measurement.result.data().expect("aggregate data");
     assert_eq!(data.read_bytes, 32_768);
@@ -283,14 +293,38 @@ async fn invalid_roots_and_existing_scratch_fail_without_clobbering() {
 #[tokio::test]
 async fn read_only_root_and_full_drive_errors_are_classified() {
     let _guard = TEST_LOCK.lock().await;
-    let root = tempfile::tempdir().expect("scratch root");
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o500)).expect("make root read only");
-    let measurement = measure_drive(&request(root.path()), &CancellationToken::new())
+    let _temp_root = tempfile::tempdir().expect("scratch root");
+    // Permission bits do not make a directory unwritable to root. Linux's
+    // sysfs is a real directory whose mount rejects child creation even for
+    // privileged test runners; other Unix runners use a mode-restricted temp
+    // directory.
+    #[cfg(target_os = "linux")]
+    let read_only_root = Path::new("/sys");
+    #[cfg(not(target_os = "linux"))]
+    let read_only_root = {
+        fs::set_permissions(_temp_root.path(), fs::Permissions::from_mode(0o500)).expect("make root read only");
+        _temp_root.path()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let metadata = fs::symlink_metadata(read_only_root).expect("read-only root metadata");
+        assert!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "Linux read-only root must be a real directory"
+        );
+    }
+    let measurement = measure_drive(&request(read_only_root), &CancellationToken::new())
         .await
         .expect("typed permission result");
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("restore permissions");
+    #[cfg(not(target_os = "linux"))]
+    fs::set_permissions(read_only_root, fs::Permissions::from_mode(0o700)).expect("restore permissions");
     assert_eq!(measurement.result.outcome(), DriveOutcome::Failed);
-    assert_eq!(measurement.result.reason_code(), DriveReasonCode::PermissionDenied);
+    assert_eq!(
+        measurement.result.reason_code(),
+        DriveReasonCode::PermissionDenied,
+        "target result: {:?}",
+        measurement.target
+    );
     assert_eq!(measurement.target.reason_code, DriveTargetReasonCode::PermissionDenied);
     let failed = serde_json::to_value(&measurement.result).expect("failed result JSON");
     assert_eq!(failed["outcome"], "FAILED");
@@ -335,6 +369,17 @@ async fn successful_result_has_signed_bounded_private_offline_export() {
     let measurement = measure_drive(&request, &CancellationToken::new())
         .await
         .expect("drive measurement");
+    assert_eq!(
+        measurement.result.outcome(),
+        DriveOutcome::Succeeded,
+        "drive measurement before signed export: result_reason={:?}, target_reason={:?}, duration_millis={}, read_bytes={}, write_bytes={}, io_count={}",
+        measurement.result.reason_code(),
+        measurement.target.reason_code,
+        measurement.target.duration_millis,
+        measurement.target.read_bytes,
+        measurement.target.write_bytes,
+        measurement.target.io_count,
+    );
     let identity = connect::DeviceIdentity::generate();
     let export = sign_drive_export(&request, &measurement, &identity, &CancellationToken::new()).expect("signed export");
     assert!(export.result_json.len() <= perf_drive::MAX_RESULT_BYTES);
@@ -344,9 +389,15 @@ async fn successful_result_has_signed_bounded_private_offline_export() {
 
     let mut archive = zip::ZipArchive::new(Cursor::new(&export.archive_bytes)).expect("three-file archive");
     assert_eq!(archive.len(), 3);
-    assert_eq!(archive.by_index(0).expect("envelope").name(), "envelope.json");
-    assert_eq!(archive.by_index(1).expect("signature").name(), "envelope.sig");
-    assert_eq!(archive.by_index(2).expect("result").name(), "result.json");
+    assert_eq!(
+        archive.by_index(0).expect("envelope").name().expect("archive entry name"),
+        "envelope.json"
+    );
+    assert_eq!(
+        archive.by_index(1).expect("signature").name().expect("archive entry name"),
+        "envelope.sig"
+    );
+    assert_eq!(archive.by_index(2).expect("result").name().expect("archive entry name"), "result.json");
 
     let envelope: serde_json::Value = serde_json::from_slice(&export.envelope_json).expect("envelope JSON");
     assert_eq!(envelope["toolId"], "performance.drive");
@@ -446,7 +497,14 @@ async fn successful_result_has_signed_bounded_private_offline_export() {
 
 #[test]
 fn production_cli_measures_and_signs_exact_binary_provenance() {
-    let temp = tempfile::tempdir().expect("CLI tempdir");
+    // This provenance probe keeps the production deadline while isolating its
+    // tiny real-I/O fixture from shared CI storage latency when Linux permits it.
+    let temp = if cfg!(target_os = "linux") && Path::new("/dev/shm").is_dir() {
+        tempfile::tempdir_in("/dev/shm")
+    } else {
+        tempfile::tempdir()
+    }
+    .expect("isolated CLI fixture");
     let state = temp.path().join("state");
     let scratch = temp.path().join("scratch");
     let output = temp.path().join("drive.zip");
@@ -454,11 +512,24 @@ fn production_cli_measures_and_signs_exact_binary_provenance() {
     let identity = rustfs::connect::IdentityStore::new(state.join("identity"))
         .load_or_create()
         .expect("enrolled identity");
-    let result = drive_command(&state, &scratch, &output, "019e3ae0-0000-7000-8000-000000000014", 32_768, true)
-        .output()
-        .expect("run production rustfs binary");
+    let result = drive_command(
+        &state,
+        &scratch,
+        &output,
+        "019e3ae0-0000-7000-8000-000000000014",
+        32_768,
+        Duration::from_secs(1),
+        true,
+    )
+    .output()
+    .expect("run production rustfs binary");
 
-    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert!(fs::read_dir(&scratch).expect("scratch directory").next().is_none());
     #[cfg(unix)]
     assert_eq!(fs::metadata(&output).expect("output metadata").permissions().mode(), 0o100600);
@@ -482,7 +553,14 @@ fn production_cli_measures_and_signs_exact_binary_provenance() {
     let archive_bytes = fs::read(&output).expect("saved archive");
     let mut archive = zip::ZipArchive::new(Cursor::new(archive_bytes.as_slice())).expect("signed archive");
     let names = (0..archive.len())
-        .map(|index| archive.by_index(index).expect("archive member").name().to_owned())
+        .map(|index| {
+            archive
+                .by_index(index)
+                .expect("archive member")
+                .name()
+                .expect("archive entry name")
+                .into_owned()
+        })
         .collect::<Vec<_>>();
     assert_eq!(names, ["envelope.json", "envelope.sig", "result.json"]);
     let envelope_bytes = read_archive_member(&mut archive, "envelope.json");
@@ -534,6 +612,7 @@ fn production_cli_rejects_missing_l1_consent_and_limits_before_artifacts() {
         &no_consent_output,
         "019e3ae0-0000-7000-8000-000000000024",
         32_768,
+        Duration::from_secs(1),
         false,
     )
     .output()
@@ -550,6 +629,7 @@ fn production_cli_rejects_missing_l1_consent_and_limits_before_artifacts() {
         &over_limit_output,
         "019e3ae0-0000-7000-8000-000000000034",
         524_289,
+        Duration::from_secs(1),
         true,
     );
     let over_limit = over_limit.output().expect("run over limit");
@@ -571,6 +651,7 @@ fn production_cli_rejects_missing_l1_consent_and_limits_before_artifacts() {
         &failed_output,
         "019e3ae0-0000-7000-8000-000000000044",
         32_768,
+        Duration::from_secs(1),
         true,
     )
     .output()
@@ -594,6 +675,7 @@ fn drive_command(
     output: &Path,
     artifact_uid: &str,
     scratch_bytes: u64,
+    duration: Duration,
     acknowledge_l1: bool,
 ) -> Command {
     let current = now();
@@ -623,7 +705,7 @@ fn drive_command(
             "--expires-at",
             &(current + 60).to_string(),
             "--duration-millis",
-            "1000",
+            &duration.as_millis().to_string(),
         ]);
     command
         .arg("--scratch-bytes")

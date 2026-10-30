@@ -14,8 +14,8 @@
 
 use crate::common::{
     AdminTransport, RustFSTestEnvironment, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user,
-    awscurl_post_sts_form_urlencoded, init_logging, local_http_client, replication_fast_env, rustfs_binary_path, signed_request,
-    signed_request_with_client, signed_request_with_session_token,
+    awscurl_post_sts_form_urlencoded, init_logging, local_http_client, parse_assume_role_credentials, replication_fast_env,
+    rustfs_binary_path, signed_request, signed_request_with_client, signed_request_with_session_token,
 };
 use crate::fake_s3_target::{
     FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
@@ -385,21 +385,6 @@ pub(crate) struct ReplicationResetStatusTarget {
     pub(crate) replicated_count: i64,
     #[serde(rename = "object", default)]
     pub(crate) object: String,
-}
-
-fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].to_string())
-}
-
-fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), Box<dyn Error + Send + Sync>> {
-    let access_key = extract_xml_tag(xml, "AccessKeyId").ok_or("missing AccessKeyId in AssumeRole response")?;
-    let secret_key = extract_xml_tag(xml, "SecretAccessKey").ok_or("missing SecretAccessKey in AssumeRole response")?;
-    let session_token = extract_xml_tag(xml, "SessionToken").ok_or("missing SessionToken in AssumeRole response")?;
-    Ok((access_key, secret_key, session_token))
 }
 
 pub(crate) struct ReplicationTargetOptions<'a> {
@@ -3875,11 +3860,10 @@ async fn test_bucket_replication_replicates_directory_marker_in_versioned_bucket
         .body(ByteStream::from_static(body))
         .send()
         .await?;
-    assert!(
-        put.version_id()
-            .is_none_or(|id| id == "null" || id == uuid::Uuid::nil().to_string()),
-        "a directory marker is the null version even in a versioned bucket: {:?}",
-        put.version_id()
+    assert_eq!(
+        put.version_id(),
+        Some("null"),
+        "a directory marker must expose its null version without leaking the internal nil UUID"
     );
 
     wait_for_source_replication_status(&source_client, source_bucket, marker_key, "COMPLETED", false).await?;
@@ -3946,7 +3930,15 @@ async fn test_bucket_replication_version_purge_of_non_inline_object_releases_sou
         (sse_key, sse_put.version_id().ok_or("SSE PUT omitted version ID")?.to_string()),
         (large_key, large_put.version_id().ok_or("large PUT omitted version ID")?.to_string()),
     ];
-    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
+    // Managed-SSE listings may omit ETags. Check the replicated version's body
+    // before deleting it rather than comparing keyless listing fingerprints.
+    for (key, version_id) in &purged {
+        let source_body = get_version_body(&source_client, &source_bucket, key, version_id).await?;
+        let expected_sha256: [u8; 32] = Sha256::digest(&source_body).into();
+        wait_for_replicated_sha256(&target_client, &target_bucket, key, expected_sha256).await?;
+        let target_body = get_version_body(&target_client, &target_bucket, key, version_id).await?;
+        assert_eq!(target_body, source_body, "replicated version body differs for {key}/{version_id}");
+    }
 
     for (key, version_id) in &purged {
         source_client
@@ -3957,10 +3949,6 @@ async fn test_bucket_replication_version_purge_of_non_inline_object_releases_sou
             .send()
             .await?;
     }
-    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
-    let target_state = list_replication_state(&target_client, &target_bucket).await?;
-    assert!(target_state.is_empty(), "target retained an explicitly purged version: {target_state:?}");
-
     // The purge state is applied on the source asynchronously after the target
     // acknowledges the delete; only then does the retained version go away and
     // the bucket become deletable. A listing that is empty while DeleteBucket
@@ -3984,6 +3972,9 @@ async fn test_bucket_replication_version_purge_of_non_inline_object_releases_sou
             Err(err) => return Err(err.into()),
         }
     }
+
+    let target_state = list_replication_state(&target_client, &target_bucket).await?;
+    assert!(target_state.is_empty(), "target retained an explicitly purged version: {target_state:?}");
 
     Ok(())
 }
@@ -7195,13 +7186,30 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
     assert!(source_info.sites.iter().all(|peer| !peer.replicate_ilm_expiry));
     assert!(target_info.sites.iter().all(|peer| !peer.replicate_ilm_expiry));
 
+    let source_deployment_id = source_info
+        .sites
+        .iter()
+        .find(|peer| peer.endpoint == source_env.url)
+        .map(|peer| peer.deployment_id.clone())
+        .ok_or("source site missing from its own replication info")?;
+    let target_deployment_id = target_info
+        .sites
+        .iter()
+        .find(|peer| peer.endpoint == target_env.url)
+        .map(|peer| peer.deployment_id.clone())
+        .ok_or("target site missing from its own replication info")?;
     let target_status =
         wait_for_site_replication_status(&target_env, "peer-state=true", |status| status.peer_states.len() == 2).await?;
     let current_updated_at = target_status
         .peer_states
-        .values()
-        .find_map(|state| state.updated_at)
+        .get(&target_deployment_id)
+        .and_then(|state| state.updated_at)
         .ok_or("missing target site replication updated_at")?;
+    let source_updated_at = target_status
+        .peer_states
+        .get(&source_deployment_id)
+        .and_then(|state| state.updated_at)
+        .ok_or("missing source site replication updated_at")?;
 
     let mut stale_peers = BTreeMap::new();
     for peer in target_info.sites {
@@ -7245,16 +7253,23 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
     .await?;
     assert!(target_after_fresh.sites.iter().all(|peer| peer.replicate_ilm_expiry));
 
+    // State edits apply only to the addressed site; status reports each site's own state.
     let target_status_after_fresh = wait_for_site_replication_status(&target_env, "peer-state=true", |status| {
         status.peer_states.len() == 2
-            && status.peer_states.values().all(|state| {
-                state.updated_at == Some(fresh_updated_at) && state.peers.values().all(|peer| peer.replicate_ilm_expiry)
+            && status.peer_states.get(&target_deployment_id).is_some_and(|state| {
+                state.updated_at == Some(fresh_updated_at)
+                    && state.peers.len() == 2
+                    && state.peers.values().all(|peer| peer.replicate_ilm_expiry)
             })
     })
     .await?;
-    assert!(target_status_after_fresh.peer_states.values().all(|state| {
-        state.updated_at == Some(fresh_updated_at) && state.peers.values().all(|peer| peer.replicate_ilm_expiry)
-    }));
+    let source_state_after_fresh = target_status_after_fresh
+        .peer_states
+        .get(&source_deployment_id)
+        .ok_or("missing source site replication state after target edit")?;
+    assert_eq!(source_state_after_fresh.updated_at, Some(source_updated_at));
+    assert_eq!(source_state_after_fresh.peers.len(), 2);
+    assert!(source_state_after_fresh.peers.values().all(|peer| !peer.replicate_ilm_expiry));
 
     let source_after_fresh = site_replication_info(&source_env).await?;
     assert!(source_after_fresh.sites.iter().all(|peer| !peer.replicate_ilm_expiry));
@@ -10070,10 +10085,9 @@ async fn build_scanner_compensation_pair(
 /// P1-20: objects that already exist when a rule with
 /// ExistingObjectReplication=Enabled arrives are compensated by the scanner's
 /// existing-object resync pass, whatever wrote them — plain PUT, CopyObject,
-/// or Snowball auto-extract. The pinned exception is a null-version object
-/// (written before the bucket became versioned): the scanner heal gate skips
-/// nil-version objects entirely (`scanner_folder.rs` heal_replication), so it
-/// must NEVER be compensated.
+/// or Snowball auto-extract. That includes a null-version object written
+/// before the bucket became versioned (rustfs/rustfs#8747): it is compensated
+/// like any other existing object and lands as the target's null version.
 #[tokio::test]
 async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestResult {
     init_logging();
@@ -10083,14 +10097,54 @@ async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestR
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
 
-    // Null-version cell: PUT before versioning; the object keeps the nil
-    // version id forever.
+    // Null-version cell: PUT before versioning; the object keeps the null
+    // version forever.
     let null_key = "pre-versioning-null.txt";
+    let null_payload = "null version payload";
     source_client
         .put_object()
         .bucket(source_bucket)
         .key(null_key)
-        .body(ByteStream::from_static(b"null version payload"))
+        .body(ByteStream::from_static(null_payload.as_bytes()))
+        .send()
+        .await?;
+
+    // Multipart null-version cell: a one-part upload already carries a
+    // multipart ETag, so its replica travels the target's multipart path,
+    // whose completion must keep the null version too.
+    let multipart_null_key = "pre-versioning-null-multipart.txt";
+    let multipart_null_payload = "multipart null version payload";
+    let upload = source_client
+        .create_multipart_upload()
+        .bucket(source_bucket)
+        .key(multipart_null_key)
+        .send()
+        .await?;
+    let upload_id = upload.upload_id().ok_or("multipart upload id missing")?;
+    let part = source_client
+        .upload_part()
+        .bucket(source_bucket)
+        .key(multipart_null_key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(multipart_null_payload.as_bytes()))
+        .send()
+        .await?;
+    source_client
+        .complete_multipart_upload()
+        .bucket(source_bucket)
+        .key(multipart_null_key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .set_e_tag(part.e_tag().map(str::to_string))
+                        .build(),
+                )
+                .build(),
+        )
         .send()
         .await?;
 
@@ -10178,9 +10232,22 @@ async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestR
     wait_for_replicated_object(&target_client, target_bucket, copy_key, plain_payload).await?;
     wait_for_replicated_object(&target_client, target_bucket, member_key, std::str::from_utf8(member_payload)?).await?;
 
-    // Null-version contract: with every sibling compensated (scanner proven
-    // live), the nil-version object must stay absent across further cycles.
-    assert_replication_key_absent(&target_client, target_bucket, null_key, Duration::from_secs(6)).await?;
+    // The null versions converge too, and keep their identity whichever path
+    // carried them: each replica is the target's null version, not a freshly
+    // minted one.
+    for (key, payload) in [(null_key, null_payload), (multipart_null_key, multipart_null_payload)] {
+        wait_for_replicated_object(&target_client, target_bucket, key, payload).await?;
+        let null_replica = target_client
+            .get_object()
+            .bucket(target_bucket)
+            .key(key)
+            .version_id("null")
+            .send()
+            .await?;
+        assert_eq!(null_replica.version_id(), Some("null"), "{key} must replicate as the null version");
+        let null_replica_body = null_replica.body.collect().await?.into_bytes();
+        assert_eq!(null_replica_body.as_ref(), payload.as_bytes());
+    }
 
     Ok(())
 }
@@ -10506,13 +10573,14 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     let target_bucket = "proxy-tag-dst";
     let (target, source_env, source_client, target_client) = start_read_proxy_lab(source_bucket, target_bucket).await?;
 
-    target_client
+    let tagged = target_client
         .put_object()
         .bucket(target_bucket)
         .key("proxy-tagged")
         .body(ByteStream::from_static(b"tagged payload"))
         .send()
         .await?;
+    let tagged_version = tagged.version_id().ok_or("versioned target PUT omitted its identity")?;
     target_client
         .put_object_tagging()
         .bucket(target_bucket)
@@ -10536,6 +10604,11 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
     assert_eq!(tags.tag_set.len(), 1, "proxied tagging read must return the target's tags");
     assert_eq!(tags.tag_set[0].key.as_str(), "team");
     assert_eq!(tags.tag_set[0].value.as_str(), "storage");
+    assert_eq!(
+        tags.version_id(),
+        Some(tagged_version),
+        "proxy must preserve the resolved remote identity"
+    );
 
     let record = target
         .requests()
@@ -10548,6 +10621,33 @@ async fn test_get_object_tagging_proxies_unreplicated_object_to_replication_targ
         "proxied tagging read must carry the anti-loop marker"
     );
     assert!(record.proxy_headers.replication_check.is_none());
+
+    let empty = target_client
+        .put_object()
+        .bucket(target_bucket)
+        .key("proxy-tagged")
+        .body(ByteStream::from_static(b"new version without tags"))
+        .send()
+        .await?;
+    let empty_version = empty.version_id().ok_or("empty-tag version omitted its identity")?;
+    for selector in [None, Some(empty_version), Some(tagged_version)] {
+        let tags = source_client
+            .get_object_tagging()
+            .bucket(source_bucket)
+            .key("proxy-tagged")
+            .set_version_id(selector.map(str::to_owned))
+            .send()
+            .await?;
+        let expected_version = selector.unwrap_or(empty_version);
+        assert_eq!(tags.version_id(), Some(expected_version));
+        if expected_version == tagged_version {
+            assert_eq!(tags.tag_set().len(), 1);
+            assert_eq!(tags.tag_set()[0].key(), "team");
+            assert_eq!(tags.tag_set()[0].value(), "storage");
+        } else {
+            assert!(tags.tag_set().is_empty());
+        }
+    }
 
     drop(source_env);
     target.shutdown().await;

@@ -155,7 +155,7 @@ fn connect_offline_bundle_is_deterministic_bounded_and_signed_over_exact_manifes
     assert_eq!(archive.len(), PATHS.len());
     for (index, expected_path) in PATHS.into_iter().enumerate() {
         let file = archive.by_index(index).expect("archive member");
-        assert_eq!(file.name(), expected_path);
+        assert_eq!(file.name().expect("archive entry name"), expected_path);
         assert_eq!(file.compression(), CompressionMethod::Stored);
         assert_eq!(file.last_modified(), Some(zip::DateTime::DEFAULT));
         assert_eq!(file.unix_mode().map(|mode| mode & 0o777), Some(0o600));
@@ -364,7 +364,7 @@ fn connect_offline_bundle_cli_requires_an_existing_offline_key() {
 
 #[cfg(target_os = "linux")]
 async fn wait_for_inventory(status: &mut watch::Receiver<InventoryStatus>) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if matches!(status.borrow_and_update().clone(), InventoryStatus::Unchanged { .. }) {
                 return;

@@ -63,6 +63,7 @@ use crate::services::tier::{
 };
 use crate::set_disk::{
     MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks, get_lock_acquire_timeout,
+    multipart_part_logical_size, should_persist_encryption_original_size,
 };
 use crate::storage_api_contracts::{
     lifecycle::ExpirationOptions,
@@ -87,6 +88,7 @@ use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatus, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info,
     is_restored_object_on_disk,
 };
+use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use rustfs_scanner_metrics::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
@@ -118,6 +120,7 @@ const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const EVENT_LIFECYCLE_WORKER_STATE: &str = "lifecycle_worker_state";
 const EVENT_LIFECYCLE_TRANSITION_COMPENSATION: &str = "lifecycle_transition_compensation";
 const EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP: &str = "lifecycle_stale_multipart_cleanup";
+const METRIC_STALE_MULTIPART_CLEANUP_BLOCKED_TOTAL: &str = "rustfs_stale_multipart_cleanup_blocked_total";
 const EVENT_LIFECYCLE_SCAN_SKIPPED: &str = "lifecycle_scan_skipped";
 const EVENT_LIFECYCLE_EVALUATION_FAILED: &str = "lifecycle_evaluation_failed";
 const EVENT_LIFECYCLE_EXPIRED_DETECTED: &str = "lifecycle_expired_detected";
@@ -190,6 +193,8 @@ const TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL: StdDuration = StdDuration::from_
 // before another full sweep can discover work persisted by another node.
 const TIER_FREE_VERSION_RECOVERY_MAX_IDLE_INTERVAL: StdDuration = StdDuration::from_secs(10 * 60);
 const TIER_FREE_VERSION_RECOVERY_JITTER_PERCENT: u64 = 10;
+const TIER_FREE_VERSION_RECOVERY_LEADER_LOCK: &str = "tier-free-version-recovery/leader.lock";
+const TIER_FREE_VERSION_RECOVERY_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 const EXPIRY_WORKER_QUEUE_CAPACITY: usize = 1000;
 const DEFAULT_MANUAL_TRANSITION_JOB_RECOVERY_LIMIT: usize = 100;
@@ -515,20 +520,26 @@ impl ExpiryStats {
         Self::add_nonnegative(&self.missed_tier_journal_tasks, 1);
     }
 
+    // The pending and active gauges are balanced by design: every increment
+    // has exactly one matching decrement. They must not saturate at zero on
+    // update, because a worker can dequeue (and decrement) before the
+    // enqueuing side has recorded its increment. Clamping that transient -1
+    // to 0 turns the later +1 into a phantom task that never drains
+    // (rustfs#7921). Readers clamp negative snapshots instead.
     fn increment_pending_tasks(&self) {
-        Self::add_nonnegative(&self.pending_tasks, 1);
+        self.pending_tasks.fetch_add(1, Ordering::AcqRel);
     }
 
     fn decrement_pending_tasks(&self) {
-        Self::add_nonnegative(&self.pending_tasks, -1);
+        self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn increment_active_tasks(&self) {
-        Self::add_nonnegative(&self.active_tasks, 1);
+        self.active_tasks.fetch_add(1, Ordering::AcqRel);
     }
 
     fn decrement_active_tasks(&self) {
-        Self::add_nonnegative(&self.active_tasks, -1);
+        self.active_tasks.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn increment_workers(&self) {
@@ -777,7 +788,7 @@ fn free_version_physical_topology_generation(api: &ECStore) -> String {
     rustfs_utils::crypto::hex(hasher.finalize().as_slice())
 }
 
-fn free_version_remote_tuple_matches(candidate: &ObjectInfo, expected: &ObjectInfo) -> std::io::Result<bool> {
+pub(crate) fn free_version_remote_tuple_matches(candidate: &ObjectInfo, expected: &ObjectInfo) -> std::io::Result<bool> {
     if candidate.transitioned_object.tier != expected.transitioned_object.tier
         || candidate.transitioned_object.name != expected.transitioned_object.name
     {
@@ -820,7 +831,7 @@ async fn scan_exact_free_version_targets(
     let mut targets = Vec::new();
     for pool in &api.pools {
         for set in &pool.disk_set {
-            let versions = match set.load_file_info_versions_exact(&oi.bucket, &oi.name).await {
+            let versions = match set.load_file_info_versions_for_tier_cleanup(&oi.bucket, &oi.name).await {
                 Ok(Some(versions)) => versions,
                 Ok(None) => continue,
                 Err(err) if is_err_strict_volume_not_found(&err) => continue,
@@ -870,7 +881,11 @@ fn free_version_cleanup_fences_current(
         && free_version_physical_topology_generation(api) == topology_generation
 }
 
-async fn cleanup_free_version_exact(api: Arc<ECStore>, oi: &ObjectInfo, cancel: &CancellationToken) -> std::io::Result<bool> {
+pub(crate) async fn cleanup_free_version_exact(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    cancel: &CancellationToken,
+) -> std::io::Result<bool> {
     const FREE_VERSION_REMOTE_DEADLINE: StdDuration = StdDuration::from_secs(30);
 
     let topology_generation = free_version_physical_topology_generation(&api);
@@ -1029,6 +1044,32 @@ pub struct ExpiryState {
     recovery_notify: Arc<Notify>,
 }
 
+/// Keeps every lifecycle expiry task the process enqueues in its queue until
+/// released, as if the expiry workers were busy.
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct HeldExpiryQueue {
+    state: Arc<RwLock<ExpiryState>>,
+    previous: ExpiryState,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl HeldExpiryQueue {
+    pub(crate) async fn hold() -> Self {
+        let held = Arc::try_unwrap(ExpiryState::new_with_unconsumed_worker_channel(16))
+            .ok()
+            .expect("a new expiry state has a single owner")
+            .into_inner();
+        let state = runtime_sources::expiry_state_handle();
+        let previous = std::mem::replace(&mut *state.write().await, held);
+        Self { state, previous }
+    }
+
+    /// Drops the held tasks unrun and restores the previous expiry state.
+    pub(crate) async fn release(self) {
+        *self.state.write().await = self.previous;
+    }
+}
+
 impl ExpiryState {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<RwLock<Self>> {
@@ -1047,8 +1088,9 @@ impl ExpiryState {
         }))
     }
 
-    #[cfg(test)]
-    fn new_with_unconsumed_worker_channel(capacity: usize) -> Arc<RwLock<Self>> {
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn new_with_unconsumed_worker_channel(capacity: usize) -> Arc<RwLock<Self>> {
         let (tx, rx) = mpsc::channel(capacity);
         Arc::new(RwLock::new(Self {
             tasks_tx: vec![tx],
@@ -1074,9 +1116,13 @@ impl ExpiryState {
     }
 
     fn send_expiry_task(&self, wrkr: Sender<Option<ExpiryOpType>>, task: ExpiryOpType) -> bool {
+        // Account for the task before a worker can observe it. The worker
+        // decrements on dequeue, so incrementing after `try_send` would let a
+        // fast dequeue run the gauge through zero first.
+        self.stats.increment_pending_tasks();
         let queued = wrkr.try_send(Some(task)).is_ok();
-        if queued {
-            self.stats.increment_pending_tasks();
+        if !queued {
+            self.stats.decrement_pending_tasks();
         }
         queued
     }
@@ -1431,24 +1477,38 @@ pub(crate) async fn enqueue_committed_free_versions(api: &ECStore, free_versions
     queued
 }
 
-async fn enqueue_recovered_free_version_with_state(state: &Arc<RwLock<ExpiryState>>, oi: ObjectInfo) -> bool {
+async fn enqueue_recovered_free_version_with_state(
+    state: &Arc<RwLock<ExpiryState>>,
+    oi: ObjectInfo,
+    cancel: &CancellationToken,
+) -> bool {
     let task = FreeVersionTask(oi);
     let hash = task.op_hash();
     let (wrkr, stats) = {
-        let state = state.read().await;
+        let state = select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            state = state.read() => state,
+        };
         (state.get_worker_ch(hash), Arc::clone(&state.stats))
     };
+    if cancel.is_cancelled() {
+        return false;
+    }
     let Some(wrkr) = wrkr else {
         stats.increment_missed_freevers_tasks();
         stats.record_scanner_expiry_state();
         return false;
     };
 
+    // Same ordering rule as `ExpiryState::send_expiry_task`: count first, so
+    // a worker that dequeues immediately cannot decrement before this
+    // increment lands.
+    stats.increment_pending_tasks();
     let queued = wrkr.try_send(Some(Box::new(task))).is_ok();
     if !queued {
+        stats.decrement_pending_tasks();
         stats.increment_missed_freevers_tasks();
-    } else {
-        stats.increment_pending_tasks();
     }
     stats.record_scanner_expiry_state();
     queued
@@ -1484,9 +1544,13 @@ fn set_recovered_free_version_enqueue_observer(
     RecoveredFreeVersionEnqueueObserverGuard
 }
 
-pub async fn enqueue_recovered_free_version(api: &ECStore, oi: ObjectInfo) -> bool {
+pub(super) async fn enqueue_recovered_free_version_with_cancel(
+    api: &ECStore,
+    oi: ObjectInfo,
+    cancel: &CancellationToken,
+) -> bool {
     let expiry_state = api.ctx.expiry_state();
-    let queued = enqueue_recovered_free_version_with_state(&expiry_state, oi).await;
+    let queued = enqueue_recovered_free_version_with_state(&expiry_state, oi, cancel).await;
 
     #[cfg(test)]
     if let Some(observer) = RECOVERED_FREE_VERSION_ENQUEUE_OBSERVER
@@ -2386,6 +2450,16 @@ fn is_slow_down(err: &Error) -> bool {
     matches!(err, Error::SlowDown)
 }
 
+/// Lifecycle expiry is idempotent when the exact object or version has already
+/// disappeared between the scanner listing and the delete admission.
+///
+/// Keep this predicate narrower than bucket/volume "not found" helpers: an
+/// unavailable bucket or disk is an operational failure and must not be
+/// reported as a completed expiry.
+fn is_lifecycle_expiry_already_gone(err: &Error) -> bool {
+    is_err_object_not_found(err) || is_err_version_not_found(err)
+}
+
 /// Resolves the expiry worker count from the single documented knob,
 /// `RUSTFS_MAX_EXPIRY_WORKERS`: a set, parsable, non-zero value wins;
 /// anything else falls back to `min(cpus, 16)`. The historical
@@ -2420,7 +2494,13 @@ fn spawn_recovery_disposition_maintenance_once(api: Arc<ECStore>) -> Option<Join
         return None;
     }
     Some(tokio::spawn(async move {
-        run_recovery_disposition_maintenance_loop(api, cancel_token).await;
+        let maintenance = run_recovery_disposition_maintenance_loop(api, cancel_token);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let maintenance = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::RecoveryDispositionMaintenance,
+            maintenance,
+        );
+        maintenance.await;
     }))
 }
 
@@ -2908,6 +2988,20 @@ fn resolve_tier_free_version_recovery_enabled(value: Result<String, env::VarErro
 }
 
 fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<()>) -> Option<JoinHandle<()>> {
+    spawn_tier_free_version_recovery_once_with_options(
+        api,
+        started,
+        TIER_FREE_VERSION_RECOVERY_LEADER_LOCK.to_string(),
+        tier_free_version_recovery_leader_retry_delay,
+    )
+}
+
+fn spawn_tier_free_version_recovery_once_with_options(
+    api: Arc<ECStore>,
+    started: &OnceLock<()>,
+    leader_lock_name: String,
+    retry_delay: fn() -> StdDuration,
+) -> Option<JoinHandle<()>> {
     if !tier_free_version_recovery_enabled() {
         warn!(
             event = EVENT_LIFECYCLE_WORKER_STATE,
@@ -2924,20 +3018,36 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<(
 
     Some(tokio::spawn(async move {
         let cancel_token = api.ctx.background_cancel_token().unwrap_or_default();
-        let expiry_state = api.ctx.expiry_state();
-        run_tier_free_version_recovery_loop(
+        let acquire_api = Arc::clone(&api);
+        let acquire_lock_name = Arc::<str>::from(leader_lock_name);
+        run_tier_free_version_recovery_coordinator(
             cancel_token,
-            expiry_state,
-            jitter_tier_free_version_recovery_delay,
-            move |bucket_marker, object_marker, recovery_cancel| {
+            retry_delay,
+            move || {
+                let api = Arc::clone(&acquire_api);
+                let lock_name = Arc::clone(&acquire_lock_name);
+                async move {
+                    let lock = api.new_ns_lock(RUSTFS_META_BUCKET, &lock_name).await?;
+                    match lock.get_write_lock_quiet(TIER_FREE_VERSION_RECOVERY_LOCK_TIMEOUT).await {
+                        Ok(guard) => Ok(Some(guard)),
+                        Err(LockError::Timeout { .. }) => Ok(None),
+                        Err(err) => Err(err.into()),
+                    }
+                }
+            },
+            move |leader_cancel| {
                 let api = Arc::clone(&api);
                 async move {
-                    recover_tier_free_versions_with_cancel(
-                        api,
-                        DEFAULT_FREE_VERSION_RECOVERY_LIMIT,
-                        bucket_marker,
-                        object_marker,
-                        recovery_cancel,
+                    run_tier_free_version_recovery_loop(
+                        leader_cancel,
+                        api.ctx.expiry_state(),
+                        jitter_tier_free_version_recovery_delay,
+                        move |bucket_marker, object_marker, recovery_cancel| {
+                            let api = Arc::clone(&api);
+                            async move {
+                                recover_configured_tier_free_versions(api, bucket_marker, object_marker, recovery_cancel).await
+                            }
+                        },
                     )
                     .await
                 }
@@ -2945,6 +3055,119 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<(
         )
         .await;
     }))
+}
+
+async fn recover_configured_tier_free_versions(
+    api: Arc<ECStore>,
+    bucket_marker: Option<String>,
+    object_marker: Option<String>,
+    cancel_token: CancellationToken,
+) -> crate::error::Result<FreeVersionRecoveryStats> {
+    let tier_config_mgr = api.tier_config_mgr();
+    let has_tiers = select! {
+        biased;
+        _ = cancel_token.cancelled() => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "tier free-version recovery cancelled").into());
+        }
+        manager = tier_config_mgr.read() => !manager.empty(),
+    };
+    // Startup can launch recovery before tier configuration is loaded. Keep
+    // polling, but release the manager lock before any namespace I/O.
+    if !has_tiers {
+        return Ok(FreeVersionRecoveryStats {
+            scanned: 0,
+            enqueued: 0,
+            failed: 0,
+            next_bucket_marker: None,
+            next_object_marker: None,
+            scanned_entries: 0,
+            buckets_scanned: 0,
+            truncated: false,
+        });
+    }
+
+    recover_tier_free_versions_with_cancel(api, DEFAULT_FREE_VERSION_RECOVERY_LIMIT, bucket_marker, object_marker, cancel_token)
+        .await
+}
+
+fn tier_free_version_recovery_leader_retry_delay() -> StdDuration {
+    StdDuration::from_secs(rand::rng().random_range(15..=30))
+}
+
+async fn run_tier_free_version_recovery_coordinator<A, AF, R, RF>(
+    cancel: CancellationToken,
+    retry_delay: fn() -> StdDuration,
+    mut acquire: A,
+    mut recover: R,
+) where
+    A: FnMut() -> AF,
+    AF: Future<Output = crate::error::Result<Option<NamespaceLockGuard>>>,
+    R: FnMut(CancellationToken) -> RF,
+    RF: Future<Output = ()>,
+{
+    loop {
+        let acquired = select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            result = acquire() => result,
+        };
+        match acquired {
+            Ok(Some(mut guard)) => {
+                let leader_cancel = cancel.child_token();
+                // Hold ownership across every page, cooldown and idle wait. A
+                // follower taking over starts a fresh sweep of persisted markers.
+                let recovery = recover(leader_cancel.clone());
+                tokio::pin!(recovery);
+                debug!(
+                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    state = "free_version_recovery_leader_acquired",
+                    lock_name = TIER_FREE_VERSION_RECOVERY_LEADER_LOCK,
+                    "Tier free-version recovery leader acquired"
+                );
+                select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        leader_cancel.cancel();
+                        recovery.await;
+                    }
+                    _ = guard.lock_lost_notified() => {
+                        debug!(
+                            event = EVENT_LIFECYCLE_WORKER_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                            state = "free_version_recovery_leader_lost",
+                            lock_name = TIER_FREE_VERSION_RECOVERY_LEADER_LOCK,
+                            "Tier free-version recovery leader lost"
+                        );
+                        // Dropping the recovery future would detach its active
+                        // walk. Cancel it and poll the same future through cleanup.
+                        leader_cancel.cancel();
+                        recovery.await;
+                    }
+                    _ = &mut recovery => {}
+                }
+                leader_cancel.cancel();
+                guard.release();
+            }
+            Ok(None) => {}
+            Err(err) => warn!(
+                event = EVENT_LIFECYCLE_WORKER_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                state = "free_version_recovery_leader_acquire_failed",
+                lock_name = TIER_FREE_VERSION_RECOVERY_LEADER_LOCK,
+                error = %err,
+                "Tier free-version recovery leader acquisition failed"
+            ),
+        }
+        select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(retry_delay()) => {}
+        }
+    }
 }
 
 async fn run_tier_free_version_recovery_loop<F, Fut>(
@@ -2956,7 +3179,11 @@ async fn run_tier_free_version_recovery_loop<F, Fut>(
     F: FnMut(Option<String>, Option<String>, CancellationToken) -> Fut,
     Fut: Future<Output = crate::error::Result<FreeVersionRecoveryStats>>,
 {
-    let recovery_notify = Arc::clone(&expiry_state.read().await.recovery_notify);
+    let recovery_notify = select! {
+        biased;
+        _ = cancel_token.cancelled() => return,
+        state = expiry_state.read() => Arc::clone(&state.recovery_notify),
+    };
     let mut schedule = TierFreeVersionRecoverySchedule::default();
 
     loop {
@@ -2979,7 +3206,11 @@ async fn run_tier_free_version_recovery_loop<F, Fut>(
                 schedule.record_success(&stats);
                 rustfs_io_metrics::record_stage_duration("lifecycle_free_version_recovery", elapsed.as_secs_f64() * 1000.0);
                 let (pending_tasks, active_tasks) = {
-                    let state = expiry_state.read().await;
+                    let state = select! {
+                        biased;
+                        _ = cancel_token.cancelled() => return,
+                        state = expiry_state.read() => state,
+                    };
                     (state.pending_tasks(), state.stats.active_tasks())
                 };
                 debug!(
@@ -3178,7 +3409,13 @@ fn spawn_tier_delete_journal_recovery_once(api: Arc<ECStore>) {
         return;
     }
     tokio::spawn(async move {
-        run_tier_delete_journal_recovery_loop(api, cancel_token).await;
+        let recovery = run_tier_delete_journal_recovery_loop(api, cancel_token);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let recovery = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::LifecycleRecovery,
+            recovery,
+        );
+        recovery.await;
     });
 }
 
@@ -3197,7 +3434,13 @@ fn spawn_transition_transaction_recovery_once(api: Arc<ECStore>) {
         return;
     }
     tokio::spawn(async move {
-        run_transition_transaction_recovery_loop(api, cancel_token).await;
+        let recovery = run_transition_transaction_recovery_loop(api, cancel_token);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let recovery = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::LifecycleRecovery,
+            recovery,
+        );
+        recovery.await;
     });
 }
 
@@ -3270,19 +3513,29 @@ async fn stale_upload_current_size_with_opts(
             &ObjectOptions {
                 data_movement,
                 no_lock,
+                strict_multipart_part_sizes: true,
                 ..Default::default()
             },
         )
         .await
         .ok()?;
 
-    Some(
-        parts
-            .parts
-            .iter()
-            .map(|part| part.actual_size.max(part.size as i64).max(0) as usize)
-            .sum(),
-    )
+    stale_upload_size_from_parts(&parts)
+}
+
+fn stale_upload_size_from_parts(parts: &crate::storage_api_contracts::multipart::ListPartsInfo) -> Option<usize> {
+    if parts.is_truncated {
+        return None;
+    }
+    let transformed = rustfs_utils::http::contains_key_str(&parts.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
+        || should_persist_encryption_original_size(&parts.user_defined);
+    parts.parts.iter().try_fold(0usize, |total, part| {
+        // ListParts represents a quorum-confirmed missing part with an empty ETag.
+        if part.etag.as_deref().is_none_or(str::is_empty) {
+            return None;
+        }
+        total.checked_add(multipart_part_logical_size(part.size, part.actual_size, transformed)?)
+    })
 }
 
 async fn stale_upload_lifecycle_due(
@@ -3299,18 +3552,44 @@ async fn stale_upload_lifecycle_due(
     let bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY)?;
     let object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY)?;
 
-    let lifecycle = match metadata_boundary::get_lifecycle_config(bucket).await {
+    let mut lifecycle = match metadata_boundary::get_lifecycle_config(bucket).await {
         Ok((lifecycle, _)) => lifecycle,
         Err(_) => return None,
     };
 
+    let has_size_filter = |filter: &s3s::dto::LifecycleRuleFilter| {
+        filter.object_size_greater_than.is_some()
+            || filter.object_size_less_than.is_some()
+            || filter
+                .and
+                .as_ref()
+                .is_some_and(|and| and.object_size_greater_than.is_some() || and.object_size_less_than.is_some())
+    };
+    let needs_size = lifecycle.rules.iter().any(|rule| {
+        rule.status.as_str() != ExpirationStatus::DISABLED
+            && rule.abort_incomplete_multipart_upload.is_some()
+            && rule.filter.as_ref().is_some_and(has_size_filter)
+    });
+    let size = if needs_size {
+        match stale_upload_current_size_with_opts(set, metadata, upload_dir, no_lock).await {
+            Some(size) => size,
+            None => {
+                // An unknown size cannot authorize a size-filtered abort.
+                // Unrelated rules can still be evaluated independently.
+                lifecycle
+                    .rules
+                    .retain(|rule| !rule.filter.as_ref().is_some_and(has_size_filter));
+                0
+            }
+        }
+    } else {
+        0
+    };
     let object_opts = ObjectOpts {
         name: object.clone(),
         user_tags: metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default(),
         mod_time: Some(initiated),
-        size: stale_upload_current_size_with_opts(set, metadata, upload_dir, no_lock)
-            .await
-            .unwrap_or_default(),
+        size,
         is_latest: true,
         delete_marker: false,
         user_defined: metadata.clone(),
@@ -3467,6 +3746,23 @@ async fn cleanup_empty_multipart_sha_dirs_on_local_disks(set: &Arc<SetDisks>) {
     }
 }
 
+fn record_stale_multipart_cleanup_blocked(stage: &'static str) {
+    metrics::counter!(METRIC_STALE_MULTIPART_CLEANUP_BLOCKED_TOTAL, "stage" => stage).increment(1);
+}
+
+fn record_stale_multipart_cleanup_lock_lost(path: &str) {
+    record_stale_multipart_cleanup_blocked("lock_lost");
+    debug!(
+        event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+        state = "skipped",
+        path = %path,
+        reason = "multipart_cleanup_lock_lost",
+        "Skipped stale multipart cleanup"
+    );
+}
+
 async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: OffsetDateTime, default_expiry: StdDuration) -> usize {
     let mut deleted = 0usize;
     let mut candidates = HashMap::new();
@@ -3563,7 +3859,8 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
     for candidate in candidates.into_values() {
         let upload_dir = candidate.path.rsplit('/').next().unwrap_or_default().to_string();
         let mut due = stale_upload_default_due(candidate.initiated, default_expiry);
-        if let Some(metadata) = candidate.metadata.as_ref()
+        if now < due
+            && let Some(metadata) = candidate.metadata.as_ref()
             && let Some(lifecycle_due) = stale_upload_lifecycle_due(set, metadata, candidate.initiated, &upload_dir, false).await
             && lifecycle_due < due
         {
@@ -3577,6 +3874,7 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
         let cleanup_guard = match set.lock_stale_multipart_cleanup(&candidate.path).await {
             Ok(guard) => guard,
             Err(err) => {
+                record_stale_multipart_cleanup_blocked("recheck");
                 debug!(
                     event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
                     component = LOG_COMPONENT_ECSTORE,
@@ -3592,13 +3890,18 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
         let current_metadata = cleanup_guard.file_info().metadata.clone();
         let current_initiated = initiated_from_upload_dir(&upload_dir, cleanup_guard.file_info().mod_time);
         let mut current_due = stale_upload_default_due(current_initiated, default_expiry);
-        if let Some(lifecycle_due) =
-            stale_upload_lifecycle_due(set, &current_metadata, current_initiated, &upload_dir, true).await
+        if now < current_due
+            && let Some(lifecycle_due) =
+                stale_upload_lifecycle_due(set, &current_metadata, current_initiated, &upload_dir, true).await
             && lifecycle_due < current_due
         {
             current_due = lifecycle_due;
         }
-        if now < current_due || cleanup_guard.is_lock_lost() {
+        if now < current_due {
+            continue;
+        }
+        if cleanup_guard.is_lock_lost() {
+            record_stale_multipart_cleanup_lock_lost(&candidate.path);
             continue;
         }
 
@@ -3618,15 +3921,18 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
                     "Removed stale multipart upload"
                 );
             }
-            Err(err) => debug!(
-                event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                path = %candidate.path,
-                error = ?err,
-                reason = "multipart_remove_failed",
-                "Failed to remove stale multipart upload"
-            ),
+            Err(err) => {
+                record_stale_multipart_cleanup_blocked("delete");
+                debug!(
+                    event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    path = %candidate.path,
+                    error = ?err,
+                    reason = "multipart_remove_failed",
+                    "Failed to remove stale multipart upload"
+                );
+            }
         }
     }
 
@@ -3757,11 +4063,8 @@ pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
     }
 }
 
-pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
-    let Some(api) = runtime_sources::object_store_handle() else {
-        return;
-    };
-    let configs = match metadata_boundary::get_expiry_configs(&api, &oi.bucket).await {
+pub(crate) async fn enqueue_immediate_expiry(api: Arc<ECStore>, oi: &ObjectInfo, src: LcEventSrc, opts: &ObjectOptions) {
+    let configs = match metadata_boundary::get_expiry_configs_for_options(&api, &oi.bucket, opts).await {
         Ok(configs) => configs,
         Err(err) => {
             observe_lifecycle_observability_event(EVENT_LIFECYCLE_EVALUATION_FAILED, "failed", Some("metadata_unavailable"));
@@ -3785,44 +4088,28 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
         return;
     };
 
-    let mut marker = None;
-    let mut version_marker = None;
-    let mut object_infos = Vec::new();
-
-    loop {
-        let page = match api
-            .clone()
-            .list_object_versions_for_lifecycle(&oi.bucket, &oi.name, marker.clone(), version_marker.clone(), None, 1000)
-            .await
-        {
-            Ok(page) => page,
-            Err(err) => {
-                warn!(
-                    event = EVENT_LIFECYCLE_EVALUATION_FAILED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    bucket = %oi.bucket,
-                    object = %oi.name,
-                    error = %err,
-                    reason = "list_versions_failed",
-                    "Failed to load lifecycle version group"
-                );
-                return;
-            }
-        };
-
-        object_infos.extend(page.objects.into_iter().filter(|object| object.name == oi.name));
-
-        if !page.is_truncated {
-            break;
+    let object_infos = match api
+        .get_object_versions_for_lifecycle(&oi.bucket, &oi.name, opts, configs.bucket_incarnation_id)
+        .await
+    {
+        Ok(objects) => objects,
+        Err(err) => {
+            warn!(
+                event = EVENT_LIFECYCLE_EVALUATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                result = "failed",
+                bucket = %oi.bucket,
+                object = %oi.name,
+                error = %err,
+                reason = "read_versions_failed",
+                "Failed to load lifecycle version group"
+            );
+            return;
         }
-
-        marker = page.next_marker;
-        version_marker = page.next_version_idmarker;
-    }
-
+    };
     if object_infos.is_empty() {
-        object_infos.push(oi.clone());
+        return;
     }
 
     let object_opts = object_infos
@@ -4738,7 +5025,7 @@ async fn expire_transitioned_object_with_lock_lost_signal(
     bucket_incarnation_id: Uuid,
     lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 ) -> Result<ObjectInfo, std::io::Error> {
-    let publication_guard = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id)
+    let publication_guard = lifecycle_expiry_publication_guard(&api, &oi.bucket, &oi.name, bucket_incarnation_id)
         .await
         .ok_or_else(|| std::io::Error::other("lifecycle expiry is not allowed for this bucket"))?;
     let snapshot = lifecycle_delete_config_snapshot(&api, oi)
@@ -4747,6 +5034,14 @@ async fn expire_transitioned_object_with_lock_lost_signal(
     let (versioned, version_suspended) = snapshot.versioning_config().delete_state(&oi.name);
     let mut opts = transitioned_object_delete_opts(oi, lc_event.action, versioned, version_suspended, bucket_incarnation_id)
         .map_err(std::io::Error::other)?;
+    if lc_event.requires_expiry_policy() {
+        opts.lifecycle_expiry_policy = Some(
+            lc_event
+                .expiry_policy
+                .clone()
+                .ok_or_else(|| std::io::Error::other("lifecycle expiration is missing its policy snapshot"))?,
+        );
+    }
     opts.add_namespace_lock_guard(&publication_guard);
     if let Some(signal) = lock_lost_signal {
         opts.add_namespace_lock_lost_signal(signal);
@@ -4767,6 +5062,20 @@ async fn expire_transitioned_object_with_lock_lost_signal(
                 //audit_log_lifecycle(*oi, ILMExpiry, tags, traceFn);
                 Ok(dobj)
             }
+            Err(err) if is_lifecycle_expiry_already_gone(&err) => {
+                debug!(
+                    event = EVENT_LIFECYCLE_DELETE_COMPLETED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                    bucket = %oi.bucket,
+                    object = %oi.name,
+                    operation = "delete_restored_object",
+                    reason = "already_gone",
+                    "Lifecycle delete target was already absent"
+                );
+                crate::object_api::notify_object_mutation(&oi.bucket, &oi.name).await;
+                Ok(oi.clone())
+            }
             Err(err) => Err(std::io::Error::other(err)),
         };
     }
@@ -4777,6 +5086,8 @@ async fn expire_transitioned_object_with_lock_lost_signal(
     // pointing to a remote tier version that has already been removed. If this
     // only creates a delete marker, remote cleanup must be driven by persisted
     // free-version recovery rather than the visible delete result.
+    // Keep remote transitioned not-found errors visible: local metadata
+    // absence alone does not prove that the tier object was cleaned up.
     let dobj = match api.delete_object(&oi.bucket, &oi.name, opts).await {
         Ok(obj) => obj,
         Err(e) => {
@@ -4828,10 +5139,14 @@ pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
 pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditEvent) -> Result<(), Error> {
     let time_ilm = Metrics::time_ilm(lae.event.action);
 
+    let (publication_guard, bucket_incarnation_id) = lifecycle_transition_publication_guard(&api, oi)
+        .await
+        .ok_or_else(|| Error::other("lifecycle transition is not allowed for this bucket"))?;
+
     let etag = if let Some(etag) = &oi.etag { etag } else { "" };
     let etag = etag.to_string();
 
-    let opts = ObjectOptions {
+    let mut opts = ObjectOptions {
         transition: TransitionOptions {
             status: lifecycle::TRANSITION_PENDING.to_string(),
             tier: lae.event.storage_class,
@@ -4843,8 +5158,10 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
         versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
         version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
         mod_time: oi.mod_time,
+        expected_bucket_incarnation_id: Some(bucket_incarnation_id),
         ..Default::default()
     };
+    opts.add_namespace_lock_guard(&publication_guard);
     let result = api.transition_object(&oi.bucket, &oi.name, &opts).await;
     time_ilm(1)();
     result
@@ -5188,6 +5505,7 @@ pub async fn put_restore_opts(
         // Restore writes stored (possibly encrypted) bytes, so the writer's
         // computed MD5 is not the object's public plaintext ETag.
         preserve_etag: oi.etag.clone(),
+        shard_integrity_write_mode: Some(oi.shard_integrity_write_mode()),
         //expires:           oi.expires,
         ..Default::default()
     })
@@ -5447,20 +5765,26 @@ pub async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, o
         .await
 }
 
-async fn lifecycle_expiry_publication_guard(
+async fn acquire_lifecycle_publication_guard(api: &ECStore, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard, Error> {
+    let lock = api
+        .new_ns_lock(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+        .await?;
+    let guard = lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(Error::other)?;
+    if guard.is_lock_lost() {
+        return Err(Error::other("table-bucket publication lock was lost before lifecycle admission"));
+    }
+    Ok(guard)
+}
+
+pub(crate) async fn lifecycle_expiry_publication_guard(
     api: &ECStore,
-    oi: &ObjectInfo,
+    bucket: &str,
+    object: &str,
     bucket_incarnation_id: Uuid,
 ) -> Option<rustfs_lock::NamespaceLockGuard> {
-    let result = async {
-        let lock = api
-            .new_ns_lock(&oi.bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
-            .await?;
-        let guard = lock.get_read_lock(get_lock_acquire_timeout()).await.map_err(Error::other)?;
-        if guard.is_lock_lost() {
-            return Err(Error::other("table-bucket publication lock was lost before lifecycle delete admission"));
-        }
-        if !metadata_boundary::lifecycle_expiry_allowed(api, &oi.bucket, bucket_incarnation_id).await? {
+    let result: std::result::Result<Option<rustfs_lock::NamespaceLockGuard>, Error> = async {
+        let guard = acquire_lifecycle_publication_guard(api, bucket).await?;
+        if !metadata_boundary::lifecycle_expiry_allowed(api, bucket, bucket_incarnation_id).await? {
             return Ok(None);
         }
         Ok(Some(guard))
@@ -5473,11 +5797,39 @@ async fn lifecycle_expiry_publication_guard(
                 event = EVENT_LIFECYCLE_DELETE_FAILED,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                bucket = %oi.bucket,
-                object = %oi.name,
+                bucket,
+                object,
                 operation = "authorize_lifecycle_expiry",
                 error = %err,
                 "Lifecycle delete admission failed"
+            );
+            None
+        }
+    }
+}
+
+async fn lifecycle_transition_publication_guard(
+    api: &ECStore,
+    oi: &ObjectInfo,
+) -> Option<(rustfs_lock::NamespaceLockGuard, Uuid)> {
+    let result: std::result::Result<(rustfs_lock::NamespaceLockGuard, Uuid), Error> = async {
+        let guard = acquire_lifecycle_publication_guard(api, &oi.bucket).await?;
+        let configs = metadata_boundary::get_expiry_configs(api, &oi.bucket).await?;
+        Ok((guard, configs.bucket_incarnation_id))
+    }
+    .await;
+    match result {
+        Ok(state) => Some(state),
+        Err(err) => {
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                operation = "authorize_lifecycle_transition",
+                error = %err,
+                "Lifecycle transition admission failed"
             );
             None
         }
@@ -5540,7 +5892,11 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
     bucket_incarnation_id: Uuid,
     lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 ) -> bool {
-    let Some(publication_guard) = lifecycle_expiry_publication_guard(&api, oi, bucket_incarnation_id).await else {
+    let Some(expiry_policy) = lc_event.expiry_policy.clone() else {
+        return false;
+    };
+    let Some(publication_guard) = lifecycle_expiry_publication_guard(&api, &oi.bucket, &oi.name, bucket_incarnation_id).await
+    else {
         return false;
     };
     let snapshot = match lifecycle_delete_config_snapshot(&api, oi).await {
@@ -5569,6 +5925,7 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
         versioned,
         version_suspended,
         expiration: ExpirationOptions { expire: true },
+        lifecycle_expiry_policy: Some(expiry_policy),
         delete_replication_config_snapshot: Some(Arc::new(snapshot)),
         expected_bucket_incarnation_id: Some(bucket_incarnation_id),
         ..Default::default()
@@ -5595,11 +5952,32 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
 
     //debug!("lc_event.action: {:?}", lc_event.action);
     debug!("expiry_on_non_transitioned_objects opts: {:?}", opts);
+    let usage_accounting = if lc_event.action == IlmAction::DeleteAction && !versioned && !version_suspended && !oi.is_dir {
+        Some(crate::data_usage::begin_expiry_usage_accounting(&oi.bucket).await)
+    } else {
+        None
+    };
+    // The delete owns the publication guard from here on, so a cancelled
+    // expiry worker cannot let table-bucket publication overtake it.
     let mut dobj = match api
-        .delete_object_with_tier_delete_journal(&oi.bucket, &encode_dir_object(&oi.name), opts)
+        .delete_object_with_tier_delete_journal_and_guards(&oi.bucket, &encode_dir_object(&oi.name), opts, [publication_guard])
         .await
     {
         Ok(dobj) => dobj,
+        Err(err) if is_lifecycle_expiry_already_gone(&err) => {
+            debug!(
+                event = EVENT_LIFECYCLE_DELETE_COMPLETED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                bucket = %oi.bucket,
+                object = %oi.name,
+                operation = "delete_object",
+                reason = "already_gone",
+                "Lifecycle delete target was already absent"
+            );
+            crate::object_api::notify_object_mutation(&oi.bucket, &oi.name).await;
+            return true;
+        }
         Err(e) => {
             error!(
                 event = EVENT_LIFECYCLE_DELETE_FAILED,
@@ -5614,6 +5992,14 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
             return false;
         }
     };
+    if let Some(accounting) = usage_accounting
+        && !dobj.name.is_empty()
+        && !dobj.delete_marker
+        && !dobj.is_dir
+        && let Ok(size) = crate::data_usage::quota_object_size(&dobj)
+    {
+        accounting.commit(size).await;
+    }
     schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
 
     // The object (or all its versions, for delete_all) was expired; evict any
@@ -5820,6 +6206,8 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 #[cfg(test)]
 mod tests {
     use super::expiry_worker_count;
+    use super::lifecycle_transition_publication_guard;
+    use super::metadata_boundary::get_expiry_configs;
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
         DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EVALUATION_FAILED, EVENT_LIFECYCLE_EXPIRED_DETECTED,
@@ -5830,15 +6218,16 @@ mod tests {
         cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, enqueue_transition_for_existing_objects_scoped,
         enqueue_transition_with_lifecycle, enqueue_transition_with_lifecycle_report, eval_action_from_lifecycle,
-        get_lock_acquire_timeout, jitter_tier_free_version_recovery_delay, lifecycle_action_blocked_by_replication,
-        lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object, lifecycle_replication_blocks_action,
-        lifecycle_rule_has_date_expiration, lifecycle_version_delete_target, manual_transition_duration_elapsed,
-        manual_transition_has_more_after_limit, manual_transition_recovery_progress_sink, manual_transition_version_marker,
-        manual_transition_worker_failure_reason, mark_delete_opts_skip_decommissioned_on_remote_success,
-        merge_stale_multipart_candidate, persist_manual_transition_job_progress_if_owned,
-        persist_manual_transition_page_checkpoint, recover_manual_transition_job, recover_manual_transition_jobs,
-        resolve_tier_free_version_recovery_enabled, resolve_transition_queue_capacity, resolve_transition_queue_send_timeout,
-        resolve_transition_worker_count, resolve_transition_workers_absolute_max, run_tier_free_version_recovery_loop,
+        get_lock_acquire_timeout, is_lifecycle_expiry_already_gone, jitter_tier_free_version_recovery_delay,
+        lifecycle_action_blocked_by_replication, lifecycle_delete_all_versions_replication_scan, lifecycle_deleted_object,
+        lifecycle_replication_blocks_action, lifecycle_rule_has_date_expiration, lifecycle_version_delete_target,
+        manual_transition_duration_elapsed, manual_transition_has_more_after_limit, manual_transition_recovery_progress_sink,
+        manual_transition_version_marker, manual_transition_worker_failure_reason,
+        mark_delete_opts_skip_decommissioned_on_remote_success, merge_stale_multipart_candidate,
+        persist_manual_transition_job_progress_if_owned, persist_manual_transition_page_checkpoint,
+        recover_manual_transition_job, recover_manual_transition_jobs, resolve_tier_free_version_recovery_enabled,
+        resolve_transition_queue_capacity, resolve_transition_queue_send_timeout, resolve_transition_worker_count,
+        resolve_transition_workers_absolute_max, run_tier_free_version_recovery_coordinator, run_tier_free_version_recovery_loop,
         select_restore_s3_location, set_lifecycle_observability_observer, set_recovered_free_version_enqueue_observer,
         should_defer_date_expiry_for_recent_config_update, transitioned_cleanup_tuple, transitioned_object_delete_opts,
         wait_for_tier_free_version_recovery,
@@ -5867,7 +6256,7 @@ mod tests {
         save_manual_transition_scope_admission_if_current, save_manual_transition_task_if_absent,
         save_manual_transition_worker_result_if_absent,
     };
-    use crate::bucket::lifecycle::replication_sink::{ReplicationStatusType, VersionPurgeStatusType};
+    use crate::bucket::lifecycle::replication_sink::{self, ReplicationStatusType, VersionPurgeStatusType};
     use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
     use crate::bucket::lifecycle::tier_free_version_recovery::{
         FreeVersionRecoveryStats, RecoveryWalkTestAction, RecoveryWorkBudget, list_tier_free_versions,
@@ -5934,6 +6323,231 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    fn recovery_test_lock() -> (Arc<rustfs_lock::NamespaceLock>, Vec<Arc<dyn rustfs_lock::LockClient>>) {
+        let clients: Vec<Arc<dyn rustfs_lock::LockClient>> = (0..3)
+            .map(|_| {
+                Arc::new(rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())))
+                    as Arc<dyn rustfs_lock::LockClient>
+            })
+            .collect();
+        let lock =
+            rustfs_lock::NamespaceLock::with_clients_and_quorum(format!("recovery-test-{}", Uuid::new_v4()), clients.clone(), 2);
+        (Arc::new(lock), clients)
+    }
+
+    async fn acquire_recovery_test_lock(
+        lock: Arc<rustfs_lock::NamespaceLock>,
+        owner: String,
+    ) -> crate::error::Result<Option<rustfs_lock::NamespaceLockGuard>> {
+        // Keep this lease longer than the virtual-time cooldown/idle advances;
+        // production uses the namespace wrapper's renewable 30-second lease.
+        lock.lock_guard(
+            rustfs_lock::ObjectKey::new(crate::disk::RUSTFS_META_BUCKET, super::TIER_FREE_VERSION_RECOVERY_LEADER_LOCK),
+            &owner,
+            StdDuration::from_millis(5),
+            StdDuration::from_secs(3600),
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    fn recovery_test_retry_delay() -> StdDuration {
+        StdDuration::from_secs(15)
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn tier_free_version_recovery_eight_coordinators_hold_one_leader_and_take_over() {
+        let (lock, _clients) = recovery_test_lock();
+        let (pages_tx, mut pages_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = Vec::new();
+        let mut cancels = Vec::new();
+        for node in 0..8 {
+            let cancel = CancellationToken::new();
+            cancels.push(cancel.clone());
+            let lock = Arc::clone(&lock);
+            let pages_tx = pages_tx.clone();
+            tasks.push(tokio::spawn(async move {
+                run_tier_free_version_recovery_coordinator(
+                    cancel,
+                    recovery_test_retry_delay,
+                    move || acquire_recovery_test_lock(Arc::clone(&lock), format!("node-{node}")),
+                    move |leader_cancel| {
+                        let pages_tx = pages_tx.clone();
+                        async move {
+                            let mut pages = 0;
+                            run_tier_free_version_recovery_loop(
+                                leader_cancel,
+                                ExpiryState::new(),
+                                std::convert::identity,
+                                move |bucket, object, _| {
+                                    pages += 1;
+                                    pages_tx.send((node, bucket, object)).expect("page observer should be open");
+                                    std::future::ready(Ok(free_version_recovery_stats(0, 0, pages == 1)))
+                                },
+                            )
+                            .await;
+                        }
+                    },
+                )
+                .await;
+            }));
+        }
+        let (leader, bucket, object) = pages_rx.recv().await.expect("one coordinator should start recovery");
+        assert!(bucket.is_none() && object.is_none());
+        // The same leader must survive both a truncated page's cooldown and
+        // complete idle sweeps. All other coordinators keep probing the lock.
+        let mut observed_pages = 1;
+        for _ in 0..27 {
+            tokio::time::advance(StdDuration::from_secs(60)).await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            while let Ok((node, bucket, object)) = pages_rx.try_recv() {
+                assert_eq!(node, leader, "followers must not repeat a namespace sweep");
+                if observed_pages == 1 {
+                    assert_eq!(bucket.as_deref(), Some("bucket"));
+                    assert_eq!(object.as_deref(), Some("object"));
+                } else {
+                    assert!(bucket.is_none() && object.is_none(), "complete sweeps should reset their cursors");
+                }
+                observed_pages += 1;
+            }
+        }
+        assert!(observed_pages >= 7, "the leader should finish a full ten-minute idle wait");
+        cancels[leader].cancel();
+        let (successor, bucket, object) = tokio::time::timeout(StdDuration::from_secs(60), pages_rx.recv())
+            .await
+            .expect("a follower should take over after leader shutdown")
+            .expect("page observer should remain open");
+        assert_ne!(successor, leader);
+        assert!(bucket.is_none() && object.is_none(), "a new leader must restart discovery safely");
+        for cancel in cancels {
+            cancel.cancel();
+        }
+        for task in tasks {
+            task.await.expect("all coordinators should shut down cleanly");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn tier_free_version_recovery_lock_loss_waits_for_active_page_cleanup() {
+        let (lock, _clients) = recovery_test_lock();
+        let cancel = CancellationToken::new();
+        let loop_cancel = cancel.clone();
+        let (page_tx, mut page_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cleanup_started = Arc::new(tokio::sync::Notify::new());
+        let finish_cleanup = Arc::new(tokio::sync::Notify::new());
+        let observed_cleanup = Arc::clone(&cleanup_started);
+        let release_cleanup = Arc::clone(&finish_cleanup);
+        let task = tokio::spawn(async move {
+            run_tier_free_version_recovery_coordinator(
+                loop_cancel,
+                recovery_test_retry_delay,
+                move || acquire_recovery_test_lock(Arc::clone(&lock), "old-leader".to_string()),
+                move |leader_cancel| {
+                    let page_tx = page_tx.clone();
+                    let cleanup_started = Arc::clone(&cleanup_started);
+                    let finish_cleanup = Arc::clone(&finish_cleanup);
+                    async move {
+                        run_tier_free_version_recovery_loop(
+                            leader_cancel,
+                            ExpiryState::new(),
+                            std::convert::identity,
+                            move |_, _, page_cancel| {
+                                let cleanup_started = Arc::clone(&cleanup_started);
+                                let finish_cleanup = Arc::clone(&finish_cleanup);
+                                page_tx.send(()).expect("page observer should remain open");
+                                async move {
+                                    page_cancel.cancelled().await;
+                                    cleanup_started.notify_one();
+                                    finish_cleanup.notified().await;
+                                    Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled page").into())
+                                }
+                            },
+                        )
+                        .await;
+                    }
+                },
+            )
+            .await;
+        });
+        page_rx.recv().await.expect("leader should start an active page");
+        // Let authoritative backend leases expire before the next heartbeat
+        // can renew them. A failed refresh must cancel the active page.
+        tokio::time::advance(StdDuration::from_secs(3600)).await;
+        tokio::time::timeout(StdDuration::from_secs(1), observed_cleanup.notified())
+            .await
+            .expect("expired backend leases must trigger recovery cancellation");
+        assert!(!task.is_finished(), "lock loss must wait for the active page's cleanup");
+        assert!(page_rx.try_recv().is_err(), "the old leader must not start another page");
+        cancel.cancel();
+        release_cleanup.notify_one();
+        task.await.expect("coordinator should finish cleanup before exiting");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier_free_version_recovery_coordinator_retries_without_scanning_after_lock_error() {
+        let cancel = CancellationToken::new();
+        let loop_cancel = cancel.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+        let task = tokio::spawn(async move {
+            run_tier_free_version_recovery_coordinator(
+                loop_cancel,
+                recovery_test_retry_delay,
+                move || {
+                    observed_attempts.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err(rustfs_lock::LockError::InsufficientNodes {
+                        required: 2,
+                        available: 1,
+                    }
+                    .into()))
+                },
+                |_| async { panic!("a node without ownership must never start discovery") },
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        tokio::time::advance(StdDuration::from_secs(14)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "lock errors must not cause a tight retry loop");
+        tokio::time::advance(StdDuration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        cancel.cancel();
+        task.await.expect("a follower should respond to shutdown during retry wait");
+    }
+
+    #[tokio::test]
+    async fn tier_free_version_recovery_enqueue_cancels_while_waiting_for_state_lock() {
+        let state = ExpiryState::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut held = state.write().await;
+        held.tasks_tx.push(tx);
+        let cancel = CancellationToken::new();
+        let enqueue_cancel = cancel.clone();
+        let enqueue_state = Arc::clone(&state);
+        let enqueue = tokio::spawn(async move {
+            enqueue_recovered_free_version_with_state(&enqueue_state, ObjectInfo::default(), &enqueue_cancel).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!enqueue.is_finished(), "enqueue should be blocked on the state lock");
+        cancel.cancel();
+        let queued = tokio::time::timeout(StdDuration::from_secs(1), enqueue)
+            .await
+            .expect("cancellation must not wait for the state write guard")
+            .expect("enqueue should return cleanly");
+        assert!(!queued);
+        assert_eq!(held.pending_tasks(), 0);
+        assert_eq!(held.stats.missed_free_vers_tasks(), 0);
+        assert!(rx.try_recv().is_err(), "a cancelled recovery must not enqueue a task");
+        drop(held);
+        assert!(!enqueue_recovered_free_version_with_state(&state, ObjectInfo::default(), &cancel).await);
+        assert!(rx.try_recv().is_err(), "cancellation must win even when the lock is available");
+    }
 
     fn free_version_recovery_stats(enqueued: usize, failed: usize, truncated: bool) -> FreeVersionRecoveryStats {
         FreeVersionRecoveryStats {
@@ -7572,6 +8186,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expiry_pending_gauge_survives_dequeue_landing_before_enqueue_accounting() {
+        // A worker may dequeue and decrement before the enqueuing side records
+        // its increment. The gauge must return to zero afterwards instead of
+        // clamping the transient -1 away and reporting a phantom pending task
+        // that no idle check can ever drain (rustfs#7921).
+        let state = ExpiryState::new();
+        let stats = Arc::clone(&state.read().await.stats);
+
+        stats.decrement_pending_tasks();
+        stats.increment_pending_tasks();
+        assert_eq!(stats.pending_tasks(), 0);
+        assert_eq!(state.read().await.pending_tasks(), 0);
+
+        stats.decrement_active_tasks();
+        stats.increment_active_tasks();
+        assert_eq!(stats.active_tasks(), 0);
+        assert_eq!(state.read().await.active_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn free_version_enqueue_rolls_back_pending_when_queue_full() {
+        // Single-threaded, so this cannot observe the count-before-publish
+        // ordering itself; it pins the rollback that ordering requires: a
+        // rejected send must not leave its speculative increment behind.
+        let state = ExpiryState::new_with_unconsumed_worker_channel(1);
+        let oi = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            transitioned_object: TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: "remote-version".to_string(),
+                tier: "WARM".to_string(),
+                free_version: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(state.read().await.enqueue_free_version(oi.clone()));
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+
+        // The single-slot queue is full for both enqueue paths.
+        assert!(!enqueue_recovered_free_version_with_state(&state, oi.clone(), &CancellationToken::new()).await);
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+        assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 1);
+
+        assert!(!state.read().await.enqueue_free_version(oi));
+        assert_eq!(state.read().await.stats.pending_tasks(), 1);
+        assert_eq!(state.read().await.stats.missed_free_vers_tasks(), 2);
+
+        // Draining the one real task returns the gauge to zero.
+        let receiver = state.read().await.tasks_rx[0].clone();
+        let task = receiver.lock().await.recv().await.expect("queued task");
+        assert!(task.is_some());
+        state.read().await.stats.decrement_pending_tasks();
+        assert_eq!(state.read().await.pending_tasks(), 0);
+    }
+
+    #[tokio::test]
     async fn enqueue_recovered_free_version_reports_false_without_worker_channel() {
         let state = ExpiryState::new();
         let oi = ObjectInfo {
@@ -7587,7 +8260,7 @@ mod tests {
             ..Default::default()
         };
 
-        let queued = enqueue_recovered_free_version_with_state(&state, oi).await;
+        let queued = enqueue_recovered_free_version_with_state(&state, oi, &CancellationToken::new()).await;
         let state = state.read().await;
 
         assert!(!queued);
@@ -7716,8 +8389,8 @@ mod tests {
             ..Default::default()
         };
 
-        let first = enqueue_recovered_free_version_with_state(&state, oi.clone()).await;
-        let second = enqueue_recovered_free_version_with_state(&state, oi).await;
+        let first = enqueue_recovered_free_version_with_state(&state, oi.clone(), &CancellationToken::new()).await;
+        let second = enqueue_recovered_free_version_with_state(&state, oi, &CancellationToken::new()).await;
         let state = state.read().await;
 
         assert!(first);
@@ -7818,7 +8491,7 @@ mod tests {
         };
 
         assert!(
-            super::enqueue_recovered_free_version(&ecstore, oi).await,
+            super::enqueue_recovered_free_version_with_cancel(&ecstore, oi, &CancellationToken::new()).await,
             "the resized production worker queue should accept the task"
         );
         stop_tx.send(None).await.expect("worker stop signal should be delivered");
@@ -8096,6 +8769,75 @@ mod tests {
                     .expect("free-version path existence check should succeed")
             );
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_overwrite_cleanup_retains_a_minority_live_remote_reference() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("overwrite-minority-{}", Uuid::new_v4());
+        let object = "still-referenced";
+        create_test_bucket(&ecstore, &bucket).await;
+        let (backend, identity) = register_recovery_mock_tier(&ecstore).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, Some(identity.clone())).await;
+        let page = list_tier_free_versions(Arc::clone(&ecstore), 100, None, None, CancellationToken::new())
+            .await
+            .expect("list persisted cleanup owner");
+        let owner = page.items.into_iter().find(|oi| oi.bucket == bucket).expect("seeded owner");
+        backend
+            .set_put_remote_version(Some(owner.transitioned_object.version_id.clone()))
+            .await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
+            .await
+            .expect("remote fixture lease");
+        lease
+            .put(
+                &owner.transitioned_object.name,
+                rustfs_s3_client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"old")),
+                3,
+            )
+            .await
+            .expect("seed referenced remote bytes");
+        drop(lease);
+        let path = disk_paths[0].join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let cleanup_metadata = fs::read(&path).await.expect("save completed replica");
+        let mut live = FileInfo::new(object, 2, 2);
+        live.volume = bucket.clone();
+        live.erasure.index = 1;
+        live.data_dir = Some(Uuid::new_v4());
+        live.mod_time = Some(OffsetDateTime::now_utc());
+        live.size = 3;
+        live.add_object_part(1, "149603e6c03516362a8da23f624db945".to_string(), 3, live.mod_time, 3, None, None);
+        live.transition_status = TRANSITION_COMPLETE.to_string();
+        live.transition_tier = "WARM".to_string();
+        live.transitioned_objname = owner.transitioned_object.name.clone();
+        live.transition_version = Some(owner.transitioned_object.version_id.clone());
+        live.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+        rustfs_utils::http::insert_str(&mut live.metadata, rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID, identity);
+        let mut old_metadata = FileMeta::new();
+        old_metadata.add_version(live).expect("prepare minority live source");
+        fs::write(&path, old_metadata.marshal_msg().expect("encode live source"))
+            .await
+            .expect("model one replica retained by an interrupted overwrite");
+
+        let err = super::cleanup_free_version_exact(Arc::clone(&ecstore), &owner, &CancellationToken::new())
+            .await
+            .expect_err("quorum free versions cannot erase a minority live reference");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(backend.remove_count().await, 0);
+        assert!(backend.contains(&owner.transitioned_object.name).await);
+
+        fs::write(&path, cleanup_metadata)
+            .await
+            .expect("complete replica convergence");
+        assert!(
+            super::cleanup_free_version_exact(Arc::clone(&ecstore), &owner, &CancellationToken::new())
+                .await
+                .expect("converged cleanup can delete the exact remote owner")
+        );
+        assert_eq!(backend.remove_count().await, 1);
+        assert!(!backend.contains(&owner.transitioned_object.name).await);
     }
 
     #[cfg(feature = "test-util")]
@@ -9947,6 +10689,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lifecycle_expiry_already_gone_only_accepts_object_or_version_absence() {
+        assert!(is_lifecycle_expiry_already_gone(&Error::FileNotFound));
+        assert!(is_lifecycle_expiry_already_gone(&Error::ObjectNotFound(
+            "bucket".to_string(),
+            "object".to_string(),
+        )));
+        assert!(is_lifecycle_expiry_already_gone(&Error::FileVersionNotFound));
+        assert!(is_lifecycle_expiry_already_gone(&Error::VersionNotFound(
+            "bucket".to_string(),
+            "object".to_string(),
+            "version".to_string(),
+        )));
+
+        assert!(!is_lifecycle_expiry_already_gone(&Error::VolumeNotFound));
+        assert!(!is_lifecycle_expiry_already_gone(&Error::DiskNotFound));
+        assert!(!is_lifecycle_expiry_already_gone(&Error::ErasureReadQuorum));
+        assert!(!is_lifecycle_expiry_already_gone(&Error::MethodNotAllowed));
+    }
+
     #[tokio::test]
     async fn manual_transition_counts_already_transitioned_object() {
         let lc = latest_transition_lifecycle();
@@ -10618,13 +11380,7 @@ mod tests {
         let marker = marker
             .as_deref()
             .expect("production checkpoint should persist an object marker");
-        let marker_suffix = marker
-            .strip_prefix(&expected_marker)
-            .expect("production checkpoint should stop at the first page boundary");
-        assert!(
-            marker_suffix.is_empty() || marker_suffix.starts_with("[rustfs_cache:v2,"),
-            "unexpected production checkpoint marker suffix: {marker_suffix}"
-        );
+        assert_eq!(marker, expected_marker, "production checkpoint should stop at the first page boundary");
         assert_eq!(version_marker.as_deref(), Some("null"));
     }
 
@@ -12268,6 +13024,7 @@ mod tests {
             .await
             .expect("bucket incarnation should be available");
 
+        let expiry_policy = install_test_expiry_policy(&ecstore, &bucket).await;
         test_recorder::install();
 
         // One version that exists and one that never did: `delete_objects`
@@ -12286,15 +13043,24 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let _ = replication_sink::take_scheduled_deletes_for_test();
         let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
             &ecstore,
             &bucket,
             &targets,
-            lifecycle::Event::default(),
+            lifecycle::Event {
+                action: IlmAction::DeleteVersionAction,
+                expiry_policy: Some(expiry_policy.into()),
+                ..Default::default()
+            },
             incarnation,
         )
         .await;
         assert_eq!(failed, 0, "a missing version is not a batch failure");
+        assert!(
+            replication_sink::take_scheduled_deletes_for_test().is_empty(),
+            "a bucket without replication must not schedule deletes for removed or missing versions"
+        );
 
         let events = test_recorder::recorded_for_bucket(&bucket);
         let announced = events.iter().map(|event| event.version_id).collect::<Vec<_>>();
@@ -12319,6 +13085,97 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].version_id, Some(current_version_id));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_noncurrent_batch_expiry_schedules_only_matching_delete_rules() {
+        use crate::bucket::metadata::BUCKET_REPLICATION_CONFIG;
+
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        for (prefix, delete_status, should_replicate) in [
+            ("other/", "Enabled", false),
+            ("logs/", "Disabled", false),
+            ("logs/", "Enabled", true),
+        ] {
+            let bucket = format!("lifecycle-repl-admission-{}", Uuid::new_v4().simple());
+            let object = "logs/object";
+            create_test_bucket(&ecstore, &bucket).await;
+            metadata_sys::update_in(
+                &ecstore.ctx,
+                &bucket,
+                BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+            )
+            .await
+            .expect("versioning should be enabled");
+
+            let mut versions = Vec::new();
+            for body in [b"noncurrent".as_slice(), b"current".as_slice()] {
+                let mut reader = PutObjReader::from_vec(body.to_vec());
+                let version = ecstore
+                    .put_object(
+                        &bucket,
+                        object,
+                        &mut reader,
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("source version should be created");
+                versions.push(version.version_id.expect("versioned PUT must have an identity"));
+            }
+            let config = format!(
+                "<ReplicationConfiguration><Role></Role><Rule><ID>delete-rule</ID><Status>Enabled</Status>\
+                 <Prefix>{prefix}</Prefix><Destination><Bucket>arn:test</Bucket></Destination>\
+                 <DeleteReplication><Status>{delete_status}</Status></DeleteReplication>\
+                 </Rule></ReplicationConfiguration>"
+            );
+            metadata_sys::update_in(&ecstore.ctx, &bucket, BUCKET_REPLICATION_CONFIG, config.into_bytes())
+                .await
+                .expect("replication configuration should be persisted");
+            let expiry_policy = install_test_expiry_policy(&ecstore, &bucket).await;
+            let incarnation = ecstore
+                .bucket_incarnation_id_from_disk(&bucket)
+                .await
+                .expect("bucket incarnation should be available");
+            let _ = replication_sink::take_scheduled_deletes_for_test();
+            let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+                &ecstore,
+                &bucket,
+                &[ObjectToDelete {
+                    object_name: object.to_string(),
+                    version_id: Some(versions[0]),
+                    ..Default::default()
+                }],
+                lifecycle::Event {
+                    action: IlmAction::DeleteVersionAction,
+                    expiry_policy: Some(expiry_policy.into()),
+                    ..Default::default()
+                },
+                incarnation,
+            )
+            .await;
+            assert_eq!(failed, 0, "batch expiry should commit");
+            let scheduled = replication_sink::take_scheduled_deletes_for_test();
+            assert_eq!(scheduled.len(), usize::from(should_replicate), "prefix={prefix}, delete={delete_status}");
+            if should_replicate {
+                assert_eq!(scheduled[0].version_id, Some(versions[0]));
+                let state = scheduled[0]
+                    .replication_state
+                    .as_ref()
+                    .expect("admitted purge state must survive");
+                assert_eq!(state.version_purge_status_internal.as_deref(), Some("arn:test=PENDING;"));
+                assert!(state.purge_targets.contains_key("arn:test"));
+            }
+            let current = ecstore
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("batch expiry must retain the current version");
+            assert_eq!(current.version_id, Some(versions[1]));
+        }
     }
 
     #[tokio::test]
@@ -12408,6 +13265,14 @@ mod tests {
         assert!(!object_infos[null_index].is_latest);
 
         let lifecycle = current_and_noncurrent_expiration_lifecycle();
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_LIFECYCLE_CONFIG,
+            crate::bucket::utils::serialize(&lifecycle).unwrap(),
+        )
+        .await
+        .unwrap();
         let object_opts = object_infos
             .iter()
             .map(lifecycle::object_opts_from_object_info)
@@ -12580,6 +13445,81 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn lifecycle_exact_immediate_expiry_preserves_guards_and_skips_stale_writes() {
+        let (paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-exact-expiry-{}", Uuid::new_v4().simple());
+        let object = "object";
+        create_test_bucket(&ecstore, &bucket).await;
+        let oi = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut PutObjReader::from_vec(b"payload".to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("create object before configuring expiry");
+
+        // Exercise persisted legacy immediate rules without relaxing the S3
+        // validator, which correctly rejects newly submitted Expiration.Days=0.
+        let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx).expect("metadata system");
+        let sys = sys.read().await.clone();
+        let mut metadata = (*sys.get(&bucket).await.expect("bucket metadata")).clone();
+        let mut lifecycle = latest_expiration_lifecycle();
+        lifecycle.rules[0].expiration.as_mut().expect("expiration rule").days = Some(0);
+        metadata.lifecycle_config_xml = crate::bucket::utils::serialize(&lifecycle).expect("encode legacy policy");
+        metadata.lifecycle_config = Some(lifecycle);
+        sys.persist_and_set(metadata).await.expect("persist legacy policy");
+
+        let state = install_unconsumed_runtime_expiry_worker(&ecstore, 4).await;
+        super::enqueue_immediate_expiry(ecstore.clone(), &oi, LcEventSrc::S3PutObject, &ObjectOptions::default()).await;
+        assert_eq!(state.read().await.stats.pending_tasks(), 1, "exact reads must preserve immediate expiry");
+
+        let state = install_unconsumed_runtime_expiry_worker(&ecstore, 4).await;
+        for path in &paths {
+            let metadata_path = path.join(&bucket).join(object).join(crate::disk::STORAGE_FORMAT_FILE);
+            let mut meta = rustfs_filemeta::FileMeta::load(&fs::read(&metadata_path).await.expect("read object metadata"))
+                .expect("decode object metadata");
+            let mut version = meta
+                .get_all_file_info_versions(&bucket, object, true)
+                .expect("version group")
+                .versions
+                .remove(0);
+            version.metadata.insert("x-amz-object-lock-legal-hold".into(), "ON".into());
+            meta.add_version(version).expect("persist legal hold");
+            fs::write(metadata_path, meta.marshal_msg().expect("encode held metadata"))
+                .await
+                .expect("write legal hold");
+        }
+        super::enqueue_immediate_expiry(ecstore.clone(), &oi, LcEventSrc::S3PutObject, &ObjectOptions::default()).await;
+        assert_eq!(
+            state.read().await.stats.pending_tasks(),
+            0,
+            "use current lock metadata, not the stale write result"
+        );
+
+        for path in &paths {
+            fs::write(path.join(&bucket).join(object).join(crate::disk::STORAGE_FORMAT_FILE), b"corrupt")
+                .await
+                .expect("inject corrupt metadata");
+        }
+        super::enqueue_immediate_expiry(ecstore.clone(), &oi, LcEventSrc::S3PutObject, &ObjectOptions::default()).await;
+        assert_eq!(state.read().await.stats.pending_tasks(), 0, "read failure must never enqueue expiry");
+        for path in &paths {
+            fs::remove_dir_all(path.join(&bucket).join(object))
+                .await
+                .expect("simulate concurrent object removal");
+        }
+        super::enqueue_immediate_expiry(ecstore.clone(), &oi, LcEventSrc::S3PutObject, &ObjectOptions::default()).await;
+        assert_eq!(
+            state.read().await.stats.pending_tasks(),
+            0,
+            "confirmed absence must not fall back to the old ObjectInfo"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn lifecycle_expiry_fails_closed_on_corrupt_object_lock_metadata() {
         let (_disk_paths, ecstore) = setup_test_env().await;
         let bucket = format!("lifecycle-lock-metadata-error-{}", Uuid::new_v4().simple());
@@ -12633,7 +13573,8 @@ mod tests {
                 .push((event, state, reason));
         });
 
-        super::enqueue_immediate_expiry(&object_info, LcEventSrc::S3PutObject).await;
+        super::enqueue_immediate_expiry(Arc::clone(&ecstore), &object_info, LcEventSrc::S3PutObject, &ObjectOptions::default())
+            .await;
 
         assert!(
             observed.lock().expect("observed events should not poison").contains(&(
@@ -12686,6 +13627,7 @@ mod tests {
             .await
             .expect("table data object should be created");
 
+        let expiry_policy = install_test_expiry_policy(&ecstore, &bucket).await;
         let publication_lock = ecstore
             .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
             .await
@@ -12700,6 +13642,7 @@ mod tests {
         let mut expiry = tokio::spawn(async move {
             let event = crate::bucket::lifecycle::lifecycle::Event {
                 action: IlmAction::DeleteAction,
+                expiry_policy: Some(expiry_policy.into()),
                 ..Default::default()
             };
             let bucket_incarnation_id = expiry_store
@@ -12749,6 +13692,303 @@ mod tests {
                 .is_ok(),
             "table data must remain readable after lifecycle admission rejects the delete"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn ordinary_expiry_accounts_the_committed_receipt_once() {
+        use crate::bucket::quota::{QuotaOperation, checker::QuotaChecker};
+        use crate::data_usage::{apply_bucket_usage_memory_overlay, replace_bucket_usage_memory_from_info};
+        use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
+
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        for size in [0usize, 42] {
+            let bytes = u64::try_from(size).expect("fixture size fits");
+            let bucket = format!("expiry-accounting-{}", Uuid::new_v4().simple());
+            create_test_bucket(&ecstore, &bucket).await;
+            let mut reader = PutObjReader::from_vec(vec![0; size]);
+            let mut queued = ecstore
+                .put_object(&bucket, "expire", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("create expiring object");
+            let mut reader = PutObjReader::from_vec(vec![0; size]);
+            ecstore
+                .put_object(&bucket, "keep", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("create retained object");
+            let mut baseline = DataUsageInfo {
+                last_update: Some(std::time::SystemTime::now()),
+                usage_snapshot_complete: true,
+                buckets_count: 1,
+                ..Default::default()
+            };
+            baseline.buckets_usage.insert(
+                bucket.clone(),
+                BucketUsageInfo {
+                    objects_count: 2,
+                    versions_count: 2,
+                    size: bytes * 2,
+                    ..Default::default()
+                },
+            );
+            baseline.bucket_sizes.insert(bucket.clone(), bytes * 2);
+            baseline.calculate_totals();
+            replace_bucket_usage_memory_from_info(&baseline).await;
+            // Legacy quota admission consumes the same conservative overlay.
+            // Durable reservations have their own storage-commit accounting.
+            metadata_sys::update(
+                &bucket,
+                rustfs_config::QUOTA_CONFIG_FILE,
+                format!(r#"{{"quota":{},"quota_type":"Hard"}}"#, bytes * 2).into_bytes(),
+            )
+            .await
+            .expect("configure the legacy quota");
+            let checker =
+                QuotaChecker::new(Arc::new(tokio::sync::RwLock::new(metadata_sys::BucketMetadataSys::new(ecstore.clone()))));
+            let attempted_size = bytes.max(1);
+            let quota = checker
+                .check_quota(&bucket, QuotaOperation::PutObject, attempted_size)
+                .await
+                .expect("check quota before expiration");
+            assert!(!quota.allowed);
+            assert!(!quota.uses_durable_reservations);
+            assert_eq!(quota.current_usage, Some(bytes * 2));
+            // Queued metadata is not the accounting receipt from the storage commit.
+            queued.size = 1;
+            let event = lifecycle::Event {
+                action: IlmAction::DeleteAction,
+                expiry_policy: Some(install_test_expiry_policy(&ecstore, &bucket).await.into()),
+                ..Default::default()
+            };
+            let incarnation = ecstore
+                .bucket_incarnation_id_from_disk(&bucket)
+                .await
+                .expect("bucket incarnation");
+            // Replaying the same scanner snapshot after the delete is an
+            // already-gone success and must not be reported as a failure.
+            for (attempt_incarnation, expected) in [(Uuid::new_v4(), false), (incarnation, true), (incarnation, true)] {
+                assert_eq!(
+                    super::apply_expiry_on_non_transitioned_objects(
+                        ecstore.clone(),
+                        &queued,
+                        &event,
+                        &LcEventSrc::Scanner,
+                        attempt_incarnation,
+                    )
+                    .await,
+                    expected
+                );
+                let mut response = baseline.clone();
+                apply_bucket_usage_memory_overlay(&mut response).await;
+                let remaining = if attempt_incarnation == incarnation { 1 } else { 2 };
+                assert_eq!(response.buckets_usage[&bucket].objects_count, remaining);
+                assert_eq!(response.buckets_usage[&bucket].size, remaining * bytes);
+                let quota = checker
+                    .check_quota(&bucket, QuotaOperation::PutObject, attempted_size)
+                    .await
+                    .expect("check quota before scanner confirmation");
+                assert!(!quota.allowed, "expiry must not release unconfirmed quota credit");
+                assert_eq!(quota.current_usage, Some(bytes * 2));
+            }
+            let mut confirmed = baseline.clone();
+            confirmed.last_update = Some(std::time::SystemTime::now());
+            confirmed.scanner_epoch = Some(7);
+            confirmed.scanner_cycle = Some(10);
+            let usage = confirmed.buckets_usage.get_mut(&bucket).expect("bucket is in the snapshot");
+            usage.size = bytes;
+            usage.objects_count = 1;
+            usage.versions_count = 0; // The scanner does not count unversioned objects as versions.
+            confirmed.bucket_sizes.insert(bucket.clone(), bytes);
+            confirmed.calculate_totals();
+            replace_bucket_usage_memory_from_info(&confirmed).await;
+            let quota = checker
+                .check_quota(&bucket, QuotaOperation::PutObject, attempted_size)
+                .await
+                .expect("check quota after scanner confirmation");
+            assert_eq!(quota.allowed, bytes > 0);
+            assert_eq!(quota.current_usage, Some(bytes));
+            let too_large = checker
+                .check_quota(&bucket, QuotaOperation::PutObject, bytes + 1)
+                .await
+                .expect("check the first byte above the quota limit");
+            assert!(!too_large.allowed);
+            assert!(
+                ecstore
+                    .get_object_info(&bucket, "keep", &ObjectOptions::default())
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_noncurrent_batch_expiry_does_not_delete_from_table_bucket() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("table-noncurrent-lifecycle-{}", Uuid::new_v4().simple());
+        let object = "tables/table-id/data/part-00001.parquet";
+        create_test_bucket(&ecstore, &bucket).await;
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be enabled");
+
+        let mut old_reader = PutObjReader::from_vec(b"old table data".to_vec());
+        let old = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut old_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the historical table version should be created");
+        let old_version_id = old.version_id.expect("the historical version should have an identity");
+        let mut current_reader = PutObjReader::from_vec(b"current table data".to_vec());
+        ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut current_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the current table version should be created");
+
+        let incarnation = ecstore
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("bucket incarnation should be available");
+        let expiry_policy = install_test_expiry_policy(&ecstore, &bucket).await;
+        let publication_lock = ecstore
+            .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("table-bucket publication lock should be created");
+        let enable_guard = publication_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("table-bucket enablement should acquire the publication lock");
+
+        let delete_store = ecstore.clone();
+        let delete_bucket = bucket.clone();
+        let delete_object = object.to_string();
+        let mut delete = tokio::spawn(async move {
+            let target = ObjectToDelete {
+                object_name: delete_object,
+                version_id: Some(old_version_id),
+                ..Default::default()
+            };
+            crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+                &delete_store,
+                &delete_bucket,
+                std::slice::from_ref(&target),
+                lifecycle::Event {
+                    action: IlmAction::DeleteVersionAction,
+                    expiry_policy: Some(expiry_policy.into()),
+                    ..Default::default()
+                },
+                incarnation,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut delete)
+                .await
+                .is_err(),
+            "noncurrent lifecycle cleanup must wait for the table-bucket publication fence"
+        );
+
+        let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx).expect("metadata system should be initialized");
+        let sys = sys.read().await.clone();
+        let mut metadata = (*sys.get(&bucket).await.expect("bucket metadata should exist")).clone();
+        metadata.table_bucket_config_json = br#"{"enabled":true}"#.to_vec();
+        sys.persist_and_set(metadata)
+            .await
+            .expect("table bucket marker should be persisted");
+        sys.reload_from_store(&bucket)
+            .await
+            .expect("table bucket marker should become authoritative");
+        drop(enable_guard);
+
+        let failed = tokio::time::timeout(StdDuration::from_secs(2), delete)
+            .await
+            .expect("noncurrent lifecycle cleanup should resume after the fence is released")
+            .expect("noncurrent lifecycle cleanup task should join");
+        assert_eq!(failed, 1, "table-bucket noncurrent cleanup must be rejected");
+        assert!(
+            ecstore
+                .get_object_info(
+                    &bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: Some(old_version_id.to_string()),
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .is_ok(),
+            "table data must remain after queued noncurrent cleanup is rejected"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_transition_admission_holds_publication_reader() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-transition-{}", Uuid::new_v4().simple());
+        let object = "tables/table-id/data/part-00001.parquet";
+        create_test_bucket(&ecstore, &bucket).await;
+        let object_info = ObjectInfo {
+            bucket: bucket.clone(),
+            name: object.to_string(),
+            ..Default::default()
+        };
+
+        let publication_lock = ecstore
+            .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("table-bucket publication lock should be created");
+        let enable_guard = publication_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("publication writer should be acquired");
+        let admission_store = ecstore.clone();
+        let admission_object = object_info.clone();
+        let mut admission =
+            tokio::spawn(async move { lifecycle_transition_publication_guard(&admission_store, &admission_object).await });
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut admission)
+                .await
+                .is_err(),
+            "transition admission must wait for an in-progress table publication"
+        );
+        drop(enable_guard);
+
+        let (transition_guard, incarnation) = tokio::time::timeout(StdDuration::from_secs(2), admission)
+            .await
+            .expect("transition admission should resume after publication")
+            .expect("transition admission task should join")
+            .expect("transition admission should succeed");
+        assert_ne!(incarnation, Uuid::nil(), "transition admission must bind a bucket incarnation");
+        let blocked_writer = publication_lock.get_write_lock(StdDuration::from_millis(100)).await;
+        assert!(blocked_writer.is_err(), "transition admission must retain the publication read lock");
+        drop(transition_guard);
+        publication_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("publication writer should proceed after transition admission releases its guard");
     }
 
     #[tokio::test]
@@ -12812,6 +14052,7 @@ mod tests {
         let queued_event = crate::bucket::lifecycle::lifecycle::Event {
             action: IlmAction::DelMarkerDeleteAllVersionsAction,
             rule_id: "delete-marker-history".to_string(),
+            expiry_policy: get_expiry_configs(&ecstore, &bucket).await.unwrap().lifecycle.map(Into::into),
             ..Default::default()
         };
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml(30).into_bytes())
@@ -12929,6 +14170,7 @@ mod tests {
             &crate::bucket::lifecycle::lifecycle::Event {
                 action: IlmAction::DeleteAllVersionsAction,
                 rule_id: "delete-all-versions".to_string(),
+                expiry_policy: get_expiry_configs(&ecstore, &bucket).await.unwrap().lifecycle.map(Into::into),
                 ..Default::default()
             },
             &LcEventSrc::Scanner,
@@ -13094,9 +14336,14 @@ mod tests {
 
         crate::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
 
-        let ecstore = ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new())
-            .await
-            .unwrap();
+        // Tests start the recovery loop they observe. An automatic startup loop
+        // would race that loop for the same unconsumed worker queue.
+        let ecstore = temp_env::async_with_vars(
+            [(super::ENV_TIER_FREE_VERSION_RECOVERY_ENABLED, Some("false"))],
+            ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new()),
+        )
+        .await
+        .unwrap();
 
         let buckets = ecstore
             .list_bucket(&BucketOptions {
@@ -13113,6 +14360,221 @@ mod tests {
         let _ = STALE_MULTIPART_TEST_ENV.set((disk_paths.clone(), ecstore.clone()));
 
         (disk_paths, ecstore)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_expiry_rejects_withdrawn_or_changed_policy() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        for case in [
+            "removed",
+            "disabled",
+            "longer-days",
+            "different-prefix",
+            "unreadable",
+            "missing-snapshot",
+            "unchanged",
+        ] {
+            let bucket = format!("expiry-policy-{case}");
+            create_test_bucket(&ecstore, &bucket).await;
+            metadata_sys::update_in(
+                &ecstore.ctx,
+                &bucket,
+                BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+            )
+            .await
+            .unwrap();
+            for object in ["single", "batch"] {
+                for age in [40, 2] {
+                    let mut reader = PutObjReader::from_vec(vec![1; 8]);
+                    ecstore
+                        .put_object(
+                            &bucket,
+                            object,
+                            &mut reader,
+                            &ObjectOptions {
+                                versioned: true,
+                                mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(age)),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let policy = current_and_noncurrent_expiration_lifecycle();
+            metadata_sys::update_in(
+                &ecstore.ctx,
+                &bucket,
+                BUCKET_LIFECYCLE_CONFIG,
+                crate::bucket::utils::serialize(&policy).unwrap(),
+            )
+            .await
+            .unwrap();
+            let incarnation = ecstore.bucket_incarnation_id_from_disk(&bucket).await.unwrap();
+            let state = install_unconsumed_runtime_expiry_worker(&ecstore, 3).await;
+            for object in ["single", "batch"] {
+                let versions = ecstore
+                    .clone()
+                    .list_object_versions(&bucket, object, None, None, None, 10)
+                    .await
+                    .unwrap()
+                    .objects;
+                let opts = versions
+                    .iter()
+                    .map(lifecycle::object_opts_from_object_info)
+                    .collect::<Vec<_>>();
+                let events = Evaluator::new(Arc::new(policy.clone())).eval(&opts).await.unwrap();
+                let index = versions.iter().position(|version| !version.is_latest).unwrap();
+                let mut event = events[index].clone();
+                assert_eq!(event.action, IlmAction::DeleteVersionAction);
+                if case == "missing-snapshot" {
+                    event.expiry_policy = None;
+                }
+                let queued = if object == "single" {
+                    state
+                        .write()
+                        .await
+                        .enqueue_by_days(&versions[index], &event, &LcEventSrc::Scanner, incarnation)
+                } else {
+                    state.write().await.enqueue_by_newer_noncurrent(
+                        &bucket,
+                        vec![lifecycle_version_delete_target(&versions[index]).unwrap()],
+                        event,
+                        &LcEventSrc::Scanner,
+                        incarnation,
+                    )
+                };
+                assert!(queued);
+            }
+            let mut changed = policy.clone();
+            match case {
+                "removed" => {
+                    metadata_sys::delete(&bucket, BUCKET_LIFECYCLE_CONFIG).await.unwrap();
+                }
+                "disabled" => changed.rules[0].status = ExpirationStatus::from_static(ExpirationStatus::DISABLED),
+                "longer-days" => {
+                    changed.rules[0]
+                        .noncurrent_version_expiration
+                        .as_mut()
+                        .unwrap()
+                        .noncurrent_days = Some(60)
+                }
+                "different-prefix" => changed.rules[0].prefix = Some("keep/".to_string()),
+                "unreadable" => {
+                    let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx)
+                        .unwrap()
+                        .read()
+                        .await
+                        .clone();
+                    let mut metadata = (*sys.get(&bucket).await.unwrap()).clone();
+                    metadata.lifecycle_config_xml = b"<LifecycleConfiguration>".to_vec();
+                    metadata.lifecycle_config = None;
+                    sys.persist_and_set(metadata).await.unwrap();
+                }
+                _ => {}
+            }
+            if !matches!(case, "removed" | "unchanged" | "missing-snapshot" | "unreadable") {
+                metadata_sys::update_in(
+                    &ecstore.ctx,
+                    &bucket,
+                    BUCKET_LIFECYCLE_CONFIG,
+                    crate::bucket::utils::serialize(&changed).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            let (rx, stats, recovery_notify) = {
+                let state = state.read().await;
+                state.tasks_tx[0].try_send(None).unwrap();
+                (state.tasks_rx[0].clone(), state.stats.clone(), state.recovery_notify.clone())
+            };
+            tokio::time::timeout(StdDuration::from_secs(30), async {
+                let mut receiver = rx.lock().await;
+                ExpiryState::worker(&mut receiver, Arc::downgrade(&ecstore), stats, recovery_notify).await;
+            })
+            .await
+            .expect("queued expiry worker must drain");
+            let versions = ecstore
+                .clone()
+                .list_object_versions(&bucket, "", None, None, None, 10)
+                .await
+                .unwrap()
+                .objects;
+            assert_eq!(versions.len(), if case == "unchanged" { 2 } else { 4 }, "case: {case}");
+            assert_eq!(versions.iter().filter(|version| version.is_latest).count(), 2);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_policy_update_waits_for_admitted_delete_commit() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = "expiry-policy-commit-fence";
+        create_test_bucket(&ecstore, bucket).await;
+        let mut reader = PutObjReader::from_vec(b"expired".to_vec());
+        let object = ecstore
+            .put_object(
+                bucket,
+                "object",
+                &mut reader,
+                &ObjectOptions {
+                    mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(40)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let policy = install_test_expiry_policy(&ecstore, bucket).await;
+        let event = eval_action_from_lifecycle(&policy, None, &object).await;
+        assert_eq!(event.action, IlmAction::DeleteAction);
+        let incarnation = ecstore.bucket_incarnation_id_from_disk(bucket).await.unwrap();
+        let barrier = crate::store::DeleteAfterObjectLockSnapshotBarrier::install(bucket);
+        let deleting_store = ecstore.clone();
+        let deleting = tokio::spawn(async move {
+            super::apply_expiry_on_non_transitioned_objects(deleting_store, &object, &event, &LcEventSrc::Scanner, incarnation)
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .unwrap();
+        let probe = metadata_sys::ConfigWriteLockProbe::install(bucket);
+        let mut removing = tokio::spawn(async move { metadata_sys::delete(bucket, BUCKET_LIFECYCLE_CONFIG).await });
+        probe.wait_until_attempted().await;
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut removing)
+                .await
+                .is_err(),
+            "configuration removal must wait for the admitted delete"
+        );
+        barrier.release();
+        assert!(
+            tokio::time::timeout(StdDuration::from_secs(30), deleting)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        tokio::time::timeout(StdDuration::from_secs(30), removing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(get_expiry_configs(&ecstore, bucket).await.unwrap().lifecycle.is_none());
+        assert!(
+            ecstore
+                .get_object_info(bucket, "object", &ObjectOptions::default())
+                .await
+                .is_err()
+        );
+    }
+
+    async fn install_test_expiry_policy(ecstore: &Arc<ECStore>, bucket: &str) -> Arc<BucketLifecycleConfiguration> {
+        let xml = br#"<LifecycleConfiguration><Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Expiration><Days>0</Days></Expiration><NoncurrentVersionExpiration><NoncurrentDays>0</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>"#;
+        metadata_sys::update_in(&ecstore.ctx, bucket, BUCKET_LIFECYCLE_CONFIG, xml.to_vec())
+            .await
+            .expect("install expiration policy");
+        get_expiry_configs(ecstore, bucket).await.unwrap().lifecycle.unwrap()
     }
 
     async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket: &str) {
@@ -13353,10 +14815,456 @@ mod tests {
         .await;
     }
 
+    fn fast_tier_free_version_recovery_leader_retry_delay() -> StdDuration {
+        StdDuration::from_millis(10)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_without_tiers_skips_listing_and_resets_cursor() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let manager = ecstore.tier_config_mgr();
+        let saved_tiers = std::mem::take(&mut manager.write().await.tiers);
+        let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
+        let recovery_rx = Arc::clone(&runtime_state.read().await.tasks_rx[0]);
+        let bucket = format!("recovery-no-tiers-{}", Uuid::new_v4());
+        let object = "free-version";
+        create_test_bucket(&ecstore, &bucket).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
+        let metadata_path = disk_paths[0].join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let metadata_before = fs::read(&metadata_path).await.expect("seeded metadata should be readable");
+
+        let list_started = Arc::new(tokio::sync::Notify::new());
+        let list_wait = set_recovery_bucket_list_wait_hook(Arc::clone(&list_started));
+        let walk_calls = Arc::new(AtomicUsize::new(0));
+        let counted_walks = Arc::clone(&walk_calls);
+        let walk_hook = set_recovery_walk_test_hook(move |_| {
+            counted_walks.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        let mut schedule = super::TierFreeVersionRecoverySchedule::default();
+        schedule.record_success(&free_version_recovery_stats(1, 0, true));
+        let stats = tokio::select! {
+            biased;
+            _ = list_started.notified() => panic!("empty tier configuration must not list buckets"),
+            result = super::recover_configured_tier_free_versions(
+                Arc::clone(&ecstore),
+                schedule.bucket_marker.clone(),
+                schedule.object_marker.clone(),
+                CancellationToken::new(),
+            ) => result.expect("empty tier configuration should be an idle recovery result"),
+        };
+        assert_eq!(
+            stats,
+            FreeVersionRecoveryStats {
+                scanned: 0,
+                enqueued: 0,
+                failed: 0,
+                next_bucket_marker: None,
+                next_object_marker: None,
+                scanned_entries: 0,
+                buckets_scanned: 0,
+                truncated: false,
+            }
+        );
+        schedule.record_success(&stats);
+        assert!(schedule.bucket_marker.is_none());
+        assert!(schedule.object_marker.is_none());
+        assert!(!schedule.follow_up_sweep);
+        assert_eq!(walk_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            recovery_rx.lock().await.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            fs::read(&metadata_path).await.expect("paused recovery must retain metadata"),
+            metadata_before
+        );
+        drop(list_wait);
+        drop(walk_hook);
+
+        remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("test bucket should be removed");
+        manager.write().await.tiers = saved_tiers;
+        reset_runtime_expiry_state(&ecstore).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_tier_snapshot_wait_is_cancellable() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let manager = ecstore.tier_config_mgr();
+        let _write_guard = manager.write().await;
+        let cancel = CancellationToken::new();
+        let recovery = super::recover_configured_tier_free_versions(ecstore, None, None, cancel.clone());
+        tokio::pin!(recovery);
+        assert!(
+            futures::poll!(&mut recovery).is_pending(),
+            "recovery should wait for the tier manager lock"
+        );
+        cancel.cancel();
+        let err = recovery
+            .await
+            .expect_err("cancellation must not wait for the tier manager writer");
+        assert!(matches!(err, crate::error::Error::Io(ref err) if err.kind() == std::io::ErrorKind::Interrupted));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_loop_observes_tier_configuration_changes() {
+        let automatic_recovery_started = super::TIER_FREE_VERSION_RECOVERY_STARTED.get().copied();
+        let (disk_paths, ecstore) = setup_test_env().await;
+        assert_eq!(
+            super::TIER_FREE_VERSION_RECOVERY_STARTED.get().copied(),
+            automatic_recovery_started,
+            "fixture must not start an unowned automatic recovery loop"
+        );
+        let manager = ecstore.tier_config_mgr();
+        let saved_tiers = std::mem::take(&mut manager.write().await.tiers);
+        let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
+        let recovery_rx = Arc::clone(&runtime_state.read().await.tasks_rx[0]);
+        let bucket = format!("recovery-dynamic-tier-{}", Uuid::new_v4());
+        let object = "free-version";
+        create_test_bucket(&ecstore, &bucket).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
+
+        let page_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let worker_permits = Arc::clone(&page_permits);
+        let (page_tx, mut page_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let loop_cancel = cancel.clone();
+        let recovery_store = Arc::clone(&ecstore);
+        let worker = tokio::spawn(async move {
+            run_tier_free_version_recovery_loop(
+                loop_cancel,
+                runtime_state,
+                std::convert::identity,
+                move |bucket, object, cancel| {
+                    let api = Arc::clone(&recovery_store);
+                    let page_tx = page_tx.clone();
+                    let page_permits = Arc::clone(&worker_permits);
+                    async move {
+                        // Advance the scheduler clock only while real disk I/O is
+                        // parked. Otherwise its timeout can win while the blocking
+                        // filesystem operation is still running on wall-clock time.
+                        let permit = tokio::select! {
+                            _ = cancel.cancelled() => return Err(crate::error::Error::other("test recovery canceled")),
+                            permit = page_permits.acquire() => permit.expect("test controls page admission"),
+                        };
+                        permit.forget();
+                        let stats =
+                            super::recover_configured_tier_free_versions(api, bucket.clone(), object.clone(), cancel).await?;
+                        page_tx
+                            .send((bucket, object, stats.clone()))
+                            .expect("test should observe each recovery result");
+                        Ok(stats)
+                    }
+                },
+            )
+            .await;
+        });
+        let (_, _, idle) = page_rx
+            .recv()
+            .await
+            .expect("worker should check the initially empty configuration");
+        assert_eq!(idle.buckets_scanned, 0);
+        assert!(matches!(
+            recovery_rx.lock().await.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let tier = format!("RECOVERY{}", Uuid::new_v4().simple()).to_uppercase();
+        crate::services::tier::test_util::register_mock_tier(&manager, &tier).await;
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL).await;
+        tokio::time::resume();
+        page_permits.add_permits(1);
+        let (bucket_marker, object_marker, active) = tokio::time::timeout(StdDuration::from_secs(30), page_rx.recv())
+            .await
+            .expect("new tier should enable the next recovery page")
+            .expect("worker should remain running");
+        assert!(bucket_marker.is_none());
+        assert!(object_marker.is_none());
+        assert_eq!(active.enqueued, 1, "recovery page: {active:?}");
+        let task = recovery_rx
+            .lock()
+            .await
+            .try_recv()
+            .expect("new tier should enable discovery")
+            .expect("queue item should exist");
+        let recovered = task
+            .as_any()
+            .downcast_ref::<FreeVersionTask>()
+            .expect("seeded free version should be queued");
+        assert_eq!(recovered.0.bucket, bucket);
+        assert_eq!(recovered.0.name, object);
+
+        // Simulate a historical or temporarily missing configuration without
+        // bypassing the admin removal path's persisted-reference proof.
+        let configured_tiers = std::mem::take(&mut manager.write().await.tiers);
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL).await;
+        tokio::time::resume();
+        page_permits.add_permits(1);
+        let (_, _, idle_again) = tokio::time::timeout(StdDuration::from_secs(30), page_rx.recv())
+            .await
+            .expect("empty configuration should still produce an idle check")
+            .expect("worker should remain running");
+        assert_eq!(idle_again.buckets_scanned, 0);
+        assert_eq!(idle_again.enqueued, 0);
+        assert!(matches!(
+            recovery_rx.lock().await.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        cancel.cancel();
+        worker.await.expect("worker should exit on cancellation");
+        manager.write().await.tiers = configured_tiers;
+        manager
+            .write()
+            .await
+            .remove(&tier, true)
+            .await
+            .expect("mock tier should be removed");
+        manager.write().await.tiers = saved_tiers;
+        remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("test bucket should be removed");
+        reset_runtime_expiry_state(&ecstore).await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_cleanup_retry_enqueues_only_target_and_retains_durable_marker() {
+        use crate::bucket::lifecycle::tier_free_version_recovery::{TierCleanupRetryStatus, retry_tier_free_version_cleanup};
+        let (disks, api) = setup_test_env().await;
+        let (_backend, identity) = register_recovery_mock_tier(&api).await;
+        let state = install_unconsumed_runtime_expiry_worker(&api, 4).await;
+        let bucket = format!("tier-retry-{}", Uuid::new_v4());
+        create_test_bucket(&api, &bucket).await;
+        seed_recoverable_free_version(&disks, &bucket, "owned", None, Some(identity)).await;
+        let check = TierConfigMgr::deletion_check(&api.tier_config_mgr(), api.clone(), "WARM")
+            .await
+            .expect("physical free-version must be diagnosed through ECStore");
+        assert!(!check.proof_complete);
+        assert_eq!(
+            check.scan_status,
+            crate::services::tier::tier::TierDeletionScanStatus::StoppedAfterBlocker
+        );
+        assert_eq!(check.reasons.len(), 1);
+        assert_eq!(check.reasons[0].kind, crate::services::tier::tier::TierDeletionReasonKind::CleanupPending);
+        let report = retry_tier_free_version_cleanup(api.clone(), "WARM")
+            .await
+            .expect("retry should enqueue durable cleanup");
+        assert_eq!(report.status, TierCleanupRetryStatus::Accepted);
+        assert_eq!(report.enqueued, 1);
+        assert_eq!(report.failed, 0);
+        let rx = Arc::clone(&state.read().await.tasks_rx[0]);
+        let task = rx.lock().await.try_recv().expect("cleanup was queued").expect("queue item");
+        let task = task
+            .as_any()
+            .downcast_ref::<FreeVersionTask>()
+            .expect("existing free-version worker task");
+        assert_eq!(
+            (&task.0.bucket, task.0.name.as_str(), task.0.transitioned_object.tier.as_str()),
+            (&bucket, "owned", "WARM")
+        );
+        assert_eq!(
+            crate::services::tier::test_util::free_version_count(&disks[0], &bucket, "owned").await,
+            1,
+            "enqueue acceptance must retain ownership until remote cleanup commits"
+        );
+        crate::services::tier::test_util::register_mock_tier(&api.tier_config_mgr(), "OTHER").await;
+        let other = retry_tier_free_version_cleanup(api.clone(), "OTHER")
+            .await
+            .expect("other tier retry should be bounded");
+        assert_eq!(other.enqueued, 0, "retry must not enqueue a different tier's marker");
+        assert!(rx.lock().await.try_recv().is_err());
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("OTHER", true)
+            .await
+            .expect("remove other mock tier");
+        reset_runtime_expiry_state(&api).await;
+        let failed = retry_tier_free_version_cleanup(api.clone(), "WARM")
+            .await
+            .expect("queue failure remains retryable");
+        assert_eq!(failed.failed, 1);
+        assert_eq!(failed.enqueued, 0);
+        assert_eq!(crate::services::tier::test_util::free_version_count(&disks[0], &bucket, "owned").await, 1);
+        remove_seeded_free_version(&disks, &bucket, "owned").await;
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("WARM", true)
+            .await
+            .expect("remove mock tier");
+        api.delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("remove test bucket");
+        reset_runtime_expiry_state(&api).await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_cleanup_retry_strictly_bounds_versions_within_one_key() {
+        use crate::bucket::lifecycle::tier_free_version_recovery::{
+            DEFAULT_FREE_VERSION_RECOVERY_LIMIT, RecoveryWalkTestAction, retry_tier_free_version_cleanup,
+            set_recovery_walk_test_hook,
+        };
+        let (_disks, api) = setup_test_env().await;
+        let (_backend, _) = register_recovery_mock_tier(&api).await;
+        let state = install_unconsumed_runtime_expiry_worker(&api, DEFAULT_FREE_VERSION_RECOVERY_LIMIT + 2).await;
+        let bucket = format!("retry-version-limit-{}", Uuid::new_v4());
+        create_test_bucket(&api, &bucket).await;
+        let selected_bucket = bucket.clone();
+        let hook = set_recovery_walk_test_hook(move |name| {
+            (name == selected_bucket).then(|| {
+                RecoveryWalkTestAction::SendItems(
+                    (0..DEFAULT_FREE_VERSION_RECOVERY_LIMIT + 1)
+                        .map(|_| {
+                            let mut object = ObjectInfo {
+                                bucket: selected_bucket.clone(),
+                                name: "same-key".to_string(),
+                                version_id: Some(Uuid::new_v4()),
+                                ..Default::default()
+                            };
+                            object.transitioned_object.free_version = true;
+                            object.transitioned_object.name = "remote/object".to_string();
+                            object.transitioned_object.tier = "WARM".to_string();
+                            object
+                        })
+                        .collect(),
+                )
+            })
+        });
+        let report = retry_tier_free_version_cleanup(api.clone(), "WARM")
+            .await
+            .expect("bounded retry succeeds");
+        assert_eq!(report.enqueued, DEFAULT_FREE_VERSION_RECOVERY_LIMIT);
+        assert_eq!(report.failed, 0);
+        assert!(report.scan_truncated, "a partial key must remain visibly truncated");
+        let receiver = Arc::clone(&state.read().await.tasks_rx[0]);
+        let mut queued = 0;
+        while receiver.lock().await.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, DEFAULT_FREE_VERSION_RECOVERY_LIMIT);
+        drop(hook);
+        reset_runtime_expiry_state(&api).await;
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("WARM", true)
+            .await
+            .expect("remove mock tier");
+        api.delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("remove empty test bucket");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_cleanup_retry_coalesces_by_backend_identity() {
+        use crate::bucket::lifecycle::tier_free_version_recovery::{TierCleanupRetryStatus, retry_tier_free_version_cleanup};
+        let (_disks, api) = setup_test_env().await;
+        let (_backend, _) = register_recovery_mock_tier(&api).await;
+        let state = install_unconsumed_runtime_expiry_worker(&api, 1).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&api.tier_config_mgr(), "WARM")
+            .await
+            .expect("test lease");
+        let name = format!(
+            "tier-cleanup-retry/{}",
+            hex_simd::encode_to_string(lease.backend_identity(), hex_simd::AsciiCase::Lower)
+        );
+        let lock = api
+            .new_ns_lock(crate::disk::RUSTFS_META_BUCKET, &name)
+            .await
+            .expect("retry lock");
+        let mut guard = lock
+            .get_write_lock_quiet(StdDuration::from_secs(1))
+            .await
+            .expect("hold concurrent retry");
+        let report = retry_tier_free_version_cleanup(api.clone(), "WARM")
+            .await
+            .expect("busy retry is observable");
+        assert_eq!(report.status, TierCleanupRetryStatus::Busy);
+        assert_eq!(report.enqueued, 0);
+        assert_eq!(report.scanned, 0);
+        assert!(state.read().await.tasks_rx[0].lock().await.try_recv().is_err());
+        guard.release();
+        drop(lease);
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("WARM", true)
+            .await
+            .expect("remove mock tier");
+        reset_runtime_expiry_state(&api).await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn tier_cleanup_retry_cancels_walk_without_dropping_cleanup_ownership() {
+        use crate::bucket::lifecycle::tier_free_version_recovery::{
+            RecoveryWalkTestAction, retry_tier_free_version_cleanup_with_cancel, set_recovery_walk_test_hook,
+        };
+        let (disks, api) = setup_test_env().await;
+        let (_backend, identity) = register_recovery_mock_tier(&api).await;
+        let bucket = format!("retry-cancel-{}", Uuid::new_v4());
+        create_test_bucket(&api, &bucket).await;
+        seed_recoverable_free_version(&disks, &bucket, "owned", None, Some(identity)).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        let selected_bucket = bucket.clone();
+        let hook = set_recovery_walk_test_hook(move |name| {
+            (name == selected_bucket).then(|| RecoveryWalkTestAction::WaitForCancellation(notify.clone()))
+        });
+        let cancel = CancellationToken::new();
+        let task_api = api.clone();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move { retry_tier_free_version_cleanup_with_cancel(task_api, "WARM", task_cancel).await });
+        tokio::time::timeout(StdDuration::from_secs(5), started.notified())
+            .await
+            .expect("retry starts a walk");
+        cancel.cancel();
+        let error = tokio::time::timeout(StdDuration::from_secs(2), task)
+            .await
+            .expect("cancelled retry must stop")
+            .expect("retry joins")
+            .expect_err("cancelled scan cannot report acceptance");
+        assert_eq!(error.status_code, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(crate::services::tier::test_util::free_version_count(&disks[0], &bucket, "owned").await, 1);
+        drop(hook);
+        remove_seeded_free_version(&disks, &bucket, "owned").await;
+        api.tier_config_mgr()
+            .write()
+            .await
+            .remove("WARM", true)
+            .await
+            .expect("remove mock tier");
+        api.delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("remove test bucket");
+    }
+
     #[tokio::test]
     #[serial]
     async fn tier_free_version_recovery_production_entrypoint_enqueues_seeded_item() {
         let (disk_paths, ecstore) = setup_test_env().await;
+        let tier = format!("RECOVERY{}", Uuid::new_v4().simple()).to_uppercase();
+        crate::services::tier::test_util::register_mock_tier(&ecstore.tier_config_mgr(), &tier).await;
         let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
         let recovery_rx = {
             let state = runtime_state.read().await;
@@ -13368,8 +15276,13 @@ mod tests {
         seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
 
         let started = OnceLock::new();
-        let recovery = super::spawn_tier_free_version_recovery_once(Arc::clone(&ecstore), &started)
-            .expect("production recovery entrypoint should start once");
+        let recovery = super::spawn_tier_free_version_recovery_once_with_options(
+            Arc::clone(&ecstore),
+            &started,
+            format!("tier-free-version-recovery/test/{}", Uuid::new_v4()),
+            fast_tier_free_version_recovery_leader_retry_delay,
+        )
+        .expect("production recovery entrypoint should start once");
         let task = tokio::time::timeout(StdDuration::from_secs(30), async { recovery_rx.lock().await.recv().await })
             .await
             .expect("production recovery entrypoint should enqueue the seeded item")
@@ -13387,6 +15300,13 @@ mod tests {
             .await
             .expect_err("aborted production recovery task should report cancellation");
         assert!(join_error.is_cancelled());
+        ecstore
+            .tier_config_mgr()
+            .write()
+            .await
+            .remove(&tier, true)
+            .await
+            .expect("mock tier should be removed");
         remove_seeded_free_version(&disk_paths, &bucket, object).await;
         ecstore
             .delete_bucket(&bucket, &DeleteBucketOptions::default())
@@ -13412,13 +15332,14 @@ mod tests {
         };
         let mut recovery_rx = recovery_rx.lock().await;
         assert!(
-            super::enqueue_recovered_free_version(
+            super::enqueue_recovered_free_version_with_cancel(
                 &ecstore,
                 ObjectInfo {
                     bucket: "prefill".to_string(),
                     name: "prefill".to_string(),
                     ..Default::default()
                 },
+                &CancellationToken::new(),
             )
             .await,
             "the production recovery queue should accept its first task"
@@ -14231,6 +16152,536 @@ mod tests {
 
         let ecstore = ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new()).await;
         assert!(ecstore.is_ok(), "fresh local ECStore boot should succeed, got {ecstore:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn stale_multipart_cleanup_preserves_partial_metadata_without_upload_part_warning() {
+        use tracing::instrument::WithSubscriber as _;
+        #[derive(Clone, Default)]
+        struct CapturedLogs(Arc<StdMutex<Vec<u8>>>);
+        struct LogWriter(Arc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+            type Writer = LogWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                LogWriter(self.0.clone())
+            }
+        }
+
+        let (paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-partial-{}", Uuid::new_v4().simple());
+        create_test_bucket(&ecstore, &bucket).await;
+        for copies in [1, 2] {
+            let object = format!("partial-{copies}.bin");
+            let initiated = OffsetDateTime::now_utc() - time::Duration::hours(30);
+            let upload = ecstore
+                .new_multipart_upload(
+                    &bucket,
+                    &object,
+                    &ObjectOptions {
+                        mod_time: Some(initiated),
+                        max_parity: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("multipart upload should be created");
+            let decoded = base64_simd::URL_SAFE_NO_PAD
+                .decode_to_vec(upload.upload_id.as_bytes())
+                .unwrap();
+            let decoded = String::from_utf8(decoded).unwrap();
+            let (_, upload_dir) = decoded.split_once('.').expect("deployment-prefixed upload id");
+            let upload_path = format!("{}/{upload_dir}", multipart_sha_dir(&bucket, &object));
+            let physical_paths: Vec<_> = paths
+                .iter()
+                .map(|path| path.join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_path))
+                .collect();
+            let original: Vec<_> = physical_paths
+                .iter()
+                .take(copies)
+                .map(|path| std::fs::read(path.join(STORAGE_FORMAT_FILE)).unwrap())
+                .collect();
+            let info = super::get_file_info(
+                &original[0],
+                RUSTFS_META_MULTIPART_BUCKET,
+                &upload_path,
+                "",
+                super::FileInfoOpts {
+                    data: false,
+                    include_free_versions: false,
+                    include_part_checksums: false,
+                },
+            )
+            .unwrap();
+            assert_eq!((info.erasure.data_blocks, info.erasure.parity_blocks), (2, 2));
+            for path in physical_paths.iter().skip(copies) {
+                fs::remove_dir_all(path).await.expect("remove selected metadata copies");
+            }
+            if copies == 2 {
+                ecstore
+                    .get_multipart_info(&bucket, &object, &upload.upload_id, &ObjectOptions::default())
+                    .await
+                    .expect("two metadata copies must meet read quorum");
+            }
+
+            let logs = CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            let recorder = crate::test_metrics::CapturingRecorder::default();
+            let recorder_guard = metrics::set_default_local_recorder(&recorder);
+            cleanup_stale_multipart_uploads_once_at(
+                ecstore.clone(),
+                OffsetDateTime::now_utc(),
+                StdDuration::from_secs(24 * 60 * 60),
+            )
+            .with_subscriber(subscriber)
+            .await;
+            drop(recorder_guard);
+            for (path, expected) in physical_paths.iter().zip(&original) {
+                assert_eq!(fs::read(path.join(STORAGE_FORMAT_FILE)).await.unwrap(), *expected);
+            }
+            let log_output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            let rechecks = log_output
+                .lines()
+                .filter(|line| line.contains("multipart_cleanup_lock_or_recheck_failed"));
+            let matching_path = rechecks.clone().any(|line| line.contains(&upload_path));
+            assert!(
+                matching_path,
+                "missing path-specific background diagnostic for {upload_path}: {log_output}"
+            );
+            assert_eq!(
+                recorder.counter_value(super::METRIC_STALE_MULTIPART_CLEANUP_BLOCKED_TOTAL, &[("stage", "recheck")]),
+                u64::try_from(rechecks.count()).expect("diagnostic count fits u64"),
+                "each observed recheck failure must increment the metric exactly once"
+            );
+            assert!(!log_output.contains("op=\"upload_part\""), "unexpected upload-part warning: {log_output}");
+            for path in physical_paths.iter().take(copies) {
+                fs::remove_dir_all(path).await.unwrap();
+            }
+        }
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            tracing::subscriber::with_default(subscriber, || {
+                super::record_stale_multipart_cleanup_lock_lost("test-hash/test-upload");
+            })
+        });
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("multipart_cleanup_lock_lost") && output.contains("test-hash/test-upload"),
+            "{output}"
+        );
+        assert!(!output.contains("op=\"upload_part\""), "{output}");
+        assert_eq!(
+            recorder.counter_value(super::METRIC_STALE_MULTIPART_CLEANUP_BLOCKED_TOTAL, &[("stage", "lock_lost")]),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn stale_multipart_cleanup_lists_parts_only_when_size_is_needed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::prelude::*;
+
+        struct PartListCounter {
+            calls: Arc<AtomicUsize>,
+            bucket: String,
+            object: &'static str,
+        }
+        struct PartListFields<'a> {
+            bucket: &'a str,
+            object: &'a str,
+            matching_bucket: bool,
+            matching_object: bool,
+        }
+        impl tracing::field::Visit for PartListFields<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                match field.name() {
+                    "bucket" => self.matching_bucket = value == self.bucket,
+                    "object" => self.matching_object = value == self.object,
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let value = format!("{value:?}");
+                match field.name() {
+                    "bucket" => self.matching_bucket = value == format!("{:?}", self.bucket),
+                    "object" => self.matching_object = value == format!("{:?}", self.object),
+                    _ => {}
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PartListCounter {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if attrs.metadata().name() != "list_object_parts" {
+                    return;
+                }
+                let mut fields = PartListFields {
+                    bucket: &self.bucket,
+                    object: self.object,
+                    matching_bucket: false,
+                    matching_object: false,
+                };
+                attrs.record(&mut fields);
+                if fields.matching_bucket && fields.matching_object {
+                    self.calls.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let (_, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-list-parts-{}", Uuid::new_v4().simple());
+        create_test_bucket(&ecstore, &bucket).await;
+        set_abort_incomplete_lifecycle(&bucket, "logs/", 0).await;
+        let now = OffsetDateTime::now_utc();
+        for (object, age, size_filter, should_list) in [
+            ("logs/default-expired", time::Duration::hours(30), false, false),
+            ("logs/lifecycle-only", time::Duration::minutes(5), false, false),
+            ("logs/size-filter", time::Duration::minutes(5), true, true),
+            ("logs/disabled-size-filter", time::Duration::minutes(5), false, false),
+        ] {
+            if size_filter {
+                set_abort_incomplete_lifecycle_with_size(&bucket, "logs/", 0, 0).await;
+            } else if object == "logs/disabled-size-filter" {
+                let rules = r#"<LifecycleConfiguration><Rule><ID>enabled</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule><Rule><ID>disabled-size</ID><Status>Disabled</Status><Filter><ObjectSizeGreaterThan>0</ObjectSizeGreaterThan></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"#;
+                metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rules.as_bytes().to_vec())
+                    .await
+                    .expect("install enabled rule and disabled size rule");
+            }
+            let upload = ecstore
+                .new_multipart_upload(
+                    &bucket,
+                    object,
+                    &ObjectOptions {
+                        mod_time: Some(now - age),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create multipart upload");
+            if size_filter {
+                let mut data = PutObjReader::from_vec(vec![1, 2, 3, 4]);
+                ecstore
+                    .put_object_part(&bucket, object, &upload.upload_id, 1, &mut data, &ObjectOptions::default())
+                    .await
+                    .expect("upload a part for size filtering");
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let subscriber = tracing_subscriber::registry().with(PartListCounter {
+                calls: Arc::clone(&calls),
+                bucket: bucket.clone(),
+                object,
+            });
+            cleanup_stale_multipart_uploads_once_at(ecstore.clone(), now, StdDuration::from_secs(24 * 60 * 60))
+                .with_subscriber(subscriber)
+                .await;
+            let listed = calls.load(Ordering::Relaxed);
+            assert_eq!(listed > 0, should_list, "unexpected ListParts calls for {object}: {listed}");
+            let result = ecstore
+                .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+                .await;
+            assert!(
+                matches!(result, Err(ref err) if is_err_invalid_upload_id(err)),
+                "upload must be removed: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_multipart_cleanup_rejects_incomplete_or_overflowing_part_sizes() {
+        use crate::storage_api_contracts::multipart::{ListPartsInfo, PartInfo};
+
+        let part = |size, actual_size, etag: &str| PartInfo {
+            size,
+            actual_size,
+            etag: Some(etag.to_owned()),
+            ..Default::default()
+        };
+        let mut parts = ListPartsInfo {
+            parts: vec![part(6, 6, "valid")],
+            ..Default::default()
+        };
+        assert_eq!(super::stale_upload_size_from_parts(&parts), Some(6));
+        parts.is_truncated = true;
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        parts.is_truncated = false;
+        parts.parts = vec![part(0, 0, "")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        parts.parts = vec![part(1, -1, "valid")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        parts.parts = vec![part(8, 6, "valid")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        parts.parts = vec![part(4, 6, "valid")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+        rustfs_utils::http::insert_str(&mut parts.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION, "test".to_owned());
+        assert_eq!(super::stale_upload_size_from_parts(&parts), Some(6));
+        parts.parts = vec![part(8, 6, "valid")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), Some(6));
+        rustfs_utils::http::remove_str(&mut parts.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
+        parts
+            .user_defined
+            .insert("x-amz-server-side-encryption".to_owned(), "AES256".to_owned());
+        assert_eq!(super::stale_upload_size_from_parts(&parts), Some(6));
+        parts.user_defined.clear();
+        parts.parts = vec![part(usize::MAX, 0, "valid"), part(1, 1, "valid")];
+        assert_eq!(super::stale_upload_size_from_parts(&parts), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_multipart_cleanup_handles_unknown_size_without_false_abort() {
+        let (_, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-unknown-size-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+        let size_rule = r#"<Rule><ID>size</ID><Status>Enabled</Status><Filter><ObjectSizeLessThan>5</ObjectSizeLessThan></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>"#;
+        let independent_rule = r#"<Rule><ID>prefix</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>"#;
+        let lifecycle = |rules: &str| format!("<LifecycleConfiguration>{rules}</LifecycleConfiguration>").into_bytes();
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle(size_rule))
+            .await
+            .expect("install upper-size lifecycle rule");
+        let metadata = HashMap::from([
+            (super::RUSTFS_MULTIPART_BUCKET_KEY.to_owned(), bucket.clone()),
+            (super::RUSTFS_MULTIPART_OBJECT_KEY.to_owned(), object.to_owned()),
+        ]);
+        let initiated = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let set = &ecstore.pools[0].disk_set[0];
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create empty multipart upload");
+        let decoded = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(upload.upload_id.as_bytes())
+            .expect("decode upload ID");
+        let decoded = String::from_utf8(decoded).expect("upload ID must be UTF-8");
+        let (_, upload_dir) = decoded.split_once('.').expect("deployment-prefixed upload ID");
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false)
+                .await
+                .is_some(),
+            "a known empty upload must match the upper-size rule"
+        );
+        let missing_upload = format!("{}x{}", Uuid::new_v4(), initiated.unix_timestamp_nanos());
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, &missing_upload, false)
+                .await
+                .is_none(),
+            "an unreadable size must not match the upper-size rule"
+        );
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle(&format!("{size_rule}{independent_rule}")))
+            .await
+            .expect("install size-independent lifecycle rule");
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, &missing_upload, false)
+                .await
+                .is_some(),
+            "a size-independent rule remains eligible when size is unknown"
+        );
+        ecstore
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("remove this test's remaining upload from the shared fixture");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn strict_multipart_lifecycle_size_skips_unavailable_participant_and_recovers() {
+        let (_, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-strict-size-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+        let rule = br#"<LifecycleConfiguration><Rule><ID>size</ID><Status>Enabled</Status><Filter><ObjectSizeLessThan>5</ObjectSizeLessThan></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"#;
+        metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rule.to_vec())
+            .await
+            .expect("install upper-size rule");
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create empty upload");
+        let decoded = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(upload.upload_id.as_bytes())
+            .expect("decode upload ID");
+        let decoded = String::from_utf8(decoded).expect("upload ID is UTF-8");
+        let (_, upload_dir) = decoded.split_once('.').expect("deployment-prefixed upload ID");
+        let metadata = HashMap::from([
+            (super::RUSTFS_MULTIPART_BUCKET_KEY.to_owned(), bucket.clone()),
+            (super::RUSTFS_MULTIPART_OBJECT_KEY.to_owned(), object.to_owned()),
+        ]);
+        let initiated = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let set = &ecstore.pools[0].disk_set[0];
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false)
+                .await
+                .is_some()
+        );
+        let disk = set.disks.write().await[3].take();
+        assert!(disk.is_some());
+        let due = super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false).await;
+        set.disks.write().await[3] = disk;
+        assert!(due.is_none(), "unknown size must not match an upper-size rule");
+        assert!(
+            super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false)
+                .await
+                .is_some()
+        );
+        ecstore
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("remove this test's remaining upload from the shared fixture");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn strict_multipart_lifecycle_does_not_treat_a_minority_part_as_empty() {
+        let (paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-part-minority-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+        let initiated = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let upload = ecstore
+            .new_multipart_upload(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    mod_time: Some(initiated),
+                    max_parity: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create upload");
+        let mut body = PutObjReader::from_vec(vec![7; 6]);
+        ecstore
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut body, &ObjectOptions::default())
+            .await
+            .expect("write a known six-byte part");
+        let decoded = base64_simd::URL_SAFE_NO_PAD
+            .decode_to_vec(upload.upload_id.as_bytes())
+            .expect("decode upload ID");
+        let decoded = String::from_utf8(decoded).expect("upload ID is UTF-8");
+        let (_, upload_dir) = decoded.split_once('.').expect("deployment-prefixed upload ID");
+        let upload_path = format!("{}/{upload_dir}", multipart_sha_dir(&bucket, object));
+        let root = paths[0].join(RUSTFS_META_MULTIPART_BUCKET).join(&upload_path);
+        let bytes = fs::read(root.join(STORAGE_FORMAT_FILE)).await.expect("read source metadata");
+        let info = super::get_file_info(
+            &bytes,
+            RUSTFS_META_MULTIPART_BUCKET,
+            &upload_path,
+            "",
+            super::FileInfoOpts {
+                data: false,
+                include_free_versions: false,
+                include_part_checksums: false,
+            },
+        )
+        .expect("decode source metadata");
+        let data_dir = info.data_dir.expect("upload data directory").to_string();
+        let metadata = HashMap::from([
+            (super::RUSTFS_MULTIPART_BUCKET_KEY.to_owned(), bucket.clone()),
+            (super::RUSTFS_MULTIPART_OBJECT_KEY.to_owned(), object.to_owned()),
+        ]);
+        let set = &ecstore.pools[0].disk_set[0];
+        let rule = |filter: &str| {
+            format!("<LifecycleConfiguration><Rule><ID>size</ID><Status>Enabled</Status><Filter>{filter}</Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>0</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>").into_bytes()
+        };
+        let filters = [
+            "<ObjectSizeLessThan>10</ObjectSizeLessThan>",
+            "<ObjectSizeGreaterThan>5</ObjectSizeGreaterThan>",
+        ];
+        for filter in filters {
+            metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rule(filter))
+                .await
+                .expect("install baseline size filter");
+            assert!(
+                super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false)
+                    .await
+                    .is_some(),
+                "known six-byte part must satisfy {filter} before the fault"
+            );
+        }
+        let mut saved = Vec::new();
+        for path in paths.iter().take(3) {
+            for file in ["part.1", "part.1.meta"] {
+                let path = path
+                    .join(RUSTFS_META_MULTIPART_BUCKET)
+                    .join(&upload_path)
+                    .join(&data_dir)
+                    .join(file);
+                let bytes = fs::read(&path).await.expect("snapshot original part");
+                fs::remove_file(&path).await.expect("simulate a missing part on this disk");
+                saved.push((path, bytes));
+            }
+        }
+        for filter in filters {
+            metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rule(filter))
+                .await
+                .expect("install size filter");
+            super::metadata_boundary::get_lifecycle_config(&bucket)
+                .await
+                .expect("size filter must be readable during the fault");
+            assert!(
+                super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false)
+                    .await
+                    .is_none(),
+                "a minority part must not satisfy {filter}"
+            );
+        }
+        cleanup_stale_multipart_uploads_once_at(
+            ecstore.clone(),
+            OffsetDateTime::now_utc(),
+            StdDuration::from_secs(7 * 24 * 60 * 60),
+        )
+        .await;
+        ecstore
+            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("unknown size must preserve the upload during cleanup");
+        for (path, bytes) in saved {
+            fs::write(path, bytes).await.expect("restore original part");
+        }
+        let size = super::stale_upload_current_size_with_opts(set, &metadata, upload_dir, false).await;
+        assert_eq!(size, Some(6), "restored part must have its original logical size");
+        for filter in filters {
+            metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, rule(filter))
+                .await
+                .expect("restore size filter");
+            let config = super::metadata_boundary::get_lifecycle_config(&bucket)
+                .await
+                .expect("read lifecycle");
+            let due = super::stale_upload_lifecycle_due(set, &metadata, initiated, upload_dir, false).await;
+            assert!(due.is_some(), "restored part must satisfy {filter}; size={size:?}, config={config:?}");
+        }
+        ecstore
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("remove the restored test upload from the shared fixture");
     }
 
     #[tokio::test]

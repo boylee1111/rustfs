@@ -34,13 +34,53 @@ An expired restored local copy can be cleaned up under Object Lock because the r
 
 ## Free-version recovery controls
 
+S3, MinIO, and RustFS tiers can use private IP endpoints. After upgrading from a build that rejected those endpoints, keep the existing tier configuration and verify reads before checking whether pending cleanup records drain. A missing durable backend identity or an unknown remote version remains a separate cleanup blocker: beta.7 transitioned objects can lack these fields, and expiry on 1.0.1 only copies fields already present. Endpoint recovery does not backfill them. The legacy transitioned-object reconcile endpoint does not accept free-version records; retain the original metadata and backend/version evidence for a dedicated recovery procedure.
+
+Forced tier removal skips constructing the remote driver and probing the remote bucket, but still requires idle operations and a complete persisted-reference proof. Live transitioned objects, free versions, delete journals, and transition transactions continue to block removal. Do not delete those records to make a tier removable.
+
 The dedicated free-version recovery loop is enabled by default and is independent of the data scanner and heal switches. Setting `RUSTFS_SCANNER_ENABLED=false` does not stop this repair loop. Set `RUSTFS_TIER_FREE_VERSION_RECOVERY_ENABLED=false` before process startup to disable only the dedicated persisted-marker walk. That setting does not disable lifecycle workers or prevent another scanner path from discovering a free version, and it can leave remote cleanup markers pending for longer, so use it as a break-glass pressure control rather than a cleanup mechanism.
+
+Before each recovery page, the leader checks its current tier configuration. If no remote tiers are configured, it skips bucket listing and object walks, clears its in-memory continuation markers, and uses the normal idle backoff to check again. The worker stays running when configuration has not yet loaded or becomes empty. Once a tier is visible in the leader's configuration, discovery resumes from the beginning at the next check; the idle interval is capped at ten minutes. A configuration change after a page starts does not cancel that page. This pause retains persisted free-version markers and does not change explicit recovery calls, other ILM recovery workers, or the fences on already queued cleanup tasks.
+
+Enabled nodes compete for the independent `tier-free-version-recovery/leader.lock` namespace lock in the internal metadata bucket. The leader holds the renewable lock across pages, cooldowns, retries, and idle waits; followers only attempt ownership with a one-second acquisition budget and a random 15–30 second delay between attempts. This uses the existing pool 0 locker majority, so recovery pauses when that lock domain cannot form quorum even if another pool remains available. Recovery resumes when ownership can be acquired again. It does not depend on the main scanner's leader lock or enable switch.
+
+Loss of the leader lease or process shutdown cancels discovery and waits for active walks to stop before the coordinator exits that leadership term. A successor starts a new sweep from the beginning because continuation markers remain process-local; frequent leadership changes can therefore delay discovery near the end of a large namespace. Already queued cleanup tasks retain their existing exact-version and object-lock checks and may finish after leadership changes. During a rolling upgrade, older nodes still perform independent walks until they are upgraded or recovery is disabled on them.
+
+Recovery discoveries enter the leader's local lifecycle worker queues. Queue pressure preserves the failed object's retry position; spare workers on other nodes do not automatically take those tasks. Recovery notifications are also process-local: a failed enqueue or cleanup on a follower is rediscovered through the leader's periodic sweeps rather than immediately waking it. The ten-minute idle cap bounds the idle gap, not the total time to discover a marker, which also includes page cooldowns and traversal time. Persisted free-version markers remain the retry source of truth.
 
 Normal transitioned deletes pass a post-commit receipt directly to the lifecycle queue. The namespace walk is the crash, queue-pressure, mixed-version, and historical-record fallback. It cannot safely skip a bucket merely because that bucket has no current lifecycle rule or the referenced tier was removed: an older `xl.meta` free-version can still be the only owner of a required remote DELETE.
 
 One background recovery page completes at most 10,000 logical objects across at most 100 buckets and enqueues at most 1,000 recoverable free versions. The scanner can decode one additional object to detect truncation; a continuation marker preserves the first unscanned bucket or the last completely scanned object. Every truncated page and follow-up sweep waits at least 60 seconds after the previous page completes; failed pages back off from 60 seconds to 10 minutes, and complete idle sweeps exponentially back off to 10 minutes with jitter. Individual walks have no fixed total timeout, but inherit the drive walk stall timeout so a large healthy bucket can make progress without recreating the old timeout/restart loop.
 
-The structured `lifecycle_worker_state` recovery event reports `duration_ms`, `scanned_entries`, `buckets_scanned`, queue counts, truncation, and continuation markers. `rustfs_internal_stage_duration_ms{stage="lifecycle_free_version_recovery"}` records successful page duration; `stage="lifecycle_free_version_recovery_failed"` records failures.
+The structured `lifecycle_worker_state` recovery event reports `duration_ms`, `scanned_entries`, `buckets_scanned`, queue counts, truncation, and continuation markers. Coordinator states include `free_version_recovery_leader_acquired`, `free_version_recovery_leader_lost`, and `free_version_recovery_leader_acquire_failed`; normal follower contention is quiet. `rustfs_internal_stage_duration_ms{stage="lifecycle_free_version_recovery"}` records successful page duration; `stage="lifecycle_free_version_recovery_failed"` records failures. When comparing cluster load, include lock acquisition/refresh RPCs and the leader's cleanup backlog as well as namespace traversal work.
+
+## Tier-delete journal recovery scheduling
+
+Tier-delete journal recovery starts immediately and remains enabled independently of the free-version discovery switch. A complete, successful scan that finds both the dispatch-manifest and journal queues empty backs off with jitter, from 60 seconds to at most five minutes. Local recovery notifications wake the loop immediately and reset the idle delay. Durable work without a local notification, including work written by another node, is discovered by the bounded periodic scan; process restart starts a fresh scan immediately.
+
+Recovery passes that observe retained entries, failed pages, continuation markers, or exhausted budgets keep the original 60-second retry cadence. Foreground dispatch still queues committed work directly; the idle wait before the next scan of unnotified new durable work can grow from 60 seconds to five minutes. In-flight recovery, listing and processing time are additional; this cap bounds idle delay rather than end-to-end cleanup latency. This scheduling does not change dispatch ownership, exact-version validation, or remote-delete authorization. An empty-queue backoff therefore reduces background listing traffic while preserving durable crash recovery; it is independent of diagnosing multipart session errors.
+
+## Diagnosing a blocked tier deletion
+
+Deleting every visible object in a versioned bucket does not prove that a tier is unused. Historical versions, lifecycle references, hidden free versions, and persisted deletion/transition records can still own remote data. Tier deletion remains synchronous and checks these references again under its existing mutation protocol. The legacy `XMinioAdminTierBackendInUse` response remains unchanged, including when `force=true` cannot bypass a durable owner.
+
+`GET /rustfs/admin/v3/tier/{tier}/deletion-check` requires `admin:ListTier` and returns a read-only, bounded observation. It never probes the remote backend or schedules cleanup. `reasons[].kind` is one of:
+
+| Reason | Next action |
+|--------|-------------|
+| `LIFECYCLE_REFERENCE` | Remove or change lifecycle rules referencing the tier, including rules for noncurrent versions. |
+| `LIVE_TRANSITIONED_VERSION` | Inspect and delete the intended historical versions and delete markers, observing retention requirements. |
+| `CLEANUP_PENDING` | Retain the tier configuration while the existing free-version or deletion-journal recovery completes. |
+| `TRANSITION_PENDING` | Inspect the retained transition transaction and its existing recovery procedure. |
+| `PROOF_INCOMPLETE` | Restore local metadata/topology readability or retry the bounded check. This is not evidence that the tier is unused. |
+
+The check stops after the first observed blocker and reports `scanStatus: "stopped_after_blocker"`, `proofComplete: false`. Other reasons may also exist. A complete scan is advisory: concurrent writes and remote backend state can still prevent the subsequent DELETE. Responses include `remote.state: "not_checked"` and contain no object inventory or credential material.
+
+`POST /rustfs/admin/v3/tier/{tier}/cleanup-retry` requires `admin:SetTier` and performs a bounded pass through the existing free-version recovery reader and expiry queue. It runs on the receiving node, so it does not depend on reaching the background recovery leader. Concurrent retry passes for the same backend identity share a distributed lock. HTTP 202 reports queue acceptance or `status: "busy"`; neither result means the tier was deleted. Lock contention or unavailable lock quorum can both produce `busy`.
+
+The pass has a 10-second work deadline, followed by at most five seconds to stop its active walk, and scans at most 100 buckets / 10,000 objects with up to 1,000 matching free versions enqueued. `enqueued`, `failed`, and `scanTruncated` describe this pass only. Zero enqueues do not prove that there is no remaining cleanup. A full queue, cancellation, or remote cleanup failure leaves the durable owner available to existing recovery. Background recovery keeps its own cursor and continues independently; repeated manual passes start at the namespace beginning. Persisted deletion journals and transition transactions retain their existing recovery cadence and procedures.
+
+After cleanup, rerun the check and explicitly retry tier deletion. A retry request never creates a persistent task to delete the tier configuration automatically.
 
 ## Metadata key conventions
 
@@ -64,6 +104,8 @@ get_bytes(&self.meta_sys, SUFFIX_TRANSITIONED_VERSION_ID)
 ```
 
 `transition_version_id == None` means only that no usable legacy UUID projection exists; it does not prove the remote bucket's versioning model. Only an explicit `KnownDisabled` state authorizes ordinary GET/DELETE to omit `versionId`. A missing state with an absent or empty version key remains `Unknown` and requires the bounded compatibility probe or the approved reconcile workflow; it never directly authorizes cleanup. A nil UUID (`00000000-...`) sent as `?versionId=` causes `NoSuchVersion`. Do not use `Uuid::from_slice(..).unwrap_or_default()` here: it converts an empty metadata value into `Uuid::nil()`, which is exactly that failure.
+
+Opaque remote version IDs, such as those returned by Backblaze B2, are treated as exact remote identifiers only after the operator-attested live fleet capability gate is active. The gate requires both `RUSTFS_TIER_REMOTE_VERSION_STATE_WRITE=true` and `RUSTFS_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED=true`, plus a current fleet proof. Recovery and operator cleanup retain an ambiguous candidate while that proof is absent or stale; they never issue a guessed opaque-version delete. Existing persisted exact opaque IDs remain routable, but new persistence and recovery cleanup fail closed until the gate is current.
 
 ## Inspect xl.meta directly
 

@@ -26,7 +26,9 @@ use super::storage_api::test::contract::{
 };
 use super::storage_api::test::ecfs::FS;
 use super::storage_api::test::object_utils::to_s3s_etag;
-use super::storage_api::test::runtime::{MockWarmBackend, MockWarmOp, register_mock_tier as register_mock_tier_util};
+use super::storage_api::test::runtime::{
+    MockWarmBackend, MockWarmOp, get_global_transition_state, register_mock_tier as register_mock_tier_util,
+};
 use super::storage_api::test::{
     ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, StorageObjectInfo as ObjectInfo,
     StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader, install_all_v6_fleet_capability_proof,
@@ -48,7 +50,7 @@ use std::{
     convert::Infallible,
     env, fs as stdfs,
     path::PathBuf,
-    sync::{Arc, Once, OnceLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use tokio::fs;
@@ -58,7 +60,6 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
-static INIT: Once = Once::new();
 const TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const RESTORE_SUSPENDED_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const ENV_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
@@ -69,7 +70,7 @@ const ENV_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_S
 const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
 fn init_tracing() {
-    INIT.call_once(|| {});
+    rustfs_test_utils::init_tracing();
 }
 
 async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
@@ -344,22 +345,60 @@ async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
     register_mock_tier_util(&current_tier_config_handle(), tier_name).await
 }
 
-async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> Option<ObjectInfo> {
+async fn wait_for_transition(
+    ecstore: &Arc<ECStore>,
+    bucket: &str,
+    object: &str,
+    timeout: Duration,
+) -> Result<ObjectInfo, String> {
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
-        if let Ok(info) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await
-            && info.transitioned_object.status == "complete"
-        {
-            return Some(info);
-        }
+        let observed = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await;
+        let observed = match observed {
+            Ok(info) if info.transitioned_object.status == "complete" => return Ok(info),
+            other => other,
+        };
 
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            let last_observation = match observed {
+                Ok(info) => format!("transitioned_status={:?}", info.transitioned_object.status),
+                Err(error) => format!("metadata_error={:?}", error.code()),
+            };
+            let state = get_global_transition_state();
+            return Err(format!(
+                "transition did not complete within {timeout:?}; {last_observation}; pending={}, active={}, compensation_pending={}, compensation_running={}",
+                state.pending_tasks(),
+                state.active_tasks(),
+                state.compensation_pending_tasks(),
+                state.compensation_running_tasks(),
+            ));
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn transition_wait_timeout_reports_metadata_state_and_read_failure() {
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let bucket = format!("test-transition-wait-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    create_test_bucket(&ecstore, &bucket).await;
+    upload_test_object(&ecstore, &bucket, "plain.txt", b"not transitioned").await;
+
+    let pending = wait_for_transition(&ecstore, &bucket, "plain.txt", Duration::ZERO)
+        .await
+        .expect_err("an untransitioned object must still fail the observation deadline");
+    assert!(pending.contains("transitioned_status=\"\""), "{pending}");
+    assert!(pending.contains("compensation_pending="), "{pending}");
+    assert!(pending.contains("compensation_running="), "{pending}");
+
+    let missing = wait_for_transition(&ecstore, &bucket, "missing.txt", Duration::ZERO)
+        .await
+        .expect_err("metadata read failures must not become a completed transition");
+    assert!(missing.contains("metadata_error=ObjectNotFound"), "{missing}");
 }
 
 async fn wait_for_restore_completion(
@@ -405,11 +444,15 @@ async fn wait_for_restore_completion(
 // runtime (`worker_threads = 1`), so no concurrent test can mutate process environment during the
 // `env::set_var` / `env::remove_var` window.
 #[allow(unsafe_code)]
-async fn with_forced_immediate_enqueue_timeout<F, Fut>(test_fn: F)
+async fn with_forced_immediate_enqueue_timeout<F, Fut>(backend: &MockWarmBackend, test_fn: F)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    let transition_state = get_global_transition_state();
+    let missed_before = transition_state.missed_immediate_tasks();
+    let compensation_before = transition_state.compensation_scheduled_tasks();
+    let put_barrier = backend.arm_put_barrier().await;
     let original = env::var_os(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
     unsafe {
         env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, "1");
@@ -426,6 +469,20 @@ where
     if let Err(err) = result {
         std::panic::resume_unwind(err);
     }
+
+    assert!(
+        transition_state.missed_immediate_tasks() > missed_before,
+        "the operation should exercise the forced immediate enqueue failure"
+    );
+    assert!(
+        transition_state.compensation_scheduled_tasks() > compensation_before,
+        "the operation should schedule automatic compensation backfill"
+    );
+
+    // Separate automatic discovery and queue latency from the metadata commit deadline.
+    put_barrier.wait_until_paused().await;
+    assert_eq!(backend.object_count().await, 1, "compensation should store the body before committing");
+    put_barrier.release();
 }
 
 async fn with_get_codec_streaming_remote_probe_env<F, Fut>(test_fn: F)
@@ -569,26 +626,47 @@ async fn put_object_if_none_match_existing_object_returns_precondition_failed() 
         .await
         .expect("Failed to fetch existing object info");
     let existing_etag = existing_info.etag.expect("existing object should have an ETag");
+    let initial_versions = live_object_version_count(&ecstore, bucket.as_str(), object).await;
 
-    let replacement_input = PutObjectInput::builder()
-        .bucket(bucket.clone())
-        .key(object.to_string())
-        .body(Some(streaming_blob_from_bytes(replacement_payload)))
-        .content_length(Some(replacement_payload.len() as i64))
-        .build()
-        .unwrap();
-    let mut req = build_request(replacement_input, Method::PUT);
-    req.headers
-        .insert(IF_NONE_MATCH, HeaderValue::from_str(existing_etag.as_str()).unwrap());
+    for (condition, expected_code) in [
+        (ETagCondition::Any, s3s::S3ErrorCode::PreconditionFailed),
+        (ETagCondition::ETag(ETag::Strong(existing_etag)), s3s::S3ErrorCode::NotImplemented),
+        (
+            ETagCondition::ETag(ETag::Strong("different-etag".to_string())),
+            s3s::S3ErrorCode::NotImplemented,
+        ),
+    ] {
+        let header = condition.to_http_header().expect("conditional PUT header should encode");
+        // Cover header-only callers and the DTO-plus-header shape of parsed HTTP requests.
+        for if_none_match in [None, Some(condition)] {
+            let has_dto = if_none_match.is_some();
+            let replacement_input = PutObjectInput::builder()
+                .bucket(bucket.clone())
+                .key(object.to_string())
+                .body(Some(streaming_blob_from_bytes(replacement_payload)))
+                .content_length(Some(replacement_payload.len() as i64))
+                .if_none_match(if_none_match)
+                .build()
+                .expect("conditional replacement PUT input should build");
+            let mut req = build_request(replacement_input, Method::PUT);
+            req.headers.insert(IF_NONE_MATCH, header.clone());
 
-    let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
-
-    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
-    assert_eq!(
-        read_object_bytes(&ecstore, bucket.as_str(), object).await,
-        initial_payload,
-        "failed conditional PutObject must not overwrite the current object"
-    );
+            let err = Box::pin(usecase.execute_put_object(&fs, req))
+                .await
+                .expect_err("conditional PUT must reject the replacement");
+            assert_eq!(err.code(), &expected_code, "header={header:?}, has_dto={has_dto}");
+            assert_eq!(
+                read_object_bytes(&ecstore, bucket.as_str(), object).await,
+                initial_payload,
+                "failed conditional PutObject must not overwrite the current object"
+            );
+            assert_eq!(
+                live_object_version_count(&ecstore, bucket.as_str(), object).await,
+                initial_versions,
+                "failed conditional PutObject must not create a version"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -615,29 +693,50 @@ async fn copy_object_if_none_match_existing_destination_returns_precondition_fai
         .await
         .expect("Failed to fetch destination object info");
     let dst_etag = dst_info.etag.expect("destination object should have an ETag");
+    let initial_versions = live_object_version_count(&ecstore, dst_bucket.as_str(), dst_object).await;
 
-    let copy_input = CopyObjectInput::builder()
-        .copy_source(CopySource::Bucket {
-            bucket: src_bucket.clone().into(),
-            key: src_object.to_string().into(),
-            version_id: None,
-        })
-        .bucket(dst_bucket.clone())
-        .key(dst_object.to_string())
-        .build()
-        .unwrap();
-    let mut req = build_request(copy_input, Method::PUT);
-    req.headers
-        .insert(IF_NONE_MATCH, HeaderValue::from_str(dst_etag.as_str()).unwrap());
+    for (condition, expected_code) in [
+        (ETagCondition::Any, s3s::S3ErrorCode::PreconditionFailed),
+        (ETagCondition::ETag(ETag::Strong(dst_etag)), s3s::S3ErrorCode::NotImplemented),
+        (
+            ETagCondition::ETag(ETag::Strong("different-etag".to_string())),
+            s3s::S3ErrorCode::NotImplemented,
+        ),
+    ] {
+        let header = condition.to_http_header().expect("conditional COPY header should encode");
+        // Cover header-only callers and the DTO-plus-header shape of parsed HTTP requests.
+        for if_none_match in [None, Some(condition)] {
+            let has_dto = if_none_match.is_some();
+            let copy_input = CopyObjectInput::builder()
+                .copy_source(CopySource::Bucket {
+                    bucket: src_bucket.clone().into(),
+                    key: src_object.to_string().into(),
+                    version_id: None,
+                })
+                .bucket(dst_bucket.clone())
+                .key(dst_object.to_string())
+                .if_none_match(if_none_match)
+                .build()
+                .expect("conditional COPY input should build");
+            let mut req = build_request(copy_input, Method::PUT);
+            req.headers.insert(IF_NONE_MATCH, header.clone());
 
-    let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
-
-    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
-    assert_eq!(
-        read_object_bytes(&ecstore, dst_bucket.as_str(), dst_object).await,
-        dst_payload,
-        "failed conditional CopyObject must not overwrite the current destination object"
-    );
+            let err = Box::pin(usecase.execute_copy_object(req))
+                .await
+                .expect_err("conditional COPY must reject the replacement");
+            assert_eq!(err.code(), &expected_code, "header={header:?}, has_dto={has_dto}");
+            assert_eq!(
+                read_object_bytes(&ecstore, dst_bucket.as_str(), dst_object).await,
+                dst_payload,
+                "failed conditional CopyObject must not overwrite the current destination object"
+            );
+            assert_eq!(
+                live_object_version_count(&ecstore, dst_bucket.as_str(), dst_object).await,
+                initial_versions,
+                "failed conditional CopyObject must not create a version"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -944,7 +1043,11 @@ async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explic
         .await
         .expect_err("explicit CopyObject overwrite of a locked version should be blocked");
 
-    assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+    assert_eq!(
+        err.message(),
+        Some("Invalid argument: A destination versionId requires replication authorization")
+    );
     assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), dst_object).await, source_payload);
     assert_eq!(live_object_version_count(&ecstore, bucket.as_str(), dst_object).await, 2);
 }
@@ -1479,7 +1582,10 @@ async fn cancelled_transition_waiting_for_prepared_reader_cleans_remote() {
                 .transition_object(&transition_bucket, object, &transition_opts)
                 .await
         });
-        put_barrier.wait_until_paused().await;
+        tokio::select! {
+            result = &mut transition => panic!("transition ended before reaching the tier PUT barrier: {result:?}"),
+            () = put_barrier.wait_until_paused() => {}
+        }
 
         let prepared_reader = ecstore
             .prepare_get_object_reader(bucket.as_str(), object, None, HeaderMap::new(), &ObjectOptions::default())
@@ -1636,7 +1742,7 @@ async fn immediate_transition_timeout_eventually_completes_via_compensation() {
         .await
         .expect("Failed to set lifecycle configuration");
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
     })
     .await;
@@ -1645,6 +1751,7 @@ async fn immediate_transition_timeout_eventually_completes_via_compensation() {
         .await
         .expect("object should eventually transition after compensation backfill");
 
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the version once");
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
     assert!(backend.contains(&info.transitioned_object.name).await);
@@ -1684,7 +1791,7 @@ async fn compensation_driven_copy_still_completes_transition() {
         .build()
         .unwrap();
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
             .await
             .expect("Failed to copy object through usecase");
@@ -1695,9 +1802,11 @@ async fn compensation_driven_copy_still_completes_transition() {
         .await
         .expect("copied object should eventually transition after compensation backfill");
 
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the copied version once");
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
     assert!(backend.contains(&info.transitioned_object.name).await);
+    assert_eq!(read_object_bytes(&ecstore, dst_bucket.as_str(), dst_object).await, payload);
 }
 
 #[serial]
@@ -1761,7 +1870,7 @@ async fn compensation_driven_complete_multipart_upload_still_transitions_inner()
         .build()
         .unwrap();
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
             .await
             .expect("Failed to complete multipart upload through usecase");
@@ -1772,6 +1881,7 @@ async fn compensation_driven_complete_multipart_upload_still_transitions_inner()
         .await
         .expect("multipart object should eventually transition after compensation backfill");
 
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the version once");
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
     assert!(backend.contains(&info.transitioned_object.name).await);
@@ -1798,7 +1908,7 @@ async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
         .await
         .expect("Failed to set lifecycle configuration");
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
     })
     .await;
@@ -1806,6 +1916,7 @@ async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
     let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await
         .expect("object should eventually transition after compensation backfill");
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the version once");
     let remote_object = transitioned.transitioned_object.name.clone();
 
     assert!(backend.contains(&remote_object).await);
@@ -1859,7 +1970,7 @@ async fn compensation_driven_versioned_delete_still_creates_delete_marker() {
         .await
         .expect("Failed to set lifecycle configuration");
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
     })
     .await;
@@ -1867,6 +1978,7 @@ async fn compensation_driven_versioned_delete_still_creates_delete_marker() {
     let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await
         .expect("object should eventually transition after compensation backfill");
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the version once");
     let remote_object = transitioned.transitioned_object.name.clone();
 
     assert!(backend.contains(&remote_object).await);
@@ -1914,7 +2026,7 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
         .await
         .expect("Failed to set transition lifecycle configuration");
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
     })
     .await;
@@ -1922,6 +2034,7 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
     let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await
         .expect("object should eventually transition after compensation backfill");
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the version once");
     let remote_object = transitioned.transitioned_object.name.clone();
 
     assert!(backend.contains(&remote_object).await);
@@ -2782,8 +2895,8 @@ async fn put_object_extract_computes_replication_decision_per_entry() {
 /// replication themselves. Without it a retention or legal hold applied after upload stays
 /// local and the replica keeps its previous, unprotected state (a WORM object that is still
 /// deletable on the peer). This observes the shared decision counter: each handler must
-/// compute a replication decision exactly once, which is the step that drives both the
-/// persisted pending marker and the schedule.
+/// compute a replication decision exactly once when replication is configured, which is
+/// the step that drives both the persisted pending marker and the schedule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "global-state usecase integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
@@ -2832,7 +2945,27 @@ async fn object_lock_handlers_schedule_replication() {
          retention change never replicates and the peer copy stays unprotected"
     );
 
-    // PutObjectLegalHold must do the same.
+    // A bucket without a replication configuration can skip the decision.
+    MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
+    let no_replication_input = PutObjectLegalHoldInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .legal_hold(Some(ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
+        }))
+        .build()
+        .unwrap();
+    fs.put_object_legal_hold(build_request(no_replication_input, Method::PUT))
+        .await
+        .expect("legal hold without replication should succeed");
+    assert_eq!(
+        MUST_REPLICATE_OBJECT_CALLS.load(Ordering::SeqCst),
+        0,
+        "a bucket without replication must skip the decision"
+    );
+
+    // A configured bucket must still evaluate the metadata replication decision.
+    install_delete_replication_config(&bucket, true, false, None).await;
     MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
     let legal_hold_input = PutObjectLegalHoldInput::builder()
         .bucket(bucket.clone())

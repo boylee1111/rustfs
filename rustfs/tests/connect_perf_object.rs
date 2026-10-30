@@ -19,25 +19,30 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64_simd::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
 use p256::pkcs8::DecodePublicKey as _;
 use rustfs::connect::{
-    DeviceIdentity, LocalObjectConsent, OBJECT_CAPABILITY, ObjectOperation, ObjectOutcome, ObjectPerformanceError,
-    ObjectPerformanceRequest, ObjectProbe, ObjectProbeError, ObjectProbeFuture, ObjectProbeMeasurement, ObjectProvenance,
-    ObjectReasonCode, ObjectTargetReasonCode, S3ObjectProbe, measure_object, save_signed_object_export, sign_object_export,
-    validate_object_limits,
+    DeviceIdentity, LocalObjectConsent, OBJECT_CAPABILITY, ObjectMeasurement, ObjectOperation, ObjectOutcome,
+    ObjectPerformanceError, ObjectPerformanceRequest, ObjectProbe, ObjectProbeError, ObjectProbeFuture, ObjectProbeMeasurement,
+    ObjectProvenance, ObjectReasonCode, ObjectTargetReasonCode, S3ObjectProbe, measure_object, save_signed_object_export,
+    sign_object_export, validate_object_limits,
 };
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber as _;
 use zeroize::Zeroizing;
 
 mod common;
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// Real storage setup shares the measurement window. Verify functionality with
+// an integration budget; deadline behavior is checked against a stalled peer.
+const REAL_SERVER_MEASUREMENT_BUDGET: Duration = Duration::from_secs(20);
 
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("current time").as_secs() as i64
@@ -306,6 +311,56 @@ async fn deadline_and_in_flight_cancellation_stop_a_stalled_probe() {
 }
 
 #[tokio::test]
+async fn s3_request_deadline_stops_a_peer_that_never_responds() {
+    use tokio::io::AsyncReadExt as _;
+
+    let _guard = TEST_LOCK.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("response listener");
+    let address = listener.local_addr().expect("listener address");
+    let (received, request_received) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("object connection");
+        let mut request = [0_u8; 4096];
+        assert!(socket.read(&mut request).await.expect("request headers") > 0);
+        received.send(()).expect("report received request");
+        std::future::pending::<()>().await;
+        drop(socket);
+    });
+    let probe = S3ObjectProbe::new(
+        &format!("http://{address}"),
+        None,
+        None,
+        Zeroizing::new("access".to_owned()),
+        Zeroizing::new("secret".to_owned()),
+        Zeroizing::new(String::new()),
+        Duration::from_secs(60),
+    )
+    .expect("object probe");
+    let mut request = request(ObjectOperation::GetObject);
+    request.duration = Duration::from_secs(30);
+    let measurement = tokio::spawn(async move { measure_object(&request, &probe, &CancellationToken::new()).await });
+
+    // Complete real TCP setup before pausing time. The 30s operation deadline
+    // must fire independently of the client's longer 60s transport timeout.
+    tokio::time::timeout(Duration::from_secs(10), request_received)
+        .await
+        .expect("peer received the request")
+        .expect("peer notification");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let measurement = tokio::time::timeout(Duration::from_secs(1), measurement)
+        .await
+        .expect("operation deadline must stop the request")
+        .expect("measurement task")
+        .expect("typed timeout");
+    assert_eq!(measurement.result.outcome(), ObjectOutcome::Failed);
+    assert_eq!(measurement.target.reason_code, ObjectTargetReasonCode::TimedOut);
+    assert_eq!(measurement.target.completed_operations, 0);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn only_one_object_collector_can_run_at_a_time() {
     let _guard = TEST_LOCK.lock().await;
     let first_cancel = CancellationToken::new();
@@ -397,6 +452,312 @@ async fn oversized_response_is_rejected_without_buffering_it() {
 }
 
 #[tokio::test]
+async fn cleanup_uses_a_budget_independent_of_the_measurement_window() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let _guard = TEST_LOCK.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("response listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        for (index, response) in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\xa5\xa5\xa5\xa5".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut socket, _) = listener.accept().await.expect("object connection");
+            let mut request = vec![0_u8; 16 * 1024];
+            let _ = socket.read(&mut request).await.expect("request headers");
+            if index >= 3 {
+                // Exercise cleanup beyond the former two-second budget while
+                // keeping both deletes inside the new bounded allowance.
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+            }
+            socket.write_all(response).await.expect("response");
+        }
+    });
+    let probe = S3ObjectProbe::new(
+        &format!("http://{address}"),
+        None,
+        None,
+        Zeroizing::new("access".to_owned()),
+        Zeroizing::new("secret".to_owned()),
+        Zeroizing::new(String::new()),
+        Duration::from_secs(1),
+    )
+    .expect("object probe");
+    let mut request = request(ObjectOperation::GetObject);
+    request.traffic_bytes = 4;
+
+    let measurement = measure_object(&request, &probe, &CancellationToken::new())
+        .await
+        .expect("object measurement");
+    assert_eq!(
+        measurement.result.outcome(),
+        ObjectOutcome::Succeeded,
+        "target result: {:?}",
+        measurement.target
+    );
+    // Both sequential cleanup requests share one bounded cleanup deadline.
+    // Leave scheduler and CI runner headroom while keeping this assertion
+    // independent from the one-second
+    // measurement window above.
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("cleanup requests should complete")
+        .expect("response server");
+}
+
+#[derive(Clone, Default)]
+struct CleanupLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CleanupLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("cleanup log").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CleanupReply {
+    Status(u16),
+    Disconnect,
+    Delay(Duration),
+}
+
+struct CleanupObservation {
+    measurement: ObjectMeasurement,
+    log: String,
+    deletes: Vec<String>,
+    elapsed: Duration,
+}
+
+async fn observe_cleanup(replies: [CleanupReply; 2]) -> CleanupObservation {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    const PRIVATE_BODY: &str = "private-cleanup-response-body";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("cleanup listener");
+    let endpoint = format!("http://{}", listener.local_addr().expect("listener address"));
+    let deletes = Arc::new(Mutex::new(Vec::new()));
+    let seen_deletes = Arc::clone(&deletes);
+    let server = tokio::spawn(async move {
+        for index in 0..4 {
+            let (mut socket, _) = listener.accept().await.expect("probe connection");
+            let mut bytes = Vec::new();
+            let (header_end, content_length) = loop {
+                let mut buffer = [0_u8; 4096];
+                let count = socket.read(&mut buffer).await.expect("request headers");
+                assert!(count > 0, "complete request headers");
+                bytes.extend_from_slice(&buffer[..count]);
+                assert!(bytes.len() <= 64 * 1024, "bounded request");
+                if let Some(offset) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&bytes[..offset]).expect("ASCII headers");
+                    let content_length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map_or(0, |(_, value)| value.trim().parse::<usize>().expect("content length"));
+                    break (offset + 4, content_length);
+                }
+            };
+            assert!(content_length <= 4, "bounded probe body");
+            while bytes.len() < header_end + content_length {
+                let mut buffer = [0_u8; 4];
+                let count = socket.read(&mut buffer).await.expect("request body");
+                assert!(count > 0, "complete request body");
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            let request_line = std::str::from_utf8(&bytes[..header_end])
+                .expect("ASCII request")
+                .lines()
+                .next()
+                .expect("request line")
+                .to_owned();
+            let reply = if index < 2 {
+                assert!(request_line.starts_with("PUT "));
+                CleanupReply::Status(200)
+            } else {
+                assert!(request_line.starts_with("DELETE "));
+                seen_deletes.lock().expect("seen deletes").push(request_line);
+                replies[index - 2]
+            };
+            let status = match reply {
+                CleanupReply::Status(status) => status,
+                CleanupReply::Disconnect => return,
+                CleanupReply::Delay(delay) => {
+                    tokio::time::sleep(delay).await;
+                    204
+                }
+            };
+            let body = if status >= 400 { PRIVATE_BODY } else { "" };
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.expect("fixture response");
+        }
+    });
+    let probe = S3ObjectProbe::new(
+        &endpoint,
+        None,
+        None,
+        Zeroizing::new("private-cleanup-access".to_owned()),
+        Zeroizing::new("private-cleanup-secret".to_owned()),
+        Zeroizing::new("private-cleanup-token".to_owned()),
+        Duration::from_secs(1),
+    )
+    .expect("cleanup probe");
+    let mut request = request(ObjectOperation::PutObject);
+    request.traffic_bytes = 4;
+    let log = CleanupLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let started = std::time::Instant::now();
+    let measurement = tokio::time::timeout(
+        Duration::from_secs(8),
+        measure_object(&request, &probe, &CancellationToken::new()).with_subscriber(subscriber),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    // Reap the fixture before asserting, including stalled or early-failure cases.
+    server.abort();
+    if let Err(error) = server.await {
+        assert!(error.is_cancelled(), "cleanup fixture failed: {error}");
+    }
+    let measurement = measurement.expect("bounded cleanup probe").expect("typed cleanup result");
+    let log = String::from_utf8(log.0.lock().expect("cleanup log").clone()).expect("UTF-8 cleanup log");
+    for sensitive in [
+        endpoint.as_str(),
+        "127.0.0.1",
+        "private-cleanup-access",
+        "private-cleanup-secret",
+        "private-cleanup-token",
+        PRIVATE_BODY,
+        "rustfs-connect-perf-",
+        "synthetic-object",
+        "Authorization",
+        "X-Amz-Security-Token",
+    ] {
+        assert!(!log.contains(sensitive), "cleanup diagnostic exposed private context");
+    }
+    let deletes = deletes.lock().expect("seen deletes").clone();
+    CleanupObservation {
+        measurement,
+        log,
+        deletes,
+        elapsed,
+    }
+}
+
+fn assert_cleanup_failure(observed: &CleanupObservation, stage: &str, reason: &str, status: Option<u16>) {
+    assert_eq!(observed.measurement.result.outcome(), ObjectOutcome::Failed);
+    assert_eq!(observed.measurement.target.reason_code, ObjectTargetReasonCode::CleanupFailed);
+    let events: Vec<_> = observed
+        .log
+        .lines()
+        .filter(|line| line.contains("event=\"connect_object_cleanup_failed\""))
+        .collect();
+    assert_eq!(events.len(), 1, "one cleanup diagnostic: {}", observed.log);
+    let event = events[0];
+    for field in [
+        "component=\"connect\"".to_owned(),
+        "subsystem=\"performance_object\"".to_owned(),
+        "result=\"failed\"".to_owned(),
+        format!("stage=\"{stage}\""),
+        format!("reason={reason}"),
+    ] {
+        assert!(event.contains(&field), "missing {field}: {event}");
+    }
+    match status {
+        Some(status) => assert!(event.contains(&format!("http_status={status}")), "{event}"),
+        None => assert!(!event.contains("http_status="), "transport failure has no HTTP status: {event}"),
+    }
+    for field in ["elapsed_ms=", "remaining_ms="] {
+        let value = event
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(field))
+            .expect("bounded timing field")
+            .parse::<u64>()
+            .expect("integer milliseconds");
+        if field == "remaining_ms=" {
+            assert!(value <= 5_000, "cleanup deadline must not be extended");
+        }
+    }
+}
+
+#[tokio::test]
+async fn cleanup_diagnostics_identify_each_failed_http_stage_without_private_context() {
+    let _guard = TEST_LOCK.lock().await;
+    for (replies, stage, status) in [
+        ([CleanupReply::Status(503), CleanupReply::Status(204)], "object_delete", 503),
+        ([CleanupReply::Status(204), CleanupReply::Status(403)], "bucket_delete", 403),
+        ([CleanupReply::Status(204), CleanupReply::Status(404)], "bucket_delete", 404),
+    ] {
+        let observed = observe_cleanup(replies).await;
+        assert_cleanup_failure(&observed, stage, "CleanupFailed", Some(status));
+        assert_eq!(observed.deletes.len(), if stage == "object_delete" { 1 } else { 2 });
+    }
+}
+
+#[tokio::test]
+async fn cleanup_diagnostics_identify_each_disconnected_transport_stage() {
+    let _guard = TEST_LOCK.lock().await;
+    for (replies, stage) in [
+        ([CleanupReply::Disconnect, CleanupReply::Status(204)], "object_delete"),
+        ([CleanupReply::Status(204), CleanupReply::Disconnect], "bucket_delete"),
+    ] {
+        let observed = observe_cleanup(replies).await;
+        assert_cleanup_failure(&observed, stage, "ProtocolFailure", None);
+    }
+}
+
+#[tokio::test]
+async fn cleanup_accepts_missing_object_and_still_deletes_the_bucket() {
+    let _guard = TEST_LOCK.lock().await;
+    let observed = observe_cleanup([CleanupReply::Status(404), CleanupReply::Status(204)]).await;
+    assert_eq!(observed.measurement.result.outcome(), ObjectOutcome::Succeeded);
+    assert_eq!(observed.measurement.target.reason_code, ObjectTargetReasonCode::Complete);
+    assert_eq!(observed.deletes.len(), 2);
+    assert!(observed.deletes[0].ends_with("/synthetic-object HTTP/1.1"));
+    assert!(observed.deletes[1].ends_with("/ HTTP/1.1"));
+    assert!(!observed.log.contains("connect_object_cleanup_failed"));
+}
+
+#[tokio::test]
+async fn cleanup_diagnostics_identify_timeouts_without_resetting_the_shared_deadline() {
+    let _guard = TEST_LOCK.lock().await;
+    for (replies, stage) in [
+        ([CleanupReply::Delay(Duration::from_secs(6)), CleanupReply::Status(204)], "object_delete"),
+        (
+            [
+                CleanupReply::Delay(Duration::from_secs(3)),
+                CleanupReply::Delay(Duration::from_secs(3)),
+            ],
+            "bucket_delete",
+        ),
+    ] {
+        let observed = observe_cleanup(replies).await;
+        assert_cleanup_failure(&observed, stage, "TimedOut", None);
+        assert!(observed.elapsed >= Duration::from_secs(5));
+        assert!(observed.log.contains("remaining_ms=0"), "{}", observed.log);
+    }
+}
+
+#[tokio::test]
 async fn signed_result_is_saved_without_overwrite() {
     let _guard = TEST_LOCK.lock().await;
     let request = request(ObjectOperation::PutObject);
@@ -463,18 +824,30 @@ fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put() {
 }
 
 async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_body() {
+    let _guard = TEST_LOCK.lock().await;
+    let startup = std::time::Instant::now();
     let port = match find_available_port() {
         Ok(port) => port,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
         Err(err) => panic!("find free port: {err}"),
     };
+    // This functional probe keeps production deadlines while avoiding the
+    // shared CI disk's fsync latency when Linux shared memory is available.
+    let storage = if cfg!(target_os = "linux") && Path::new("/dev/shm").is_dir() {
+        tempfile::tempdir_in("/dev/shm")
+    } else {
+        tempfile::tempdir()
+    }
+    .expect("isolated object fixture storage");
     let server = RustFSServerBuilder::new()
         .address(format!("127.0.0.1:{port}"))
+        .volume(storage.path().to_str().expect("object fixture storage path"))
         .access_key("object-perf-access")
         .secret_key("object-perf-secret")
         .build()
         .await
         .expect("start embedded server");
+    eprintln!("embedded object fixture ready after {:?}", startup.elapsed());
     let probe = S3ObjectProbe::new(
         &server.endpoint(),
         None,
@@ -482,17 +855,25 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
         Zeroizing::new(server.access_key().to_owned()),
         Zeroizing::new(server.secret_key().to_owned()),
         Zeroizing::new(String::new()),
-        Duration::from_secs(2),
+        REAL_SERVER_MEASUREMENT_BUDGET,
     )
     .expect("object probe");
 
     for operation in [ObjectOperation::GetObject, ObjectOperation::PutObject] {
         let mut request = request(operation);
-        request.duration = Duration::from_secs(2);
+        request.duration = REAL_SERVER_MEASUREMENT_BUDGET;
         if operation == ObjectOperation::PutObject {
             request.artifact_uid = "019e3ae0-0000-7000-8000-000000000016".to_owned();
         }
         let measurement = measure_object(&request, &probe, &CancellationToken::new())
+            .with_subscriber(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::ERROR)
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(std::io::stderr)
+                    .finish(),
+            )
             .await
             .expect("real object measurement");
         assert_eq!(
@@ -548,7 +929,7 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
             "--traffic-bytes",
             "65536",
             "--duration-millis",
-            "1000",
+            &REAL_SERVER_MEASUREMENT_BUDGET.as_millis().to_string(),
             "--acknowledge-l1",
         ]);
     let result = tokio::task::spawn_blocking(move || command.output())
@@ -556,7 +937,12 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
         .expect("CLI task")
         .expect("run production rustfs binary");
 
-    assert!(result.status.success(), "stderr: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     let stdout = String::from_utf8(result.stdout).expect("UTF-8 stdout");
     assert!(stdout.contains("tool=performance.object outcome=SUCCEEDED reason=COMPLETE\n"));
     assert!(stdout.contains("upload=not-performed\n"));
@@ -591,6 +977,8 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
         .expect("public key")
         .verify(&signed, &signature)
         .expect("valid ES256 signature");
+
+    server.shutdown().await;
 }
 
 fn write_credential(path: &Path, value: &str) {

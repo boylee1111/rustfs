@@ -27,8 +27,49 @@ pub(super) enum ScannerCycleWakeReason {
     ClusterActivityUnavailable,
     RuntimeConfig,
     MaintenanceConfig,
+    Recovery,
     LeaderLockLost,
     Cancelled,
+}
+
+// Literal labels keep recorder keys bounded and avoid allocating label vectors
+// when telemetry is not installed. Only the outer scheduler records wakeups;
+// activity-poll timer slices are not independent scheduler wakeups.
+fn record_scanner_cycle_trigger(reason: ScannerCycleWakeReason, attempt: bool) {
+    macro_rules! record {
+        ($reason:literal) => {
+            if attempt {
+                metrics::counter!("rustfs_scanner_cycle_attempts_total", "reason" => $reason).increment(1);
+            } else {
+                metrics::counter!("rustfs_scanner_cycle_wakeups_total", "reason" => $reason).increment(1);
+            }
+        };
+    }
+    match reason {
+        ScannerCycleWakeReason::Timer => record!("timer"),
+        ScannerCycleWakeReason::DirtyUsage => record!("dirty_usage"),
+        ScannerCycleWakeReason::MovementGeneration => record!("movement_generation"),
+        ScannerCycleWakeReason::ClusterActivity => record!("cluster_activity"),
+        ScannerCycleWakeReason::ClusterMaintenance => record!("cluster_maintenance"),
+        ScannerCycleWakeReason::ClusterActivityUnavailable => record!("cluster_activity_unavailable"),
+        ScannerCycleWakeReason::RuntimeConfig => record!("runtime_config"),
+        ScannerCycleWakeReason::MaintenanceConfig => record!("maintenance_config"),
+        ScannerCycleWakeReason::Recovery => record!("recovery"),
+        ScannerCycleWakeReason::LeaderLockLost => record!("leader_lock_lost"),
+        ScannerCycleWakeReason::Cancelled => record!("cancelled"),
+    }
+}
+
+pub(super) fn record_scanner_cycle_wakeup(reason: ScannerCycleWakeReason) {
+    record_scanner_cycle_trigger(reason, false);
+}
+
+pub(super) fn record_scanner_cycle_attempt(reason: Option<ScannerCycleWakeReason>) {
+    if let Some(reason) = reason {
+        record_scanner_cycle_trigger(reason, true);
+    } else {
+        metrics::counter!("rustfs_scanner_cycle_attempts_total", "reason" => "initial").increment(1);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +80,8 @@ pub(crate) enum ScannerCycleOutcome {
     Superseded,
     Deferred(ScannerCycleDeferReason),
     Failed,
+    // The write may have committed; reload and reclaim before dispatching again.
+    StatePersistenceFailed,
 }
 
 pub(crate) fn scanner_cycle_outcome_with_pending_maintenance(
@@ -149,17 +192,40 @@ impl ScannerRetryBackoff {
 pub(super) fn scanner_superseded_retry_interval(
     backoff: ScannerRetryBackoff,
     runtime_config: &ScannerRuntimeConfig,
+    maintenance_features: ScannerMaintenanceFeatures,
 ) -> Option<Duration> {
-    let retry_interval = backoff.retry_interval(runtime_config.cycle_interval)?;
-    if runtime_config.cycle_interval_source == ScannerRuntimeConfigSource::Default {
-        return Some(retry_interval);
+    let mut retry_interval = backoff.retry_interval(runtime_config.cycle_interval)?;
+    // Preserve an operator-selected duty-cycle floor during convergence.
+    if runtime_config.cycle_interval_source != ScannerRuntimeConfigSource::Default {
+        retry_interval = retry_interval.max(runtime_config.cycle_interval);
     }
+    // A complete but non-authoritative walk must not postpone lifecycle or
+    // replication evaluation beyond its ordinary maintenance cadence.
+    if maintenance_features.needs_regular_cycle() {
+        retry_interval = retry_interval.min(runtime_config.cycle_interval.max(Duration::from_secs(1)));
+    }
+    Some(retry_interval)
+}
 
-    // An explicit cycle is an operator-selected duty-cycle floor. A
-    // superseded snapshot keeps its dirty work pending, but retrying that work
-    // sooner than the configured cadence would turn continuous writes into a
-    // repeated full-walk loop despite the override.
-    Some(retry_interval.max(runtime_config.cycle_interval))
+/// Pacing for the cycle after a full-namespace scope fallback while dirty
+/// buckets remain. The scoped cycle's immediate dirty-usage wake would run
+/// such full walks back to back under sustained writes, so the next attempt
+/// waits on the capped retry schedule instead. The wait never exceeds the
+/// configured cycle interval: a namespace that stays unscopable is walked at
+/// the ordinary cadence rather than starved by the superseded cap. The next
+/// timer wake still requests a scope, so a scoped cycle resumes as soon as
+/// one is admitted and resets this schedule.
+pub(super) fn scanner_scope_fallback_retry_interval(
+    backoff: ScannerRetryBackoff,
+    runtime_config: &ScannerRuntimeConfig,
+) -> Option<Duration> {
+    let cycle_interval = runtime_config.cycle_interval.max(Duration::from_secs(1));
+    let retry_interval = backoff.retry_interval(runtime_config.cycle_interval)?.min(cycle_interval);
+    // Preserve an operator-selected duty-cycle floor, as superseded retries do.
+    if runtime_config.cycle_interval_source != ScannerRuntimeConfigSource::Default {
+        return Some(cycle_interval);
+    }
+    Some(retry_interval)
 }
 
 const SCANNER_PUBLICATION_PROOF_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
@@ -180,6 +246,8 @@ pub(crate) fn scanner_publication_lease_error_is_retryable(error: &str) -> bool 
     scanner_publication_activity_error_is_retryable(error)
         || error.ends_with("scanner publication lease capacity is exhausted")
         || error.ends_with("scanner publication lease response arrived after its safety window")
+        || error.ends_with("scanner publication lease is blocked by pending namespace commit")
+        || error.ends_with("scanner publication lease namespace changed during acquisition")
 }
 
 pub(crate) enum ScannerPublicationProofWait<T, E> {
@@ -255,8 +323,9 @@ where
                         stage,
                         attempt = consecutive_failures,
                         retry_delay = ?retry_delay,
+                        pending_duration = ?started_at.elapsed(),
                         error = %err,
-                        "Scanner retained a completed scan while publication proof is unavailable"
+                        "Scanner is waiting for publication proof"
                     );
                 } else {
                     debug!(
@@ -453,14 +522,15 @@ impl ScannerCycleObservedGenerations {
 ///
 /// Keeping the movement inputs together makes it harder for callers to pair a
 /// generation with the wrong notification or lock predicate.
-pub(super) struct ScannerMovementWaitContext<G, F> {
+pub(super) struct ScannerMovementWaitContext<'a, G, F> {
     pub(super) movement_generation_seen: Option<u64>,
     pub(super) movement_changed: Arc<Notify>,
     pub(super) current_movement_generation: G,
     pub(super) is_lock_lost: F,
+    pub(super) recovery_wake: Option<&'a Notify>,
 }
 
-pub(super) const LOCAL_SCANNER_ACTIVITY_NODE: &str = "<local>";
+pub(crate) const LOCAL_SCANNER_ACTIVITY_NODE: &str = "<local>";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScannerNodeActivity {
@@ -474,6 +544,24 @@ pub(crate) struct ScannerNodeActivity {
     pub(super) dirty_usage_pending: bool,
     pub(super) movement_generation: u64,
     pub(super) publication_blocked: bool,
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+impl ScannerNodeActivity {
+    pub(crate) fn e2e_observation(&self) -> serde_json::Value {
+        serde_json::json!({
+            "instance_id": self.instance_id,
+            "namespace_generation": self.namespace_generation,
+            "maintenance_generation": self.maintenance_generation,
+            "protocol_version": self.protocol_version,
+            "topology_digest": crate::e2e_barrier::hex(&self.topology_digest),
+            "data_movement_active": self.data_movement_active,
+            "dirty_usage_generation": self.dirty_usage_generation,
+            "dirty_usage_pending": self.dirty_usage_pending,
+            "movement_generation": self.movement_generation,
+            "publication_blocked": self.publication_blocked,
+        })
+    }
 }
 
 pub(crate) type ScannerActivitySnapshot = BTreeMap<String, ScannerNodeActivity>;
@@ -682,6 +770,7 @@ where
         movement_changed: Arc::new(Notify::new()),
         current_movement_generation: || 0,
         is_lock_lost,
+        recovery_wake: None,
     };
     wait_for_next_scanner_cycle_with_movement(
         ctx,
@@ -701,7 +790,7 @@ pub(super) async fn wait_for_next_scanner_cycle_with_movement<G, F>(
     ctx: &CancellationToken,
     delay: Duration,
     generations: ScannerCycleObservedGenerations,
-    movement: &ScannerMovementWaitContext<G, F>,
+    movement: &ScannerMovementWaitContext<'_, G, F>,
 ) -> ScannerCycleWakeReason
 where
     F: Fn() -> bool,
@@ -747,9 +836,17 @@ where
         {
             return ScannerCycleWakeReason::MovementGeneration;
         }
+        let recovery_notification = async {
+            match movement.recovery_wake {
+                Some(wake) => wake.notified().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(recovery_notification);
         tokio::select! {
             _ = ctx.cancelled() => return ScannerCycleWakeReason::Cancelled,
             _ = &mut sleep => return ScannerCycleWakeReason::Timer,
+            _ = &mut recovery_notification => return ScannerCycleWakeReason::Recovery,
             _ = &mut lock_poll => {
                 if (movement.is_lock_lost)() {
                     return ScannerCycleWakeReason::LeaderLockLost;
@@ -812,6 +909,7 @@ where
         movement_changed: Arc::new(Notify::new()),
         current_movement_generation: || 0,
         is_lock_lost,
+        recovery_wake: None,
     };
     wait_for_next_scanner_cycle_with_activity_and_movement(
         ctx,
@@ -831,7 +929,7 @@ pub(super) async fn wait_for_next_scanner_cycle_with_activity_and_movement<F, G,
     activity_poll_interval: Option<Duration>,
     activity_seen: &mut Option<ScannerActivitySnapshot>,
     generations: ScannerCycleObservedGenerations,
-    movement: ScannerMovementWaitContext<G, F>,
+    movement: ScannerMovementWaitContext<'_, G, F>,
     mut probe_activity: Probe,
 ) -> ScannerCycleWakeReason
 where
@@ -1014,15 +1112,25 @@ pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapsho
         hasher.update(activity.dirty_usage_generation.to_be_bytes());
         hasher.update([u8::from(activity.dirty_usage_pending)]);
         hasher.update(activity.movement_generation.to_be_bytes());
-        hasher.update([u8::from(activity.publication_blocked)]);
     }
     hasher.finalize().into()
 }
 
-/// Hash the activity inputs that make an existing scanner cache unsafe to
-/// reuse. Regular namespace writes and dirty-usage generations are omitted:
-/// their affected buckets are tracked separately and may be refreshed from a
-/// complete authoritative cache baseline.
+/// The reuse identity: hash the activity inputs that make an existing
+/// scanner result unsafe to reuse without walking again. Besides the
+/// coverage identity below it binds each peer's `instance_id` and
+/// `maintenance_generation`: a restarted node may have lost the dirty hints
+/// of its last journal window and a changed lifecycle or replication rule
+/// needs a maintenance pass, so both invalidate the authoritative baseline
+/// and the set caches and force the next cycle to walk every bucket. With
+/// the bucket list it is the plan under which set caches and the
+/// scoped-scan baseline are reused (`scanner_bucket_plan_digest`).
+///
+/// Regular namespace writes and dirty-usage generations are omitted: their
+/// buckets are tracked separately and rescanned from a complete baseline.
+/// `publication_blocked` is omitted from every identity: a movement pause
+/// vetoes the cycle it moves in (`scanner_activity_guardrail_veto`) and
+/// describes nothing about the heap.
 pub(crate) fn scanner_activity_structural_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
@@ -1038,9 +1146,148 @@ pub(crate) fn scanner_activity_structural_digest(snapshot: &ScannerActivitySnaps
         hasher.update(activity.topology_digest);
         hasher.update([u8::from(activity.data_movement_active)]);
         hasher.update(activity.movement_generation.to_be_bytes());
-        hasher.update([u8::from(activity.publication_blocked)]);
     }
     hasher.finalize().into()
+}
+
+/// The coverage identity: hash the activity inputs under which a bucket
+/// sweep's traversal stays one traversal, so a checkpoint resumed in a later
+/// cycle is not mixed coverage. It binds the peer set, the protocol, the
+/// topology and the data-movement state. A coordinator restart, a
+/// maintenance publication or a publication pause changes none of the
+/// namespace a sweep walks, so `instance_id`, `maintenance_generation` and
+/// `publication_blocked` are left out; hashing them made every resumed sweep
+/// restart as mixed coverage after such an event (rustfs/rustfs#8494). The
+/// local node's namespace and dirty generations are left out too: the
+/// bucket's own dirty generation joins the checkpoint plan in
+/// `scanner_bucket_cache_digest`, which is what certification compares. A
+/// remote peer's generations stay in, because its dirty buckets are still
+/// acknowledged per cycle rather than per bucket, and a write there between
+/// the two halves of a sweep would otherwise be acknowledged without having
+/// been walked.
+pub(crate) fn scanner_activity_coverage_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for (host, activity) in snapshot {
+        let host_bytes = host.as_bytes();
+        hasher.update(u64::try_from(host_bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(host_bytes);
+        hasher.update(activity.protocol_version.to_be_bytes());
+        hasher.update(activity.topology_digest);
+        hasher.update([u8::from(activity.data_movement_active)]);
+        hasher.update(activity.movement_generation.to_be_bytes());
+        if host.as_str() != LOCAL_SCANNER_ACTIVITY_NODE {
+            hasher.update(activity.namespace_generation.to_be_bytes());
+            hasher.update(activity.dirty_usage_generation.to_be_bytes());
+            hasher.update([u8::from(activity.dirty_usage_pending)]);
+        }
+    }
+    hasher.finalize().into()
+}
+
+/// An attributed veto of the cluster activity guardrail: the named field on
+/// the named host moved between the pre-walk and post-walk probes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScannerActivityGuardrailVeto {
+    pub(crate) host: String,
+    pub(crate) field: &'static str,
+}
+
+impl ScannerActivityGuardrailVeto {
+    pub(crate) fn new(host: &str, field: &'static str) -> Self {
+        Self {
+            host: host.to_string(),
+            field,
+        }
+    }
+
+    /// Operator-facing label, `<field>@<host>`.
+    pub(crate) fn reason(&self) -> String {
+        format!("{}@{}", self.field, self.host)
+    }
+}
+
+/// `ScannerNodeActivity` fields whose movement means the heap the probe
+/// describes is not the heap that was walked. Each is a guardrail veto on its
+/// own; `peer_set` covers a host that appeared or disappeared.
+#[cfg(test)]
+pub(crate) const SCANNER_ACTIVITY_GUARDRAIL_VETO_FIELDS: [&str; 8] = [
+    "peer_set",
+    "instance_id",
+    "protocol_version",
+    "topology_digest",
+    "maintenance_generation",
+    "data_movement_active",
+    "movement_generation",
+    "publication_blocked",
+];
+
+/// `ScannerNodeActivity` fields that only shade buckets: they are consumed
+/// per bucket by dirty-usage certification and never veto on their own.
+#[cfg(test)]
+pub(crate) const SCANNER_ACTIVITY_SHADE_FIELDS: [&str; 3] =
+    ["namespace_generation", "dirty_usage_generation", "dirty_usage_pending"];
+
+/// Compare the guardrail fields of two activity probes and name the first
+/// field that moved. `maintenance_generation` is a veto because no cycle today
+/// distinguishes whether it published maintenance results. The veto fields
+/// are compared one by one; which of them also change the reuse or the
+/// coverage identity is decided by `scanner_activity_structural_digest` and
+/// `scanner_activity_coverage_digest`, not here.
+pub(crate) fn scanner_activity_guardrail_veto(
+    before: &ScannerActivitySnapshot,
+    after: &ScannerActivitySnapshot,
+) -> Option<ScannerActivityGuardrailVeto> {
+    for (host, before_activity) in before {
+        let Some(after_activity) = after.get(host) else {
+            return Some(ScannerActivityGuardrailVeto::new(host, "peer_set"));
+        };
+        let moved = if before_activity.instance_id != after_activity.instance_id {
+            "instance_id"
+        } else if before_activity.protocol_version != after_activity.protocol_version {
+            "protocol_version"
+        } else if before_activity.topology_digest != after_activity.topology_digest {
+            "topology_digest"
+        } else if before_activity.maintenance_generation != after_activity.maintenance_generation {
+            "maintenance_generation"
+        } else if before_activity.data_movement_active != after_activity.data_movement_active {
+            "data_movement_active"
+        } else if before_activity.movement_generation != after_activity.movement_generation {
+            "movement_generation"
+        } else if before_activity.publication_blocked != after_activity.publication_blocked {
+            "publication_blocked"
+        } else {
+            continue;
+        };
+        return Some(ScannerActivityGuardrailVeto::new(host, moved));
+    }
+    after
+        .keys()
+        .find(|host| !before.contains_key(*host))
+        .map(|host| ScannerActivityGuardrailVeto::new(host, "peer_set"))
+}
+
+/// Name the first remote peer whose dirty-usage state moved between the two
+/// probes. The local node's dirty state is certified per bucket, but a peer's
+/// moved buckets cannot be named without a post-walk scoped snapshot, so this
+/// phase keeps the whole-cycle fallback for peers; phase 5 lifts it.
+pub(crate) fn scanner_peer_dirty_usage_moved(
+    before: &ScannerActivitySnapshot,
+    after: &ScannerActivitySnapshot,
+) -> Option<ScannerActivityGuardrailVeto> {
+    before
+        .iter()
+        .filter(|(host, _)| host.as_str() != LOCAL_SCANNER_ACTIVITY_NODE)
+        .find_map(|(host, before_activity)| {
+            let after_activity = after.get(host)?;
+            if before_activity.dirty_usage_generation != after_activity.dirty_usage_generation {
+                Some(ScannerActivityGuardrailVeto::new(host, "dirty_usage_generation"))
+            } else if before_activity.dirty_usage_pending != after_activity.dirty_usage_pending {
+                Some(ScannerActivityGuardrailVeto::new(host, "dirty_usage_pending"))
+            } else {
+                None
+            }
+        })
 }
 
 pub(crate) fn scanner_activity_allows_usage_publication(snapshot: &ScannerActivitySnapshot) -> bool {

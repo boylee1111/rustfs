@@ -13,18 +13,19 @@
 // limitations under the License.
 
 use crate::cluster::rpc::{
-    build_auth_headers, build_put_file_auth_trailer, verify_ns_scanner_capability_with_tier_registry_generation,
-    verify_put_file_capability,
+    build_auth_headers, build_put_file_auth_trailer, verify_ns_scanner_capability_with_checkpoint_coverage,
+    verify_ns_scanner_capability_with_tier_registry_generation, verify_put_file_capability,
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{FileReader, FileWriter};
 use crate::storage_api_contracts::internode::{
-    NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY,
-    NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_PROTOCOL_VERSION_QUERY, NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY,
-    NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY,
-    NsScannerCapabilityResponse, PUT_FILE_AUTH_QUERY, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_CHALLENGE_QUERY,
-    PUT_FILE_CAPABILITY_QUERY, PUT_FILE_CAPABILITY_VERSION, PUT_FILE_NONCE_QUERY, PUT_FILE_SERVER_EPOCH_QUERY,
-    PutFileCapabilityResponse, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY, WALK_DIR_STREAM_COMPLETION_V1,
+    NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CHECKPOINT_COVERAGE_QUERY,
+    NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY, NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_PROTOCOL_VERSION_QUERY,
+    NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY,
+    NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY, NsScannerCapabilityResponse, PUT_FILE_AUTH_QUERY, PUT_FILE_AUTH_V1,
+    PUT_FILE_CAPABILITY_CHALLENGE_QUERY, PUT_FILE_CAPABILITY_QUERY, PUT_FILE_CAPABILITY_VERSION, PUT_FILE_NONCE_QUERY,
+    PUT_FILE_SERVER_EPOCH_QUERY, PutFileCapabilityResponse, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY,
+    WALK_DIR_STREAM_COMPLETION_V1,
 };
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
@@ -32,7 +33,9 @@ use rustfs_config::{
     DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP,
     KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
 };
-use rustfs_rio::{ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter};
+use rustfs_rio::{
+    ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter, HttpWriterMemoryReservation, HttpWriterMemoryReserver,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
@@ -64,6 +67,19 @@ const PUT_FILE_V1_CAPABILITY_TTL: Duration = Duration::from_secs(30);
 const PUT_FILE_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTENT_TYPE_JSON: &str = "application/json";
 const CONTENT_TYPE_MSGPACK: &str = "application/msgpack";
+
+fn http_writer_memory_reserver() -> Option<HttpWriterMemoryReserver> {
+    crate::disk::current_resource_unit()
+        .and_then(|resources| resources.memory_budget())
+        .map(|budget| {
+            // Payloads can outlive the operation; never retain its node or disk units.
+            Arc::new(move |capacity| {
+                budget
+                    .reserve(capacity)
+                    .map(|reservation| Box::new(reservation) as HttpWriterMemoryReservation)
+            }) as HttpWriterMemoryReserver
+        })
+}
 
 fn unsupported_transport_message(transport: &str) -> String {
     format!(
@@ -250,6 +266,7 @@ pub struct NsScannerStreamRequest {
 pub struct NsScannerCapabilityRequest {
     pub endpoint: String,
     pub supports_tier_registry_generation: bool,
+    pub supports_checkpoint_coverage: bool,
 }
 
 /// Data-plane stream opener used by `RemoteDisk`.
@@ -289,6 +306,7 @@ pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
             server_epoch,
             proof: Vec::new(),
             supports_tier_registry_generation: None,
+            supports_checkpoint_coverage: None,
         })
     }
     // Interface facet nobody calls yet: every transport implements both, but no
@@ -343,13 +361,17 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     }
 
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
+        let memory_reserver = http_writer_memory_reserver();
         let server_epoch = self.put_file_auth_capability(&request.endpoint).await?;
         let auth_scope = server_epoch.map(|server_epoch| (Uuid::new_v4(), server_epoch));
         let url = build_put_file_stream_url(&request, auth_scope);
         let endpoint = request.endpoint;
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::PUT, &mut headers)?;
-        let writer = HttpWriter::new(url.clone(), Method::PUT, headers).await?;
+        let writer = match memory_reserver {
+            Some(reserve) => HttpWriter::new_with_memory_reserver(url.clone(), Method::PUT, headers, reserve).await?,
+            None => HttpWriter::new(url.clone(), Method::PUT, headers).await?,
+        };
         match auth_scope {
             Some((nonce, server_epoch)) => Ok(Box::new(PutFileAuthWriter::new(writer, url, nonce, endpoint, server_epoch))),
             None => Ok(Box::new(writer)),
@@ -379,6 +401,18 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     }
 
     async fn probe_ns_scanner_capability(&self, request: NsScannerCapabilityRequest) -> Result<NsScannerCapabilityResponse> {
+        let request = if request.supports_checkpoint_coverage {
+            match self.probe_ns_scanner_capability_once(&request).await {
+                Ok(response) => return Ok(response),
+                Err(error) if ns_scanner_capability_error_allows_legacy(&error) => NsScannerCapabilityRequest {
+                    supports_checkpoint_coverage: false,
+                    ..request
+                },
+                Err(error) => return Err(error),
+            }
+        } else {
+            request
+        };
         if request.supports_tier_registry_generation {
             return match self.probe_ns_scanner_capability_once(&request).await {
                 Ok(response) => Ok(response),
@@ -390,6 +424,7 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
                     let legacy_request = NsScannerCapabilityRequest {
                         endpoint: request.endpoint.clone(),
                         supports_tier_registry_generation: false,
+                        supports_checkpoint_coverage: false,
                     };
                     match self.probe_ns_scanner_capability_once(&legacy_request).await {
                         Ok(mut response) => {
@@ -447,18 +482,32 @@ impl TcpHttpInternodeDataTransport {
         if response.version != NS_SCANNER_PROTOCOL_VERSION || response.server_epoch.is_nil() {
             return Err(Error::other("incompatible remote namespace scanner capability response"));
         }
-        if let Err(err) = verify_ns_scanner_capability_with_tier_registry_generation(
+        if let Err(err) = verify_ns_scanner_capability_with_checkpoint_coverage(
             challenge,
             response.server_epoch,
             &response.proof,
             request.supports_tier_registry_generation,
+            request.supports_checkpoint_coverage,
         ) {
+            if request.supports_checkpoint_coverage
+                && verify_ns_scanner_capability_with_tier_registry_generation(
+                    challenge,
+                    response.server_epoch,
+                    &response.proof,
+                    request.supports_tier_registry_generation,
+                )
+                .is_ok()
+            {
+                normalize_ns_scanner_capability_response(&mut response, request.supports_tier_registry_generation, false);
+                return Ok(response);
+            }
             // A permissive older peer can ignore the additive marker and
             // return a valid legacy-scope proof with HTTP 200. Accept that
             // response only after independently authenticating the legacy
             // scope; all other verification failures remain fail-closed.
             if request.supports_tier_registry_generation && ns_scanner_capability_legacy_proof_is_valid(challenge, &response) {
                 response.supports_tier_registry_generation = None;
+                response.supports_checkpoint_coverage = None;
                 return Ok(response);
             }
             return Err(Error::other(format!("remote namespace scanner capability authentication failed: {err}")));
@@ -468,7 +517,11 @@ impl TcpHttpInternodeDataTransport {
         // verified scope so an intermediary cannot strip or rewrite the field
         // and force a silent downgrade after a successful generation-bound
         // handshake.
-        normalize_ns_scanner_capability_response(&mut response, request.supports_tier_registry_generation);
+        normalize_ns_scanner_capability_response(
+            &mut response,
+            request.supports_tier_registry_generation,
+            request.supports_checkpoint_coverage,
+        );
         Ok(response)
     }
 
@@ -798,8 +851,13 @@ fn build_walk_dir_url(request: &WalkDirStreamRequest) -> String {
     )
 }
 
-fn normalize_ns_scanner_capability_response(response: &mut NsScannerCapabilityResponse, requested_generation_support: bool) {
+fn normalize_ns_scanner_capability_response(
+    response: &mut NsScannerCapabilityResponse,
+    requested_generation_support: bool,
+    requested_checkpoint_coverage: bool,
+) {
     response.supports_tier_registry_generation = requested_generation_support.then_some(true);
+    response.supports_checkpoint_coverage = requested_checkpoint_coverage.then_some(true);
 }
 
 fn ns_scanner_capability_legacy_proof_is_valid(challenge: Uuid, response: &NsScannerCapabilityResponse) -> bool {
@@ -832,7 +890,7 @@ fn build_ns_scanner_url(request: &NsScannerStreamRequest) -> String {
 
 fn build_ns_scanner_capability_url(request: &NsScannerCapabilityRequest, challenge: Uuid) -> String {
     format!(
-        "{}{}?{}={}&{}={}{}",
+        "{}{}?{}={}&{}={}{}{}",
         request.endpoint,
         NS_SCANNER_PATH,
         NS_SCANNER_PROTOCOL_VERSION_QUERY,
@@ -841,6 +899,11 @@ fn build_ns_scanner_capability_url(request: &NsScannerCapabilityRequest, challen
         challenge,
         if request.supports_tier_registry_generation {
             format!("&{}=true", NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY)
+        } else {
+            String::new()
+        },
+        if request.supports_checkpoint_coverage {
+            format!("&{}=true", NS_SCANNER_CHECKPOINT_COVERAGE_QUERY)
         } else {
             String::new()
         }
@@ -901,7 +964,195 @@ pub fn build_internode_data_transport_from_env() -> Result<Arc<dyn InternodeData
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
     use tokio::sync::{Barrier, Notify};
+
+    fn memory_test_write_request(authenticated: bool) -> WriteStreamRequest {
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let endpoint = format!("http://writer-memory-{}.invalid", Uuid::new_v4());
+        put_file_capability_cache_entry(&endpoint).write().cached = Some(if authenticated {
+            PutFileCapabilityState::V1 {
+                server_epoch: Uuid::new_v4(),
+                revalidate_after: Instant::now() + PUT_FILE_V1_CAPABILITY_TTL,
+            }
+        } else {
+            PutFileCapabilityState::LegacyUntil(Instant::now() + PUT_FILE_LEGACY_CAPABILITY_TTL)
+        });
+        WriteStreamRequest {
+            endpoint,
+            disk: "disk-a".to_owned(),
+            volume: "bucket".to_owned(),
+            path: "part.1".to_owned(),
+            append: false,
+            size: 4,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_write_memory_reserver_outlives_only_the_memory_scope() {
+        use crate::disk::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        assert!(http_writer_memory_reserver().is_none(), "foreground must use the existing writer");
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(2 * 1024 * 1024, Duration::from_secs(30));
+        let (resources, gates) = test_resource_units(2);
+        let request = memory_test_write_request(true);
+        let endpoint = request.endpoint.clone();
+        let writer = with_optional_resource_unit(
+            Some(resources.with_memory_budget(memory.clone())),
+            TcpHttpInternodeDataTransport.open_write(request),
+        )
+        .await;
+        PUT_FILE_CAPABILITY_CACHE.write().remove(&endpoint);
+        let mut writer = writer.expect("admitted transport writer");
+        assert!(
+            gates.iter().all(|gate| gate.snapshot().active == 0),
+            "the callback must not retain disk units"
+        );
+        assert_eq!(memory.snapshot().used, 1024 * 1024);
+        writer.write_all(b"data").await.expect("buffered bytes");
+        writer.flush().await.expect("transfer charged allocation to queue");
+        memory.set_sampled_limit(2 * 1024 * 1024, Duration::ZERO);
+        writer
+            .write_all(&vec![0x5a; 1024 * 1024 - 4])
+            .await
+            .expect("reuse the already charged tail after observation expiry");
+        assert_eq!(memory.snapshot().used, 1024 * 1024, "reuse must not allocate separate storage");
+        let error = writer
+            .write(b"rejected")
+            .await
+            .expect_err("expired observation must reject new storage");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            crate::disk::background_memory::is_memory_pressure(&error),
+            "preserve the typed memory-pressure marker"
+        );
+        assert_eq!(memory.snapshot().used, 1024 * 1024, "queued storage remains charged after expiry");
+        drop(writer);
+        tokio::task::yield_now().await;
+        assert_eq!(memory.snapshot().used, 0);
+    }
+
+    #[tokio::test]
+    async fn http_write_memory_denial_preserves_the_budget_error() {
+        use crate::disk::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        for (authenticated, sample) in [false, true].into_iter().flat_map(|authenticated| {
+            [
+                None,
+                Some((1024 * 1024 - 1, Duration::from_secs(30))),
+                Some((1024 * 1024, Duration::ZERO)),
+            ]
+            .into_iter()
+            .map(move |sample| (authenticated, sample))
+        }) {
+            let memory = BackgroundMemoryBudget::new();
+            if let Some((limit, valid_for)) = sample {
+                memory.set_sampled_limit(limit, valid_for);
+            }
+            let (resources, _) = test_resource_units(1);
+            let request = memory_test_write_request(authenticated);
+            let endpoint = request.endpoint.clone();
+            let result = with_optional_resource_unit(
+                Some(resources.with_memory_budget(memory.clone())),
+                TcpHttpInternodeDataTransport.open_write(request),
+            )
+            .await;
+            PUT_FILE_CAPABILITY_CACHE.write().remove(&endpoint);
+            let error = match result {
+                Err(Error::Io(error)) => error,
+                Err(error) => panic!("unexpected transport error: {error}"),
+                Ok(_) => panic!("unavailable memory must reject construction"),
+            };
+            assert!(crate::disk::background_memory::is_memory_pressure(&error));
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(memory.snapshot().used, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_remote_reads_bind_receiver_admission_to_the_http_signature() {
+        use crate::disk::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("remote admission listener");
+        let address = listener.local_addr().expect("remote admission address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("remote read connection");
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let read = socket.read(&mut chunk).await.expect("remote read headers");
+                assert!(read > 0 && bytes.len() < 16 * 1024, "bounded complete request headers");
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let request = std::str::from_utf8(&bytes).expect("HTTP request");
+            let mut lines = request.split("\r\n");
+            let target = lines
+                .next()
+                .expect("request line")
+                .split_whitespace()
+                .nth(1)
+                .expect("request target")
+                .to_owned();
+            let mut headers = HeaderMap::new();
+            for line in lines.take_while(|line| !line.is_empty()) {
+                let (name, value) = line.split_once(':').expect("header field");
+                headers.append(
+                    http::header::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                    HeaderValue::from_str(value.trim()).expect("header value"),
+                );
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello")
+                .await
+                .expect("remote read response");
+            (target, headers)
+        });
+        let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let resource = gate.try_acquire().expect("sender device admission");
+        let mut reader = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_background_resource_unit(
+                resource,
+                TcpHttpInternodeDataTransport.open_read(ReadStreamRequest {
+                    endpoint: format!("http://{address}"),
+                    disk: "disk-a".to_owned(),
+                    volume: "bucket".to_owned(),
+                    path: "part.1".to_owned(),
+                    offset: 0,
+                    length: 5,
+                    stall_timeout: Some(Duration::from_secs(5)),
+                }),
+            ),
+        )
+        .await
+        .expect("bounded remote request")
+        .expect("remote reader");
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.expect("complete remote body");
+        assert_eq!(body, b"hello");
+        let (target, headers) = server.await.expect("remote request capture");
+        assert_eq!(gate.snapshot().active, 0, "remote body does not retain the sender's device");
+        assert_eq!(
+            headers
+                .get("x-rustfs-rpc-background-admission")
+                .and_then(|value| value.to_str().ok()),
+            Some("v1"),
+            "resource-controlled remote work must request receiver-side admission"
+        );
+        crate::cluster::rpc::verify_rpc_signature(&target, &Method::GET, &headers).expect("bound request signature");
+        let mut stripped = headers;
+        stripped.remove("x-rustfs-rpc-background-admission");
+        assert!(
+            crate::cluster::rpc::verify_rpc_signature(&target, &Method::GET, &stripped).is_err(),
+            "removing background admission must invalidate the signature"
+        );
+    }
 
     async fn wait_for_capability_flight_waiters(entry: &PutFileCapabilityCacheEntry, waiters: usize) {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1000,6 +1251,7 @@ mod tests {
             .probe_ns_scanner(NsScannerCapabilityRequest {
                 endpoint: "http://node1:9000".to_string(),
                 supports_tier_registry_generation: false,
+                supports_checkpoint_coverage: false,
             })
             .await
             .expect_err("legacy transport should report namespace scanner as unsupported");
@@ -1024,6 +1276,136 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(open_err, Error::MethodNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn namespace_scanner_checkpoint_capability_authenticates_new_and_legacy_peers() {
+        crate::runtime::sources::ensure_test_rpc_secret();
+        for peer in ["current", "strict-old", "permissive-old", "invalid-proof", "missing-proof"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("capability listener");
+            let address = listener.local_addr().expect("capability listener address");
+            let server_epoch = Uuid::new_v4();
+            let server = tokio::spawn(async move {
+                let requests = if peer == "strict-old" { 2 } else { 1 };
+                for index in 0..requests {
+                    let (mut socket, _) = listener.accept().await.expect("capability request");
+                    let mut bytes = Vec::new();
+                    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let mut chunk = [0; 1024];
+                        let read = socket.read(&mut chunk).await.expect("capability headers");
+                        assert!(read > 0 && bytes.len() < 16 * 1024, "bounded complete capability headers");
+                        bytes.extend_from_slice(&chunk[..read]);
+                    }
+                    let request = std::str::from_utf8(&bytes).expect("HTTP headers");
+                    let target = request.split_whitespace().nth(1).expect("HTTP request target");
+                    let url = reqwest::Url::parse(&format!("http://{address}{target}")).expect("capability URL");
+                    let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+                    assert_eq!(query.get(NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY).map(String::as_str), Some("true"));
+                    assert_eq!(query.contains_key(NS_SCANNER_CHECKPOINT_COVERAGE_QUERY), index == 0);
+                    if peer == "strict-old" && index == 0 {
+                        socket
+                            .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            .await
+                            .expect("legacy parser rejection");
+                        continue;
+                    }
+                    let challenge = query[NS_SCANNER_CAPABILITY_CHALLENGE_QUERY].parse().expect("challenge UUID");
+                    let proof = match peer {
+                        "invalid-proof" => vec![0; 32],
+                        "missing-proof" => Vec::new(),
+                        _ => crate::cluster::rpc::sign_ns_scanner_capability_with_checkpoint_coverage(
+                            challenge,
+                            server_epoch,
+                            true,
+                            peer == "current",
+                        )
+                        .expect("server capability proof"),
+                    };
+                    let body = rmp_serde::to_vec_named(&NsScannerCapabilityResponse {
+                        version: NS_SCANNER_PROTOCOL_VERSION,
+                        server_epoch,
+                        proof,
+                        supports_tier_registry_generation: Some(true),
+                        // Strip a supported bit, or forge it for an older peer.
+                        supports_checkpoint_coverage: (peer != "current").then_some(true),
+                    })
+                    .expect("capability response");
+                    socket
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes(),
+                        )
+                        .await
+                        .expect("capability response headers");
+                    socket.write_all(&body).await.expect("capability response body");
+                }
+                requests
+            });
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                TcpHttpInternodeDataTransport.probe_ns_scanner_capability(NsScannerCapabilityRequest {
+                    endpoint: format!("http://{address}"),
+                    supports_tier_registry_generation: true,
+                    supports_checkpoint_coverage: true,
+                }),
+            )
+            .await
+            .expect("bounded capability probe");
+            if peer.ends_with("proof") {
+                assert!(
+                    response
+                        .expect_err("unverified capability must fail closed")
+                        .to_string()
+                        .contains("authentication failed")
+                );
+            } else {
+                let response = response.expect("authenticated capability");
+                assert_eq!(response.server_epoch, server_epoch);
+                assert_eq!(response.supports_tier_registry_generation, Some(true));
+                assert_eq!(response.supports_checkpoint_coverage, (peer == "current").then_some(true));
+            }
+            assert_eq!(server.await.expect("capability server"), if peer == "strict-old" { 2 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
+    async fn walk_dir_restores_explicit_remote_missing_error() {
+        let _ = rustfs_credentials::set_global_rpc_secret("walk-dir-error-test-secret".to_string());
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("test listener address should be available");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("test server should accept the request");
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.expect("request should be readable");
+            socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nx-rustfs-disk-error: file-not-found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("typed disk error response should be writable");
+        });
+
+        let endpoint = format!("http://{addr}");
+        let error = match TcpHttpInternodeDataTransport
+            .open_walk_dir(WalkDirStreamRequest {
+                endpoint: endpoint.clone(),
+                disk: "disk-a".to_string(),
+                body: b"{}".to_vec(),
+                stall_timeout: Some(Duration::from_secs(2)),
+            })
+            .await
+        {
+            Ok(_) => panic!("an explicit remote missing-path response must fail the open"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, Error::FileNotFound));
+        server.await.expect("test server task should finish");
     }
 
     #[test]
@@ -1729,6 +2111,7 @@ mod tests {
             &NsScannerCapabilityRequest {
                 endpoint: "http://node1:9000".to_string(),
                 supports_tier_registry_generation: false,
+                supports_checkpoint_coverage: false,
             },
             challenge,
         );
@@ -1748,6 +2131,7 @@ mod tests {
             &NsScannerCapabilityRequest {
                 endpoint: "http://node1:9000".to_string(),
                 supports_tier_registry_generation: true,
+                supports_checkpoint_coverage: false,
             },
             challenge,
         );
@@ -1786,13 +2170,14 @@ mod tests {
             server_epoch: Uuid::new_v4(),
             proof: Vec::new(),
             supports_tier_registry_generation: None,
+            supports_checkpoint_coverage: None,
         };
 
-        normalize_ns_scanner_capability_response(&mut response, true);
+        normalize_ns_scanner_capability_response(&mut response, true, true);
         assert_eq!(response.supports_tier_registry_generation, Some(true));
 
         response.supports_tier_registry_generation = Some(false);
-        normalize_ns_scanner_capability_response(&mut response, false);
+        normalize_ns_scanner_capability_response(&mut response, false, false);
         assert_eq!(response.supports_tier_registry_generation, None);
     }
 
@@ -1806,6 +2191,7 @@ mod tests {
             proof: crate::cluster::rpc::sign_ns_scanner_capability(challenge, Uuid::new_v4())
                 .expect("placeholder proof should be generated"),
             supports_tier_registry_generation: None,
+            supports_checkpoint_coverage: None,
         };
         // A proof bound to a different challenge cannot authorize the legacy
         // fallback, even though the response has the expected shape.

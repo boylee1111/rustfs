@@ -18,10 +18,8 @@ use const_str::concat;
 /// Default value: RustFS
 /// Environment variable: RUSTFS_APP_NAME
 pub const APP_NAME: &str = "RustFS";
-/// Application version
-/// Default value: 1.0.0
-/// Environment variable: RUSTFS_VERSION
-pub const VERSION: &str = "1.0.0";
+/// Cargo package version for this workspace member.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Default configuration logger level
 /// Default value: error
@@ -38,12 +36,6 @@ pub const SAMPLE_RATIO: f64 = 1.0;
 /// Default configuration meter interval
 /// Default value: 30
 pub const METER_INTERVAL: u64 = 30;
-
-/// Default configuration service version
-/// Default value: 1.0.0
-/// Environment variable: RUSTFS_OBS_SERVICE_VERSION
-/// Uses the same value as VERSION constant
-pub const SERVICE_VERSION: &str = "1.0.0";
 
 /// Default configuration environment
 /// Default value: production
@@ -230,6 +222,16 @@ pub const ENV_RUSTFS_TLS_PATH: &str = "RUSTFS_TLS_PATH";
 /// Environment variable for server KMS enable.
 pub const ENV_RUSTFS_KMS_ENABLE: &str = "RUSTFS_KMS_ENABLE";
 
+/// Environment variable for Veeam SOSAPI virtual system objects.
+///
+/// When true (the default), authenticated GET and HEAD of the two Veeam
+/// SOSAPI keys return generated XML. When false, those keys use the normal
+/// object path so an operator can remove a real object stored there earlier.
+pub const ENV_VEEAM_SOSAPI_ENABLE: &str = "RUSTFS_VEEAM_SOSAPI_ENABLE";
+
+/// Default Veeam SOSAPI enablement.
+pub const DEFAULT_VEEAM_SOSAPI_ENABLE: bool = true;
+
 /// Default KMS enable for server-side encryption
 /// This is the default value for enabling KMS encryption for server-side encryption.
 /// Default value: false
@@ -382,6 +384,9 @@ pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = true;
 /// Environment variable: RUSTFS_OBS_LOG_STDOUT_ENABLED
 pub const DEFAULT_OBS_LOG_STDOUT_ENABLED: bool = false;
 
+/// Fixed target for sampled local-batch diagnostics with isolated JSON output.
+pub const LOCAL_BATCH_DIAGNOSTIC_LOG_TARGET: &str = "rustfs_local_batch_diagnostic";
+
 /// Constant representing 1 Kibibyte (1024 bytes)
 /// Default value: 1024
 pub const KI_B: usize = 1024;
@@ -410,7 +415,6 @@ mod tests {
             APP_NAME,
             VERSION,
             DEFAULT_LOG_LEVEL,
-            SERVICE_VERSION,
             ENVIRONMENT,
             RUSTFS_TLS_KEY,
             RUSTFS_TLS_CERT,
@@ -446,8 +450,7 @@ mod tests {
     fn test_configuration_consistency() {
         // Test configuration consistency
 
-        // Version consistency
-        assert_eq!(VERSION, SERVICE_VERSION, "Application version should match service version");
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
 
         // Port conflict check
         let ports = [DEFAULT_PORT, DEFAULT_CONSOLE_PORT];

@@ -45,6 +45,9 @@ pub mod on_demand_migration;
 #[cfg(test)]
 pub mod fault_proxy;
 
+#[cfg(test)]
+mod rpc_fault_proxy;
+
 // Reliability tests built on the fault-injection harness
 #[cfg(test)]
 mod reliability_disk_fault_test;
@@ -138,6 +141,10 @@ mod admin_auth_test;
 #[cfg(test)]
 mod existing_object_tag_policy_test;
 
+/// IAM / bucket / STS session policy with `s3:if-none-match` / `s3:if-match` conditions (E2E).
+#[cfg(test)]
+mod conditional_write_policy_test;
+
 #[cfg(test)]
 mod sts_query_compat_test;
 
@@ -180,7 +187,13 @@ mod compression_test;
 mod delete_objects_versioning_test;
 
 #[cfg(test)]
+mod conditional_delete_objects_test;
+
+#[cfg(test)]
 mod delete_authorization_test;
+
+#[cfg(test)]
+mod table_location_authorization_test;
 
 // Regression test for signed DELETE Object?versionId requests without Content-Length.
 #[cfg(test)]
@@ -232,6 +245,10 @@ mod tier_stats_cluster_test;
 #[cfg(test)]
 mod checksum_upload_test;
 
+// GetObject with partNumber reporting x-amz-mp-parts-count
+#[cfg(test)]
+mod get_object_parts_count_test;
+
 // Group deletion tests
 #[cfg(test)]
 mod group_delete_test;
@@ -258,6 +275,9 @@ mod copy_object_version_restore_test;
 mod copy_object_checksum_test;
 
 #[cfg(test)]
+mod multipart_copy_readiness_test;
+
+#[cfg(test)]
 mod ssec_copy_test;
 
 #[cfg(test)]
@@ -269,6 +289,8 @@ mod storage_class_capability_test;
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;
+#[cfg(test)]
+mod website_hosting_test;
 
 // Multipart control API auth regression tests
 #[cfg(test)]

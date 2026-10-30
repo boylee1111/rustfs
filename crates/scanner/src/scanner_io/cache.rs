@@ -11,8 +11,31 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-/// scanner cache locks and the cache snapshot persist/publish path.
 use super::*;
+/// scanner cache locks and the cache snapshot persist/publish path.
+use crate::data_usage_define::clone_cache_value;
+use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
+use rustfs_scanner_metrics::usage_candidate::{
+    ScannerUsageCandidateKind as CandidateKind, ScannerUsageCandidateOutcome as CandidateOutcome,
+};
+
+pub(crate) fn log_saved_partial_bucket_cache(cache: &DataUsageCache, cache_name: &str) {
+    debug!(
+        target: "rustfs::scanner::io",
+        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_IO,
+        state = "partial_saved_not_published",
+        bucket = %cache.info.name,
+        pool = cache.info.source.map(|source| source.pool_index),
+        set = cache.info.source.map(|source| source.set_index),
+        cycle = cache.info.next_cycle,
+        leader_epoch = cache.info.leader_epoch,
+        cache_name,
+        resume_position = cache.has_scan_position(),
+        "Scanner partial bucket cache saved without publishing usage aggregate"
+    );
+}
 
 pub(crate) fn scanner_cache_lock_resource(cache_name: &str, source: DataUsageCacheSource) -> String {
     let lock_name = format!("{SCANNER_CACHE_LOCK_SUFFIX}.pool-{}.set-{}", source.pool_index, source.set_index);
@@ -24,13 +47,194 @@ pub(crate) fn scanner_cache_lock_timeout() -> Duration {
 }
 
 #[derive(Debug)]
+pub(crate) enum ScannerCheckpointPersistResult {
+    Saved,
+    FenceChanged,
+    Skipped,
+    RetryBucket(StorageError),
+}
+
+pub(crate) struct ScannerCheckpointPersistContext<'a> {
+    pub(crate) ctx: &'a CancellationToken,
+    pub(crate) expected_publication_epoch: u64,
+    pub(crate) cycle: u64,
+    pub(crate) leader_epoch: u64,
+}
+
+/// Persist one bounded checkpoint and refresh its CAS revisions.
+///
+/// Local and remote workers share the same publication/leader fencing and
+/// revision-refresh contract. Cycle/leader state belongs to the global store,
+/// while cache revisions and publication admission belong to the set store.
+/// Only their lock/cancellation handling remains
+/// at the caller because those guards have different concrete types.
+pub(crate) async fn persist_scanner_checkpoint<S, F>(
+    store: Arc<S>,
+    fence_store: Arc<F>,
+    context: ScannerCheckpointPersistContext<'_>,
+    cache_name: &str,
+    checkpoint: &DataUsageCache,
+    revisions: &mut DataUsageCacheRevisions,
+) -> ScannerCheckpointPersistResult
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+    F: ScannerObjectIO,
+{
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(
+        context.cycle,
+        context.leader_epoch,
+        fence_store.clone(),
+    )
+    .await
+    .is_err()
+    {
+        return ScannerCheckpointPersistResult::FenceChanged;
+    }
+    if scanner_publication_admission_for_epoch(store.clone(), context.expected_publication_epoch)
+        .await
+        .is_none()
+    {
+        return ScannerCheckpointPersistResult::FenceChanged;
+    }
+
+    let checkpoint_save = crate::storage_api::ecstore_with_background_disk_io(
+        context.ctx.clone(),
+        checkpoint.save_with_revisions_for_epoch(store.clone(), cache_name, revisions, context.expected_publication_epoch),
+    )
+    .await;
+    if let Err(error) = checkpoint_save {
+        record_checkpoint_save_failure(cache_name, checkpoint, &error);
+        return if matches!(error, StorageError::PreconditionFailed) {
+            ScannerCheckpointPersistResult::RetryBucket(error)
+        } else {
+            ScannerCheckpointPersistResult::Skipped
+        };
+    }
+
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, fence_store)
+        .await
+        .is_err()
+        || scanner_publication_admission_for_epoch(store.clone(), context.expected_publication_epoch)
+            .await
+            .is_none()
+    {
+        return ScannerCheckpointPersistResult::FenceChanged;
+    }
+
+    match crate::storage_api::ecstore_with_background_disk_io(
+        context.ctx.clone(),
+        DataUsageCache::read_revisions(store, cache_name),
+    )
+    .await
+    {
+        Ok(next_revisions) => {
+            *revisions = next_revisions;
+            if let Some(source) = checkpoint.info.source {
+                let saved = checkpoint.info.scan_checkpoint.as_ref().map(|cursor| {
+                    rustfs_scanner_metrics::metrics::ScannerCheckpointReport {
+                        version: cursor.version,
+                        resume_after: cursor.resume_after.clone(),
+                        reason: cursor.reason.as_str().to_string(),
+                        last_event: "saved".to_string(),
+                    }
+                });
+                global_metrics().record_scanner_checkpoint_saved(
+                    source.pool_index,
+                    source.set_index,
+                    &checkpoint.info.name,
+                    saved,
+                );
+            }
+            ScannerCheckpointPersistResult::Saved
+        }
+        Err(error) => {
+            // A successful PUT consumed the old CAS revision. Reload the bucket
+            // before another write instead of rebasing this scan over a newer writer.
+            record_checkpoint_save_failure(cache_name, checkpoint, &error);
+            ScannerCheckpointPersistResult::RetryBucket(error)
+        }
+    }
+}
+
+fn record_checkpoint_save_failure(cache_name: &str, checkpoint: &DataUsageCache, error: &StorageError) {
+    global_metrics().record_scanner_checkpoint_save_failed();
+    error!(
+        target: "rustfs::scanner::io",
+        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_IO,
+        state = "periodic_checkpoint_save_failed",
+        bucket = %checkpoint.info.name,
+        cache_name = %cache_name,
+        error = %error,
+        "Scanner periodic checkpoint save failed"
+    );
+}
+
+#[derive(Debug)]
 pub(crate) struct ScannerCacheLockGuards {
-    scoped: NamespaceLockGuard,
+    scoped: Option<NamespaceLockGuard>,
 }
 
 impl ScannerCacheLockGuards {
     pub(crate) fn is_lock_lost(&self) -> bool {
-        self.scoped.is_lock_lost()
+        self.scoped.as_ref().is_none_or(NamespaceLockGuard::is_lock_lost)
+    }
+
+    /// Suspend the same traversal while yielding its cache lease. Lock order on
+    /// resumption is physical/node admission -> cache lease -> revision reads.
+    pub(crate) async fn resume_node_operation(
+        &mut self,
+        store: Arc<SetDisks>,
+        cache_name: &str,
+        source: DataUsageCacheSource,
+        revisions: &DataUsageCacheRevisions,
+        request: crate::workload_admission::ScannerNodeRequest,
+    ) -> Result<()> {
+        if self.is_lock_lost() {
+            return Err(Error::other("scanner cache lock was lost before node admission"));
+        }
+        if request.respond.is_closed() {
+            return Ok(());
+        }
+        let crate::workload_admission::ScannerNodeRequest {
+            owner,
+            physical,
+            respond,
+            cancel,
+        } = request;
+        drop(self.scoped.take());
+        let resume = async {
+            use crate::workload_admission::ScannerNodePermit;
+            let permit = match physical {
+                Some(plan) => plan
+                    .acquire(&owner)
+                    .await
+                    .map(|permit| ScannerNodePermit::Physical { permit, plan })
+                    .ok_or(crate::ScannerError::ResourceDeferred),
+                None => Ok(ScannerNodePermit::Node(owner.acquire().await)),
+            };
+            *self = acquire_scanner_cache_locks(store.as_ref(), cache_name, source)
+                .await
+                .map_err(Error::other)?;
+            let current = crate::storage_api::ecstore_with_background_disk_io(
+                cancel.clone(),
+                DataUsageCache::read_revisions(store, cache_name),
+            )
+            .await?;
+            if self.is_lock_lost() || &current != revisions {
+                return Err(Error::other("scanner cache changed while waiting for node admission"));
+            }
+            // If the walk was dropped, send returns ownership and drops the
+            // permit without recording completed work.
+            let _ = respond.send(permit);
+            Ok(())
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::other("scanner node admission cancelled")),
+            result = resume => result,
+        }
     }
 }
 
@@ -68,6 +272,15 @@ impl std::fmt::Display for ScannerCacheLockError {
     }
 }
 
+impl std::error::Error for ScannerCacheLockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Create { source, .. } => Some(source),
+            Self::Acquire { source, .. } => Some(source),
+        }
+    }
+}
+
 pub(crate) async fn acquire_scanner_cache_locks(
     store: &SetDisks,
     cache_name: &str,
@@ -90,7 +303,7 @@ pub(crate) async fn acquire_scanner_cache_locks(
             source,
         })?;
 
-    Ok(ScannerCacheLockGuards { scoped })
+    Ok(ScannerCacheLockGuards { scoped: Some(scoped) })
 }
 
 pub(super) async fn await_scanner_disk_shutdown<F>(scan: Pin<&mut F>)
@@ -142,6 +355,10 @@ pub(crate) struct DataUsageCacheReuseOptions {
     pub(crate) require_source: bool,
     pub(crate) tier_registry_generation: Option<u64>,
     pub(crate) checkpoint_identity: Option<crate::DataUsageScanIdentity>,
+    /// The coverage plan a sweep is started and resumed under
+    /// (`scanner_activity_coverage_digest`); `None` resumes under the reuse
+    /// plan itself for requests from older remote coordinators.
+    pub(crate) checkpoint_plan_digest: Option<DataUsageScanPlanDigest>,
 }
 
 #[cfg(test)]
@@ -165,6 +382,7 @@ pub(crate) fn current_cache_root_or_prepare(
             require_source,
             tier_registry_generation: None,
             checkpoint_identity: None,
+            checkpoint_plan_digest: None,
         },
     )
 }
@@ -178,6 +396,7 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
     scan_plan_digest: DataUsageScanPlanDigest,
     options: DataUsageCacheReuseOptions,
 ) -> DataUsageCacheScanState {
+    let checkpoint_plan_digest = options.checkpoint_plan_digest.unwrap_or(scan_plan_digest);
     if cache.info.next_cycle <= next_cycle
         && cache.info.leader_epoch <= leader_epoch
         && cache.info.scan_identity != options.checkpoint_identity
@@ -193,6 +412,24 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
         // an older registry cannot be reused under the new cycle generation.
         cache.info.scan_plan_digest = None;
     }
+    if cache.info.name == name
+        && cache.info.next_cycle <= next_cycle
+        && cache.info.leader_epoch <= leader_epoch
+        && cache.info.snapshot_complete
+        && cache
+            .info
+            .replication
+            .as_ref()
+            .is_some_and(|config| config.has_active_rules("", true))
+    {
+        // Replication writebacks leave namespace generations unchanged. A
+        // completed cache must start a fresh coverage sweep, even on retry.
+        cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+            started_plan: checkpoint_plan_digest,
+            requested_plan: checkpoint_plan_digest,
+        });
+        cache.info.scan_plan_digest = None;
+    }
     match current_cache_root_entry_with_generation(
         cache,
         name,
@@ -206,9 +443,15 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
         current => DataUsageCacheScanState::Prepared {
             invalid_current: current.err(),
             outcome: match options.checkpoint_identity.filter(crate::DataUsageScanIdentity::is_valid) {
-                Some(identity) => {
-                    cache.prepare_bucket_checkpoint(name, next_cycle, leader_epoch, source, scan_plan_digest, identity)
-                }
+                Some(identity) => cache.prepare_bucket_checkpoint_with_coverage(
+                    name,
+                    next_cycle,
+                    leader_epoch,
+                    source,
+                    scan_plan_digest,
+                    checkpoint_plan_digest,
+                    identity,
+                ),
                 None => cache.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, options.require_source),
             },
         },
@@ -228,6 +471,96 @@ pub(super) fn cache_snapshot_is_current(
         current_cache_root_entry_with_generation(cache, name, source, next_cycle, leader_epoch, scan_plan_digest, None),
         Ok(Some(_))
     )
+}
+
+/// A set cache that stands in for buckets whose walk stopped early is not
+/// the execution a full walk of the same cycle produces. Bind the carried
+/// bucket names so neither snapshot is adopted in place of the other by the
+/// same-execution reuse in `persist_and_publish_cache_snapshot`.
+pub(super) fn scanner_carried_execution_digest(
+    execution_digest: DataUsageScanPlanDigest,
+    carried_buckets: &[String],
+) -> DataUsageScanPlanDigest {
+    if carried_buckets.is_empty() {
+        return execution_digest;
+    }
+    let mut carried = carried_buckets.to_vec();
+    carried.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(b"scanner-carried-execution-v1");
+    hasher.update(execution_digest.0);
+    hasher.update(u64::try_from(carried.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for bucket in carried {
+        hasher.update(u64::try_from(bucket.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(bucket.as_bytes());
+    }
+    DataUsageScanPlanDigest(hasher.finalize().into())
+}
+
+/// Replication statistics are observational and may change within one
+/// namespace execution. Bind them without relaxing same-execution reuse.
+pub(super) fn scanner_replication_execution_digest(
+    execution_digest: DataUsageScanPlanDigest,
+    cache: &DataUsageCache,
+) -> DataUsageScanPlanDigest {
+    let mut entries = cache
+        .cache
+        .iter()
+        .filter_map(|(key, entry)| {
+            entry
+                .replication_stats
+                .as_ref()
+                .filter(|stats| stats.replica_size != 0 || stats.replica_count != 0 || !stats.targets.is_empty())
+                .map(|stats| (key, stats))
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return execution_digest;
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let mut hasher = Sha256::new();
+    hasher.update(b"scanner-replication-execution-v1");
+    hasher.update(execution_digest.0);
+    for (key, stats) in entries {
+        hasher.update(u64::try_from(key.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update(stats.replica_size.to_be_bytes());
+        hasher.update(stats.replica_count.to_be_bytes());
+        let mut targets = stats.targets.iter().collect::<Vec<_>>();
+        targets.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        hasher.update(u64::try_from(targets.len()).unwrap_or(u64::MAX).to_be_bytes());
+        for (arn, target) in targets {
+            hasher.update(u64::try_from(arn.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(arn.as_bytes());
+            let rustfs_data_usage::ReplicationTargetUsage {
+                pending_size,
+                replicated_size,
+                failed_size,
+                failed_count,
+                pending_count,
+                missed_threshold_size,
+                after_threshold_size,
+                missed_threshold_count,
+                after_threshold_count,
+                replicated_count,
+            } = target;
+            for value in [
+                pending_size,
+                replicated_size,
+                failed_size,
+                failed_count,
+                pending_count,
+                missed_threshold_size,
+                after_threshold_size,
+                missed_threshold_count,
+                after_threshold_count,
+                replicated_count,
+            ] {
+                hasher.update(value.to_be_bytes());
+            }
+        }
+    }
+    DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +654,18 @@ impl ScannerPublicationExpectation {
     pub(crate) fn same_candidate(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.candidate, &other.candidate) && self.candidate.1 == other.candidate.1
     }
+
+    #[cfg(feature = "e2e-test-hooks")]
+    pub(crate) fn e2e_digests(&self) -> (String, String) {
+        (crate::e2e_barrier::hex(&self.candidate.0), crate::e2e_barrier::hex(&self.candidate.1.0))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(candidate_digest: [u8; 32], coverage_digest: DataUsageScanPlanDigest) -> Self {
+        Self {
+            candidate: Arc::new((candidate_digest, coverage_digest)),
+        }
+    }
 }
 
 pub(super) struct ValidatedUsageCandidate {
@@ -336,33 +681,47 @@ pub(super) fn empty_namespace_usage_candidate(
     buckets_by_source: &HashMap<DataUsageCacheSource, Vec<BucketInfo>>,
     identity: ScannerSnapshotIdentity,
 ) -> Option<ValidatedUsageCandidate> {
-    if !all_buckets.is_empty()
-        || sources.is_empty()
-        || sources.len() != buckets_by_source.len()
-        || sources
-            .iter()
-            .any(|source| buckets_by_source.get(source).is_none_or(|buckets| !buckets.is_empty()))
-    {
-        return None;
-    }
-    let last_update = SystemTime::now();
-    Some(ValidatedUsageCandidate {
-        data: DataUsageInfo {
-            last_update: Some(last_update),
-            scanner_cycle: Some(identity.cycle),
-            scanner_epoch: Some(identity.leader_epoch),
-            usage_snapshot_complete: true,
-            ..Default::default()
+    let candidate: std::result::Result<ValidatedUsageCandidate, CandidateOutcome> = (|| {
+        if !all_buckets.is_empty()
+            || sources.is_empty()
+            || sources.len() != buckets_by_source.len()
+            || sources
+                .iter()
+                .any(|source| buckets_by_source.get(source).is_none_or(|buckets| !buckets.is_empty()))
+        {
+            return Err(CandidateOutcome::EmptyNamespaceGuard);
+        }
+        let last_update = SystemTime::now();
+        Ok(ValidatedUsageCandidate {
+            data: DataUsageInfo {
+                last_update: Some(last_update),
+                scanner_cycle: Some(identity.cycle),
+                scanner_epoch: Some(identity.leader_epoch),
+                usage_snapshot_complete: true,
+                ..Default::default()
+            },
+            #[cfg(test)]
+            last_update,
+            coverage_digest: identity.coverage_digest,
+        })
+    })();
+    global_metrics().record_usage_candidate(
+        CandidateKind::Completed,
+        match &candidate {
+            Ok(_) => CandidateOutcome::Accepted,
+            Err(outcome) => *outcome,
         },
-        #[cfg(test)]
-        last_update,
-        coverage_digest: identity.coverage_digest,
-    })
+    );
+    candidate.ok()
 }
 
 impl ValidatedUsageCandidate {
-    pub(super) fn prepare(mut self, status: ScannerCycleStatus) -> (DataUsageInfo, Option<ScannerPublicationExpectation>) {
-        self.data.usage_snapshot_converged = Some(status == ScannerCycleStatus::Complete);
+    pub(super) fn prepare(
+        mut self,
+        status: ScannerCycleStatus,
+        pending_buckets: &ScannerCyclePendingBuckets,
+    ) -> (DataUsageInfo, Option<ScannerPublicationExpectation>) {
+        apply_scanner_cycle_publication_marks(&mut self.data, status, pending_buckets);
         let expectation = if status == ScannerCycleStatus::Complete {
             struct DigestWriter(Sha256);
             impl std::io::Write for DigestWriter {
@@ -400,6 +759,15 @@ pub(super) fn completed_data_usage_info(
         .map(|candidate| (candidate.data, candidate.last_update))
 }
 
+/// Certify an incarnation only when every contributing set reports the same non-nil identity.
+fn certified_bucket_incarnation(results: &[DataUsageCache], bucket: &str) -> Option<uuid::Uuid> {
+    let mut identities = results
+        .iter()
+        .map(|result| result.info.scan_bucket_incarnations.get(bucket).copied());
+    let first = identities.next().flatten().filter(|id| !id.is_nil())?;
+    identities.all(|id| id == Some(first)).then_some(first)
+}
+
 pub(super) fn completed_usage_candidate(
     results: &[DataUsageCache],
     scope: &ScannerSnapshotScope<'_>,
@@ -408,90 +776,109 @@ pub(super) fn completed_usage_candidate(
     budget_elapsed: bool,
     cancelled: bool,
 ) -> Option<ValidatedUsageCandidate> {
-    if !bucket_plan_complete {
-        return None;
-    }
-    let completed_set_count = results.iter().filter(|result| result.info.last_update.is_some()).count();
-    if !should_publish_completed_snapshot(completed_set_count, results.len(), budget_elapsed, cancelled) {
-        return None;
-    }
-    let validated = ValidatedScannerSnapshot::validate(results, scope).ok()?;
-    let results = validated.results;
-    let all_buckets = scope.buckets;
-    let registry_generation = scope.identity.tier_registry_generation;
+    let candidate: std::result::Result<ValidatedUsageCandidate, CandidateOutcome> = (|| {
+        if !bucket_plan_complete {
+            return Err(CandidateOutcome::InventoryIncomplete);
+        }
+        let completed_set_count = results.iter().filter(|result| result.info.last_update.is_some()).count();
+        if !should_publish_completed_snapshot(completed_set_count, results.len(), budget_elapsed, cancelled) {
+            return Err(CandidateOutcome::PublishGate);
+        }
+        let validated = ValidatedScannerSnapshot::validate(results, scope).map_err(|reason| match reason {
+            ScannerSnapshotValidationError::IncompleteSets => CandidateOutcome::IncompleteSets,
+            ScannerSnapshotValidationError::GenerationMismatch => CandidateOutcome::GenerationMismatch,
+            ScannerSnapshotValidationError::InvalidInventory => CandidateOutcome::InvalidInventory,
+            ScannerSnapshotValidationError::InvalidRoot => CandidateOutcome::InvalidRoot,
+        })?;
+        let results = validated.results;
+        let all_buckets = scope.buckets;
+        let registry_generation = scope.identity.tier_registry_generation;
 
-    let mut total = DataUsageEntry::default();
-    let mut bucket_entries = HashMap::with_capacity(all_buckets.len());
-    for bucket in all_buckets {
-        let mut merged = DataUsageEntry::default();
-        for result in results {
-            let entry = result.checked_flatten(bucket)?;
-            if !merged.checked_merge(&entry) {
-                return None;
+        let mut total = DataUsageEntry::default();
+        let mut bucket_entries = HashMap::with_capacity(all_buckets.len());
+        for bucket in all_buckets {
+            let mut merged = DataUsageEntry::default();
+            for result in results {
+                let entry = result.checked_flatten(bucket).ok_or(CandidateOutcome::Flatten)?;
+                if !merged.checked_merge(&entry) {
+                    return Err(CandidateOutcome::Merge);
+                }
             }
+            if !total.checked_merge(&merged) {
+                return Err(CandidateOutcome::Merge);
+            }
+            if !tier_accounting_proof_is_publishable(&merged, registry_generation, tier_registry_names) {
+                return Err(CandidateOutcome::TierProof);
+            }
+            bucket_entries.insert(bucket.clone(), merged);
         }
-        if !total.checked_merge(&merged) {
-            return None;
-        }
-        if !tier_accounting_proof_is_publishable(&merged, registry_generation, tier_registry_names) {
-            return None;
-        }
-        bucket_entries.insert(bucket.clone(), merged);
-    }
 
-    if !tier_accounting_proof_is_publishable(&total, registry_generation, tier_registry_names) {
-        return None;
-    }
+        if !tier_accounting_proof_is_publishable(&total, registry_generation, tier_registry_names) {
+            return Err(CandidateOutcome::TierProof);
+        }
 
-    let merged_last_update = validated.last_update;
-    let buckets_usage = bucket_entries
-        .iter()
-        .map(|(bucket, entry)| Some((bucket.clone(), checked_bucket_usage_info(entry)?)))
-        .collect::<Option<HashMap<_, _>>>()?;
-    let bucket_sizes = buckets_usage
-        .iter()
-        .map(|(bucket, usage)| (bucket.clone(), usage.size))
-        .collect();
-    let mut usage_snapshot_set_states = results
-        .iter()
-        .map(|result| {
-            let source = result.info.source?;
-            Some(DataUsageSnapshotSetState {
-                pool_index: u64::try_from(source.pool_index).ok()?,
-                set_index: u64::try_from(source.set_index).ok()?,
-                scanner_cycle: Some(result.info.next_cycle),
-                scanner_epoch: Some(result.info.leader_epoch),
-                scan_plan_digest: Some(result.info.scan_plan_digest?.0),
-                complete: true,
-                tombstone: false,
-                segment_invalidation_proof: result.info.segment_invalidation_proof.clone(),
+        let merged_last_update = validated.last_update;
+        let buckets_usage = bucket_entries
+            .into_iter()
+            .map(|(bucket, entry)| {
+                let mut usage = checked_bucket_usage_info(entry).ok_or(CandidateOutcome::UsageCounters)?;
+                usage.bucket_incarnation = certified_bucket_incarnation(results, &bucket).map(|id| id.to_string());
+                Ok((bucket, usage))
             })
+            .collect::<std::result::Result<HashMap<_, _>, CandidateOutcome>>()?;
+        let bucket_sizes = buckets_usage
+            .iter()
+            .map(|(bucket, usage)| (bucket.clone(), usage.size))
+            .collect();
+        let mut usage_snapshot_set_states = results
+            .iter()
+            .map(|result| {
+                let source = result.info.source.ok_or(CandidateOutcome::MissingSource)?;
+                Ok(DataUsageSnapshotSetState {
+                    pool_index: u64::try_from(source.pool_index).map_err(|_| CandidateOutcome::CountOverflow)?,
+                    set_index: u64::try_from(source.set_index).map_err(|_| CandidateOutcome::CountOverflow)?,
+                    scanner_cycle: Some(result.info.next_cycle),
+                    scanner_epoch: Some(result.info.leader_epoch),
+                    scan_plan_digest: Some(result.info.scan_plan_digest.ok_or(CandidateOutcome::SetState)?.0),
+                    complete: true,
+                    tombstone: false,
+                    segment_invalidation_proof: clone_cache_value(&result.info.segment_invalidation_proof),
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, CandidateOutcome>>()?;
+        usage_snapshot_set_states.sort_by_key(|state| (state.pool_index, state.set_index));
+        let data_usage_info = DataUsageInfo {
+            last_update: Some(merged_last_update),
+            scanner_cycle: Some(scope.identity.cycle),
+            scanner_epoch: Some(scope.identity.leader_epoch),
+            objects_total_count: u64::try_from(total.objects).map_err(|_| CandidateOutcome::CountOverflow)?,
+            versions_total_count: u64::try_from(total.versions).map_err(|_| CandidateOutcome::CountOverflow)?,
+            delete_markers_total_count: u64::try_from(total.delete_markers).map_err(|_| CandidateOutcome::CountOverflow)?,
+            objects_total_size: u64::try_from(total.size).map_err(|_| CandidateOutcome::CountOverflow)?,
+            tier_stats: total.all_tier_stats.filter(|tiers| !tiers.is_empty()),
+            unknown_tier_stats: total.unknown_tier_stats.filter(|stats| !stats.is_empty()),
+            buckets_count: u64::try_from(all_buckets.len()).map_err(|_| CandidateOutcome::CountOverflow)?,
+            bucket_sizes,
+            buckets_usage,
+            usage_snapshot_complete: true,
+            usage_snapshot_set_states,
+            ..Default::default()
+        };
+        Ok(ValidatedUsageCandidate {
+            data: data_usage_info,
+            #[cfg(test)]
+            last_update: merged_last_update,
+            coverage_digest: scope.identity.coverage_digest,
         })
-        .collect::<Option<Vec<_>>>()?;
-    usage_snapshot_set_states.sort_by_key(|state| (state.pool_index, state.set_index));
-    let data_usage_info = DataUsageInfo {
-        last_update: Some(merged_last_update),
-        scanner_cycle: Some(scope.identity.cycle),
-        scanner_epoch: Some(scope.identity.leader_epoch),
-        objects_total_count: u64::try_from(total.objects).ok()?,
-        versions_total_count: u64::try_from(total.versions).ok()?,
-        delete_markers_total_count: u64::try_from(total.delete_markers).ok()?,
-        objects_total_size: u64::try_from(total.size).ok()?,
-        tier_stats: total.all_tier_stats.filter(|tiers| !tiers.is_empty()),
-        unknown_tier_stats: total.unknown_tier_stats.filter(|stats| !stats.is_empty()),
-        buckets_count: u64::try_from(all_buckets.len()).ok()?,
-        bucket_sizes,
-        buckets_usage,
-        usage_snapshot_complete: true,
-        usage_snapshot_set_states,
-        ..Default::default()
-    };
-    Some(ValidatedUsageCandidate {
-        data: data_usage_info,
-        #[cfg(test)]
-        last_update: merged_last_update,
-        coverage_digest: scope.identity.coverage_digest,
-    })
+    })();
+    global_metrics().record_usage_candidate(
+        CandidateKind::Completed,
+        match &candidate {
+            Ok(_) => CandidateOutcome::Accepted,
+            Err(outcome) => *outcome,
+        },
+    );
+    candidate.ok()
 }
 
 fn tier_accounting_proof_is_publishable(
@@ -611,151 +998,166 @@ pub(super) fn observational_data_usage_info(
     scanner_cycle: u64,
     leader_epoch: u64,
 ) -> Option<(DataUsageInfo, SystemTime)> {
-    let mut by_source = HashMap::with_capacity(results.len());
-    for result in results {
-        let source = result.info.source?;
-        if !expected_sources.contains(&source) || by_source.insert(source, result).is_some() {
-            return None;
+    let candidate: std::result::Result<(DataUsageInfo, SystemTime), CandidateOutcome> = (|| {
+        let mut by_source = HashMap::with_capacity(results.len());
+        for result in results {
+            let source = result.info.source.ok_or(CandidateOutcome::MissingSource)?;
+            if !expected_sources.contains(&source) || by_source.insert(source, result).is_some() {
+                return Err(CandidateOutcome::SourceMembership);
+            }
         }
-    }
 
-    let mut usable = Vec::new();
-    let mut set_states = Vec::with_capacity(expected_sources.len());
-    let mut sources = expected_sources.iter().copied().collect::<Vec<_>>();
-    sources.sort_by_key(|source| (source.pool_index, source.set_index));
-    for source in sources {
-        let result = by_source.get(&source).copied();
-        let current = result.filter(|result| {
-            result.info.snapshot_complete
-                && result.info.next_cycle == scanner_cycle
-                && result.info.leader_epoch == leader_epoch
-                && result.info.scan_plan_digest == Some(expected_plan_digest)
-        });
-        let lkg = result.filter(|result| {
-            !result.info.snapshot_complete
-                && result.info.lkg_snapshot_complete
-                && result.info.lkg_scan_plan_digest == Some(expected_plan_digest)
-                && result.info.lkg_leader_epoch.is_some_and(|epoch| {
-                    epoch < leader_epoch
-                        || (epoch == leader_epoch && result.info.lkg_next_cycle.is_some_and(|cycle| cycle <= scanner_cycle))
-                })
-        });
-        let current_snapshot = current.is_some();
-        let selected = current.or(lkg);
-        if let Some(selected) = selected {
-            let (cycle, epoch, digest, last_update, complete, segment_invalidation_proof) = if current_snapshot {
-                (
-                    Some(selected.info.next_cycle),
-                    Some(selected.info.leader_epoch),
-                    selected.info.scan_plan_digest.map(|digest| digest.0),
-                    selected.info.last_update,
-                    true,
-                    selected.info.segment_invalidation_proof.clone(),
-                )
+        let mut usable = Vec::new();
+        let mut set_states = Vec::with_capacity(expected_sources.len());
+        let mut sources = expected_sources.iter().copied().collect::<Vec<_>>();
+        sources.sort_by_key(|source| (source.pool_index, source.set_index));
+        for source in sources {
+            let result = by_source.get(&source).copied();
+            let current = result.filter(|result| {
+                result.info.snapshot_complete
+                    && result.info.next_cycle == scanner_cycle
+                    && result.info.leader_epoch == leader_epoch
+                    && result.info.scan_plan_digest == Some(expected_plan_digest)
+            });
+            let lkg = result.filter(|result| {
+                !result.info.snapshot_complete
+                    && result.info.lkg_snapshot_complete
+                    && result.info.lkg_scan_plan_digest == Some(expected_plan_digest)
+                    && result.info.lkg_leader_epoch.is_some_and(|epoch| {
+                        epoch < leader_epoch
+                            || (epoch == leader_epoch && result.info.lkg_next_cycle.is_some_and(|cycle| cycle <= scanner_cycle))
+                    })
+            });
+            let current_snapshot = current.is_some();
+            let selected = current.or(lkg);
+            if let Some(selected) = selected {
+                let (cycle, epoch, digest, last_update, complete, segment_invalidation_proof) = if current_snapshot {
+                    (
+                        Some(selected.info.next_cycle),
+                        Some(selected.info.leader_epoch),
+                        selected.info.scan_plan_digest.map(|digest| digest.0),
+                        selected.info.last_update,
+                        true,
+                        clone_cache_value(&selected.info.segment_invalidation_proof),
+                    )
+                } else {
+                    (
+                        selected.info.lkg_next_cycle,
+                        selected.info.lkg_leader_epoch,
+                        selected.info.lkg_scan_plan_digest.map(|digest| digest.0),
+                        selected.info.lkg_last_update,
+                        false,
+                        None,
+                    )
+                };
+                set_states.push(DataUsageSnapshotSetState {
+                    pool_index: u64::try_from(source.pool_index).map_err(|_| CandidateOutcome::CountOverflow)?,
+                    set_index: u64::try_from(source.set_index).map_err(|_| CandidateOutcome::CountOverflow)?,
+                    scanner_cycle: cycle,
+                    scanner_epoch: epoch,
+                    scan_plan_digest: digest,
+                    complete,
+                    tombstone: false,
+                    segment_invalidation_proof,
+                });
+                usable.push((selected, last_update));
             } else {
-                (
-                    selected.info.lkg_next_cycle,
-                    selected.info.lkg_leader_epoch,
-                    selected.info.lkg_scan_plan_digest.map(|digest| digest.0),
-                    selected.info.lkg_last_update,
-                    false,
-                    None,
-                )
-            };
-            set_states.push(DataUsageSnapshotSetState {
-                pool_index: u64::try_from(source.pool_index).ok()?,
-                set_index: u64::try_from(source.set_index).ok()?,
-                scanner_cycle: cycle,
-                scanner_epoch: epoch,
-                scan_plan_digest: digest,
-                complete,
-                tombstone: false,
-                segment_invalidation_proof,
-            });
-            usable.push((selected, last_update));
-        } else {
-            set_states.push(DataUsageSnapshotSetState {
-                pool_index: u64::try_from(source.pool_index).ok()?,
-                set_index: u64::try_from(source.set_index).ok()?,
-                scanner_cycle: None,
-                scanner_epoch: None,
-                scan_plan_digest: Some(expected_plan_digest.0),
-                complete: false,
-                tombstone: false,
-                segment_invalidation_proof: None,
-            });
+                set_states.push(DataUsageSnapshotSetState {
+                    pool_index: u64::try_from(source.pool_index).map_err(|_| CandidateOutcome::CountOverflow)?,
+                    set_index: u64::try_from(source.set_index).map_err(|_| CandidateOutcome::CountOverflow)?,
+                    scanner_cycle: None,
+                    scanner_epoch: None,
+                    scan_plan_digest: Some(expected_plan_digest.0),
+                    complete: false,
+                    tombstone: false,
+                    segment_invalidation_proof: None,
+                });
+            }
         }
-    }
-    if usable.is_empty() {
-        return None;
-    }
-    let registry_generation = usable.first()?.0.info.tier_registry_generation;
-    if usable.iter().any(|(result, _)| match registry_generation {
-        Some(generation) => result.info.tier_registry_generation != Some(generation),
-        None => result.info.tier_registry_generation.is_some(),
-    }) {
-        return None;
-    }
+        if usable.is_empty() {
+            return Err(CandidateOutcome::NoUsableSnapshots);
+        }
+        let registry_generation = usable
+            .first()
+            .ok_or(CandidateOutcome::NoUsableSnapshots)?
+            .0
+            .info
+            .tier_registry_generation;
+        if usable.iter().any(|(result, _)| match registry_generation {
+            Some(generation) => result.info.tier_registry_generation != Some(generation),
+            None => result.info.tier_registry_generation.is_some(),
+        }) {
+            return Err(CandidateOutcome::TierGeneration);
+        }
 
-    let mut total = DataUsageEntry::default();
-    let mut bucket_entries = HashMap::with_capacity(all_buckets.len());
-    let mut merged_last_update = None;
-    for (result, last_update) in usable {
-        if let Some(update) = last_update {
-            merged_last_update = Some(merged_last_update.map_or(update, |current: SystemTime| current.max(update)));
-        }
-        for bucket in all_buckets {
-            let Some(entry) = result.checked_flatten(bucket) else {
-                continue;
-            };
-            let bucket_entry = bucket_entries.entry(bucket.clone()).or_insert_with(DataUsageEntry::default);
-            if !bucket_entry.checked_merge(&entry) {
-                return None;
+        let mut total = DataUsageEntry::default();
+        let mut bucket_entries = HashMap::with_capacity(all_buckets.len());
+        let mut merged_last_update = None;
+        for (result, last_update) in usable {
+            if let Some(update) = last_update {
+                merged_last_update = Some(merged_last_update.map_or(update, |current: SystemTime| current.max(update)));
             }
-            if !total.checked_merge(&entry) {
-                return None;
+            for bucket in all_buckets {
+                let Some(entry) = result.checked_flatten(bucket) else {
+                    continue;
+                };
+                let bucket_entry = bucket_entries.entry(bucket.clone()).or_insert_with(DataUsageEntry::default);
+                if !bucket_entry.checked_merge(&entry) {
+                    return Err(CandidateOutcome::Merge);
+                }
+                if !total.checked_merge(&entry) {
+                    return Err(CandidateOutcome::Merge);
+                }
             }
         }
-    }
-    if bucket_entries
-        .values()
-        .any(|entry| !tier_accounting_proof_is_publishable(entry, registry_generation, tier_registry_names))
-    {
-        return None;
-    }
-    if !tier_accounting_proof_is_publishable(&total, registry_generation, tier_registry_names) {
-        return None;
-    }
-    let merged_last_update = merged_last_update?;
-    let buckets_usage = bucket_entries
-        .iter()
-        .map(|(bucket, entry)| Some((bucket.clone(), checked_bucket_usage_info(entry)?)))
-        .collect::<Option<HashMap<_, _>>>()?;
-    Some((
-        DataUsageInfo {
-            last_update: Some(merged_last_update),
-            scanner_cycle: Some(scanner_cycle),
-            scanner_epoch: Some(leader_epoch),
-            objects_total_count: u64::try_from(total.objects).ok()?,
-            versions_total_count: u64::try_from(total.versions).ok()?,
-            delete_markers_total_count: u64::try_from(total.delete_markers).ok()?,
-            objects_total_size: u64::try_from(total.size).ok()?,
-            tier_stats: total.all_tier_stats.filter(|tiers| !tiers.is_empty()),
-            unknown_tier_stats: total.unknown_tier_stats.filter(|stats| !stats.is_empty()),
-            buckets_count: u64::try_from(buckets_usage.len()).ok()?,
-            bucket_sizes: buckets_usage
-                .iter()
-                .map(|(bucket, usage)| (bucket.clone(), usage.size))
-                .collect(),
-            buckets_usage,
-            usage_snapshot_complete: false,
-            usage_snapshot_partial: true,
-            usage_snapshot_converged: Some(false),
-            usage_snapshot_set_states: set_states,
-            ..Default::default()
+        if bucket_entries
+            .values()
+            .any(|entry| !tier_accounting_proof_is_publishable(entry, registry_generation, tier_registry_names))
+        {
+            return Err(CandidateOutcome::TierProof);
+        }
+        if !tier_accounting_proof_is_publishable(&total, registry_generation, tier_registry_names) {
+            return Err(CandidateOutcome::TierProof);
+        }
+        let merged_last_update = merged_last_update.ok_or(CandidateOutcome::MissingLastUpdate)?;
+        let buckets_usage = bucket_entries
+            .into_iter()
+            .map(|(bucket, entry)| Ok((bucket, checked_bucket_usage_info(entry).ok_or(CandidateOutcome::UsageCounters)?)))
+            .collect::<std::result::Result<HashMap<_, _>, CandidateOutcome>>()?;
+        Ok((
+            DataUsageInfo {
+                last_update: Some(merged_last_update),
+                scanner_cycle: Some(scanner_cycle),
+                scanner_epoch: Some(leader_epoch),
+                objects_total_count: u64::try_from(total.objects).map_err(|_| CandidateOutcome::CountOverflow)?,
+                versions_total_count: u64::try_from(total.versions).map_err(|_| CandidateOutcome::CountOverflow)?,
+                delete_markers_total_count: u64::try_from(total.delete_markers).map_err(|_| CandidateOutcome::CountOverflow)?,
+                objects_total_size: u64::try_from(total.size).map_err(|_| CandidateOutcome::CountOverflow)?,
+                tier_stats: total.all_tier_stats.filter(|tiers| !tiers.is_empty()),
+                unknown_tier_stats: total.unknown_tier_stats.filter(|stats| !stats.is_empty()),
+                buckets_count: u64::try_from(buckets_usage.len()).map_err(|_| CandidateOutcome::CountOverflow)?,
+                bucket_sizes: buckets_usage
+                    .iter()
+                    .map(|(bucket, usage)| (bucket.clone(), usage.size))
+                    .collect(),
+                buckets_usage,
+                usage_snapshot_complete: false,
+                usage_snapshot_partial: true,
+                usage_snapshot_converged: Some(false),
+                usage_snapshot_set_states: set_states,
+                ..Default::default()
+            },
+            merged_last_update,
+        ))
+    })();
+    global_metrics().record_usage_candidate(
+        CandidateKind::Observational,
+        match &candidate {
+            Ok(_) => CandidateOutcome::Accepted,
+            Err(outcome) => *outcome,
         },
-        merged_last_update,
-    ))
+    );
+    candidate.ok()
 }
 
 pub(super) async fn send_cache_root_entry_info(
@@ -780,6 +1182,24 @@ pub(super) async fn send_cache_root_entry(
         .map_err(|err| ScannerError::Other(format!("scanner cache root channel closed: {err}")))
 }
 
+fn log_missing_set_snapshot_metadata(store: &SetDisks, info: &DataUsageCacheInfo, reason: &'static str) {
+    warn!(
+        target: "rustfs::scanner::io",
+        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_IO,
+        state = "snapshot_metadata_missing",
+        reason,
+        store_pool = store.pool_index,
+        store_set = store.set_index,
+        snapshot_source_pool = info.source.map(|source| source.pool_index),
+        snapshot_source_set = info.source.map(|source| source.set_index),
+        snapshot_cycle = info.next_cycle,
+        snapshot_leader_epoch = info.leader_epoch,
+        "Scanner set snapshot is missing required metadata"
+    );
+}
+
 pub(super) async fn persist_and_publish_cache_snapshot(
     store: Arc<SetDisks>,
     updates: &mpsc::Sender<DataUsageCache>,
@@ -788,9 +1208,20 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     cache_cycle_floor: &AtomicU64,
     expected_publication_epoch: u64,
 ) -> Option<SystemTime> {
-    let source = cache_snapshot.info.source?;
-    let coverage_digest = cache_snapshot.info.scan_coverage_digest?;
-    let execution_digest = cache_snapshot.info.scan_execution_digest?;
+    let snapshot_cycle = cache_snapshot.info.next_cycle;
+    let snapshot_leader_epoch = cache_snapshot.info.leader_epoch;
+    let Some(source) = cache_snapshot.info.source else {
+        log_missing_set_snapshot_metadata(&store, &cache_snapshot.info, "source");
+        return None;
+    };
+    let Some(coverage_digest) = cache_snapshot.info.scan_coverage_digest else {
+        log_missing_set_snapshot_metadata(&store, &cache_snapshot.info, "coverage_digest");
+        return None;
+    };
+    let Some(execution_digest) = cache_snapshot.info.scan_execution_digest else {
+        log_missing_set_snapshot_metadata(&store, &cache_snapshot.info, "execution_digest");
+        return None;
+    };
     let guard = match acquire_scanner_cache_locks(store.as_ref(), DATA_USAGE_CACHE_NAME, source).await {
         Ok(guard) => guard,
         Err(err) => {
@@ -799,8 +1230,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
                 event = EVENT_SCANNER_CACHE_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
-                cache_name = DATA_USAGE_CACHE_NAME,
                 state = err.state(),
+                store_pool = store.pool_index,
+                store_set = store.set_index,
+                snapshot_source_pool = source.pool_index,
+                snapshot_source_set = source.set_index,
+                snapshot_cycle,
+                snapshot_leader_epoch,
+                cache_name = DATA_USAGE_CACHE_NAME,
                 error = %err,
                 "Scanner cache snapshot lock acquisition failed"
             );
@@ -817,15 +1254,24 @@ pub(super) async fn persist_and_publish_cache_snapshot(
                 event = EVENT_SCANNER_CACHE_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
-                cache_name = DATA_USAGE_CACHE_NAME,
                 state = "load_or_revision_lookup_failed",
+                store_pool = store.pool_index,
+                store_set = store.set_index,
+                snapshot_source_pool = source.pool_index,
+                snapshot_source_set = source.set_index,
+                snapshot_cycle,
+                snapshot_leader_epoch,
+                cache_name = DATA_USAGE_CACHE_NAME,
                 error = %err,
                 "Scanner cache snapshot load or revision lookup failed"
             );
             return None;
         }
     };
-    let scan_plan_digest = cache_snapshot.info.scan_plan_digest?;
+    let Some(scan_plan_digest) = cache_snapshot.info.scan_plan_digest else {
+        log_missing_set_snapshot_metadata(&store, &cache_snapshot.info, "plan_digest");
+        return None;
+    };
     if persisted.info.next_cycle > cache_snapshot.info.next_cycle {
         cache_cycle_floor.fetch_max(persisted.info.next_cycle, Ordering::AcqRel);
         warn!(
@@ -833,10 +1279,16 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             event = EVENT_SCANNER_CACHE_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
+            state = "stale_cycle_rejected",
+            store_pool = store.pool_index,
+            store_set = store.set_index,
+            snapshot_source_pool = source.pool_index,
+            snapshot_source_set = source.set_index,
+            snapshot_cycle,
+            snapshot_leader_epoch,
             cache_name = DATA_USAGE_CACHE_NAME,
             requested_cycle = cache_snapshot.info.next_cycle,
             persisted_cycle = persisted.info.next_cycle,
-            state = "stale_cycle_rejected",
             "Scanner rejected a set cache cycle regression"
         );
         return None;
@@ -847,10 +1299,16 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             event = EVENT_SCANNER_CACHE_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
+            state = "stale_leader_rejected",
+            store_pool = store.pool_index,
+            store_set = store.set_index,
+            snapshot_source_pool = source.pool_index,
+            snapshot_source_set = source.set_index,
+            snapshot_cycle,
+            snapshot_leader_epoch,
             cache_name = DATA_USAGE_CACHE_NAME,
             requested_epoch = cache_snapshot.info.leader_epoch,
             persisted_epoch = persisted.info.leader_epoch,
-            state = "stale_leader_rejected",
             "Scanner rejected a set cache snapshot from an older leader epoch"
         );
         return None;
@@ -881,6 +1339,12 @@ pub(super) async fn persist_and_publish_cache_snapshot(
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
                 state = "scan_baseline_revision_changed",
+                store_pool = store.pool_index,
+                store_set = store.set_index,
+                snapshot_source_pool = source.pool_index,
+                snapshot_source_set = source.set_index,
+                snapshot_cycle,
+                snapshot_leader_epoch,
                 cache_name = DATA_USAGE_CACHE_NAME,
                 "Scanner skipped set snapshot without an unchanged baseline revision"
             );
@@ -892,8 +1356,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
                 event = EVENT_SCANNER_CACHE_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
-                cache_name = DATA_USAGE_CACHE_NAME,
                 state = "lock_lost",
+                store_pool = store.pool_index,
+                store_set = store.set_index,
+                snapshot_source_pool = source.pool_index,
+                snapshot_source_set = source.set_index,
+                snapshot_cycle,
+                snapshot_leader_epoch,
+                cache_name = DATA_USAGE_CACHE_NAME,
                 "Scanner cache snapshot save skipped after lock loss"
             );
             return None;
@@ -909,8 +1379,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
                 event = EVENT_SCANNER_CACHE_PERSIST_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_IO,
-                cache_name = DATA_USAGE_CACHE_NAME,
                 state = "save_failed",
+                store_pool = store.pool_index,
+                store_set = store.set_index,
+                snapshot_source_pool = source.pool_index,
+                snapshot_source_set = source.set_index,
+                snapshot_cycle,
+                snapshot_leader_epoch,
+                cache_name = DATA_USAGE_CACHE_NAME,
                 error = %e,
                 "Scanner cache snapshot persistence failed"
             );
@@ -925,8 +1401,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             event = EVENT_SCANNER_CACHE_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
-            cache_name = DATA_USAGE_CACHE_NAME,
             state = "lock_lost_after_save",
+            store_pool = store.pool_index,
+            store_set = store.set_index,
+            snapshot_source_pool = source.pool_index,
+            snapshot_source_set = source.set_index,
+            snapshot_cycle,
+            snapshot_leader_epoch,
+            cache_name = DATA_USAGE_CACHE_NAME,
             "Scanner cache snapshot publish skipped after lock loss"
         );
         return None;
@@ -943,8 +1425,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             event = EVENT_SCANNER_CACHE_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
-            cache_name = DATA_USAGE_CACHE_NAME,
             state = "publication_epoch_changed_before_publish",
+            store_pool = store.pool_index,
+            store_set = store.set_index,
+            snapshot_source_pool = source.pool_index,
+            snapshot_source_set = source.set_index,
+            snapshot_cycle,
+            snapshot_leader_epoch,
+            cache_name = DATA_USAGE_CACHE_NAME,
             "Scanner cache root publish skipped after movement epoch change"
         );
         return None;
@@ -958,8 +1446,14 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             event = EVENT_SCANNER_CACHE_PERSIST_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
-            cache_name = DATA_USAGE_CACHE_NAME,
             state = "publish_failed",
+            store_pool = store.pool_index,
+            store_set = store.set_index,
+            snapshot_source_pool = source.pool_index,
+            snapshot_source_set = source.set_index,
+            snapshot_cycle,
+            snapshot_leader_epoch,
+            cache_name = DATA_USAGE_CACHE_NAME,
             error = %e,
             "Scanner cache snapshot publish failed"
         );

@@ -16,7 +16,7 @@ name: Continuous Integration
 
 on:
   push:
-    branches: [ main, release ]
+    branches: [ main ]
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -36,23 +36,30 @@ on:
       - "flake.lock"
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
-    branches: [ main, release ]
+    # gateway/integration carries main's ruleset (rustfs/backlog#2734), so its
+    # pull requests must produce the same required checks.
+    branches: [ main, gateway/integration ]
   merge_group:
     types: [ checks_requested ]
   schedule:
-    - cron: "11 0 * * 0" # Weekly on Sunday 00:11 UTC
+    - cron: "11 0 * * *" # Nightly 00:11 UTC, after the 22:41 UTC cache-warm run
   workflow_dispatch:
+    inputs:
+      rehearse_workspace_shards:
+        description: Compare one full execution with at most two resource-safe shards of the same archive
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 # Concurrency groups are scoped per event so different triggers never cancel
-# each other: PR pushes cancel the previous run of that PR, main pushes keep
-# latest-wins semantics among themselves, and scheduled runs always complete
-# (a shared group used to let every merge kill the weekly scheduled run).
+# each other. PR pushes cancel superseded attempts; main and scheduled runs
+# finish so a busy merge stream cannot starve the complete baseline. For main,
+# GitHub retains one running run and replaces the pending run with the latest.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -60,6 +67,11 @@ env:
 
 jobs:
 
+  # Compile-free lanes, and lanes that only run a prebuilt binary, use
+  # GitHub-hosted runners: they are free for this public repository, and the
+  # self-hosted pool is reserved for the lanes that need its CPU count and
+  # disk (the workspace test build leaves a ~64GB target/, hosted runners
+  # have 14GB). Placement and billing rules: README.md in this directory.
   cancel-closed-pr-runs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
@@ -76,24 +88,50 @@ jobs:
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.scope.outputs.mode }}
+      plan: ${{ steps.scope.outputs.plan }}
+      connect: ${{ steps.scope.outputs.connect || 'true' }}
+      packages: ${{ steps.scope.outputs.packages }}
+      full_validation: ${{ steps.scope.outputs.full_validation || 'true' }}
+      rehearse_shards: ${{ steps.scope.outputs.rehearse_shards || 'false' }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           fetch-depth: 2
           persist-credentials: false
       - name: Select scope using the base revision's policy
         id: scope
         env:
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_EVENT_ACTION: ${{ github.event.action }}
+          CI_REHEARSE_SHARDS: ${{ inputs.rehearse_workspace_shards && 'true' || 'false' }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
-            printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
+            python3 -I scripts/ci_gate.py select
           elif [[ "$CI_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && git show "$CI_BASE_SHA:scripts/ci_gate.py" > "$RUNNER_TEMP/ci-gate-base.py"; then
             python3 -I "$RUNNER_TEMP/ci-gate-base.py" select
           else
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^rehearse_shards=' "$GITHUB_OUTPUT"; then
+            printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'rehearse_shards=false' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
+            echo "Base policy does not cover this workflow contract; retaining the full matrix."
+          fi
+      - name: Retain verification plan
+        if: steps.scope.outputs.plan != ''
+        env:
+          CI_PLAN: ${{ steps.scope.outputs.plan }}
+        run: |
+          mkdir -p artifacts/ci-plan
+          printf '%s\n' "$CI_PLAN" > artifacts/ci-plan/plan.json
+      - name: Upload verification plan
+        if: steps.scope.outputs.plan != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verification-plan-${{ github.run_attempt }}
+          path: artifacts/ci-plan/plan.json
+          if-no-files-found: error
+          retention-days: 7
 
   typos:
     name: Typos
@@ -101,11 +139,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Typos check with custom config file
-        uses: crate-ci/typos@37bb98842b0d8c4ffebdb75301a13db0267cef89 # master
+        uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
 
   # Fail early with compile-free checks for every pull request.
   quick-checks:
@@ -115,7 +153,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -123,16 +161,17 @@ jobs:
         uses: ./.github/actions/quick-checks
 
   test-and-lint:
-    name: Workspace Test and Lint
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    name: Workspace Lint and Build
+    if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CI_PACKAGES: ${{ needs.classify-changes.outputs.packages }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           # Checkout otherwise writes the token into .git/config, where a PR's
           # own build.rs or proc-macro could read it back out.
@@ -142,11 +181,9 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          # Every lane in this workflow reads its cache and none writes it.
-          # cache-warm.yml is the sole writer for all four keys: this workflow
-          # cancels superseded runs on main, and a cancelled run never reaches
-          # rust-cache's post step, so writing from here saved nothing (12 of 15
-          # consecutive main-push runs were cancelled). See rustfs/backlog#1600.
+          # Every lane reads its cache; cache-warm.yml remains the sole writer
+          # with the matching feature closure. Tests never compete to replace
+          # shared caches, including when a PR attempt is cancelled.
           cache-shared-key: ci-dev
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
@@ -164,93 +201,46 @@ jobs:
             echo "started_at=$(date --utc --iso-8601=seconds)"
           } > artifacts/test-and-lint/run-metadata.txt
 
-      # Clippy runs before the test pass: lint failures are the most common
-      # CI-only breakage and should surface in minutes, not after 20+ minutes
-      # of tests.
-      # Sampled too: clippy is the natural control arm for any CARGO_BUILD_JOBS
-      # experiment, since --all-targets is check-only for workspace members and
-      # never links the ~100 test binaries the limit exists to throttle.
+      # Clippy gates every event, pull requests included. When it ran only after
+      # merge, a lint regression merged freely and then failed every main run
+      # until someone fixed it (10 of 12 main runs on 2026-10-17/18). cache-warm
+      # writes the same invocation's check artifacts into ci-dev, so a pull
+      # request re-checks only the crates its diff touches. Main keeps the step
+      # because pull requests can merge without being up to date with main.
       - name: Run clippy lints
         run: |
           ./scripts/ci/resource_sampler.sh start clippy
           trap './scripts/ci/resource_sampler.sh stop' EXIT
-          cargo clippy --all-targets -- -D warnings
+          python3 scripts/ci_test_artifact.py cargo lint --configuration workspace
 
-      - name: Run nextest tests
+      - name: Archive workspace test binaries
         env:
-          # #5394 mitigation, now under a measured experiment (backlog#1601).
-          #
-          # 2 was chosen when three concurrent workspace test links were believed
-          # to saturate the runner's overlay I/O and wedge Cargo until the 75m
-          # timeout. cgroup v2 readings from the sampler show the pod actually
-          # has 14 CPUs and 28GB (peak use 2.1GB), so 2 throttles compilation to
-          # a seventh of what is available and memory was never the constraint —
-          # the label name "sm-standard-4" had led everyone, including the
-          # original mitigation, to assume 4 cores.
-          #
-          # Raised to 3 on main pushes and manual dispatches; PRs keep 2 so the
-          # merge path is untouched while the experiment runs.
-          #
-          # Dispatch is included because push alone cannot supply the samples:
-          # this workflow cancels superseded runs on main, and only 4 of the last
-          # 20 push-triggered Test and Lint jobs reached a terminal state — at
-          # that rate ten samples would take roughly fifty merges. The
-          # concurrency group is scoped by event_name, so a dispatched run has
-          # its own group and is not cancelled by merge traffic, which makes the
-          # sample collectable on demand rather than by waiting.
-          #
-          # Baseline over 17 samples at 2:
-          # median nextest/clippy step ratio 1.95, spread 1.85-2.06. The gate-2
-          # criterion is that ratio dropping at least 10% (below ~1.76) with no
-          # 75m timeout and no run showing three consecutive samples of
-          # rustc/collect2/rust-lld in D state. If it does not, the conclusion is
-          # "this limit is not the bottleneck" — fix it back at 2 and record the
-          # experiment, which is a result, not a failure.
-          #
-          # Must stay step-level: rust-cache hashes CARGO/CC/CFLAGS/CXX/CMAKE/RUST
-          # prefixed variables from process.env into the cache key, so promoting
-          # this to job level would rotate every key on this lane.
           CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
         run: |
-          mkdir -p artifacts/test-and-lint
-          rm -f target/nextest/ci/junit.xml
-          ./scripts/ci/resource_sampler.sh start nextest
+          ./scripts/ci/resource_sampler.sh start workspace-archive
           trap './scripts/ci/resource_sampler.sh stop' EXIT
-          set +e
-          NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 75m \
-            cargo nextest run --profile ci --all --exclude e2e_test \
-            --status-level all --final-status-level all \
-            2>&1 | tee artifacts/test-and-lint/nextest.log
-          status=${PIPESTATUS[0]}
-          if [[ "${status}" -eq 0 ]]; then
-            cargo nextest list --profile ci --all --exclude e2e_test --message-format json \
-              > artifacts/test-and-lint/core-test-listing.json \
-              && python3 scripts/check_test_wiring.py --check-core artifacts/test-and-lint/core-test-listing.json \
-              && test -s target/nextest/ci/junit.xml || status=$?
-          fi
-          {
-            echo "command=cargo nextest run --profile ci --all --exclude e2e_test"
-            echo "exit_status=${status}"
-            echo "finished_at=$(date --utc --iso-8601=seconds)"
-            echo
-            echo "Remaining test-related processes:"
-            pgrep -af 'cargo|nextest|target/.*/deps/' || true
-            echo
-            echo "Kernel OOM / kill events:"
-            dmesg -T 2>/dev/null | grep -iE 'oom|out of memory|killed process' | tail -20 || true
-          } > artifacts/test-and-lint/nextest-diagnostics.txt
-          exit "${status}"
+          python3 scripts/ci_test_artifact.py build --configuration workspace --archive "$RUNNER_TEMP/workspace-tests.tar.zst"
+
+      - name: Upload workspace test binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-test-binaries
+          overwrite: true
+          path: ${{ runner.temp }}/workspace-tests.tar.zst*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Run documentation tests
         run: |
           mkdir -p artifacts/test-and-lint
           set +e
           timeout --verbose --signal=TERM --kill-after=30s 15m \
-            cargo test --all --doc \
+            python3 scripts/ci_test_artifact.py cargo doc --configuration workspace \
             2>&1 | tee artifacts/test-and-lint/doctest.log
           status=${PIPESTATUS[0]}
           {
-            echo "command=cargo test --all --doc"
+            echo "command=cargo test --all --exclude e2e_test --doc"
             echo "exit_status=${status}"
             echo "finished_at=$(date --utc --iso-8601=seconds)"
             echo
@@ -261,11 +251,10 @@ jobs:
 
       - name: Upload test reports and diagnostics
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: junit-test-and-lint-${{ github.run_number }}
+          name: junit-test-and-lint-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
-            target/nextest/ci/junit.xml
             artifacts/test-and-lint
           retention-days: 3
           if-no-files-found: error
@@ -277,109 +266,79 @@ jobs:
       - name: Check log-analyzer rule anchors
         run: ./scripts/check_log_analyzer_rules.sh
 
-      # Explicit gate for migration-critical suites. These tests already ran in
-      # the full nextest pass above; a single filtered nextest invocation keeps
-      # the named gate without rebuilding or re-running them one package at a time.
-      #
-      # The gate selects tests by name substring (data_movement / rebalance /
-      # decommission / source_cleanup / delete_marker), so renames can silently
-      # thin it. The script owns the filter expression and first verifies the
-      # selected-test count against the committed floor in
-      # .config/migration-gate-floor.txt before running the gate; renames or
-      # removals must update that file consciously (see the script header).
-      # Kept on the default profile (no --profile ci): a second --profile ci run
-      # would clobber target/nextest/ci/junit.xml, and none of these tests are
-      # quarantined so they gain nothing from the ci profile's retry overrides.
-      - name: Run rebalance/decommission migration proofs
-        run: ./scripts/check_migration_gate_count.sh
-
-  # The root boundary requires fresh CLI and integration-test builds. Give it
-  # its own time budget instead of sharing the workspace lint/test budget.
-  offline-enrollment-root-boundary:
-    name: Offline Enrollment Root Boundary
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
-    needs: [ quick-checks, classify-changes ]
+  workspace-tests:
+    name: Workspace tests
+    needs: [ test-and-lint, classify-changes ]
+    # The archive retains compile-time fixture paths and the large test set
+    # requires the same runner image until the hosted-runtime pilot passes.
     runs-on: sm-standard-4
     timeout-minutes: 90
+    outputs:
+      workspace_shards: ${{ steps.shards.outputs.workspace_shards || '[]' }}
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CI_PACKAGES: ${{ needs.classify-changes.outputs.packages }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: ci-dev
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-
+      - uses: ./.github/actions/test-runtime
       - name: Protect Connect test home
         run: chmod go-w "$(realpath "$HOME")"
-
-      - name: Check offline enrollment E2E root boundary
-        run: ./scripts/check_offline_enrollment_e2e.sh
-
-  # Dedicated serial lane for the ILM / lifecycle integration tests. These tests
-  # drive the object layer through process-global singletons (the GLOBAL_ENV
-  # ECStore, the global tier-config manager, background-expiry workers) and bind
-  # fixed ports (9002 for the scanner suite, 9003 for the app suite), so they are
-  # marked #[ignore] to keep them out of the default parallel `cargo nextest run
-  # --all` pass. Run them here explicitly with `--run-ignored ignored-only` and
-  # `-j1` so no two of them share global state or race for a port at once.
-  # serial_test's #[serial] does NOT serialize across nextest's process-per-test
-  # boundary (see .config/nextest.toml); `-j1` is what actually serializes them.
-  # See rustfs/backlog#1148 (ilm-1) and #1155.
-  test-ilm-integration-serial:
-    name: ILM Integration (serial)
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
-    needs: [ quick-checks, classify-changes ]
-    runs-on: sm-standard-4
-    timeout-minutes: 90
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          persist-credentials: false
+          name: workspace-test-binaries
+          path: ${{ runner.temp }}
+      - name: Verify workspace archive identity
+        run: python3 scripts/ci_test_artifact.py verify --configuration workspace --archive "$RUNNER_TEMP/workspace-tests.tar.zst"
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: ci-dev
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
+      - name: Extract and list workspace tests
+        run: |
+          mkdir -p artifacts/test-and-lint
+          cargo nextest list --profile ci --archive-file "$RUNNER_TEMP/workspace-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --message-format json \
+            > artifacts/test-and-lint/core-test-listing.json
+          python3 scripts/check_test_wiring.py --check-core artifacts/test-and-lint/core-test-listing.json
 
-      # test_transition_and_restore_flows was re-enabled by rustfs/backlog#1303:
-      # its "missing xl.meta on disk2" was a test-util bug (open_disk hardcoded
-      # disk_index 0), not an EC metadata-distribution issue.
-      # restore_object_usecase_reports_ongoing_conflict_and_completion was
-      # re-enabled by backlog#1304 (restore accepts serialize on a short CAS
-      # guard; the copy-back no longer holds the #4877 whole-copy-back lock,
-      # so the mid-restore ongoing read and fast 409 rejection it asserts are
-      # the implemented contract). The remaining exclusions each hit a
-      # DIFFERENT, independent issue (all tracked under rustfs/backlog#1148;
-      # they keep #[ignore] with a backlog reference):
-      #   - test_noncurrent_{expiry,transition}_still_works_after_immediate_compensation_transition:
-      #     noncurrent transition/expiry after an immediate compensation transition.
+      - name: Run nextest tests
+        run: |
+          mkdir -p artifacts/test-and-lint
+          rm -f target/nextest/ci/junit.xml
+          ./scripts/ci/resource_sampler.sh start nextest
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
+          set +e
+          NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 75m \
+            cargo nextest run --profile ci --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            --status-level all --final-status-level all \
+            2>&1 | tee artifacts/test-and-lint/nextest.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "command=workspace archive execution"
+            echo "exit_status=${status}"
+            echo "finished_at=$(date --utc --iso-8601=seconds)"
+            echo
+            echo "Remaining test-related processes:"
+            pgrep -af 'cargo|nextest|target/.*/deps/' || true
+            echo
+            echo "Kernel OOM / kill events:"
+            dmesg -T 2>/dev/null | grep -iE 'oom|out of memory|killed process' | tail -20 || true
+          } > artifacts/test-and-lint/nextest-diagnostics.txt
+          exit "${status}"
+
+      - name: Verify workspace execution completeness
+        run: |
+          python3 scripts/ci_test_artifact.py evidence artifacts/test-and-lint/core-test-listing.json target/nextest/ci/junit.xml
+          ./scripts/check_migration_gate_count.sh evidence artifacts/test-and-lint/core-test-listing.json target/nextest/ci/junit.xml
+
       - name: Run ignored ILM integration tests serially
-        env:
-          # Match the measured Test and Lint link budget. The default exposed
-          # all 14 pod CPUs and a cold cache spent the full 80m compiling
-          # without starting one ILM test (main run 32982910990).
-          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
+        if: needs.classify-changes.outputs.mode == 'full'
         run: |
           mkdir -p artifacts/ilm-integration
           set +e
           NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 80m \
-            cargo nextest run -j1 --run-ignored ignored-only \
-            -p rustfs-scanner -p rustfs \
-            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition))' \
+            cargo nextest run --profile default -j1 --run-ignored ignored-only \
+            --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))' \
             --status-level all --final-status-level all \
             2>&1 | tee artifacts/ilm-integration/nextest.log
           status=${PIPESTATUS[0]}
@@ -392,18 +351,105 @@ jobs:
           } > artifacts/ilm-integration/diagnostics.txt
           exit "${status}"
 
-      - name: Upload ILM test diagnostics
+      - name: Upload workspace test evidence
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ilm-integration-${{ github.run_number }}-${{ github.run_attempt }}
+          name: workspace-test-evidence-${{ github.run_attempt }}
           path: |
-            artifacts/ilm-integration
             target/nextest/ci/junit.xml
+            artifacts/test-and-lint
+            artifacts/ilm-integration
+          retention-days: 3
+          if-no-files-found: error
 
-  test-and-lint-rio-v2:
-    name: Test and Lint (rio-v2)
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+      - name: Prepare bounded shards from this candidate's observed durations
+        id: shards
+        if: needs.classify-changes.outputs.rehearse_shards == 'true'
+        run: |
+          python3 scripts/ci_test_shards.py prepare \
+            --listing artifacts/test-and-lint/core-test-listing.json \
+            --junit target/nextest/ci/junit.xml --output artifacts/workspace-shard-plan
+      - name: Upload same-run shard plan
+        if: needs.classify-changes.outputs.rehearse_shards == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-shard-plan-${{ github.run_attempt }}
+          path: artifacts/workspace-shard-plan
+          retention-days: 3
+          if-no-files-found: error
+
+  workspace-shards:
+    name: Workspace shards (${{ matrix.shard }})
+    if: needs.classify-changes.outputs.rehearse_shards == 'true'
+    needs: [classify-changes, workspace-tests]
+    # Reuse the producer image and checkout path for the full RustFS archive.
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: ${{ fromJSON(needs.workspace-tests.outputs.workspace_shards || '[]') }}
+    env:
+      CI_PACKAGES: ${{ needs.classify-changes.outputs.packages }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/test-runtime
+      - name: Protect Connect test home
+        run: chmod go-w "$(realpath "$HOME")"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: workspace-test-binaries-${{ github.run_attempt }}
+          path: ${{ runner.temp }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: workspace-shard-plan-${{ github.run_attempt }}
+          path: artifacts/workspace-shard-plan
+      - name: Verify and execute this shard without compilation
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: |
+          python3 scripts/ci_test_artifact.py verify --configuration workspace --archive "$RUNNER_TEMP/workspace-tests.tar.zst"
+          python3 scripts/ci_test_shards.py execute --plan artifacts/workspace-shard-plan \
+            --archive "$RUNNER_TEMP/workspace-tests.tar.zst" --index "$SHARD_INDEX" --output artifacts/workspace-shard-result
+      - name: Retain shard evidence including failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-shard-result-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: artifacts/workspace-shard-result
+          retention-days: 3
+          if-no-files-found: error
+
+  workspace-shard-evidence:
+    name: Workspace shard completeness
+    if: always() && needs.classify-changes.outputs.rehearse_shards == 'true'
+    needs: [classify-changes, workspace-tests, workspace-shards]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: workspace-shard-plan-${{ github.run_attempt }}
+          path: artifacts/workspace-shard-plan
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: workspace-shard-result-*-${{ github.run_attempt }}
+          path: artifacts/workspace-shards
+      - name: Require the exact union of successful shard executions
+        run: |
+          python3 scripts/ci_test_shards.py verify --plan artifacts/workspace-shard-plan --evidence artifacts/workspace-shards
+          ./scripts/check_migration_gate_count.sh evidence artifacts/workspace-shard-plan/listing.json artifacts/workspace-shards/combined.xml
+
+  connect-feature-boundaries:
+    name: Connect Feature Boundaries
+    if: needs.classify-changes.outputs.mode == 'full' && needs.classify-changes.outputs.connect != 'false' && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -411,7 +457,61 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+
+      - name: Protect Connect test home
+        run: chmod go-w "$(realpath "$HOME")"
+
+      - name: Run short credential behavior tests
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cargo test --locked -p rustfs --test connect_registration \
+            --features connect-e2e-short-credentials -- --exact --test-threads=1 \
+            registration_enforces_build_profile_credential_lifetime \
+            rotation_waits_for_threshold_and_stops_on_revocation
+
+      # The guard in rustfs/src/connect/registration.rs is cfg(not(debug_assertions)),
+      # and it must be tripped by a profile that turns debug assertions off for
+      # the whole graph. Handing `-C debug-assertions=off` to the rustfs lib alone
+      # through `cargo rustc` leaves its dependencies on the dev-profile cfg, so
+      # the lib also fails on items gated on one side only (E0599 on
+      # Filenames::Embedded) and "fails solely at the compile_error" can never
+      # hold. `cargo check --release` is metadata-only and needs no
+      # link-concurrency limit; it is cold because ci-dev holds no release
+      # artifacts.
+      - name: Reject short credentials in release builds
+        run: python3 scripts/check_connect_release_boundary.py
+
+      - name: Check offline enrollment E2E root boundary
+        run: ./scripts/check_offline_enrollment_e2e.sh
+
+  test-and-lint-rio-v2:
+    name: Test and Lint (rio-v2)
+    # Alternate feature configurations run on the nightly schedule, merge
+    # groups and manual dispatch. The default workspace remains the PR gate and
+    # the per-push main baseline: repeating four feature builds on every merge
+    # bought nothing the nightly run does not report within a day.
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["merge_group", "schedule", "workflow_dispatch"]'), github.event_name)
+    needs: [ quick-checks, classify-changes ]
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -430,6 +530,7 @@ jobs:
         run: cargo clippy -p rustfs -p rustfs-ecstore --all-targets --features rio-v2 -- -D warnings
 
       - name: Run rio-v2 feature tests
+        shell: bash
         env:
           # Match the main nextest lane's #5394 link-I/O guard. A cold feature
           # cache otherwise fans out enough rust-lld processes to exhaust this
@@ -439,92 +540,49 @@ jobs:
           # --profile ci so the quarantine list (and its junit flaky markers)
           # covers this leg too; the default profile is the local no-retry
           # profile and silently ignored quarantined flakes here (rustfs#6703).
-          cargo nextest run --profile ci -p rustfs -p rustfs-ecstore --features rio-v2
+          mkdir -p artifacts/test-and-lint
+          rm -f target/nextest/ci/junit.xml
+          ./scripts/ci/resource_sampler.sh start nextest-rio-v2
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
+          cargo nextest run --profile ci -p rustfs -p rustfs-ecstore --features rio-v2 \
+            2>&1 | tee artifacts/test-and-lint/nextest.log
           cargo test -p rustfs --doc --features rio-v2
 
-  connect-short-credential-boundary:
-    name: Connect Short Credential Boundary
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
-    needs: [ quick-checks, classify-changes ]
-    runs-on: sm-standard-4
-    timeout-minutes: 60
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Upload rio-v2 test reports and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: ci-dev
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Run short credential behavior tests
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          cargo test -p rustfs --test connect_registration \
-            --features connect-e2e-short-credentials \
-            registration_enforces_build_profile_credential_lifetime -- --exact
-          cargo test -p rustfs --test connect_registration \
-            --features connect-e2e-short-credentials \
-            rotation_waits_for_threshold_and_stops_on_revocation -- --exact
-
-      - name: Reject short credentials in release builds
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          log="$(mktemp)"
-          set +e
-          CARGO_TERM_COLOR=never cargo check -p rustfs --release \
-            --features connect-e2e-short-credentials >"$log" 2>&1
-          status=$?
-          set -e
-          cat "$log"
-          expected='error: connect-e2e-short-credentials is restricted to debug builds'
-          summary="error: could not compile \`rustfs\` (lib) due to 1 previous error"
-          expected_count="$(grep -Fxc "$expected" "$log" || true)"
-          summary_count="$(grep -Fc "$summary" "$log" || true)"
-          error_count="$(grep -Ec '^error(:|\[)' "$log" || true)"
-          if [ "$status" -ne 101 ] || [ "$expected_count" -ne 1 ] \
-            || [ "$summary_count" -ne 1 ] || [ "$error_count" -ne 2 ]; then
-            echo "release feature gate did not fail solely at the expected compile_error" >&2
-            rm -f "$log"
-            exit 1
-          fi
-          rm -f "$log"
+          name: junit-test-and-lint-rio-v2-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            target/nextest/ci/junit.xml
+            artifacts/test-and-lint
+          retention-days: 3
+          if-no-files-found: error
 
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    # Same cadence as test-and-lint-rio-v2 above.
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["merge_group", "schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
     strategy:
-      # On a PR, one failing protocol leg is enough to know the PR is not ready,
-      # so stop the sibling leg instead of paying another ~40 minutes for it.
-      # Everywhere else (main pushes, the merge queue, the weekly schedule) keep
-      # the full signal: there we want to know whether swift AND sftp are broken,
-      # not just whichever failed first. This is the only part of the early-stop
-      # work that also covers fork PRs, since it needs no token.
-      fail-fast: ${{ github.event_name == 'pull_request' }}
+      # Preserve independent results when one protocol fails, so diagnosis
+      # and a focused fix do not require rebuilding an interrupted sibling.
+      fail-fast: false
       matrix:
         features:
           - name: swift
             flags: "--features swift"
           - name: sftp
             flags: "--features sftp"
+          - name: http3
+            flags: "--features http3,swift"
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -536,35 +594,58 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
-      - name: Protect Connect test home
-        run: chmod go-w "$(realpath "$HOME")"
+      - name: Prepare protocol test state
+        run: |
+          rm -f target/nextest/ci/junit.xml
+          chmod go-w "$(realpath "$HOME")"
 
       - name: Run clippy with ${{ matrix.features.name }}
         run: |
+          ./scripts/ci/resource_sampler.sh start clippy
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
           cargo clippy -p rustfs -p rustfs-protocols --all-targets ${{ matrix.features.flags }} -- -D warnings
 
       - name: Run tests with ${{ matrix.features.name }}
+        id: protocol-tests
+        shell: bash
         env:
           # Keep feature-test linking under the same bounded concurrency as the
           # main nextest lane; Clippy is metadata-only and needs no such limit.
           CARGO_BUILD_JOBS: "2"
+          SAMPLER_INTERVAL_SECS: "15"
         run: |
           # --profile ci so the quarantine list (and its junit flaky markers)
           # covers this leg too; the default profile is the local no-retry
           # profile and silently ignored quarantined flakes here (rustfs#6703).
-          cargo nextest run --profile ci -p rustfs -p rustfs-protocols ${{ matrix.features.flags }}
+          mkdir -p artifacts/protocol-tests
+          ./scripts/ci/resource_sampler.sh start nextest
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
+          cargo nextest run --profile ci -p rustfs -p rustfs-protocols ${{ matrix.features.flags }} \
+            2>&1 | tee artifacts/protocol-tests/nextest.log
+
+      - name: Upload protocol test reports and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: junit-test-and-lint-${{ matrix.features.name }}-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            target/nextest/ci/junit.xml
+            artifacts/protocol-tests
+            artifacts/test-and-lint
+          retention-days: 3
+          if-no-files-found: warn
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -624,9 +705,10 @@ jobs:
           PYBUILD
 
       - name: Upload debug binary
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustfs-debug-binary
+          overwrite: true
           path: |
             target/debug/rustfs
             target/debug/rustfs.e2e.json
@@ -634,10 +716,28 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Archive E2E test binaries
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: python3 scripts/ci_test_artifact.py build --configuration e2e --archive "$RUNNER_TEMP/e2e-tests.tar.zst"
+
+      - name: Run E2E documentation tests
+        run: cargo test --locked -p e2e_test --doc
+
+      - name: Upload E2E test binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-test-binaries
+          overwrite: true
+          path: ${{ runner.temp }}/e2e-tests.tar.zst*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
   build-rustfs-debug-binary-rio-v2:
     name: Build RustFS Debug Binary (rio-v2)
     # Dormant rio-v2 variant (rustfs/backlog#1835): the feature ships in no
-    # default build, so this full-suite lane runs only on the weekly schedule
+    # default build, so this full-suite lane runs only on the nightly schedule
     # and manual dispatch. Per-PR cfg-seam coverage stays with
     # test-and-lint-rio-v2. Lifecycle and the promote-or-delete condition:
     # docs/architecture/minio-file-format-compat.md ("rio-v2 variant lifecycle").
@@ -649,7 +749,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -665,9 +765,10 @@ jobs:
         run: python3 scripts/e2e_binary.py build --bins --features rio-v2,e2e-test-hooks
 
       - name: Upload debug binary
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustfs-debug-binary-rio-v2
+          overwrite: true
           path: |
             target/debug/rustfs
             target/debug/rustfs.e2e.json
@@ -693,7 +794,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -750,30 +851,72 @@ jobs:
         # scripts/check_uring_lane_lib_only.sh guards the --lib precondition.
         run: cargo test -p rustfs-ecstore --lib uring_ -- --test-threads=1 --nocapture
 
+  core-contract:
+    name: Core contract
+    needs: [ build-rustfs-debug-binary ]
+    # Compile-time fixture paths must match the producer until the pilot passes.
+    runs-on: sm-standard-4
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/test-runtime
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rustfs-debug-binary
+          path: target/debug
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-test-binaries
+          path: ${{ runner.temp }}
+      - name: Run core storage and authorization contract
+        env:
+          RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/core-contract-logs
+        run: |
+          chmod +x target/debug/rustfs
+          python3 scripts/ci_test_artifact.py verify --configuration e2e --archive "$RUNNER_TEMP/e2e-tests.tar.zst"
+          cargo nextest list --profile core-contract --archive-file "$RUNNER_TEMP/e2e-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --message-format json > "$RUNNER_TEMP/core-contract-list.json"
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile core-contract --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" --no-tests fail
+          python3 scripts/ci_test_artifact.py evidence --core "$RUNNER_TEMP/core-contract-list.json" target/nextest/core-contract/junit.xml
+      - name: Upload core contract evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: core-contract-${{ github.run_attempt }}
+          path: |
+            target/nextest/core-contract/junit.xml
+            ${{ runner.temp }}/core-contract-list.json
+            ${{ runner.temp }}/core-contract-logs
+          if-no-files-found: error
+          retention-days: 3
+
   e2e-tests:
     name: End-to-End Tests
     needs: [ build-rustfs-debug-binary ]
-    runs-on: sm-standard-2
+    # Retain the producer image and fixture paths until the runtime pilot passes.
+    runs-on: sm-standard-4
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
-      # Full setup with dependency caching: the smoke-suite step below
-      # compiles the e2e_test crate, which pulls in most of the workspace.
-      # Without a restored cache this was a cold multi-GB build on every run.
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
+      - name: Install verification runtime
+        uses: ./.github/actions/test-runtime
+
+      - name: Download E2E test binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          rust-version: stable
-          cache-shared-key: ci-dev
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
+          name: e2e-test-binaries
+          path: ${{ runner.temp }}
+
+      - name: Verify E2E archive identity
+        run: python3 scripts/ci_test_artifact.py verify --configuration e2e --archive "$RUNNER_TEMP/e2e-tests.tar.zst"
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -788,7 +931,7 @@ jobs:
       # Download after the cache restore so the freshly built binary from the
       # build job always wins over anything restored into target/debug.
       - name: Download debug binary
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: rustfs-debug-binary
           path: target/debug
@@ -799,13 +942,12 @@ jobs:
       # Build the e2e test graph once. The archive is reused by the smoke
       # selection guard, security exact-count check, and run below, avoiding a
       # second compile of the same e2e_test target on cold runners (backlog#1645).
-      - name: Archive e2e smoke test binaries
+      - name: Verify e2e smoke test membership
         env:
-          NEXTEST_ARCHIVE: ${{ runner.temp }}/rustfs-e2e-smoke.tar.zst
+          NEXTEST_ARCHIVE: ${{ runner.temp }}/e2e-tests.tar.zst
           NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-smoke-list.json
         run: |
-          cargo nextest archive --profile e2e-smoke -p e2e_test --archive-file "${NEXTEST_ARCHIVE}"
-          cargo nextest list --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" --message-format json > "${NEXTEST_LISTING}"
+          cargo nextest list --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --message-format json > "${NEXTEST_LISTING}"
           python3 ./scripts/check_test_wiring.py --check-profile e2e-smoke "${NEXTEST_LISTING}"
           ./scripts/check_security_smoke_count.sh check "${NEXTEST_LISTING}"
 
@@ -816,29 +958,39 @@ jobs:
       # random port and reuses the downloaded debug binary above.
       - name: Run e2e smoke suite
         env:
-          NEXTEST_ARCHIVE: ${{ runner.temp }}/rustfs-e2e-smoke.tar.zst
+          NEXTEST_ARCHIVE: ${{ runner.temp }}/e2e-tests.tar.zst
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-smoke-logs
+          SAMPLER_INTERVAL_SECS: "15"
         run: |
-          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke --archive-file "${NEXTEST_ARCHIVE}" \
+          ./scripts/ci/resource_sampler.sh start e2e-smoke
+          trap './scripts/ci/resource_sampler.sh stop' EXIT
+          python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --status-level all --final-status-level all --failure-output final
 
+      - name: Verify e2e smoke execution completeness
+        run: python3 scripts/ci_test_artifact.py evidence "$RUNNER_TEMP/rustfs-e2e-smoke-list.json" target/nextest/e2e-smoke/junit.xml
+
       - name: Upload e2e smoke diagnostics
-        if: failure()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-smoke-diagnostics-${{ github.run_number }}
+          name: e2e-smoke-diagnostics-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/rustfs-e2e-smoke-logs/
             ${{ runner.temp }}/rustfs-e2e-smoke-list.json
+            artifacts/test-and-lint
           if-no-files-found: warn
 
       - name: Upload e2e smoke JUnit report
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-smoke-junit-${{ github.run_number }}
+          name: e2e-smoke-junit-${{ github.run_number }}-${{ github.run_attempt }}
           path: target/nextest/e2e-smoke/junit.xml
           if-no-files-found: warn
+
+      - name: Install tool build dependencies
+        run: sudo apt-get install -y build-essential cmake pkg-config
 
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
@@ -859,9 +1011,9 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-test-logs-${{ github.run_number }}
+          name: e2e-test-logs-${{ github.run_number }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/rustfs-e2e-*/rustfs.log
           retention-days: 3
 
@@ -870,30 +1022,34 @@ jobs:
     # Merge gate only (backlog#1149 ci-5): the never-automated user-visible
     # suites — KMS, object_lock, multipart_auth, quota, checksum, encryption,
     # security-boundary, ... — via the e2e-full nextest profile. Too heavy for
-    # every PR, so it is gated to main/release pushes, the merge queue, and manual
+    # every PR, so it is gated to main pushes, the merge queue, and manual
     # dispatch. protocols / the 7 cluster suites / replication / #[ignore] are
     # owned by other lanes (see .config/nextest.toml profile.e2e-full).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'merge_group' ||
-      (github.event_name == 'push' &&
-        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release'))
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: [ build-rustfs-debug-binary ]
-    runs-on: sm-standard-2
+    # Retain the producer image and fixture paths until the runtime pilot passes.
+    runs-on: sm-standard-4
     timeout-minutes: 55
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
+      - name: Install verification runtime
+        uses: ./.github/actions/test-runtime
+
+      - name: Download E2E test binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          rust-version: stable
-          cache-shared-key: ci-dev
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
+          name: e2e-test-binaries
+          path: ${{ runner.temp }}
+
+      - name: Verify E2E archive identity
+        run: python3 scripts/ci_test_artifact.py verify --configuration e2e --archive "$RUNNER_TEMP/e2e-tests.tar.zst"
 
       - name: Install network fault-injection tools
         run: |
@@ -907,7 +1063,7 @@ jobs:
           fi
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -949,7 +1105,7 @@ jobs:
       # Download after the cache restore so the freshly built binary from the
       # build job always wins over anything restored into target/debug.
       - name: Download debug binary
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: rustfs-debug-binary
           path: target/debug
@@ -992,7 +1148,7 @@ jobs:
         env:
           NEXTEST_LISTING: ${{ runner.temp }}/rustfs-e2e-full-list.json
         run: |
-          cargo nextest list --profile e2e-full -p e2e_test --message-format json > "${NEXTEST_LISTING}"
+          cargo nextest list --profile e2e-full --archive-file "$RUNNER_TEMP/e2e-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --message-format json > "${NEXTEST_LISTING}"
           python3 ./scripts/check_test_wiring.py --check-profile e2e-full "${NEXTEST_LISTING}"
 
       # Full single-node e2e lane (backlog#1149 ci-5). The e2e-full
@@ -1005,13 +1161,17 @@ jobs:
           RUSTFS_E2E_STARTUP_CAS_BINARY: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs
           RUSTFS_E2E_STARTUP_CAS_BUILD_MANIFEST: ${{ runner.temp }}/rustfs-startup-cas-input/rustfs.e2e-startup-cas-build.json
           RUSTFS_E2E_STARTUP_CAS_ARTIFACT_DIR: ${{ runner.temp }}/rustfs-startup-cas-evidence
-        run: python3 scripts/e2e_binary.py run --binary "$RUSTFS_E2E_STARTUP_CAS_BINARY" --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test
+          RUSTFS_HEAL_CHAOS_LOG_ROOT: ${{ runner.temp }}/rustfs-heal-chaos-logs
+        run: python3 scripts/e2e_binary.py run --binary "$RUSTFS_E2E_STARTUP_CAS_BINARY" --features e2e-test-hooks -- cargo nextest run --profile e2e-full --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target"
+
+      - name: Verify e2e full execution completeness
+        run: python3 scripts/ci_test_artifact.py evidence "$RUNNER_TEMP/rustfs-e2e-full-list.json" target/nextest/e2e-full/junit.xml
 
       - name: Upload junit
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-full-junit-${{ github.run_number }}
+          name: e2e-full-junit-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             target/nextest/e2e-full/junit.xml
             ${{ runner.temp }}/rustfs-e2e-full-list.json
@@ -1019,12 +1179,21 @@ jobs:
 
       - name: Upload startup CAS evidence
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fresh-startup-cas-evidence-${{ github.run_number }}
+          name: fresh-startup-cas-evidence-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/rustfs-startup-cas-evidence
             ${{ runner.temp }}/rustfs-startup-cas-input/rustfs.e2e-startup-cas-build.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload heal cluster logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-full-heal-logs-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rustfs-heal-chaos-logs
           if-no-files-found: warn
           retention-days: 7
 
@@ -1038,7 +1207,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -1048,7 +1217,7 @@ jobs:
           rm -f /tmp/rustfs.log
 
       - name: Download debug binary
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: rustfs-debug-binary-rio-v2
           path: target/debug
@@ -1081,25 +1250,25 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-test-logs-rio-v2-${{ github.run_number }}
+          name: e2e-test-logs-rio-v2-${{ github.run_number }}-${{ github.run_attempt }}
           path: /tmp/rustfs.log
           retention-days: 3
 
   s3-implemented-tests:
     name: S3 Implemented Tests
-    needs: [ build-rustfs-debug-binary, e2e-tests ]
-    runs-on: sm-standard-4
+    needs: [ build-rustfs-debug-binary ]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
       - name: Download debug binary
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: rustfs-debug-binary
           path: target/debug
@@ -1124,9 +1293,9 @@ jobs:
 
       - name: Upload s3 test artifacts
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: s3tests-implemented-${{ github.run_number }}
+          name: s3tests-implemented-${{ github.run_number }}-${{ github.run_attempt }}
           path: artifacts/s3tests-single/**
           if-no-files-found: ignore
           retention-days: 3
@@ -1159,21 +1328,21 @@ jobs:
     name: S3 Lifecycle Behavior Tests
     # Also gated on e2e-tests, matching s3-implemented-tests: when the e2e smoke
     # suite is already red this lane cannot tell us anything new, and it holds a
-    # sm-standard-4 for up to 30 minutes doing so. Both lanes only download the
+    # runner for up to 30 minutes doing so. Both lanes only download the
     # prebuilt debug binary (no cargo build), and s3-implemented-tests — which
     # already waits on e2e-tests — finishes later anyway, so a green PR's total
     # wall clock is unchanged.
-    needs: [ build-rustfs-debug-binary, e2e-tests ]
-    runs-on: sm-standard-4
+    needs: [ build-rustfs-debug-binary ]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
       - name: Download debug binary
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: rustfs-debug-binary
           path: target/debug
@@ -1206,9 +1375,9 @@ jobs:
 
       - name: Upload s3 test artifacts
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: s3tests-lifecycle-behavior-${{ github.run_number }}
+          name: s3tests-lifecycle-behavior-${{ github.run_number }}-${{ github.run_attempt }}
           path: artifacts/s3tests-single/**
           if-no-files-found: ignore
           retention-days: 3
@@ -1221,10 +1390,12 @@ jobs:
       - typos
       - quick-checks
       - test-and-lint
-      - offline-enrollment-root-boundary
-      - test-ilm-integration-serial
+      - workspace-tests
+      - workspace-shards
+      - workspace-shard-evidence
+      - core-contract
+      - connect-feature-boundaries
       - test-and-lint-rio-v2
-      - connect-short-credential-boundary
       - test-and-lint-protocols
       - build-rustfs-debug-binary
       - uring-integration
@@ -1237,7 +1408,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Require the expected result of every CI lane
@@ -1250,13 +1421,13 @@ jobs:
     name: Alert on scheduled failure
     needs:
       - classify-changes
-      - connect-short-credential-boundary
+      - connect-feature-boundaries
       - required-checks
       - typos
       - quick-checks
       - test-and-lint
-      - offline-enrollment-root-boundary
-      - test-ilm-integration-serial
+      - workspace-tests
+      - core-contract
       - test-and-lint-rio-v2
       - test-and-lint-protocols
       - build-rustfs-debug-binary
@@ -1276,7 +1447,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Open or update failure-tracking issue

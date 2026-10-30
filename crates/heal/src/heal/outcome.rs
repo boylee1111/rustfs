@@ -15,96 +15,38 @@
 //! Execution results are separate from repair responsibility. A legacy
 //! successful storage call supplies no authoritative repair receipt.
 
+use rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL;
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, time::SystemTime};
+use std::collections::VecDeque;
 use uuid::Uuid;
 
 const MAX_OUTCOME_ITEMS: usize = 128;
 const MAX_OUTCOME_BYTES: usize = 64 * 1024;
 const MAX_OUTCOME_DETAIL_BYTES: usize = 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HealObjectKind {
-    Object,
-    Metadata,
-    Decode,
+pub use rustfs_heal_contracts::outcome::{
+    HealAbortReason, HealDeferredReason, HealExecutionOutcome, HealFailureClass, HealObjectDisposition, HealObjectIdentity,
+    HealObjectKind, HealObjectReceipt,
+};
+
+/// Repair responsibility policy stays private to the heal executor.
+pub(crate) trait HealObjectReceiptExt {
+    fn verified_for(&self, expected: &HealObjectIdentity) -> bool;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HealObjectIdentity {
-    pub kind: HealObjectKind,
-    pub bucket: String,
-    pub object: String,
-    /// The requested version; None remains unresolved, never an absence proof.
-    pub version_id: Option<String>,
-    pub bucket_incarnation_id: Option<Uuid>,
-    pub pool_index: Option<usize>,
-    pub set_index: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HealDeferredReason {
-    DanglingDeleteGrace,
-    TransientUsageCache,
-    TransientExistenceCheck,
-    Deadline,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HealFailureClass {
-    Recoverable,
-    RetryExhausted,
-    Permanent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(
-    tag = "state",
-    content = "details",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase"
-)]
-pub enum HealObjectDisposition {
-    /// The legacy storage response does not prove the requested check or commit.
-    Unknown,
-    Repaired,
-    VerifiedHealthy,
-    AuthoritativelyAbsent,
-    Deferred {
-        reason: HealDeferredReason,
-        retry_not_before: Option<SystemTime>,
-    },
-    Failed(HealFailureClass),
-    Cancelled,
-    DryRunObserved,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HealObjectOutcome {
-    pub identity: HealObjectIdentity,
-    pub disposition: HealObjectDisposition,
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HealObjectReceipt {
-    pub identity: HealObjectIdentity,
-    pub disposition: HealObjectDisposition,
-}
-
-impl HealObjectReceipt {
-    pub(crate) fn verified_for(&self, expected: &HealObjectIdentity) -> bool {
-        matches!(
-            self.disposition,
+impl HealObjectReceiptExt for HealObjectReceipt {
+    fn verified_for(&self, expected: &HealObjectIdentity) -> bool {
+        let disposition_verifies = match self.disposition {
             HealObjectDisposition::Repaired
-                | HealObjectDisposition::VerifiedHealthy
-                | HealObjectDisposition::AuthoritativelyAbsent
-        ) && self.identity.kind == expected.kind
+            | HealObjectDisposition::VerifiedHealthy
+            | HealObjectDisposition::AuthoritativelyAbsent => true,
+            // A metadata/presence proof never certifies payload bytes, so it
+            // cannot discharge a request that exists to decode the payload.
+            HealObjectDisposition::MetadataHealthy => expected.kind != HealObjectKind::Decode,
+            _ => false,
+        };
+        disposition_verifies
+            && self.identity.kind == expected.kind
             && self.identity.bucket == expected.bucket
             && self.identity.object == expected.object
             && self.identity.version_id == expected.version_id
@@ -113,6 +55,20 @@ impl HealObjectReceipt {
             && self.identity.bucket_incarnation_id == expected.bucket_incarnation_id
             && expected.bucket_incarnation_id.is_some()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HealObjectOutcome {
+    pub identity: HealObjectIdentity,
+    pub disposition: HealObjectDisposition,
+    pub detail: Option<String>,
+    /// Local quorum metadata selection; absent from wire snapshots.
+    #[serde(skip)]
+    pub quorum_selected_data_dir: Option<Uuid>,
+    /// Local Deep check-path observation; absent from wire snapshots.
+    #[serde(skip)]
+    pub deep_check_observed: bool,
 }
 
 impl HealObjectOutcome {
@@ -125,32 +81,13 @@ impl HealObjectOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealTraversalCoverage {
     #[default]
     Unknown,
     Partial,
     Complete,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HealAbortReason {
-    Cancelled,
-    Deadline,
-    Untraversable,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", content = "reason", rename_all = "snake_case")]
-pub enum HealExecutionOutcome {
-    #[default]
-    Pending,
-    Running,
-    Completed,
-    CompletedWithErrors,
-    Aborted(HealAbortReason),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +119,61 @@ pub struct HealTaskOutcome {
     untraversable: bool,
 }
 
+impl<'de> Deserialize<'de> for HealTaskOutcome {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Snapshot {
+            execution: HealExecutionOutcome,
+            coverage: HealTraversalCoverage,
+            counters: HealOutcomeCounters,
+            objects: VecDeque<HealObjectOutcome>,
+            objects_truncated: bool,
+        }
+
+        let mut snapshot = Snapshot::deserialize(deserializer)?;
+        if snapshot.objects.len() > MAX_OUTCOME_ITEMS {
+            return Err(serde::de::Error::custom("heal outcome object window exceeds its limit"));
+        }
+        let mut retained_object_bytes = 0usize;
+        for object in &mut snapshot.objects {
+            object.identity.bucket.shrink_to_fit();
+            object.identity.object.shrink_to_fit();
+            if let Some(version) = &mut object.identity.version_id {
+                version.shrink_to_fit();
+            }
+            if let Some(detail) = &mut object.detail {
+                if detail.len() > MAX_OUTCOME_DETAIL_BYTES {
+                    return Err(serde::de::Error::custom("heal outcome detail exceeds its limit"));
+                }
+                detail.shrink_to_fit();
+            }
+            retained_object_bytes = retained_object_bytes.saturating_add(object.retained_bytes());
+        }
+        if retained_object_bytes > MAX_OUTCOME_BYTES {
+            return Err(serde::de::Error::custom("heal outcome bytes exceed their limit"));
+        }
+        let counters = &snapshot.counters;
+        let total = counters
+            .healed
+            .checked_add(counters.unchanged)
+            .and_then(|total| total.checked_add(counters.skipped))
+            .and_then(|total| total.checked_add(counters.failed));
+        if !counters.overflowed && (total != Some(counters.processed) || counters.unknown > counters.skipped) {
+            return Err(serde::de::Error::custom("heal outcome counters are inconsistent"));
+        }
+        Ok(Self {
+            execution: snapshot.execution,
+            coverage: snapshot.coverage,
+            counters: snapshot.counters,
+            objects: snapshot.objects,
+            objects_truncated: snapshot.objects_truncated,
+            retained_object_bytes,
+            untraversable: snapshot.execution == HealExecutionOutcome::Aborted(HealAbortReason::Untraversable),
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HealOutcomeWireError {
     #[error("heal outcome is missing execution or counters")]
@@ -209,10 +201,23 @@ pub fn legacy_wire_status<'a>(
     {
         return Err(HealOutcomeWireError::ContradictoryCompletion);
     }
-    let (adapted, detail) = legacy_execution_status(summary, None, execution, &counters, first_failed_wire_object(wire));
+    let legacy_unverified = || {
+        counters.unknown > 0
+            && wire
+                .get("objects")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|objects| {
+                    objects.iter().any(|item| {
+                        item["disposition"]["state"].as_str() == Some("unknown")
+                            && item["detail"].as_str() == Some(LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL)
+                    })
+                })
+    };
+    let (adapted, detail) =
+        legacy_execution_status(summary, None, execution, &counters, || first_failed_wire_object(wire), legacy_unverified);
     Ok((
         adapted,
-        if adapted != summary {
+        if adapted != summary || counters.unknown > 0 {
             heal_status_detail(detail, truncated)
         } else {
             None
@@ -233,7 +238,8 @@ fn legacy_execution_status<'a>(
     detail: Option<String>,
     execution: HealExecutionOutcome,
     counters: &HealOutcomeCounters,
-    first_failure: Option<String>,
+    first_failure: impl FnOnce() -> Option<String>,
+    legacy_unverified: impl FnOnce() -> bool,
 ) -> (&'a str, Option<String>) {
     if summary != "finished" {
         return (summary, detail);
@@ -241,7 +247,7 @@ fn legacy_execution_status<'a>(
     match execution {
         HealExecutionOutcome::CompletedWithErrors => {
             let detail = format!("heal traversal completed with errors: {} failed objects", counters.failed);
-            ("stopped", Some(append_first_failure(detail, first_failure)))
+            ("stopped", Some(append_first_failure(detail, first_failure())))
         }
         HealExecutionOutcome::Aborted(reason) => {
             let reason = match reason {
@@ -251,13 +257,18 @@ fn legacy_execution_status<'a>(
             };
             ("stopped", Some(format!("heal task {reason}")))
         }
-        HealExecutionOutcome::Completed if counters.unknown > 0 => (
-            summary,
-            Some(format!(
+        HealExecutionOutcome::Completed if counters.unknown > 0 => {
+            let mut detail = format!(
                 "heal traversal completed; authoritative storage proof is unavailable for {} objects",
                 counters.unknown
-            )),
-        ),
+            );
+            if legacy_unverified() {
+                detail.push_str(
+                    "; legacy objects lack independent payload identity proof; online drives do not certify payload integrity",
+                );
+            }
+            (summary, Some(detail))
+        }
         HealExecutionOutcome::Pending | HealExecutionOutcome::Running => {
             ("running", Some("heal execution has not reached a terminal outcome".to_string()))
         }
@@ -267,7 +278,21 @@ fn legacy_execution_status<'a>(
 
 impl HealTaskOutcome {
     pub(crate) fn legacy_status<'a>(&self, summary: &'a str, detail: Option<String>) -> (&'a str, Option<String>) {
-        legacy_execution_status(summary, detail, self.execution, &self.counters, self.first_failed_object())
+        let legacy_unverified = || {
+            self.counters.unknown > 0
+                && self.objects.iter().any(|item| {
+                    item.disposition == HealObjectDisposition::Unknown
+                        && item.detail.as_deref() == Some(LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL)
+                })
+        };
+        legacy_execution_status(
+            summary,
+            detail,
+            self.execution,
+            &self.counters,
+            || self.first_failed_object(),
+            legacy_unverified,
+        )
     }
 
     pub(crate) fn start(&mut self) {
@@ -309,7 +334,9 @@ impl HealTaskOutcome {
         counters.overflowed |= !increment_counter(&mut counters.processed);
         let counter = match item.disposition {
             HealObjectDisposition::Repaired => &mut counters.healed,
-            HealObjectDisposition::VerifiedHealthy | HealObjectDisposition::AuthoritativelyAbsent => &mut counters.unchanged,
+            HealObjectDisposition::VerifiedHealthy
+            | HealObjectDisposition::MetadataHealthy
+            | HealObjectDisposition::AuthoritativelyAbsent => &mut counters.unchanged,
             HealObjectDisposition::Failed(_) => &mut counters.failed,
             HealObjectDisposition::Unknown => {
                 counters.overflowed |= !increment_counter(&mut counters.unknown);
@@ -420,6 +447,8 @@ mod canonical_outcome_tests {
 
     fn item(disposition: HealObjectDisposition) -> HealObjectOutcome {
         HealObjectOutcome {
+            deep_check_observed: false,
+            quorum_selected_data_dir: None,
             identity: HealObjectIdentity {
                 kind: HealObjectKind::Object,
                 bucket: "bucket".to_string(),
@@ -435,12 +464,73 @@ mod canonical_outcome_tests {
     }
 
     #[test]
+    fn persisted_outcome_rebuilds_accounting_and_enforces_window_boundaries() {
+        let mut outcome = HealTaskOutcome::default();
+        for _ in 0..MAX_OUTCOME_ITEMS {
+            outcome.record(item(HealObjectDisposition::Repaired));
+        }
+        outcome.finish(None);
+        let value = serde_json::to_value(&outcome).expect("bounded outcome");
+        let mut restored: HealTaskOutcome = serde_json::from_value(value.clone()).expect("restore bounded window");
+        assert_eq!(restored.retained_object_bytes, outcome.retained_object_bytes);
+        restored.record(item(HealObjectDisposition::Repaired));
+        assert_eq!(restored.objects.len(), MAX_OUTCOME_ITEMS);
+        assert!(restored.objects_truncated);
+        let mut oversized = value;
+        let extra = oversized["objects"][0].clone();
+        oversized["objects"].as_array_mut().expect("objects").push(extra);
+        assert!(serde_json::from_value::<HealTaskOutcome>(oversized).is_err());
+
+        let mut object = item(HealObjectDisposition::Repaired);
+        let fixed_bytes = object.retained_bytes() - object.identity.object.capacity();
+        object.identity.object = "x".repeat(MAX_OUTCOME_BYTES - fixed_bytes);
+        let mut outcome = HealTaskOutcome::default();
+        outcome.record(object);
+        outcome.finish(None);
+        assert_eq!(outcome.retained_object_bytes, MAX_OUTCOME_BYTES);
+        let mut value = serde_json::to_value(outcome).expect("exact byte boundary");
+        let restored: HealTaskOutcome = serde_json::from_value(value.clone()).expect("exact bound remains readable");
+        assert_eq!(restored.retained_object_bytes, MAX_OUTCOME_BYTES);
+        value["objects"][0]["identity"]["object"] = serde_json::json!("x".repeat(MAX_OUTCOME_BYTES - fixed_bytes + 1));
+        assert!(serde_json::from_value::<HealTaskOutcome>(value).is_err());
+    }
+
+    #[test]
+    fn metadata_health_receipt_never_discharges_a_payload_decode_request() {
+        let incarnation = Uuid::new_v4();
+        let mut expected = HealObjectIdentity {
+            bucket_incarnation_id: Some(incarnation),
+            ..item(HealObjectDisposition::Unknown).identity
+        };
+        let mut receipt = HealObjectReceipt {
+            deep_check_observed: false,
+            quorum_selected_data_dir: None,
+            identity: expected.clone(),
+            disposition: HealObjectDisposition::MetadataHealthy,
+        };
+        assert!(
+            receipt.verified_for(&expected),
+            "a presence proof still settles a metadata-level object request"
+        );
+
+        expected.kind = HealObjectKind::Decode;
+        receipt.identity.kind = HealObjectKind::Decode;
+        assert!(
+            !receipt.verified_for(&expected),
+            "a presence-only proof must not clear a payload decode responsibility"
+        );
+        receipt.disposition = HealObjectDisposition::VerifiedHealthy;
+        assert!(receipt.verified_for(&expected));
+    }
+
+    #[test]
     fn canonical_outcome_categories_have_one_terminal_count() {
         let mut outcome = HealTaskOutcome::default();
         for disposition in [
             HealObjectDisposition::Unknown,
             HealObjectDisposition::Repaired,
             HealObjectDisposition::VerifiedHealthy,
+            HealObjectDisposition::MetadataHealthy,
             HealObjectDisposition::AuthoritativelyAbsent,
             HealObjectDisposition::Deferred {
                 reason: HealDeferredReason::DanglingDeleteGrace,
@@ -453,7 +543,7 @@ mod canonical_outcome_tests {
             outcome.record(item(disposition));
         }
         let c = &outcome.counters;
-        assert_eq!((c.processed, c.healed, c.unchanged, c.skipped, c.failed, c.unknown), (8, 1, 2, 4, 1, 1));
+        assert_eq!((c.processed, c.healed, c.unchanged, c.skipped, c.failed, c.unknown), (9, 1, 3, 4, 1, 1));
         assert_eq!(c.processed, c.healed + c.unchanged + c.skipped + c.failed);
     }
 
@@ -552,6 +642,95 @@ mod canonical_outcome_tests {
     }
 
     #[test]
+    fn status_computes_only_the_selected_diagnostic() {
+        use std::cell::Cell;
+        for (summary, execution, unknown, expected_failure, expected_legacy) in [
+            ("running", HealExecutionOutcome::CompletedWithErrors, 1, 0, 0),
+            ("finished", HealExecutionOutcome::Running, 1, 0, 0),
+            ("finished", HealExecutionOutcome::Pending, 1, 0, 0),
+            ("finished", HealExecutionOutcome::Aborted(HealAbortReason::Cancelled), 1, 0, 0),
+            ("finished", HealExecutionOutcome::Completed, 0, 0, 0),
+            ("finished", HealExecutionOutcome::CompletedWithErrors, 1, 1, 0),
+            ("finished", HealExecutionOutcome::Completed, 1, 0, 1),
+        ] {
+            let failure_calls = Cell::new(0);
+            let legacy_calls = Cell::new(0);
+            let counters = HealOutcomeCounters {
+                unknown,
+                ..Default::default()
+            };
+            let _ = legacy_execution_status(
+                summary,
+                None,
+                execution,
+                &counters,
+                || {
+                    assert_eq!(expected_failure, 1, "irrelevant failure diagnostics must not run");
+                    failure_calls.set(failure_calls.get() + 1);
+                    Some("first failure".to_owned())
+                },
+                || {
+                    assert_eq!(expected_legacy, 1, "irrelevant legacy diagnostics must not run");
+                    legacy_calls.set(legacy_calls.get() + 1);
+                    true
+                },
+            );
+            assert_eq!(failure_calls.get(), expected_failure);
+            assert_eq!(legacy_calls.get(), expected_legacy);
+        }
+    }
+
+    #[test]
+    fn legacy_unknown_status_explains_only_storage_owned_legacy_reason() {
+        let legacy = rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL;
+        for reason in [None, Some("untrusted peer diagnostic"), Some(legacy)] {
+            let mut outcome = HealTaskOutcome::default();
+            let mut object = item(HealObjectDisposition::Unknown);
+            object.detail = reason.map(str::to_owned);
+            outcome.record(object);
+            outcome.finish(None);
+            let (summary, detail) = outcome.legacy_status("finished", None);
+            assert_eq!(summary, "finished");
+            let detail = detail.expect("unverified result remains explicit");
+            assert!(detail.contains("authoritative storage proof is unavailable for 1 objects"));
+            assert_eq!(detail.contains("independent payload identity"), reason == Some(legacy));
+            assert!(!detail.contains("untrusted peer diagnostic"));
+            let wire = serde_json::to_value(&outcome).expect("canonical status");
+            assert_eq!(
+                legacy_wire_status("finished", &wire, false).expect("wire status"),
+                (summary, Some(detail.clone()))
+            );
+            let (_, truncated) = legacy_wire_status("finished", &wire, true).expect("truncated status");
+            assert_eq!(truncated, Some(format!("{detail}; heal result items were truncated")));
+        }
+    }
+
+    #[test]
+    fn legacy_reason_cannot_override_verified_dry_run_or_failed_status() {
+        for disposition in [
+            HealObjectDisposition::VerifiedHealthy,
+            HealObjectDisposition::DryRunObserved,
+            HealObjectDisposition::Failed(HealFailureClass::Permanent),
+        ] {
+            let mut outcome = HealTaskOutcome::default();
+            let mut object = item(disposition.clone());
+            object.detail = Some(LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_owned());
+            outcome.record(object);
+            if matches!(disposition, HealObjectDisposition::Failed(_)) {
+                let mut unknown = item(HealObjectDisposition::Unknown);
+                unknown.detail = Some(LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_owned());
+                outcome.record(unknown);
+            }
+            outcome.finish(None);
+            let status = outcome.legacy_status("finished", None);
+            assert!(!status.1.as_deref().is_some_and(|detail| detail.contains("online drives")));
+            let wire = serde_json::to_value(&outcome).expect("canonical status");
+            assert_eq!(legacy_wire_status("finished", &wire, false).expect("wire status"), status);
+            assert_eq!(outcome.counters.healed, 0);
+        }
+    }
+
+    #[test]
     fn canonical_outcome_counter_overflow_cannot_claim_complete_coverage() {
         let mut outcome = HealTaskOutcome::default();
         outcome.counters.processed = u64::MAX;
@@ -570,6 +749,8 @@ mod canonical_outcome_tests {
             ..item(HealObjectDisposition::Unknown).identity
         };
         let mut receipt = HealObjectReceipt {
+            deep_check_observed: false,
+            quorum_selected_data_dir: None,
             identity: expected.clone(),
             disposition: HealObjectDisposition::Repaired,
         };

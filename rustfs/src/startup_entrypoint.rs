@@ -15,11 +15,11 @@
 use crate::{
     config::{
         CommandResult, Config, ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts,
-        ConnectEnvironmentInventoryOpts, ConnectInspectObjectOpts, ConnectLicenseCommands, ConnectLicenseScopeOpts,
-        ConnectLogsMode, ConnectLogsOpts, ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts,
-        ConnectProfileTool, ConnectRelayMaterialKind, ConnectRelayOpts, ConnectReportUploadOpts,
-        ConnectSiteReplicationPerformanceOpts, ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope,
-        ConnectTopCommands, Opt,
+        ConnectEnvironmentInventoryOpts, ConnectHealthOpts, ConnectInspectObjectOpts, ConnectLicenseCommands,
+        ConnectLicenseScopeOpts, ConnectLogsMode, ConnectLogsOpts, ConnectNetworkPerformanceOpts,
+        ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts, ConnectProfileOpts, ConnectProfileTool,
+        ConnectRelayMaterialKind, ConnectRelayOpts, ConnectReportUploadOpts, ConnectSiteReplicationPerformanceOpts,
+        ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectThreadProfileScope, ConnectTopCommands, Opt,
     },
     startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
@@ -30,6 +30,7 @@ use crate::{
     storage_api::startup::storage::bootstrap_instance_ctx,
 };
 use std::io::{Error, Read as _, Result, Write as _};
+use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, instrument};
@@ -39,26 +40,64 @@ const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_SERVER_RUNTIME_FAILED: &str = "server_runtime_failed";
 const OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED: &str = "observability initialization failure already reported";
 
-pub fn run_process() {
+/// Thread name for the thread that drives the root startup future.
+const STARTUP_THREAD_NAME: &str = "rustfs-main";
+
+/// Stack reserved for the thread that drives the root startup future.
+///
+/// `block_on` polls `async_main` on the calling thread, so the whole startup
+/// chain runs on that thread's stack rather than on a Tokio worker. The native
+/// main thread only gets what the platform hands out: 8 MiB from `ulimit -s`
+/// on Linux and macOS, but the 1 MiB PE default on Windows, where a debug
+/// build overflows before it starts listening. `RUST_MIN_STACK` does not apply
+/// to the native main thread, so the budget is set here explicitly instead.
+/// Startup currently peaks near 2 MiB in a debug build and under 1 MiB in a
+/// release build; 8 MiB keeps the budget Linux and macOS already had.
+const STARTUP_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+pub fn run_process() -> ExitCode {
+    run_on_startup_thread(run_process_on_current_thread)
+}
+
+/// Run `f` on a thread whose stack is [`STARTUP_THREAD_STACK_SIZE`] on every
+/// platform, propagating its panic so the process exit status is unchanged.
+fn run_on_startup_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    // Failing to spawn the startup thread is a startup fatal boundary.
+    let handle = std::thread::Builder::new()
+        .name(STARTUP_THREAD_NAME.to_owned())
+        .stack_size(STARTUP_THREAD_STACK_SIZE)
+        .spawn(f)
+        .expect("Failed to spawn startup thread");
+    match handle.join() {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn run_process_on_current_thread() -> ExitCode {
     // Building the process runtime is a startup fatal boundary.
     let (runtime, dial9_guard) = crate::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
 
-    // Flush and seal the trace segment before any exit path. `process::exit`
-    // below does not run destructors, and neither does returning from `main`
-    // for a guard held in a `static`. Under feature sets where the dial9 guard
-    // carries no Drop impl (e.g. `--features sftp`), this is an intentional no-op.
+    // Preserve the existing trace flush/seal order before runtime teardown.
+    // A disabled telemetry guard remains a no-op.
     #[allow(clippy::drop_non_drop)]
     drop(dial9_guard);
 
-    if let Err(ref e) = result {
+    let exit_code = if let Err(ref e) = result {
         if e.to_string() != OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED {
             // Tracing may not be initialized when startup fails this early.
             emit_fatal_stderr("Server runtime failed", e);
         }
         let _ = crate::startup_runtime_sources::shutdown_observability_guard();
-        std::process::exit(1);
-    }
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    };
+    drop(result);
+    // block_on has left its entered scope; the startup thread owns teardown.
+    drop(runtime);
+    exit_code
 }
 
 fn format_fatal_stderr_message(context: &str, error: impl std::fmt::Display) -> String {
@@ -144,11 +183,13 @@ async fn async_main() -> Result<()> {
         CommandResult::ConnectEnvironmentInventory(options) => return execute_connect_environment_inventory(options).await,
         CommandResult::ConnectClientPerformance(options) => return execute_connect_client_performance(*options).await,
         CommandResult::ConnectDrivePerformance(options) => return execute_connect_drive_performance(options).await,
+        CommandResult::ConnectNetworkPerformance(options) => return execute_connect_network_performance(options).await,
         CommandResult::ConnectObjectPerformance(options) => return execute_connect_object_performance(options).await,
         CommandResult::ConnectSiteReplicationPerformance(options) => {
             return execute_connect_site_replication_performance(*options).await;
         }
         CommandResult::ConnectProfile(options) => return execute_connect_profile(options).await,
+        CommandResult::ConnectHealth(options) => return execute_connect_health(options).await,
         CommandResult::ConnectLogs(options) => return execute_connect_logs(options).await,
         CommandResult::ConnectTelemetry(command) => return execute_connect_telemetry(command).await,
         CommandResult::ConnectTop(command) => return execute_connect_top(command).await,
@@ -674,9 +715,8 @@ fn unix_now() -> Result<i64> {
 
 async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
     use crate::connect::{
-        IdentityStore, LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, TOP_CLASSIFICATION, TopApiOperation,
-        TopCaptureLimits, TopCaptureRequest, TopCaptureScope, capture_top_api, capture_top_disk, capture_top_locks,
-        capture_top_net, capture_top_rpc,
+        IdentityStore, LocalTopConsent, MAX_TOP_DURATION, MAX_TOP_EXPORT_VALIDITY, TOP_CLASSIFICATION, TopCaptureLimits,
+        TopCaptureRequest, TopCaptureScope, capture_top_net,
     };
 
     let (tool_id, options) = match command {
@@ -692,6 +732,76 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
         return Err(Error::other("connect_top_limits_invalid"));
     }
 
+    if matches!(tool_id, "top.api" | "top.disk" | "top.locks" | "top.rpc") {
+        let offline_key_id = options
+            .offline_key_id
+            .ok_or_else(|| Error::other("--offline-key-id must select an existing offline identity"))?;
+        let input = crate::connect::diagnostics::LocalTopRequest {
+            offline_key_id,
+            organization_name: options.organization,
+            cluster_name: options.cluster,
+            device_name: options.device,
+            run_uid: options.run_uid,
+            artifact_uid: options.artifact_uid,
+            consent_uid: options.consent_uid,
+            policy_revision: options.policy_revision,
+            consent_expires_at_unix: options.consent_expires_at_unix,
+            acknowledge_l3: options.acknowledge_l3,
+            run_expires_at_unix: options.run_expires_at_unix,
+            window_millis: options.window_millis,
+            export_validity_seconds: options.export_validity_seconds,
+        };
+        let cancel = CancellationToken::new();
+        let capture = async {
+            match tool_id {
+                "top.api" => crate::connect::request_local_top_api(&options.state_dir, input, &cancel).await,
+                "top.disk" => crate::connect::request_local_top_disk(&options.state_dir, input, &cancel).await,
+                "top.locks" => crate::connect::request_local_top_locks(&options.state_dir, input, &cancel).await,
+                "top.rpc" => crate::connect::request_local_top_rpc(&options.state_dir, input, &cancel).await,
+                _ => unreachable!("closed local top command"),
+            }
+        };
+        tokio::pin!(capture);
+        let export = tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(Error::other)?;
+                cancel.cancel();
+                return match capture.await {
+                    Err(error) => Err(Error::other(error)),
+                    Ok(_) => Err(Error::other("top collection cancelled")),
+                };
+            }
+            result = &mut capture => result.map_err(Error::other)?,
+        };
+        let writer_cancel = cancel.clone();
+        let mut writer = tokio::task::spawn_blocking(move || {
+            crate::connect::diagnostics::save_top_archive(
+                &options.output,
+                &export.artifact_uid,
+                &export.archive_bytes,
+                &export.archive_sha256,
+                &writer_cancel,
+            )
+        });
+        let receipt = tokio::select! {
+            biased;
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(Error::other)?; cancel.cancel();
+                writer.await.map_err(Error::other)?.map_err(Error::other)?
+            }
+            result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+        };
+        println!(
+            "artifact={} bytes={} sha256={}",
+            receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+        );
+        println!("upload=not-performed");
+        return Ok(());
+    }
+    if options.offline_key_id.is_some() {
+        return Err(Error::other("--offline-key-id is only supported for top api, disk, locks or rpc"));
+    }
     let identity = IdentityStore::new(options.state_dir.join("identity"))
         .load()
         .map_err(Error::other)?
@@ -721,24 +831,8 @@ async fn execute_connect_top(command: ConnectTopCommands) -> Result<()> {
     };
     let cancel = CancellationToken::new();
     match tool_id {
-        "top.api" => {
-            let result = await_top_capture(capture_top_api(&request, TopApiOperation::GetObject, &cancel), &cancel).await?;
-            finish_top_capture(&request, result, &identity, options.output, &cancel).await
-        }
-        "top.disk" => {
-            let result = await_top_capture(capture_top_disk(&request, &cancel), &cancel).await?;
-            finish_top_capture(&request, result, &identity, options.output, &cancel).await
-        }
-        "top.locks" => {
-            let result = await_top_capture(capture_top_locks(&request, &cancel), &cancel).await?;
-            finish_top_capture(&request, result, &identity, options.output, &cancel).await
-        }
         "top.net" => {
             let result = await_top_capture(capture_top_net(&request, &cancel), &cancel).await?;
-            finish_top_capture(&request, result, &identity, options.output, &cancel).await
-        }
-        "top.rpc" => {
-            let result = await_top_capture(capture_top_rpc(&request, &cancel), &cancel).await?;
             finish_top_capture(&request, result, &identity, options.output, &cancel).await
         }
         _ => unreachable!("closed top command"),
@@ -812,10 +906,14 @@ async fn execute_connect_client_performance(options: ConnectClientPerformanceOpt
 
     let duration = Duration::from_millis(options.duration_millis);
     validate_client_limits(duration, options.traffic_bytes).map_err(Error::other)?;
-    let key = IdentityStore::new(options.state_dir.join("identity"))
-        .load()
-        .map_err(Error::other)?
-        .ok_or_else(|| Error::other("connect client performance requires an enrolled device identity"))?;
+    let key = if let Some(offline_key_id) = options.offline_key_id.as_deref() {
+        crate::connect::load_selected_offline_key(&options.state_dir, offline_key_id).map_err(Error::other)?
+    } else {
+        IdentityStore::new(options.state_dir.join("identity"))
+            .load()
+            .map_err(Error::other)?
+            .ok_or_else(|| Error::other("connect client performance requires an enrolled device identity"))?
+    };
     let access_key = read_protected_client_credential(&options.access_key_file).map_err(Error::other)?;
     let secret_key = read_protected_client_credential(&options.secret_key_file).map_err(Error::other)?;
     let session_token = options
@@ -1336,6 +1434,120 @@ async fn execute_connect_drive_performance(options: ConnectDrivePerformanceOpts)
     Ok(())
 }
 
+async fn execute_connect_network_performance(options: ConnectNetworkPerformanceOpts) -> Result<()> {
+    let cancel = CancellationToken::new();
+    let request = crate::connect::LocalNetworkRequest {
+        offline_key_id: options.offline_key_id,
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        consent_uid: options.consent_uid,
+        policy_revision: options.policy_revision,
+        consent_expires_at_unix: options.consent_expires_at_unix,
+        acknowledge_l1: options.acknowledge_l1,
+        expires_at_unix: options.expires_at_unix,
+        duration_millis: options.duration_millis,
+        traffic_bytes: options.traffic_bytes,
+    };
+    let capture = crate::connect::request_local_network(&options.state_dir, request, &cancel);
+    tokio::pin!(capture);
+    let archive = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            return match capture.await {
+                Err(error) => Err(Error::other(error)),
+                Ok(_) => Err(Error::other("network performance collection cancelled")),
+            };
+        }
+        result = &mut capture => result.map_err(Error::other)?,
+    };
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || {
+        crate::connect::diagnostics::save_top_archive(
+            &options.output,
+            &archive.artifact_uid,
+            &archive.archive_bytes,
+            &archive.archive_sha256,
+            &writer_cancel,
+        )
+    });
+    let receipt = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    };
+    println!("tool=performance.network");
+    println!(
+        "artifact={} bytes={} sha256={}",
+        receipt.artifact_uid, receipt.archive_size_bytes, receipt.archive_sha256
+    );
+    println!("upload=not-performed");
+    Ok(())
+}
+
+async fn execute_connect_health(options: ConnectHealthOpts) -> Result<()> {
+    let cancel = CancellationToken::new();
+    let request = crate::connect::LocalHealthRequest {
+        offline_key_id: options.offline_key_id,
+        organization_name: options.organization,
+        cluster_name: options.cluster,
+        device_name: options.device,
+        run_uid: options.run_uid,
+        artifact_uid: options.artifact_uid,
+        schema_version: 1,
+        capability: crate::connect::HEALTH_SERVICE_CAPABILITY.to_owned(),
+        consent_uid: options.consent_uid,
+        policy_revision: options.policy_revision,
+        consent_expires_at_unix: options.consent_expires_at_unix,
+        acknowledge_l0: options.acknowledge_l0,
+        expires_at_unix: options.expires_at_unix,
+    };
+    let capture = crate::connect::request_local_health(&options.state_dir, request, &cancel);
+    tokio::pin!(capture);
+    let archive = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            return match capture.await {
+                Err(error) => Err(Error::other(error)),
+                Ok(_) => Err(Error::other("health collection cancelled")),
+            };
+        }
+        result = &mut capture => result.map_err(Error::other)?,
+    };
+    let size = archive.archive_bytes.len();
+    let sha256 = archive.archive_sha256.clone();
+    let artifact_uid = archive.artifact_uid.clone();
+    let output = options.output;
+    let writer_cancel = cancel.clone();
+    let mut writer = tokio::task::spawn_blocking(move || {
+        crate::connect::save_signed_health_export(&output, &archive.archive_bytes, &archive.artifact_uid, &writer_cancel)
+    });
+    tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(Error::other)?;
+            cancel.cancel();
+            writer.await.map_err(Error::other)?.map_err(Error::other)?;
+            return Err(Error::other("health export cancelled"));
+        }
+        result = &mut writer => result.map_err(Error::other)?.map_err(Error::other)?,
+    }
+    println!("tool=health.check outcome=PARTIAL");
+    println!("artifact={artifact_uid} bytes={size} sha256={sha256}");
+    println!("upload=not-performed");
+    Ok(())
+}
+
 async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
     use crate::connect::{
         IdentityStore, LocalProfileConsent, ProfileCaptureRequest, ProfileProvenance, ThreadProfileScope, export_cpu_profile,
@@ -1343,69 +1555,42 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
     };
     use rand::{TryRng as _, rngs::SysRng};
 
-    let key = IdentityStore::new(options.state_dir.join("identity"))
-        .load()
-        .map_err(Error::other)?
-        .ok_or_else(|| Error::other("connect profile requires an enrolled device identity"))?;
-    let executable_sha256 = hash_current_executable()?;
-    let produced_at_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(Error::other)
-        .and_then(|duration| i64::try_from(duration.as_secs()).map_err(Error::other))?;
-    let mut nonce = [0_u8; 32];
-    SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
-    let request = ProfileCaptureRequest {
-        organization_name: options.organization,
-        cluster_name: options.cluster,
-        device_name: options.device,
-        run_uid: options.run_uid,
-        artifact_uid: options.artifact_uid,
-        schema_version: options.schema_version,
-        capability: options.capability,
-        consent: LocalProfileConsent {
+    let service_profile = (options.tool == ConnectProfileTool::Threads && options.thread_scope.is_some())
+        || (options.tool != ConnectProfileTool::Threads && options.offline_key_id.is_some());
+    if options.tool != ConnectProfileTool::Threads && options.thread_scope.is_some() {
+        return Err(Error::other("--thread-scope is valid only for the threads profile"));
+    }
+    if !service_profile && options.offline_key_id.is_some() {
+        return Err(Error::other("--offline-key-id is valid only for a service profile"));
+    }
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let export = if service_profile {
+        let native_threads = options.thread_scope == Some(ConnectThreadProfileScope::NativeThreads);
+        let offline_key_id = options
+            .offline_key_id
+            .ok_or_else(|| Error::other("--offline-key-id must explicitly select an existing offline identity"))?;
+        let input = crate::connect::diagnostics::LocalRuntimeProfileRequest {
+            offline_key_id,
+            organization_name: options.organization,
+            cluster_name: options.cluster,
+            device_name: options.device,
+            run_uid: options.run_uid,
+            artifact_uid: options.artifact_uid,
+            schema_version: options.schema_version,
+            capability: options.capability,
             consent_uid: options.consent_uid,
             policy_revision: options.policy_revision,
-            expires_at_unix: options.consent_expires_at_unix,
-            confirmed: options.acknowledge_l3,
-        },
-        produced_at_unix,
-        expires_at_unix: options.expires_at_unix,
-        nonce,
-        duration: Duration::from_millis(options.duration_millis),
-        sample_period: Duration::from_micros(options.sample_period_micros),
-        provenance: ProfileProvenance::new(
-            crate::version::build::COMMIT_HASH,
-            executable_sha256,
-            env!("CARGO_PKG_VERSION"),
-            enabled_build_features(),
-        ),
-    };
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let export = {
+            consent_expires_at_unix: options.consent_expires_at_unix,
+            acknowledge_l3: options.acknowledge_l3,
+            expires_at_unix: options.expires_at_unix,
+            duration_millis: options.duration_millis,
+            sample_period_micros: options.sample_period_micros,
+        };
         let capture = async {
-            match options.tool {
-                ConnectProfileTool::Cpu => {
-                    if options.thread_scope.is_some() {
-                        return Err(Error::other("--thread-scope is valid only for the threads profile"));
-                    }
-                    export_cpu_profile(&request, &key, &cancel).await.map_err(Error::other)
-                }
-                ConnectProfileTool::Memory => {
-                    if options.thread_scope.is_some() {
-                        return Err(Error::other("--thread-scope is valid only for the threads profile"));
-                    }
-                    export_memory_profile(&request, &key, &cancel).await.map_err(Error::other)
-                }
-                ConnectProfileTool::Threads => {
-                    let scope = match options.thread_scope {
-                        Some(ConnectThreadProfileScope::TokioRuntime) => ThreadProfileScope::TokioRuntime,
-                        Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
-                        None => return Err(Error::other("--thread-scope is required for the threads profile")),
-                    };
-                    export_thread_profile(&request, scope, &key, &cancel)
-                        .await
-                        .map_err(Error::other)
-                }
+            if native_threads {
+                crate::connect::request_local_native_threads_profile(&options.state_dir, input, &cancel).await
+            } else {
+                crate::connect::request_local_runtime_profile(&options.state_dir, input, &cancel).await
             }
         };
         tokio::pin!(capture);
@@ -1414,9 +1599,89 @@ async fn execute_connect_profile(options: ConnectProfileOpts) -> Result<()> {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(Error::other)?;
                 cancel.cancel();
-                return Err(Error::other("profile collection cancelled"));
+                return match capture.await {
+                    Err(error) => Err(Error::other(error)),
+                    Ok(_) => Err(Error::other("profile collection cancelled")),
+                };
             }
-            result = capture.as_mut() => result?,
+            result = &mut capture => result.map_err(Error::other)?,
+        }
+    } else {
+        let key = IdentityStore::new(options.state_dir.join("identity"))
+            .load()
+            .map_err(Error::other)?
+            .ok_or_else(|| Error::other("connect profile requires an enrolled device identity"))?;
+        let executable_sha256 = hash_current_executable()?;
+        let produced_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(Error::other)
+            .and_then(|duration| i64::try_from(duration.as_secs()).map_err(Error::other))?;
+        let mut nonce = [0_u8; 32];
+        SysRng.try_fill_bytes(&mut nonce).map_err(Error::other)?;
+        let request = ProfileCaptureRequest {
+            organization_name: options.organization,
+            cluster_name: options.cluster,
+            device_name: options.device,
+            run_uid: options.run_uid,
+            artifact_uid: options.artifact_uid,
+            schema_version: options.schema_version,
+            capability: options.capability,
+            consent: LocalProfileConsent {
+                consent_uid: options.consent_uid,
+                policy_revision: options.policy_revision,
+                expires_at_unix: options.consent_expires_at_unix,
+                confirmed: options.acknowledge_l3,
+            },
+            produced_at_unix,
+            expires_at_unix: options.expires_at_unix,
+            nonce,
+            duration: Duration::from_millis(options.duration_millis),
+            sample_period: Duration::from_micros(options.sample_period_micros),
+            provenance: ProfileProvenance::new(
+                crate::version::build::COMMIT_HASH,
+                executable_sha256,
+                env!("CARGO_PKG_VERSION"),
+                enabled_build_features(),
+            ),
+        };
+
+        {
+            let capture = async {
+                match options.tool {
+                    ConnectProfileTool::Cpu => {
+                        if options.thread_scope.is_some() {
+                            return Err(Error::other("--thread-scope is valid only for the threads profile"));
+                        }
+                        export_cpu_profile(&request, &key, &cancel).await.map_err(Error::other)
+                    }
+                    ConnectProfileTool::Memory => {
+                        if options.thread_scope.is_some() {
+                            return Err(Error::other("--thread-scope is valid only for the threads profile"));
+                        }
+                        export_memory_profile(&request, &key, &cancel).await.map_err(Error::other)
+                    }
+                    ConnectProfileTool::Threads => {
+                        let scope = match options.thread_scope {
+                            Some(ConnectThreadProfileScope::TokioRuntime) => ThreadProfileScope::TokioRuntime,
+                            Some(ConnectThreadProfileScope::NativeThreads) => ThreadProfileScope::NativeThreads,
+                            None => return Err(Error::other("--thread-scope is required for the threads profile")),
+                        };
+                        export_thread_profile(&request, scope, &key, &cancel)
+                            .await
+                            .map_err(Error::other)
+                    }
+                }
+            };
+            tokio::pin!(capture);
+            tokio::select! {
+                biased;
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(Error::other)?;
+                    cancel.cancel();
+                    return Err(Error::other("profile collection cancelled"));
+                }
+                result = capture.as_mut() => result?,
+            }
         }
     };
     let tool = export.tool;
@@ -1807,5 +2072,44 @@ mod tests {
             format_fatal_stderr_message("Observability initialization failed", "collector unavailable"),
             "[FATAL] Observability initialization failed: collector unavailable"
         );
+    }
+
+    /// Consume roughly `bytes` of stack through non-elidable recursive frames.
+    #[inline(never)]
+    fn consume_stack(bytes: usize) -> u8 {
+        const FRAME: usize = 64 * 1024;
+        let mut frame = [0_u8; FRAME];
+        std::hint::black_box(&mut frame);
+        if bytes <= FRAME {
+            return frame[0];
+        }
+        frame[0].wrapping_add(consume_stack(bytes - FRAME))
+    }
+
+    #[test]
+    fn startup_thread_provides_documented_stack_budget() {
+        // Half the budget exceeds both the 2 MiB Rust thread default and the
+        // 1 MiB Windows main thread, so this overflows unless the startup
+        // thread really gets its explicit budget.
+        let used = STARTUP_THREAD_STACK_SIZE / 2;
+        let name = run_on_startup_thread(move || {
+            std::hint::black_box(consume_stack(used));
+            std::thread::current().name().map(str::to_owned)
+        });
+        assert_eq!(name.as_deref(), Some(STARTUP_THREAD_NAME));
+    }
+
+    #[test]
+    fn startup_thread_returns_process_exit_codes() {
+        for code in [ExitCode::SUCCESS, ExitCode::FAILURE] {
+            assert_eq!(run_on_startup_thread(move || code), code);
+        }
+    }
+
+    #[test]
+    fn startup_thread_propagates_panics() {
+        let result = std::panic::catch_unwind(|| run_on_startup_thread(|| panic!("startup thread panic")));
+        let payload = result.expect_err("startup thread panic must propagate");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"startup thread panic"));
     }
 }

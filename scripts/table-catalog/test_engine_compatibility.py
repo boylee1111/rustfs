@@ -32,7 +32,7 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(spark["status"], "manual-live-harness")
         self.assertContainsScenario(spark, "create-namespace", "manual-live-harness")
         self.assertContainsScenario(spark, "create-table", "manual-live-harness")
-        self.assertContainsScenario(spark, "append", "manual-live-harness")
+        self.assertContainsScenario(spark, "staged-create", "manual-live-harness")
         self.assertContainsScenario(spark, "reload-table", "manual-live-harness")
         self.assertContainsScenario(spark, "drop-table", "manual-live-harness")
         self.assertContainsScenario(spark, "commit-conflict", "manual-validation-required")
@@ -142,7 +142,7 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(config["spark.sql.catalog.rustfs.s3.secret-access-key"], "rustfsadmin")
         self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3tables")
 
-    def test_spark_sql_smoke_covers_lifecycle_append_reload_and_cleanup(self) -> None:
+    def test_spark_sql_smoke_covers_staged_ctas_reload_and_cleanup(self) -> None:
         sql = engine_compatibility.spark_sql_smoke(
             catalog_name="rustfs",
             namespace="sales",
@@ -152,8 +152,9 @@ class EngineCompatibilityTest(unittest.TestCase):
 
         self.assertIn("CREATE NAMESPACE IF NOT EXISTS rustfs.`sales`", sql)
         self.assertIn("DROP TABLE IF EXISTS rustfs.`sales`.`orders`", sql)
-        self.assertIn("CREATE TABLE rustfs.`sales`.`orders`", sql)
-        self.assertIn("INSERT INTO rustfs.`sales`.`orders`", sql)
+        self.assertIn("CREATE TABLE rustfs.`sales`.`orders` USING iceberg AS", sql)
+        self.assertIn("SELECT * FROM VALUES (1L, 'alpha'), (2L, 'beta')", sql)
+        self.assertNotIn("INSERT INTO rustfs.`sales`.`orders`", sql)
         self.assertIn("REFRESH TABLE rustfs.`sales`.`orders`", sql)
         self.assertIn("SELECT COUNT(*) AS row_count FROM rustfs.`sales`.`orders`", sql)
         self.assertIn("DROP TABLE IF EXISTS rustfs.`sales`.`orders`", sql)
@@ -543,11 +544,58 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(validation["claim"], "automated-smoke")
         self.assertEqual(validation["client_name"], "PyIceberg")
 
+        for legacy in ("create-append-reload-scan", "create-append-reload-scan-backing-contracts"):
+            with self.subTest(scenario=legacy):
+                historical = dict(record, scenario=legacy)
+                validated = engine_compatibility.validate_live_conformance_evidence(historical)
+                self.assertEqual(validated["scenario"], legacy)
+                self.assertNotIn("catalog_probes", historical)
+
+    def test_backing_probe_evidence_rejects_missing_or_overstated_results(self) -> None:
+        for backing in ("object", "durable-strong"):
+            for skipped in (False, True):
+                for vended in (False, True):
+                    with self.subTest(backing=backing, skipped=skipped, vended=vended):
+                        scenario = (engine_compatibility.PYICEBERG_CORE_SCENARIO if skipped
+                                    else engine_compatibility.PYICEBERG_BACKING_SCENARIO)
+                        record = engine_compatibility.live_conformance_evidence_record(
+                            client_name="PyIceberg", client_version="0.11.1", scenario=scenario,
+                            rustfs_build="test", git_sha="abc123", catalog_backing=backing,
+                            endpoint="http://127.0.0.1:9000", warehouse="lake", rest_path="/iceberg",
+                            namespace="sales", table="orders", metadata_location="s3://lake/metadata/v2.json",
+                            run_timestamp_utc="2026-10-14T00:00:00Z", operator="test",
+                            expected_status="pass", observed_status="pass", row_count=2,
+                            cleanup_result="not-requested", claim="automated-smoke", command="smoke",
+                        )
+                        probes = engine_compatibility.pyiceberg_catalog_probe_results(
+                            backing, skipped=skipped, vended=vended
+                        )
+                        record.update(catalog_probes=probes, rest_signing_name="s3",
+                                      credential_vending_required=vended)
+                        validate = engine_compatibility.validate_live_conformance_evidence
+                        self.assertEqual(validate(record)["status"], "accepted")
+                        for changes in (
+                            {"catalog_probes": {}},
+                            {"catalog_probes": {**probes, "automatic-worker": "pass"}},
+                            {"rest_signing_name": "unknown"},
+                            {"credential_vending_required": "false"},
+                        ):
+                            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                                validate({**record, **changes})
+                        if skipped:
+                            with self.assertRaises(ValueError):
+                                validate({**record, "scenario": engine_compatibility.PYICEBERG_BACKING_SCENARIO})
+                        else:
+                            for name in ("metadata-maintenance", "maintenance-worker-dry-run", "diagnostics", "export"):
+                                broken = {**probes, name: "skipped"}
+                                with self.subTest(probe=name), self.assertRaises(ValueError):
+                                    validate({**record, "catalog_probes": broken})
+
     def test_live_conformance_evidence_rejects_missing_or_mismatched_results(self) -> None:
         record = engine_compatibility.live_conformance_evidence_record(
             client_name="Spark Iceberg REST catalog",
             client_version="3.5.4/iceberg-1.7.1",
-            scenario="create-namespace-create-table-append-refresh-count-cleanup",
+            scenario="create-namespace-staged-ctas-refresh-count-cleanup",
             rustfs_build="rustfs-test",
             git_sha="abc123",
             catalog_backing="durable-strong",

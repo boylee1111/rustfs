@@ -50,15 +50,19 @@ use storage_api::owner::{
 };
 #[cfg(test)]
 use storage_api::owner::{
-    EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints, EcstoreInstanceContext,
-    EcstorePoolEndpoints, ecstore_config_init, ecstore_init_bucket_metadata_sys, ecstore_init_local_disks_with_instance_ctx,
-    ecstore_new_disk,
+    EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints, EcstoreExpiryState,
+    EcstoreInstanceContext, EcstorePoolEndpoints, ecstore_config_init, ecstore_init_bucket_metadata_sys,
+    ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub mod data_usage_define;
+#[cfg(feature = "e2e-test-hooks")]
+#[doc(hidden)]
+pub mod e2e_barrier;
 pub mod error;
+mod heal_completion;
 pub mod prefix_usage;
 pub mod raw_page_index;
 mod remote_scanner;
@@ -77,23 +81,28 @@ mod workload_admission;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
+pub use heal_completion::{
+    ScannerHealObservationStatus, ScannerHealTerminalObservation, ScannerHealUnknownObservation, scanner_heal_observation_status,
+};
 pub use prefix_usage::{BucketPrefixUsageResponse, bucket_prefix_usage, invalidate_prefix_usage_cache};
 pub use remote_scanner::{
     NS_SCANNER_MAX_REQUEST_BODY_SIZE, RemoteScannerAdmission, RemoteScannerRequest, admit_remote_scanner_request,
     claim_remote_scanner_request, decode_remote_scanner_request, preflight_remote_scanner_request,
-    remote_scanner_request_matches_envelope, serve_remote_scanner_request, validate_remote_scanner_request_fence,
+    remote_scanner_request_matches_envelope, serve_remote_scanner_request, serve_remote_scanner_request_with_memory,
+    validate_remote_scanner_request_fence,
 };
 pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
 pub use rustfs_scanner_metrics::last_minute;
 pub use scanner::{
-    SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD, ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus,
-    ScannerCycleScheduleStatus, ScannerPauseBacklogAlertReason, ScannerPauseBacklogPhase, ScannerPauseBacklogStatus,
-    ScannerPauseBacklogThresholds, ScannerRecoveryIntentAcceptResult, ScannerRecoveryIntentConflict, ScannerRecoveryIntentRecord,
-    ScannerRecoveryIntentRequest, ScannerUsageStateResetResult, accept_scanner_usage_recovery_intent,
-    get_scanner_usage_recovery_intent, init_data_scanner, init_scanner_with_recovery, register_scanner_pause_backlog_retirement,
-    reset_scanner_cycle_recovery, reset_scanner_usage_state_for_full_rebuild, run_scanner_usage_recovery_intent,
-    scanner_cycle_recovery_status, scanner_cycle_schedule_status, scanner_pause_backlog_status, scanner_recovery_actor_sha256,
-    scanner_topology_digest,
+    SCANNER_RECOVERY_INTENT_ACTION_USAGE_FULL_REBUILD, ScannerBitrotStartSource, ScannerBitrotStatus, ScannerCycleRecoveryMarker,
+    ScannerCycleRecoveryStatus, ScannerCycleScheduleStatus, ScannerPauseBacklogAlertReason, ScannerPauseBacklogPhase,
+    ScannerPauseBacklogReplicaId, ScannerPauseBacklogReplicaStatus, ScannerPauseBacklogReplicaStatusState,
+    ScannerPauseBacklogStatus, ScannerPauseBacklogThresholds, ScannerRecoveryIntentAcceptResult, ScannerRecoveryIntentConflict,
+    ScannerRecoveryIntentRecord, ScannerRecoveryIntentRequest, ScannerUsageStateResetResult,
+    accept_scanner_usage_recovery_intent, get_scanner_usage_recovery_intent, init_data_scanner, init_scanner_with_recovery,
+    register_scanner_pause_backlog_retirement, reset_scanner_cycle_recovery, reset_scanner_usage_state_for_full_rebuild,
+    run_scanner_usage_recovery_intent, scanner_bitrot_status, scanner_cycle_recovery_status, scanner_cycle_schedule_status,
+    scanner_pause_backlog_status, scanner_recovery_actor_sha256, scanner_topology_digest,
 };
 pub use scanner_io::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageClearObserver, ScannerDirtyUsageMutationObserver,
@@ -102,11 +111,15 @@ pub use scanner_io::{
     acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, encode_durable_dirty_usage_producer_replay_record,
     record_dirty_usage_bucket, record_dirty_usage_bucket_from_producer, record_dirty_usage_bucket_from_producers,
     record_dirty_usage_object, record_dirty_usage_object_from_producer, record_scanner_maintenance_change,
-    replay_durable_dirty_usage_producer_record, scanner_activity_epoch, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
+    record_status_class_mutation, replay_durable_dirty_usage_producer_record, scanner_activity_epoch,
+    scanner_dirty_usage_bucket_generation, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
     scanner_maintenance_generation, set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
 };
 pub use segment_invalidation::SegmentInvalidationProducerIdentity;
-pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
+pub use sleeper::{
+    DynamicSleeper, SCANNER_DISK_IO_BUDGET_MAX_WAIT, SCANNER_IDLE_MODE, SCANNER_SLEEPER, ScannerDiskIoBudgetStatus,
+    ScannerDiskMedia, scanner_disk_io_budget_status,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 pub use storage_api::ScannerReplicationConfig as ReplicationConfig;
 pub use storage_api::scan::{
@@ -114,7 +127,7 @@ pub use storage_api::scan::{
     SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
     SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
 };
-pub use workload_admission::set_scanner_workload_admission_snapshot_provider;
+pub use workload_admission::{set_scanner_node_admission, set_scanner_workload_admission_snapshot_provider};
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
 static SCANNER_RUNTIME_INSTANCES: AtomicU64 = AtomicU64::new(0);
@@ -217,18 +230,39 @@ impl ScannerActivityGuard {
     }
 }
 
-pub(crate) struct ScannerRuntimeGuard;
+pub(crate) struct ScannerRuntimeGuard {
+    startup: rustfs_scanner_metrics::startup::ScannerStartupToken,
+    initialized: bool,
+}
 
 impl ScannerRuntimeGuard {
     pub(crate) fn new() -> Self {
-        SCANNER_RUNTIME_INSTANCES.fetch_add(1, Ordering::Relaxed);
-        Self
+        Self {
+            startup: rustfs_scanner_metrics::metrics::global_metrics().startup().begin(),
+            initialized: false,
+        }
+    }
+
+    pub(crate) fn mark_initialized(&mut self) {
+        if !self.initialized {
+            SCANNER_RUNTIME_INSTANCES.fetch_add(1, Ordering::Relaxed);
+            self.initialized = true;
+        }
+    }
+
+    pub(crate) fn startup_token(&self) -> rustfs_scanner_metrics::startup::ScannerStartupToken {
+        self.startup
     }
 }
 
 impl Drop for ScannerRuntimeGuard {
     fn drop(&mut self) {
-        let _ = SCANNER_RUNTIME_INSTANCES.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
+        rustfs_scanner_metrics::metrics::global_metrics()
+            .startup()
+            .finish(self.startup);
+        if self.initialized {
+            let _ = SCANNER_RUNTIME_INSTANCES.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
+        }
     }
 }
 
@@ -648,8 +682,37 @@ fn reset_tier_name_cache_for_test() {
     TIER_REGISTRY_GENERATION.store(0, Ordering::Relaxed);
 }
 
-pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo) {
-    ecstore_expiry_state_handle().write().await.enqueue_free_version(oi);
+// Only a task running an isolated unit test can override these handles.
+#[cfg(test)]
+struct ExpiryLockTestContext {
+    state: Arc<tokio::sync::RwLock<EcstoreExpiryState>>,
+    store: Option<Arc<ECStore>>,
+    completed_incarnation_reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static EXPIRY_LOCK_TEST_CONTEXT: ExpiryLockTestContext;
+}
+
+pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo, cancellation: Option<&CancellationToken>) {
+    #[cfg(test)]
+    let state = EXPIRY_LOCK_TEST_CONTEXT
+        .try_with(|context| context.state.clone())
+        .unwrap_or_else(|_| ecstore_expiry_state_handle());
+    #[cfg(not(test))]
+    let state = ecstore_expiry_state_handle();
+    let state = match cancellation {
+        Some(cancel) => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            state = state.write() => state,
+        },
+        None => state.write().await,
+    };
+    if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+        state.enqueue_free_version(oi);
+    }
 }
 
 pub(crate) async fn enqueue_runtime_newer_noncurrent(
@@ -657,20 +720,50 @@ pub(crate) async fn enqueue_runtime_newer_noncurrent(
     to_delete_objs: Vec<ObjectToDelete>,
     event: Event,
     src: &LcEventSrc,
+    cancellation: Option<&CancellationToken>,
 ) -> bool {
-    let Some(store) = ecstore_resolve_object_store_handle() else {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return false;
+    }
+    #[cfg(test)]
+    let store = EXPIRY_LOCK_TEST_CONTEXT
+        .try_with(|context| context.store.clone())
+        .unwrap_or_else(|_| ecstore_resolve_object_store_handle());
+    #[cfg(not(test))]
+    let store = ecstore_resolve_object_store_handle();
+    let Some(store) = store else {
         return false;
     };
     let Ok(bucket_incarnation_id) = store.bucket_incarnation_id(bucket).await else {
         return false;
     };
-    ecstore_expiry_state_handle().write().await.enqueue_by_newer_noncurrent(
-        bucket,
-        to_delete_objs,
-        event,
-        src,
-        bucket_incarnation_id,
-    )
+    #[cfg(test)]
+    let _ = EXPIRY_LOCK_TEST_CONTEXT.try_with(|context| {
+        context
+            .completed_incarnation_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return false;
+    }
+    #[cfg(test)]
+    let state = EXPIRY_LOCK_TEST_CONTEXT
+        .try_with(|context| context.state.clone())
+        .unwrap_or_else(|_| ecstore_expiry_state_handle());
+    #[cfg(not(test))]
+    let state = ecstore_expiry_state_handle();
+    let mut state = match cancellation {
+        Some(cancel) => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            state = state.write() => state,
+        },
+        None => state.write().await,
+    };
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return false;
+    }
+    state.enqueue_by_newer_noncurrent(bucket, to_delete_objs, event, src, bucket_incarnation_id)
 }
 
 pub(crate) async fn queue_replication_heal(
@@ -732,17 +825,23 @@ where
     S: ScannerObjectIO,
 {
     let mut reader = ScannerPutObjReader::from_vec(data);
-    api.put_object(
-        RUSTFS_META_BUCKET,
-        file,
-        &mut reader,
-        &ScannerObjectOptions {
-            max_parity: true,
-            http_preconditions: Some(preconditions),
-            ..Default::default()
+    let opts = ScannerObjectOptions {
+        max_parity: true,
+        http_preconditions: Some(preconditions),
+        ..Default::default()
+    };
+    let write = api.put_object(RUSTFS_META_BUCKET, file, &mut reader, &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let write = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerConfigWrite,
+        async {
+            crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerConfigWrite,
+            );
+            write.await
         },
-    )
-    .await
+    );
+    write.await
 }
 
 pub(crate) async fn save_config_with_publication_admission_for_epoch<S>(
@@ -857,19 +956,25 @@ where
             fence.to_string(),
         );
     }
-    api.put_object(
-        RUSTFS_META_BUCKET,
-        file,
-        &mut reader,
-        &ScannerObjectOptions {
-            max_parity: true,
-            http_preconditions: Some(preconditions),
-            scanner_publication_commit_scope,
-            user_defined,
-            ..Default::default()
+    let opts = ScannerObjectOptions {
+        max_parity: true,
+        http_preconditions: Some(preconditions),
+        scanner_publication_commit_scope,
+        user_defined,
+        ..Default::default()
+    };
+    let write = api.put_object(RUSTFS_META_BUCKET, file, &mut reader, &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let write = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerConfigWrite,
+        async {
+            crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerConfigWrite,
+            );
+            write.await
         },
-    )
-    .await
+    );
+    write.await
 }
 
 pub(crate) async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> std::result::Result<(), DiskError> {
@@ -1181,7 +1286,13 @@ mod tests {
         assert!(!scanner_runtime_initialized());
 
         {
-            let _guard = ScannerRuntimeGuard::new();
+            let mut guard = ScannerRuntimeGuard::new();
+            assert!(
+                !scanner_runtime_initialized(),
+                "observation must not change admission before initialization"
+            );
+            guard.mark_initialized();
+            guard.mark_initialized();
             assert!(scanner_runtime_initialized());
         }
 

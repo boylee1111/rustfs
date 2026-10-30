@@ -33,12 +33,36 @@ impl Operation for EnableTableBucketHandler {
         let warehouse = warehouse_from_params(&params)?;
         let resource = TableCatalogResource::warehouse(&warehouse);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableBucketAction).await?;
+        let app_context = runtime_sources::app_context_from_extensions(&req.extensions);
         let backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let object_store = runtime_sources::object_store_from_req(&req)
             .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
         let store = table_catalog_store_from_backend(backend.clone())?;
         let publication = TableCommitObjectBackend::preauthorized(backend);
         let response = enable_table_bucket_response(&store, &publication, object_store.as_ref(), &warehouse).await?;
+        crate::app::bucket_usecase::notify_table_bucket_metadata_reload(warehouse.clone(), "enable table bucket", app_context)
+            .await;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct DisableTableBucketHandler {}
+
+#[async_trait::async_trait]
+impl Operation for DisableTableBucketHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableBucketAction).await?;
+        let app_context = runtime_sources::app_context_from_extensions(&req.extensions);
+        let backend = table_catalog_backend_from_extensions(&req.extensions)?;
+        let object_store = runtime_sources::object_store_from_req(&req)
+            .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
+        let store = table_catalog_store_from_backend(backend.clone())?;
+        let publication = TableCommitObjectBackend::preauthorized(backend);
+        let response = disable_table_bucket_response(&store, &publication, object_store.as_ref(), &warehouse).await?;
+        crate::app::bucket_usecase::notify_table_bucket_metadata_reload(warehouse.clone(), "disable table bucket", app_context)
+            .await;
         build_json_response(StatusCode::OK, &response)
     }
 }
@@ -116,6 +140,75 @@ impl Operation for CancelTableCatalogMigrationHandler {
         record_table_catalog_admin_operation_result("migration-cancel", &warehouse, "", "", started, &result);
         let response = result?;
         build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct CreateTableCatalogBackupHandler {}
+
+#[async_trait::async_trait]
+impl Operation for CreateTableCatalogBackupHandler {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let request = read_json_body_or_default::<CatalogBackupRequest>(std::mem::take(&mut req.input)).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let started = Instant::now();
+        let result = store
+            .create_durable_catalog_backup(&warehouse, request.expected_snapshot_etag.as_deref())
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("catalog-backup", &warehouse, "", "", started, &result);
+        let response = result?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RestoreTableCatalogBackupHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RestoreTableCatalogBackupHandler {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let request = read_json_body::<CatalogRestoreRequest>(std::mem::take(&mut req.input)).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let started = Instant::now();
+        let result = store
+            .restore_durable_catalog_backup(
+                &warehouse,
+                &request.backup_id,
+                request.expected_snapshot_etag.as_deref(),
+                request.allow_replace,
+            )
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("catalog-restore", &warehouse, "", "", started, &result);
+        let response = result?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct BackfillTableWarehouseIndexHandler {}
+
+#[async_trait::async_trait]
+impl Operation for BackfillTableWarehouseIndexHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
+        let started = Instant::now();
+        let result = store
+            .backfill_table_warehouse_index(&warehouse)
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("warehouse-index-backfill", &warehouse, "", "", started, &result);
+        result?;
+        Ok(empty_response(StatusCode::NO_CONTENT))
     }
 }
 

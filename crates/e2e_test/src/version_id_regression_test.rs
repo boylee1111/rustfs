@@ -27,7 +27,9 @@ mod tests {
     use aws_sdk_s3::Client;
     use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
+    use aws_sdk_s3::types::{
+        BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Tag, Tagging, VersioningConfiguration,
+    };
     use tracing::info;
 
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
@@ -81,6 +83,156 @@ mod tests {
 
         info!("✅ Versioning suspended for bucket {}", bucket);
         Ok(())
+    }
+
+    async fn assert_version_tags(client: &Client, bucket: &str, key: &str, version: Option<&str>, value: Option<&str>) {
+        let tags = client
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .set_version_id(version.map(str::to_owned))
+            .send()
+            .await
+            .expect("GetObjectTagging must accept the exact version selector");
+        let expected = value
+            .map(|value| vec![Tag::builder().key("generation").value(value).build().expect("valid tag")])
+            .unwrap_or_default();
+        assert_eq!(tags.tag_set(), expected, "version selector: {version:?}");
+    }
+
+    async fn assert_null_tagging_across_versioning_changes(client: &Client, bucket: &str, key: &str) {
+        assert_version_tags(client, bucket, key, None, None).await;
+        assert_version_tags(client, bucket, key, Some("null"), None).await;
+        client
+            .put_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .version_id("null")
+            .tagging(
+                Tagging::builder()
+                    .tag_set(
+                        Tag::builder()
+                            .key("generation")
+                            .value("original-null")
+                            .build()
+                            .expect("valid tag"),
+                    )
+                    .build()
+                    .expect("valid tagging"),
+            )
+            .send()
+            .await
+            .expect("tag the original null version");
+
+        enable_versioning(client, bucket)
+            .await
+            .expect("enable versioning over a null version");
+        let versioned = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .tagging("generation=versioned")
+            .body(ByteStream::from_static(b"new version"))
+            .send()
+            .await
+            .expect("write a newer UUID version");
+        let version = versioned.version_id().expect("versioned PUT must return a UUID");
+        assert_ne!(version, "null");
+        assert_version_tags(client, bucket, key, None, Some("versioned")).await;
+        assert_version_tags(client, bucket, key, Some(version), Some("versioned")).await;
+        assert_version_tags(client, bucket, key, Some("null"), Some("original-null")).await;
+
+        client
+            .put_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .version_id("null")
+            .tagging(
+                Tagging::builder()
+                    .tag_set(
+                        Tag::builder()
+                            .key("generation")
+                            .value("updated-null")
+                            .build()
+                            .expect("valid tag"),
+                    )
+                    .build()
+                    .expect("valid tagging"),
+            )
+            .send()
+            .await
+            .expect("update tags on the noncurrent null version");
+        assert_version_tags(client, bucket, key, Some("null"), Some("updated-null")).await;
+        assert_version_tags(client, bucket, key, None, Some("versioned")).await;
+        client
+            .delete_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .version_id("null")
+            .send()
+            .await
+            .expect("delete only the noncurrent null version tags");
+        assert_version_tags(client, bucket, key, Some("null"), None).await;
+        assert_version_tags(client, bucket, key, Some(version), Some("versioned")).await;
+
+        suspend_versioning(client, bucket).await.expect("suspend versioning");
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .tagging("generation=suspended-null")
+            .body(ByteStream::from_static(b"replacement null version"))
+            .send()
+            .await
+            .expect("replace the null version while suspended");
+        assert_version_tags(client, bucket, key, None, Some("suspended-null")).await;
+        assert_version_tags(client, bucket, key, Some("null"), Some("suspended-null")).await;
+        assert_version_tags(client, bucket, key, Some(version), Some("versioned")).await;
+
+        enable_versioning(client, bucket).await.expect("re-enable versioning");
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .tagging("generation=latest")
+            .body(ByteStream::from_static(b"latest version"))
+            .send()
+            .await
+            .expect("write a new latest version");
+        assert_version_tags(client, bucket, key, Some("null"), Some("suspended-null")).await;
+        assert_version_tags(client, bucket, key, None, Some("latest")).await;
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id("null")
+            .send()
+            .await
+            .expect("remove only the null version");
+        assert_version_tags(client, bucket, key, None, Some("latest")).await;
+        let absent_version = uuid::Uuid::new_v4().to_string();
+        for (missing_key, selector, expected_code) in [
+            (key, Some("null"), "NoSuchVersion"),
+            (key, Some(absent_version.as_str()), "NoSuchVersion"),
+            ("never-created", None, "NoSuchKey"),
+            ("never-created", Some("null"), "NoSuchVersion"),
+            ("never-created", Some(absent_version.as_str()), "NoSuchVersion"),
+        ] {
+            let missing = client
+                .get_object_tagging()
+                .bucket(bucket)
+                .key(missing_key)
+                .set_version_id(selector.map(str::to_owned))
+                .send()
+                .await
+                .expect_err("a missing version must not fall back to latest");
+            assert_eq!(
+                missing.as_service_error().and_then(ProvideErrorMetadata::code),
+                Some(expected_code),
+                "key: {missing_key}, version selector: {selector:?}"
+            );
+        }
+        assert_version_tags(client, bucket, key, None, Some("latest")).await;
     }
 
     /// Test 1: PutObject should return version_id when versioning is enabled
@@ -262,7 +414,9 @@ mod tests {
         info!("🧪 TEST: PutObject behavior without versioning (no regression)");
 
         let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
-        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+        env.start_rustfs_server_without_cleanup(vec![])
+            .await
+            .expect("Failed to start isolated RustFS");
 
         let client = create_s3_client(&env);
         let bucket = "test-no-versioning";
@@ -290,6 +444,9 @@ mod tests {
             output.version_id().is_none() || output.version_id() == Some("null"),
             "non-versioned PUT must omit version ID or return the S3 null version"
         );
+        // Reuse this unversioned fixture to prove explicit null never becomes
+        // an implicit latest-version read after enable/suspend transitions.
+        assert_null_tagging_across_versioning_changes(&client, bucket, key).await;
         info!("✅ PASSED: PutObject works correctly without versioning");
     }
 
@@ -441,6 +598,154 @@ mod tests {
         }
 
         info!("✅ PASSED: Veeam backup workflow simulation completed successfully");
+    }
+
+    /// Veeam B&R discovers SOSAPI by GET/HEAD of two well-known keys.
+    #[tokio::test]
+    async fn test_veeam_sosapi_system_and_capacity() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::common::local_http_client;
+
+        const SYSTEM_KEY: &str = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/system.xml";
+        const CAPACITY_KEY: &str = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/capacity.xml";
+
+        init_logging();
+        info!("🧪 TEST: Veeam SOSAPI system.xml and capacity.xml");
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server_with_env(vec![], crate::common::FAST_DATA_USAGE_SCANNER_ENV)
+            .await?;
+        let client = create_s3_client(&env);
+        let bucket = "veeam-sosapi";
+        create_bucket(&client, bucket).await?;
+
+        let system = client.get_object().bucket(bucket).key(SYSTEM_KEY).send().await?;
+        let system_etag = system.e_tag().map(str::to_string);
+        let system_len = system.content_length();
+        assert_eq!(system.content_type(), Some("application/xml"));
+        let system_body = system.body.collect().await?.into_bytes();
+        let system_xml = std::str::from_utf8(&system_body)?;
+        assert!(system_xml.contains("<ProtocolVersion>\"1.0\"</ProtocolVersion>"), "{system_xml}");
+        assert!(
+            system_xml.contains("<ModelName>\"RustFS ") && system_xml.contains("\"</ModelName>"),
+            "{system_xml}"
+        );
+        assert!(system_xml.contains("<CapacityInfo>true</CapacityInfo>"));
+        assert!(system_xml.contains("<UploadSessions>false</UploadSessions>"));
+        assert!(system_xml.contains("<IAMSTS>false</IAMSTS>"));
+        assert!(!system_xml.contains("SystemRecommendations"));
+        assert!(!system_xml.contains("APIEndpoints"));
+        assert!(!system_xml.contains("&quot;"));
+
+        let head = client.head_object().bucket(bucket).key(SYSTEM_KEY).send().await?;
+        assert_eq!(head.content_type(), Some("application/xml"));
+        assert_eq!(head.content_length(), system_len);
+        assert_eq!(head.e_tag().map(str::to_string), system_etag);
+        assert!(head.last_modified().is_some());
+
+        let ranged = client
+            .get_object()
+            .bucket(bucket)
+            .key(SYSTEM_KEY)
+            .range("bytes=0-3")
+            .send()
+            .await?;
+        assert_eq!(ranged.content_length(), Some(4));
+        let ranged_header = ranged.content_range().unwrap_or("");
+        assert!(ranged_header.starts_with("bytes 0-3/"), "{ranged_header}");
+        let ranged_body = ranged.body.collect().await?.into_bytes();
+        assert_eq!(&ranged_body[..], &system_body[..4]);
+
+        let capacity = tokio::time::timeout(std::time::Duration::from_secs(180), async {
+            loop {
+                match client.get_object().bucket(bucket).key(CAPACITY_KEY).send().await {
+                    Ok(capacity) => break Ok(capacity),
+                    Err(err) if err.code() == Some("ServiceUnavailable") => {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+        })
+        .await??;
+        assert_eq!(capacity.content_type(), Some("application/xml"));
+        let capacity_body = capacity.body.collect().await?.into_bytes();
+        let capacity_xml = std::str::from_utf8(&capacity_body)?;
+        let capacity_value = xml_u64(capacity_xml, "Capacity")?;
+        let available_value = xml_u64(capacity_xml, "Available")?;
+        let used_value = xml_u64(capacity_xml, "Used")?;
+        assert!(used_value <= capacity_value, "{capacity_xml}");
+        assert!(available_value <= capacity_value.saturating_sub(used_value), "{capacity_xml}");
+
+        let put_err = client
+            .put_object()
+            .bucket(bucket)
+            .key(SYSTEM_KEY)
+            .body(ByteStream::from_static(b"overwrite"))
+            .send()
+            .await
+            .expect_err("SOSAPI put must fail");
+        assert_eq!(put_err.code(), Some("MethodNotAllowed"));
+        let delete_err = client
+            .delete_object()
+            .bucket(bucket)
+            .key(CAPACITY_KEY)
+            .send()
+            .await
+            .expect_err("SOSAPI delete must fail");
+        assert_eq!(delete_err.code(), Some("MethodNotAllowed"));
+
+        let normal_key = "Veeam/Backup/job.dat";
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(normal_key)
+            .body(ByteStream::from_static(b"backup-bytes"))
+            .send()
+            .await?;
+        let normal = client.get_object().bucket(bucket).key(normal_key).send().await?;
+        let normal_body = normal.body.collect().await?.into_bytes();
+        assert_eq!(&normal_body[..], b"backup-bytes");
+
+        let anon = local_http_client()
+            .get(format!("{}/{bucket}/{SYSTEM_KEY}", env.url))
+            .send()
+            .await?;
+        assert_eq!(anon.status(), reqwest::StatusCode::FORBIDDEN);
+        let anon_body = anon.text().await?;
+        assert!(!anon_body.contains("ProtocolVersion"), "{anon_body}");
+
+        let now = time::OffsetDateTime::now_utc();
+        let scope_date = format!("{:04}{:02}{:02}", now.year(), u8::from(now.month()), now.day());
+        let amz_date = format!("{scope_date}T{:02}{:02}{:02}Z", now.hour(), now.minute(), now.second());
+        let bad = local_http_client()
+            .get(format!("{}/{bucket}/{SYSTEM_KEY}", env.url))
+            .header("x-amz-date", &amz_date)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=bad/{scope_date}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000"
+                ),
+            )
+            .send()
+            .await?;
+        assert_eq!(bad.status(), reqwest::StatusCode::FORBIDDEN);
+        let bad_body = bad.text().await?;
+        assert!(!bad_body.contains("ProtocolVersion"), "{bad_body}");
+
+        info!("✅ PASSED: Veeam SOSAPI system.xml and capacity.xml");
+        Ok(())
+    }
+
+    fn xml_u64(xml: &str, element: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let start = format!("<{element}>");
+        let end = format!("</{element}>");
+        let start_idx = xml.find(&start).ok_or_else(|| format!("missing {element} in {xml}"))? + start.len();
+        let end_idx = xml[start_idx..]
+            .find(&end)
+            .ok_or_else(|| format!("unclosed {element} in {xml}"))?
+            + start_idx;
+        Ok(xml[start_idx..end_idx].parse()?)
     }
 
     #[tokio::test]

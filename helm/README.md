@@ -32,6 +32,42 @@ You can override the inference by setting `drivesPerNode` explicitly, e.g.
 (with `--cascade=orphan` to keep pods and PVCs) and recreate it, or perform a
 full reinstall.
 
+## Bring-your-own drives (JBOD)
+
+By default every drive is a PersistentVolumeClaim sized by
+`storageclass.dataStorageSize`. To use disks that you provide yourself, such as
+JBOD `hostPath` or local volumes, set `storageclass.dataStorageSize` to an empty
+string. The chart then renders no data PVCs (no data `volumeClaimTemplates` in
+distributed mode, no data PVC in standalone mode) and no data `volumeMounts`,
+and you supply the drives through `extraVolumes` and `extraVolumeMounts`:
+
+```yaml
+replicaCount: 3
+drivesPerNode: 4
+storageclass:
+  dataStorageSize: ""
+extraVolumes:
+  - name: disk0
+    hostPath: {path: /mnt/disk0, type: Directory}
+  # ... disk1 to disk3
+extraVolumeMounts:
+  - name: disk0
+    mountPath: /data/rustfs0
+  # ... /data/rustfs1 to /data/rustfs3
+```
+
+Mount the drives at `/data/rustfs0` … `/data/rustfs<drivesPerNode-1>` when
+`drivesPerNode` is greater than 1, otherwise at `/data`, so they match the
+generated `RUSTFS_VOLUMES`. The logs PVC is unaffected; set
+`config.rustfs.obs_log_directory` to an empty string to drop it as well. Each
+entry of `pools.list` may override `storageclass.dataStorageSize`
+independently. In standalone mode, `mode.standalone.existingClaim.dataClaim`
+still mounts the named claim as `data`.
+
+Switching `storageclass.dataStorageSize` between empty and non-empty changes
+`volumeClaimTemplates`, so the same StatefulSet recreation rules as for
+`drivesPerNode` apply.
+
 ---
 
 ## Upgrade notes
@@ -138,8 +174,12 @@ behavior.
 | config.rustfs.scanner.bitrot_cycle_secs | string | `""` | Override periodic deep bitrot cycle with `RUSTFS_SCANNER_BITROT_CYCLE_SECS`; `false`, `off`, `no`, or `disabled` disables it. |
 | config.rustfs.scanner.idle_mode | string | `""` | Override scanner idle throttling flag (`RUSTFS_SCANNER_IDLE_MODE`). |
 | config.rustfs.scanner.cache_save_timeout_secs | string | `""` | Override scanner cache save timeout in seconds with `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (minimum `1`). |
+| config.rustfs.scanner.recovery_backoff_cap_secs | string | `""` | Cap the wait between automatic scanner startup recovery retries in seconds with `RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS` (positive integer; default `600`). |
 | config.rustfs.scanner.max_concurrent_set_scans | string | `""` | Cap concurrent scanner set tasks with `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` (`0` keeps topology-derived concurrency). |
 | config.rustfs.scanner.max_concurrent_disk_scans | string | `""` | Cap concurrent scanner disk bucket walks per set with `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` (`0` keeps disk-count-derived concurrency). |
+| config.rustfs.scanner.walkers_per_disk | string | `""` | Bucket walkers per local disk with `RUSTFS_SCANNER_WALKERS_PER_DISK` (`1` to `16`; the default `1` keeps one bucket walk per disk, raise it on flash so one disk walks several buckets concurrently). |
+| config.rustfs.scanner.disk_io_budget_iops | string | `""` | Per-local-disk ceiling on scanner metadata operations per second with `RUSTFS_SCANNER_DISK_IO_BUDGET_IOPS` (`auto` picks the media default, `off` removes the cap, a number is an explicit rate). |
+| config.rustfs.scanner.disk_io_budget_bytes_per_sec | string | `""` | Per-local-disk ceiling on scanner metadata bytes per second with `RUSTFS_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC` (`auto` picks the media default, `off` removes the cap, a number is an explicit rate). |
 | config.rustfs.scanner.yield_every_n_objects | string | `""` | Yield to the async runtime every N scanned objects with `RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS` (`0` disables extra yield). |
 | config.rustfs.scanner.alert_excess_versions | string | `""` | Set version count threshold for scanner alerts with `RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS`. |
 | config.rustfs.scanner.alert_excess_version_size | string | `""` | Set retained version byte threshold for scanner alerts with `RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE`. |
@@ -208,6 +248,7 @@ behavior.
 | livenessProbe.periodSeconds | int | `5` |  |
 | livenessProbe.successThreshold | int | `1` |  |
 | livenessProbe.timeoutSeconds | int | `3` |  |
+| minReadySeconds | int | `45` | Seconds a replaced pod must stay Ready before the rolling update moves to the next pod. Covers the platform DNS TTL and survivor re-admission window after a restart (see `docs/operations/rolling-restart.md`). `0` disables. |
 | mode.distributed.enabled | bool | `true` | RustFS distributed mode support, namely multiple pod multiple pvc. |
 | mode.standalone.enabled | bool | `false` | RustFS standalone mode support, namely one pod one pvc.  |
 | mode.standalone.existingClaim.dataClaim |string |`""` |Whether to use existing pvc claim for data storage. |
@@ -277,7 +318,8 @@ uer. `ClusterIssuer` or `Issuer`. |
 | gatewayApi.listeners.tls.name | string | `tls` | Gateway API TLS passthrough listener name. |
 | gatewayApi.listeners.tls.port | int | `443` | Gateway API TLS passthrough listener port. |
 | gatewayApi.listeners.tls.backendPort | int | `null` | Backend service port that terminates TLS; defaults to the console port. |
-| gatewayApi.hostname | string | Hostname to access RustFS via gateway api. |
+| gatewayApi.hostname | string | `example.rustfs.com` | Console hostname for Gateway API. |
+| gatewayApi.endpointHostname | string | `""` | Optional separate S3 endpoint hostname; empty disables the S3 HTTPRoute. |
 | gatewayApi.secretName | string | Secret tls to via RustFS using HTTPS. |
 | gatewayApi.existingGateway.name | string | `""` |  The existing gateway name, instead of creating a new one. |
 | gatewayApi.existingGateway.namespace | string | `""` |  The namespace of the existing gateway, if not the local namespace. |
@@ -449,7 +491,21 @@ NAME           HOSTNAMES            AGE
 rustfs-route   ["example.rustfs.com"]   172m
 ```
 
-Then, via RustFS instance via `https://example.rustfs.com` or `http://example.rustfs.com`.
+Access the console at `https://example.rustfs.com`; HTTP redirects to HTTPS by default. HTTPRoutes reference the chart's Kubernetes Service directly and do not require the TraefikService CRD or Traefik's Kubernetes CRD provider. The former TraefikService cookie stickiness is no longer configured by this chart.
+
+To expose the S3 endpoint alongside the console, set a different `gatewayApi.endpointHostname`:
+
+```yaml
+gatewayApi:
+  enabled: true
+  hostname: console.example.com
+  endpointHostname: s3.example.com
+  existingGateway:
+    name: shared-gateway
+    namespace: gateway-system
+```
+
+The console route uses `service.console.port` (9001 by default), and the optional S3 route uses `service.endpoint.port` (9000 by default). Both attach to the configured HTTPS listener and preserve request paths. Configure DNS and the Gateway's TLS certificate for both hostnames. When using a Gateway in another namespace, its listener must allow routes from the RustFS namespace. Leaving `endpointHostname` empty preserves the console-only behavior.
 
 For end-to-end encryption, set `gatewayApi.listeners.tls.enabled` to `true`. The chart then adds a `TLS` listener with `tls.mode: Passthrough` to the `Gateway` and generates a `TLSRoute` that forwards the encrypted stream to the RustFS service, where TLS is terminated on the backend side. Note that backend TLS termination must be configured on RustFS itself (for example `RUSTFS_TLS_PATH` pointing to server certificates), and the installed Gateway API CRDs must include `TLSRoute`.
 

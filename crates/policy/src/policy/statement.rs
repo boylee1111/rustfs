@@ -182,15 +182,24 @@ impl Statement {
     /// left empty. An empty `args.object` means the caller did not scope the request to a
     /// key, which preserves the legacy match-every-key behaviour.
     async fn kms_key_scope_matches(&self, args: &Args<'_>, resolver: &VariableResolver) -> bool {
+        if self.not_resources.iter().any(|resource| matches!(resource, Resource::All)) {
+            return false;
+        }
+
         if matches!(args.action, Action::KmsAction(KmsAction::BackupAction | KmsAction::RestoreAction))
-            && (!self.resources.is_empty() || !self.not_resources.is_empty())
+            && ((!self.resources.is_empty() && !self.resources.iter().any(|resource| matches!(resource, Resource::All)))
+                || !self.not_resources.is_empty())
         {
             // Global bundle operations require an unscoped Allow, while a Deny
             // covering any key must still block an operation covering every key.
             return matches!(self.effect, Effect::Deny);
         }
 
-        let kms_resources: Vec<&Resource> = self.resources.iter().filter(|resource| resource.is_kms()).collect();
+        let kms_resources: Vec<&Resource> = self
+            .resources
+            .iter()
+            .filter(|resource| matches!(resource, Resource::All | Resource::Kms(_)))
+            .collect();
         let kms_not_resources: Vec<&Resource> = self.not_resources.iter().filter(|resource| resource.is_kms()).collect();
 
         if kms_resources.len() != self.resources.len() || kms_not_resources.len() != self.not_resources.len() {
@@ -247,7 +256,8 @@ impl Statement {
     /// Returns true when this statement would reach `conditions.evaluate_with_resolver` in
     /// [`Statement::is_allowed`] (including the KMS resource path). Does not evaluate conditions.
     pub(crate) async fn request_reaches_condition_eval(&self, args: &Args<'_>, resolver: &VariableResolver) -> bool {
-        if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
+        let deny = matches!(self.effect, Effect::Deny);
+        if !self.actions.statement_covers(&self.not_actions, &args.action, deny) {
             return false;
         }
 
@@ -423,7 +433,8 @@ impl BPStatement {
             return false;
         }
 
-        if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
+        let deny = matches!(self.effect, Effect::Deny);
+        if !self.actions.statement_covers(&self.not_actions, &args.action, deny) {
             return false;
         }
 

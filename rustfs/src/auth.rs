@@ -15,6 +15,7 @@
 use crate::runtime_sources::{AppContext, ServerContextSlot, current_action_credentials, current_ready_iam_handle};
 use http::HeaderMap;
 use http::Uri;
+use http::header::{IF_MATCH, IF_NONE_MATCH};
 use rustfs_credentials::Credentials;
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
@@ -239,7 +240,6 @@ impl S3Auth for IAMAuth {
                         event = EVENT_SECRET_KEY_LOOKUP_FAILED,
                         component = LOG_COMPONENT_AUTH,
                         subsystem = LOG_SUBSYSTEM_CREDENTIALS,
-                        access_key = %MaskedAccessKey(access_key),
                         reason = "no_such_user",
                         "Secret key lookup rejected"
                     );
@@ -249,7 +249,6 @@ impl S3Auth for IAMAuth {
                         event = EVENT_SECRET_KEY_LOOKUP_FAILED,
                         component = LOG_COMPONENT_AUTH,
                         subsystem = LOG_SUBSYSTEM_CREDENTIALS,
-                        access_key = %MaskedAccessKey(access_key),
                         error = ?e,
                         reason = "check_key_error",
                         "Secret key lookup errored"
@@ -262,7 +261,6 @@ impl S3Auth for IAMAuth {
                 event = EVENT_SECRET_KEY_LOOKUP_FAILED,
                 component = LOG_COMPONENT_AUTH,
                 subsystem = LOG_SUBSYSTEM_CREDENTIALS,
-                access_key = %MaskedAccessKey(access_key),
                 reason = "iam_not_initialized",
                 "Secret key lookup skipped"
             );
@@ -450,6 +448,8 @@ pub async fn check_key_valid_with_context(
                 return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
             }
 
+            check_session_token(session_token, &u.credentials)?;
+
             warn!(
                 event = EVENT_SECRET_KEY_LOOKUP_FAILED,
                 component = LOG_COMPONENT_AUTH,
@@ -468,8 +468,7 @@ pub async fn check_key_valid_with_context(
         cred = u.credentials;
     }
 
-    let claims = check_claims_from_token_with_context(session_token, &cred, ctx)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {e}")))?;
+    let claims = check_claims_from_token_with_context(session_token, &cred, ctx)?;
 
     cred.claims = if !claims.is_empty() { Some(claims) } else { None };
 
@@ -481,30 +480,39 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
     check_claims_from_token_with_context(token, cred, None)
 }
 
+fn check_session_token(token: &str, cred: &Credentials) -> S3Result<()> {
+    // Session identity survives expiration; is_temp() only describes active credentials.
+    let has_session_token = !cred.session_token.is_empty();
+
+    if !token.is_empty() && cred.access_key.is_empty() {
+        return Err(s3_error!(InvalidRequest, "no access key"));
+    }
+
+    if token.is_empty() && has_session_token && !cred.is_service_account() {
+        return Err(s3_error!(InvalidRequest, "invalid token1"));
+    }
+
+    if !token.is_empty() && !has_session_token {
+        return Err(s3_error!(InvalidRequest, "invalid token2"));
+    }
+
+    if !cred.is_service_account() && has_session_token && !constant_time_eq(token, &cred.session_token) {
+        return Err(s3_error!(InvalidRequest, "invalid token3"));
+    }
+
+    if has_session_token && !cred.is_service_account() && cred.is_expired() {
+        return Err(s3_error!(ExpiredToken, "The provided token has expired."));
+    }
+
+    Ok(())
+}
+
 fn check_claims_from_token_with_context(
     token: &str,
     cred: &Credentials,
     ctx: Option<&AppContext>,
 ) -> S3Result<HashMap<String, Value>> {
-    if !token.is_empty() && cred.access_key.is_empty() {
-        return Err(s3_error!(InvalidRequest, "no access key"));
-    }
-
-    if token.is_empty() && cred.is_temp() && !cred.is_service_account() {
-        return Err(s3_error!(InvalidRequest, "invalid token1"));
-    }
-
-    if !token.is_empty() && !cred.is_temp() {
-        return Err(s3_error!(InvalidRequest, "invalid token2"));
-    }
-
-    if !cred.is_service_account() && cred.is_temp() && !constant_time_eq(token, &cred.session_token) {
-        return Err(s3_error!(InvalidRequest, "invalid token3"));
-    }
-
-    if cred.is_temp() && cred.is_expired() {
-        return Err(s3_error!(InvalidRequest, "invalid access key is temp and expired"));
-    }
+    check_session_token(token, cred)?;
 
     let sys_cred = match ctx {
         Some(context) => context.action_credentials().get(),
@@ -720,10 +728,8 @@ pub fn get_condition_values_with_query_and_client_info(
         args.insert("LocationConstraint".to_owned(), vec![lc.to_string()]);
     }
 
-    let mut clone_header = header.clone();
-    if let Some(v) = clone_header.get("x-amz-signature-age") {
+    if let Some(v) = header.get("x-amz-signature-age") {
         args.insert("signatureAge".to_string(), vec![v.to_str().unwrap_or("").to_string()]);
-        clone_header.remove("x-amz-signature-age");
     }
 
     for obj_lock in &[
@@ -731,7 +737,7 @@ pub fn get_condition_values_with_query_and_client_info(
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     ] {
-        let values = clone_header
+        let values = header
             .get_all(*obj_lock)
             .iter()
             .map(|v| v.to_str().unwrap_or("").to_string())
@@ -739,7 +745,6 @@ pub fn get_condition_values_with_query_and_client_info(
         if !values.is_empty() {
             args.insert(obj_lock.trim_start_matches("x-amz-").to_string(), values);
         }
-        clone_header.remove(*obj_lock);
     }
 
     // S3 policy condition keys use "x-amz-grant-*" (policy key s3:x-amz-grant-* -> name() returns x-amz-grant-*)
@@ -750,7 +755,7 @@ pub fn get_condition_values_with_query_and_client_info(
         "x-amz-grant-read-acp",
         "x-amz-grant-write-acp",
     ] {
-        let values = clone_header
+        let values = header
             .get_all(*grant_header)
             .iter()
             .map(|v| v.to_str().unwrap_or("").to_string())
@@ -758,7 +763,6 @@ pub fn get_condition_values_with_query_and_client_info(
         if !values.is_empty() {
             args.insert((*grant_header).to_string(), values);
         }
-        clone_header.remove(*grant_header);
     }
 
     // Claims and group membership are part of the verified identity, so they are
@@ -766,7 +770,15 @@ pub fn get_condition_values_with_query_and_client_info(
     if let Some(claims) = &cred.claims {
         for (k, v) in claims {
             if let Some(v_str) = v.as_str() {
-                args.insert(k.trim_start_matches("ldap").to_lowercase(), vec![v_str.to_string()]);
+                let key = k.trim_start_matches("ldap");
+                // Request conditions cannot originate from identity claims, even without a header.
+                if key.eq_ignore_ascii_case(OBJECT_CREATION_OPERATION_CONDITION)
+                    || key.eq_ignore_ascii_case(IF_MATCH.as_str())
+                    || key.eq_ignore_ascii_case(IF_NONE_MATCH.as_str())
+                {
+                    continue;
+                }
+                args.insert(key.to_lowercase(), vec![v_str.to_string()]);
             }
         }
 
@@ -794,9 +806,27 @@ pub fn get_condition_values_with_query_and_client_info(
     // both the ones already populated above and the well-known identity keys that are
     // absent for this credential, since an absent key is exactly what a spoofed header
     // would fill in.
-    for key in clone_header.keys() {
-        if key.as_str().eq_ignore_ascii_case("x-amz-tagging") {
-            continue;
+    for key in header.keys() {
+        match key.as_str() {
+            // These headers were consumed under their policy names above, or by tagging authorization.
+            "x-amz-signature-age"
+            | AMZ_OBJECT_LOCK_MODE_LOWER
+            | AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER
+            | AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER
+            | "x-amz-tagging" => continue,
+            "if-match" | "if-none-match" => {
+                // A blank header must not satisfy `Null: false` while storage ignores it.
+                if let Some(value) = header
+                    .get(key)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    args.insert(key.as_str().to_string(), vec![value.to_string()]);
+                }
+                continue;
+            }
+            _ => {}
         }
         if is_reserved_condition_key(key.as_str(), &args) {
             continue;
@@ -814,6 +844,13 @@ pub fn get_condition_values_with_query_and_client_info(
     args
 }
 
+/// The S3 operation, rather than identity claims or request input, determines this value.
+pub(crate) const OBJECT_CREATION_OPERATION_CONDITION: &str = "ObjectCreationOperation";
+
+/// Condition name for `s3:object-lock-remaining-retention-days`. Storage access
+/// derives it from the requested retain-until date, so no header may set it.
+pub(crate) const OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION: &str = "object-lock-remaining-retention-days";
+
 /// Whether a request header is forbidden from contributing to policy condition key
 /// `key`, either because the server already derived that key from verified state or
 /// because it is a well-known identity/context key that only the server may populate.
@@ -826,6 +863,7 @@ fn is_reserved_condition_key(key: &str, server_derived: &HashMap<String, Vec<Str
         ]
         .iter()
         .any(|header| key.eq_ignore_ascii_case(header.trim_start_matches("x-amz-")))
+        || key.eq_ignore_ascii_case(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION)
         || is_server_derived_condition_key(key)
 }
 
@@ -1546,6 +1584,58 @@ mod tests {
         assert!(error.message().unwrap_or("").contains("Your account is not signed up"));
     }
 
+    #[tokio::test]
+    async fn credential_boundary_rejected_access_key_logs_omit_key_fragments() {
+        use rustfs_iam::{cache::Cache, manager::IamCache};
+        use tracing::instrument::WithSubscriber;
+
+        let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        let (send_chan, _receiver) = tokio::sync::mpsc::channel(1);
+        let cache = Arc::new(IamCache {
+            cache: Cache::default(),
+            api: ObjectStore::new(store.clone()),
+            state: Default::default(),
+            loading: Default::default(),
+            roles: HashMap::new(),
+            send_chan,
+            last_timestamp: Default::default(),
+            sync_failures: Default::default(),
+            sync_successes: Default::default(),
+            last_sync_duration_millis: Default::default(),
+        });
+        let slot = ServerContextSlot::new();
+        let context = AppContext::new(
+            store,
+            Arc::new(ContextIam {
+                handle: Arc::new(IamSys::new(cache)),
+            }),
+            Arc::new(TestKms),
+        );
+        assert!(slot.install(Arc::new(context)));
+        for (slot, reason) in [(slot, "no_such_user"), (ServerContextSlot::new(), "iam_not_initialized")] {
+            let auth = IAMAuth::with_server_context("bootstrap-key", SecretKey::from("bootstrap-secret"), slot);
+            let log = tempfile::NamedTempFile::new().expect("capture file");
+            let writer = log.reopen().expect("capture writer");
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.try_clone().expect("clone capture writer"))
+                .finish();
+            let error = auth
+                .get_secret_key("LEAK-private-access-key-TAIL")
+                .with_subscriber(subscriber)
+                .await
+                .expect_err("unknown credentials must be rejected");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidAccessKeyId);
+            let captured = std::fs::read_to_string(log.path()).expect("read captured logs");
+            assert!(captured.contains(reason), "capture the expected rejection: {captured}");
+            for forbidden in ["LEAK", "TAIL", "private-access-key", "access_key="] {
+                assert!(!captured.contains(forbidden), "rejected access-key material must not be logged");
+            }
+        }
+    }
+
     #[test]
     fn test_iam_lookup_error_maps_to_internal_error() {
         let result = iam_lookup_error_to_s3_error(&IamError::Io(std::io::Error::other("load user failed")));
@@ -1611,22 +1701,118 @@ mod tests {
     #[test]
     fn test_check_claims_from_token_expired_credentials() {
         let mut cred = create_temp_credentials();
-        cred.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1)); // Expired
-        cred.claims = None; // Make sure it's not a service account
+        cred.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
 
-        let result = check_claims_from_token(&cred.session_token, &cred);
+        let error = check_claims_from_token(&cred.session_token, &cred).unwrap_err();
+        assert_eq!(error.code(), &S3ErrorCode::ExpiredToken);
+        let response = error.to_http_response().expect("serialize the S3 error");
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        let body = response.body().bytes().expect("error XML body");
+        let xml = std::str::from_utf8(&body).expect("UTF-8 error XML");
+        assert!(xml.contains("<Code>ExpiredToken</Code>"));
+        assert!(!xml.contains(&cred.session_token));
+        assert!(!xml.contains(&cred.secret_key));
+    }
 
-        assert!(result.is_err());
-        let error = result.unwrap_err();
-        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+    #[test]
+    fn expired_sts_credentials_require_the_matching_token() {
+        let mut cred = create_temp_credentials();
+        cred.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
+        for token in ["", "wrong-session-token"] {
+            let error = check_claims_from_token(token, &cred).unwrap_err();
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        }
+    }
 
-        // The function checks various conditions in order. An expired temp credential
-        // might trigger other validation errors first (like token mismatch)
-        let msg = error.message().unwrap_or("");
-        let is_valid_error = msg.contains("invalid access key is temp and expired")
-            || msg.contains("invalid token")
-            || msg.contains("action cred not init");
-        assert!(is_valid_error, "Unexpected error message: '{msg}'");
+    #[tokio::test]
+    async fn check_key_valid_preserves_sts_error_codes() {
+        use rustfs_iam::{cache::Cache, manager::IamCache};
+        use rustfs_policy::auth::UserIdentity;
+
+        let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        let (send_chan, _receiver) = tokio::sync::mpsc::channel(1);
+        let iam_cache = Arc::new(IamCache {
+            cache: Cache::default(),
+            api: ObjectStore::new(store.clone()),
+            state: Default::default(),
+            loading: Default::default(),
+            roles: HashMap::new(),
+            send_chan,
+            last_timestamp: Default::default(),
+            sync_failures: Default::default(),
+            sync_successes: Default::default(),
+            last_sync_duration_millis: Default::default(),
+        });
+        let iam = Arc::new(IamSys::new(iam_cache.clone()));
+        let context = AppContext::new(store, Arc::new(ContextIam { handle: iam }), Arc::new(TestKms));
+        let root = Credentials {
+            access_key: "sts-test-root".to_string(),
+            secret_key: "sts-test-signing-secret".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        };
+        assert!(context.publish_action_credentials(root.clone()));
+        let now = OffsetDateTime::now_utc();
+        let claims = HashMap::from([("exp".to_string(), json!((now + time::Duration::hours(1)).unix_timestamp()))]);
+        let mut valid = get_new_credentials_with_metadata(&claims, &root.secret_key).expect("signed STS credentials");
+        valid.parent_user = root.access_key.clone();
+        iam_cache
+            .cache
+            .add_or_update_sts_account(&valid.access_key, &UserIdentity::new(valid.clone()), now);
+        assert!(
+            check_key_valid_with_context(&valid.session_token, &valid.access_key, Some(&context))
+                .await
+                .is_ok()
+        );
+        assert!(
+            check_key_valid_with_context("", &root.access_key, Some(&context))
+                .await
+                .is_ok()
+        );
+
+        // Seed the state of an issued identity after expiration without sleeping
+        // or changing the clock used by signature verification.
+        let expired_claims = HashMap::from([("exp".to_string(), json!((now - time::Duration::hours(1)).unix_timestamp()))]);
+        let mut expired =
+            get_new_credentials_with_metadata(&expired_claims, &root.secret_key).expect("expired signed STS credentials");
+        expired.parent_user = root.access_key.clone();
+        let mut disabled = expired.clone();
+        disabled.status = "off".to_string();
+        let mut service_account = create_service_account_credentials();
+        service_account.expiration = expired.expiration;
+        let mut invalid_key = create_test_credentials();
+        invalid_key.secret_key = "short".to_string();
+        for (name, credential, token, expected) in [
+            ("expired", &expired, expired.session_token.as_str(), S3ErrorCode::ExpiredToken),
+            ("expired without token", &expired, "", S3ErrorCode::InvalidRequest),
+            ("expired with wrong token", &expired, "wrong-token", S3ErrorCode::InvalidRequest),
+            (
+                "disabled expired",
+                &disabled,
+                disabled.session_token.as_str(),
+                S3ErrorCode::InvalidAccessKeyId,
+            ),
+            ("expired service account", &service_account, "", S3ErrorCode::InvalidRequest),
+            ("active without token", &valid, "", S3ErrorCode::InvalidRequest),
+            ("active with wrong token", &valid, "wrong-token", S3ErrorCode::InvalidRequest),
+            ("invalid key", &invalid_key, "", S3ErrorCode::InvalidRequest),
+        ] {
+            iam_cache.cache.add_or_update_sts_account(
+                &credential.access_key,
+                &UserIdentity::new(credential.clone()),
+                OffsetDateTime::now_utc(),
+            );
+            let error = check_key_valid_with_context(token, &credential.access_key, Some(&context))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), &expected, "{name}");
+            if expected == S3ErrorCode::ExpiredToken {
+                let response = error.to_http_response().expect("serialize the S3 error");
+                assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+                let body = response.body().bytes().expect("error XML body");
+                assert!(std::str::from_utf8(&body).unwrap().contains("<Code>ExpiredToken</Code>"));
+            }
+        }
     }
 
     #[test]
@@ -1690,12 +1876,10 @@ mod tests {
             verified.claims.as_ref().and_then(|claims| claims.get("context")),
             Some(&json!("matching"))
         );
-        assert!(
-            check_key_valid_with_context(&credential.session_token, &credential.access_key, Some(&mismatching))
-                .await
-                .is_err(),
-            "a different server context must not validate the token"
-        );
+        let error = check_key_valid_with_context(&credential.session_token, &credential.access_key, Some(&mismatching))
+            .await
+            .expect_err("a different server context must not validate the token");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -1901,6 +2085,17 @@ mod tests {
     }
 
     #[test]
+    fn object_lock_remaining_retention_days_header_is_ignored() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION, HeaderValue::from_static("1"));
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get(OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION), None);
+    }
+
+    #[test]
     fn test_get_condition_values_with_grant_headers() {
         let cred = create_test_credentials();
         let mut headers = HeaderMap::new();
@@ -1917,6 +2112,131 @@ mod tests {
             conditions.get("x-amz-grant-read"),
             Some(&vec!["uri=http://acs.amazonaws.com/groups/global/AllUsers".to_string()])
         );
+    }
+
+    #[test]
+    fn test_get_condition_values_with_conditional_write_headers() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("If-None-Match", HeaderValue::from_static(" * "));
+        headers.insert("If-Match", HeaderValue::from_static("\"9b2cf535f27731c974343645a3985328\""));
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("if-none-match"), Some(&vec!["*".to_string()]));
+        assert_eq!(
+            conditions.get("if-match"),
+            Some(&vec!["\"9b2cf535f27731c974343645a3985328\"".to_string()])
+        );
+    }
+
+    /// Storage ignores a blank precondition, and s3s rejects a non-UTF-8 one, so
+    /// neither may satisfy a `Null: false` check on `s3:if-none-match` / `s3:if-match`.
+    #[test]
+    fn test_get_condition_values_without_conditional_write_headers() {
+        let cred = create_test_credentials();
+        let mut blank = HeaderMap::new();
+        blank.insert("If-None-Match", HeaderValue::from_static(""));
+        blank.insert("If-Match", HeaderValue::from_static(""));
+        let mut non_utf8 = HeaderMap::new();
+        non_utf8.insert(
+            "If-None-Match",
+            HeaderValue::from_bytes(b"\xff").expect("obs-text is a valid header value"),
+        );
+        non_utf8.insert("If-Match", HeaderValue::from_bytes(b"\xff").expect("obs-text is a valid header value"));
+
+        for headers in [HeaderMap::new(), blank, non_utf8] {
+            let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+            assert!(!conditions.contains_key("if-none-match"), "headers {headers:?}");
+            assert!(!conditions.contains_key("if-match"), "headers {headers:?}");
+        }
+    }
+
+    #[test]
+    fn test_get_condition_values_conditional_write_headers_cannot_be_overridden_by_claims() {
+        let mut cred = create_service_account_credentials();
+        cred.claims = Some(HashMap::from([
+            ("if-none-match".to_string(), json!("*")),
+            ("if-match".to_string(), json!("\"claim-etag\"")),
+            ("IF-NONE-MATCH".to_string(), json!("*")),
+            ("ldapIF-MATCH".to_string(), json!("\"claim-etag\"")),
+        ]));
+
+        for value in [None, Some(""), Some(" ")] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(IF_NONE_MATCH, HeaderValue::from_str(value).expect("valid header"));
+                headers.insert(IF_MATCH, HeaderValue::from_str(value).expect("valid header"));
+            }
+            let conditions = get_condition_values(&headers, &cred, None, None, None);
+            assert!(
+                !conditions.contains_key("if-none-match"),
+                "claim must not fabricate an absent precondition"
+            );
+            assert!(!conditions.contains_key("if-match"), "claim must not fabricate an absent precondition");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
+        headers.insert(IF_MATCH, HeaderValue::from_static("\"request-etag\""));
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+        assert_eq!(conditions.get("if-none-match"), Some(&vec!["*".to_string()]));
+        assert_eq!(conditions.get("if-match"), Some(&vec!["\"request-etag\"".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_preserves_consumed_headers_and_multivalues() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-signature-age", HeaderValue::from_static("300"));
+        headers.insert("x-amz-object-lock-mode", HeaderValue::from_static("GOVERNANCE"));
+        headers.insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("ON"));
+        headers.insert("x-amz-object-lock-retain-until-date", HeaderValue::from_static("2030-01-01T00:00:00Z"));
+        headers.insert("x-amz-tagging", HeaderValue::from_static("project=blue"));
+        for name in [
+            "x-amz-grant-full-control",
+            "x-amz-grant-read",
+            "x-amz-grant-write",
+            "x-amz-grant-read-acp",
+            "x-amz-grant-write-acp",
+            "x-custom-header",
+        ] {
+            headers.append(name, HeaderValue::from_static("first"));
+            headers.append(name, HeaderValue::from_static("second"));
+        }
+        headers.append(IF_MATCH, HeaderValue::from_static(" \"first-etag\" "));
+        headers.append(IF_MATCH, HeaderValue::from_static("\"second-etag\""));
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+        for (name, expected) in [
+            ("signatureAge", "300"),
+            ("object-lock-mode", "GOVERNANCE"),
+            ("object-lock-legal-hold", "ON"),
+            ("object-lock-retain-until-date", "2030-01-01T00:00:00Z"),
+            ("if-match", "\"first-etag\""),
+        ] {
+            assert_eq!(conditions.get(name), Some(&vec![expected.to_string()]), "{name}");
+        }
+        for name in [
+            "x-amz-signature-age",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-legal-hold",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-tagging",
+        ] {
+            assert!(!conditions.contains_key(name), "consumed header {name} must not be merged again");
+        }
+        for name in [
+            "x-amz-grant-full-control",
+            "x-amz-grant-read",
+            "x-amz-grant-write",
+            "x-amz-grant-read-acp",
+            "x-amz-grant-write-acp",
+            "x-custom-header",
+        ] {
+            assert_eq!(conditions.get(name), Some(&vec!["first".to_string(), "second".to_string()]), "{name}");
+        }
     }
 
     #[test]

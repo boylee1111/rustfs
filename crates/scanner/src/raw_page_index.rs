@@ -12,9 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::data_usage_define::clone_cache_value;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+
+mod writer;
+pub(crate) use writer::RawEnumerationPageWriter;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RAW_PAGE_DIGEST_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 const RAW_PAGE_INDEX_VERSION: u16 = 1;
 const RAW_PAGE_ENTRY_MAX_BYTES: usize = 16 * 1024;
@@ -145,6 +154,13 @@ impl RawEnumerationPageIndex {
         }
     }
 
+    pub(crate) fn parent(&self) -> Option<&str> {
+        match &self.state {
+            RawEnumerationPageIndexState::Unsupported => None,
+            RawEnumerationPageIndexState::Supported(inner) => Some(&inner.parent),
+        }
+    }
+
     pub fn status(&self) -> RawEnumerationPageOwnerStatus {
         match &self.state {
             RawEnumerationPageIndexState::Unsupported => RawEnumerationPageOwnerStatus::Unsupported,
@@ -211,7 +227,7 @@ impl RawEnumerationPageIndex {
             return Err(RawEnumerationPageIndexError::IdentityMismatch);
         }
 
-        let mut indexed_entries = committed_entries.clone();
+        let mut indexed_entries = clone_cache_value(&committed_entries);
         if let Some(building) = &inner.building {
             building.validate(
                 u64::try_from(inner.pages.len()).unwrap_or(u64::MAX),
@@ -221,7 +237,7 @@ impl RawEnumerationPageIndex {
             if source_complete && !entries_contain_all(&entries, &building.entries) {
                 return Err(RawEnumerationPageIndexError::IdentityMismatch);
             }
-            indexed_entries.extend(building.entries.iter().cloned());
+            indexed_entries.extend(building.entries.iter().map(clone_cache_value));
         }
         let indexed_entries = normalize_owner_entries(indexed_entries)?;
         if source_complete && entry_sets_match(&entries, &indexed_entries) && inner.building.is_none() {
@@ -251,7 +267,7 @@ impl RawEnumerationPageIndex {
                     .iter()
                     .filter(|entry| indexed_entries.binary_search(entry).is_err())
                     .take(max_new_entries.min(remaining_page_slots))
-                    .cloned()
+                    .map(clone_cache_value)
                     .collect::<Vec<_>>();
                 let append_count = append_entries.len();
                 if append_count == 0 {
@@ -267,7 +283,7 @@ impl RawEnumerationPageIndex {
                     building.entries.dedup();
                     let source_entries_indexed = source_complete && {
                         let mut indexed_after_append = indexed_entries;
-                        indexed_after_append.extend(building.entries.iter().cloned());
+                        indexed_after_append.extend(building.entries.iter().map(clone_cache_value));
                         let indexed_after_append = normalize_owner_entries(indexed_after_append)?;
                         entry_sets_match(&indexed_after_append, &entries)
                     };
@@ -295,25 +311,12 @@ impl RawEnumerationPageIndex {
             return Err(RawEnumerationPageIndexError::StaleGeneration);
         }
         let entries_start = inner.validated_committed_entries()?.len();
-        let Some(building) = inner.building.as_ref() else {
-            return Err(RawEnumerationPageIndexError::EmptyCommit);
-        };
-        if building.entries.is_empty() {
-            return Err(RawEnumerationPageIndexError::EmptyCommit);
-        }
-        building.validate(
-            u64::try_from(inner.pages.len()).unwrap_or(u64::MAX),
-            u64::try_from(entries_start).unwrap_or(u64::MAX),
-            inner.page_entry_limit,
-        )?;
-        let Some(building) = inner.building.take() else {
-            return Err(RawEnumerationPageIndexError::EmptyCommit);
-        };
-        let page = RawEnumerationPage::new(&inner.parent, building);
-        inner.complete = page.terminal;
-        inner.pages.push(page.clone());
-        inner.generation = inner.generation.saturating_add(1);
-        Ok(page)
+        inner.commit_building_page(entries_start)?;
+        inner
+            .pages
+            .last()
+            .map(clone_cache_value)
+            .ok_or(RawEnumerationPageIndexError::EmptyCommit)
     }
 
     pub fn page(&self, page_index: u64, expected_digest: [u8; 32]) -> Result<&RawEnumerationPage, RawEnumerationPageIndexError> {
@@ -349,12 +352,37 @@ impl RawEnumerationPageIndex {
 }
 
 impl RawEnumerationPageIndexInner {
+    // Callers validate the committed prefix at the restore/API boundary. The
+    // live writer maintains its entry count without revisiting that prefix,
+    // and the committed page moves into `pages` without a copy.
+    fn commit_building_page(&mut self, entries_start: usize) -> Result<(), RawEnumerationPageIndexError> {
+        let Some(building) = self.building.as_ref() else {
+            return Err(RawEnumerationPageIndexError::EmptyCommit);
+        };
+        if building.entries.is_empty() {
+            return Err(RawEnumerationPageIndexError::EmptyCommit);
+        }
+        building.validate(
+            u64::try_from(self.pages.len()).unwrap_or(u64::MAX),
+            u64::try_from(entries_start).unwrap_or(u64::MAX),
+            self.page_entry_limit,
+        )?;
+        let Some(building) = self.building.take() else {
+            return Err(RawEnumerationPageIndexError::EmptyCommit);
+        };
+        let page = RawEnumerationPage::new(&self.parent, building);
+        self.complete = page.terminal;
+        self.pages.push(page);
+        self.generation = self.generation.saturating_add(1);
+        Ok(())
+    }
+
     fn status(&self) -> RawEnumerationPageOwnerStatus {
         let indexed_entries = u64::try_from(self.indexed_entries()).unwrap_or(u64::MAX);
         if let Some(building) = &self.building {
             RawEnumerationPageOwnerStatus::Building {
                 generation: self.generation,
-                parent: self.parent.clone(),
+                parent: clone_cache_value(&self.parent),
                 page_index: building.page_index,
                 indexed_entries,
                 buffered_entries: building.entries.len(),
@@ -362,7 +390,7 @@ impl RawEnumerationPageIndexInner {
         } else {
             RawEnumerationPageOwnerStatus::Ready {
                 generation: self.generation,
-                parent: self.parent.clone(),
+                parent: clone_cache_value(&self.parent),
                 committed_pages: self.pages.len(),
                 indexed_entries,
                 complete: self.complete,
@@ -381,12 +409,12 @@ impl RawEnumerationPageIndexInner {
             if page.terminal && page_index + 1 != self.pages.len() {
                 return Err(RawEnumerationPageIndexError::CorruptIndex);
             }
-            entries.extend(page.entries.iter().cloned());
+            entries.extend(page.entries.iter().map(clone_cache_value));
         }
         if self.complete && self.pages.last().is_some_and(|page| !page.terminal) {
             return Err(RawEnumerationPageIndexError::CorruptIndex);
         }
-        let mut unique_entries = entries.clone();
+        let mut unique_entries = clone_cache_value(&entries);
         unique_entries.sort();
         unique_entries.dedup();
         if unique_entries.len() != entries.len() {
@@ -403,7 +431,7 @@ impl RawEnumerationPageIndexInner {
                 u64::try_from(entries.len()).unwrap_or(u64::MAX),
                 self.page_entry_limit,
             )?;
-            entries.extend(building.entries.iter().cloned());
+            entries.extend(building.entries.iter().map(clone_cache_value));
         }
         Ok(entries)
     }
@@ -461,7 +489,7 @@ impl RawEnumerationPage {
         let digest = raw_page_digest(parent, &building);
         Self {
             version: RAW_PAGE_INDEX_VERSION,
-            parent: parent.to_string(),
+            parent: clone_cache_value(parent),
             page_index: building.page_index,
             entries_start: building.entries_start,
             entries: building.entries,
@@ -474,7 +502,7 @@ impl RawEnumerationPage {
         let builder = RawEnumerationPageBuilder {
             page_index: self.page_index,
             entries_start: self.entries_start,
-            entries: self.entries.clone(),
+            entries: clone_cache_value(&self.entries),
             terminal: self.terminal,
         };
         if self.version != RAW_PAGE_INDEX_VERSION
@@ -528,6 +556,8 @@ fn entry_sets_match(left: &[String], right: &[String]) -> bool {
 }
 
 fn raw_page_digest(parent: &str, building: &RawEnumerationPageBuilder) -> [u8; 32] {
+    #[cfg(test)]
+    RAW_PAGE_DIGEST_ENTRIES.with(|count| count.set(count.get().saturating_add(building.entries.len())));
     let mut digest = Sha256::new();
     update_digest(&mut digest, b"version", &RAW_PAGE_INDEX_VERSION.to_le_bytes());
     update_digest(&mut digest, b"parent", parent.as_bytes());

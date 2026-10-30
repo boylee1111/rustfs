@@ -30,6 +30,7 @@ use tokio::sync::Mutex;
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([3; 32]);
 
 mod cache_cost;
+mod save_metrics;
 
 #[test]
 fn scoped_scan_coverage_metadata_preserves_map_compatibility() {
@@ -71,6 +72,12 @@ struct BackupFallbackStore {
     recover_main_revision: AtomicBool,
     backup_reads: Mutex<usize>,
     puts: Mutex<Vec<CachePutRecord>>,
+    put_delays: [Duration; 2],
+    read_delays: [Duration; 2],
+    put_attempts: [AtomicUsize; 2],
+    main_put_failures: usize,
+    publication_admitted: bool,
+    payloads: Mutex<Vec<(usize, Vec<u8>)>>,
 }
 
 impl BackupFallbackStore {
@@ -82,6 +89,12 @@ impl BackupFallbackStore {
             recover_main_revision: AtomicBool::new(recover_main_revision),
             backup_reads: Mutex::new(0),
             puts: Mutex::new(Vec::new()),
+            put_delays: [Duration::ZERO; 2],
+            read_delays: [Duration::ZERO; 2],
+            put_attempts: std::array::from_fn(|_| AtomicUsize::new(0)),
+            main_put_failures: 0,
+            publication_admitted: true,
+            payloads: Mutex::new(Vec::new()),
         }
     }
 
@@ -93,6 +106,12 @@ impl BackupFallbackStore {
             recover_main_revision: AtomicBool::new(true),
             backup_reads: Mutex::new(0),
             puts: Mutex::new(Vec::new()),
+            put_delays: [Duration::ZERO; 2],
+            read_delays: [Duration::ZERO; 2],
+            put_attempts: std::array::from_fn(|_| AtomicUsize::new(0)),
+            main_put_failures: 0,
+            publication_admitted: true,
+            payloads: Mutex::new(Vec::new()),
         }
     }
 
@@ -113,6 +132,18 @@ impl BackupFallbackStore {
 enum CacheReadBody {
     Bytes(Vec<u8>),
     PrefixThenError(Vec<u8>),
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    Pending,
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+struct PendingCacheReader;
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+impl AsyncRead for PendingCacheReader {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
 }
 
 #[derive(Debug)]
@@ -138,7 +169,10 @@ impl AsyncRead for PrefixThenErrorReader {
 struct CacheReadStore {
     main: CacheReadBody,
     backup: Option<Vec<u8>>,
+    legacy: Option<Vec<u8>>,
     puts: AtomicUsize,
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
 }
 
 #[derive(Debug, Default)]
@@ -152,7 +186,10 @@ impl CacheReadStore {
         Self {
             main,
             backup,
+            legacy: None,
             puts: AtomicUsize::new(0),
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            entry_sources: Mutex::new(Vec::new()),
         }
     }
 
@@ -163,6 +200,8 @@ impl CacheReadStore {
                 prefix: Cursor::new(prefix),
                 failed: false,
             }),
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            CacheReadBody::Pending => Box::new(PendingCacheReader),
         };
         ScannerGetObjectReader {
             stream,
@@ -194,6 +233,18 @@ impl ObjectIO for CacheReadStore {
         _h: Self::HeaderMap,
         _opts: &Self::ObjectOptions,
     ) -> StorageResult<Self::GetObjectReader> {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        self.entry_sources
+            .lock()
+            .await
+            .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
+        if bucket == DATA_USAGE_BUCKET.as_str() {
+            return self
+                .legacy
+                .clone()
+                .map(|data| Self::reader(CacheReadBody::Bytes(data), "legacy-etag"))
+                .ok_or(Error::FileNotFound);
+        }
         if bucket != RUSTFS_META_BUCKET {
             return Err(Error::FileNotFound);
         }
@@ -326,6 +377,10 @@ impl ObjectIO for BackupFallbackStore {
 
         let main_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
         let backup_path = format!("{main_path}.bkp");
+        let delay = self.read_delays[usize::from(object.ends_with(".bkp"))];
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
         if object == main_path {
             let read = self.main_reads.fetch_add(1, Ordering::SeqCst);
             if read == 0 || !self.recover_main_revision.load(Ordering::SeqCst) {
@@ -345,7 +400,7 @@ impl ObjectIO for BackupFallbackStore {
         &self,
         bucket: &str,
         object: &str,
-        _data: &mut Self::PutObjectReader,
+        data: &mut Self::PutObjectReader,
         opts: &Self::ObjectOptions,
     ) -> StorageResult<Self::ObjectInfo> {
         if bucket != RUSTFS_META_BUCKET {
@@ -361,6 +416,18 @@ impl ObjectIO for BackupFallbackStore {
             .as_ref()
             .and_then(HTTPPreconditions::if_none_match_value)
             .map(str::to_owned);
+        let path_index = usize::from(object.ends_with(".bkp"));
+        let attempt = self.put_attempts[path_index].fetch_add(1, Ordering::SeqCst);
+        let mut payload = Vec::new();
+        data.stream.read_to_end(&mut payload).await?;
+        self.payloads.lock().await.push((path_index, payload));
+        let delay = self.put_delays[path_index];
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        if path_index == 0 && attempt < self.main_put_failures {
+            return Err(Error::other("ambiguous cache write failure"));
+        }
         self.puts.lock().await.push(CachePutRecord {
             object: object.to_string(),
             if_match,
@@ -385,7 +452,8 @@ impl crate::ScannerConfigObjectDelete for BackupFallbackStore {
     }
 
     async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
-        Some(crate::ScannerDataUsagePublicationAdmission::unfenced())
+        self.publication_admitted
+            .then(crate::ScannerDataUsagePublicationAdmission::unfenced)
     }
 }
 
@@ -398,6 +466,53 @@ fn cache_revisions_map_to_compare_and_swap_preconditions() {
     assert!(missing.if_match_value().is_none());
     assert_eq!(existing.if_match_value(), Some("etag-1"));
     assert!(existing.if_none_match_value().is_none());
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[tokio::test]
+async fn diagnostic_revision_readers_keep_scanner_or_earlier_entry() {
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
+    let path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+    let payload = b"scanner revision diagnostic".to_vec();
+    for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
+        let store = Arc::new(CacheReadStore::new(CacheReadBody::Bytes(payload.clone()), None));
+        let read = async {
+            let (body, revision) = read_config_with_revision(store.clone(), &path)
+                .await
+                .expect("revision and body read");
+            assert_eq!(body, Some(payload.clone()));
+            assert_eq!(revision, DataUsageCacheRevision::Etag("main-etag".to_string()));
+            assert_eq!(
+                read_config_revision(store.clone(), &path).await.expect("revision-only read"),
+                DataUsageCacheRevision::Etag("main-etag".to_string())
+            );
+            let missing = format!("{path}.missing");
+            assert_eq!(
+                read_config_with_revision(store.clone(), &missing)
+                    .await
+                    .expect("missing body is harmless"),
+                (None, DataUsageCacheRevision::Missing)
+            );
+            assert_eq!(
+                read_config_revision(store.clone(), &missing)
+                    .await
+                    .expect("missing revision is harmless"),
+                DataUsageCacheRevision::Missing
+            );
+        };
+        match earlier {
+            Some(source) => with_read_version_entry(source, read).await,
+            None => read.await,
+        }
+        assert_eq!(
+            *store.entry_sources.lock().await,
+            vec![Some(earlier.unwrap_or(ReadVersionEntrySource::ScannerRevisionRead)); 4],
+            "both readers and missing paths preserve the earliest diagnostic source"
+        );
+        assert_eq!(current_read_version_entry_source(), None, "reader scopes must not leak to the caller");
+    }
 }
 
 #[tokio::test]
@@ -495,6 +610,71 @@ async fn cache_save_reconciles_an_ambiguous_committed_write() {
             .name,
         "bucket"
     );
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[tokio::test]
+async fn diagnostic_cache_load_attempts_preserve_source_through_fallback_and_timeout() {
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
+
+    let mut cache = DataUsageCache::default();
+    cache.info.name = "diagnostic-cache".to_string();
+    let bytes = cache.marshal_msg().expect("cache fixture should serialize");
+    for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
+        for case in ["primary", "legacy", "missing", "body_error", "timeout"] {
+            let body = match case {
+                "body_error" => CacheReadBody::PrefixThenError(vec![0x81, 0xa4, b'n', b'a']),
+                "timeout" => CacheReadBody::Pending,
+                _ => CacheReadBody::Bytes(bytes.clone()),
+            };
+            let mut fixture = CacheReadStore::new(body, None);
+            if case == "legacy" {
+                fixture.legacy = Some(bytes.clone());
+            }
+            let store = Arc::new(fixture);
+            let name = if matches!(case, "legacy" | "missing") {
+                "diagnostic-legacy-cache"
+            } else {
+                DATA_USAGE_CACHE_NAME
+            };
+            let timeout = if case == "timeout" {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_secs(1)
+            };
+            let load = DataUsageCache::try_load_inner(store.clone(), name, timeout);
+            let attempt = match earlier {
+                Some(source) => with_read_version_entry(source, load).await,
+                None => load.await,
+            }
+            .expect("diagnostic wrapper must preserve load-attempt results");
+            match (case, attempt) {
+                ("primary", DataUsageCacheLoadAttempt::Loaded { cache, revision }) => {
+                    assert_eq!(cache.info.name, "diagnostic-cache");
+                    assert_eq!(revision, Some(DataUsageCacheRevision::Etag("main-etag".to_string())));
+                }
+                ("legacy", DataUsageCacheLoadAttempt::Loaded { cache, revision }) => {
+                    assert_eq!(cache.info.name, "diagnostic-cache");
+                    assert_eq!(revision, Some(DataUsageCacheRevision::Missing));
+                }
+                ("missing", DataUsageCacheLoadAttempt::Missing { revision }) => {
+                    assert_eq!(revision, Some(DataUsageCacheRevision::Missing));
+                }
+                ("body_error" | "timeout", DataUsageCacheLoadAttempt::Retryable(_)) => {}
+                _ => panic!("unexpected load-attempt outcome for {case}"),
+            }
+            let calls = if matches!(case, "legacy" | "missing") { 2 } else { 1 };
+            assert_eq!(
+                *store.entry_sources.lock().await,
+                vec![Some(earlier.unwrap_or(ReadVersionEntrySource::DataUsageCacheRead)); calls],
+                "primary and legacy reads must retain this attempt's entry source: {case}"
+            );
+            assert_eq!(store.puts.load(Ordering::SeqCst), 0, "load attempts must not save: {case}");
+            assert_eq!(current_read_version_entry_source(), None, "scope must restore even after timeout: {case}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1371,14 +1551,18 @@ fn prepare_bucket_checkpoint_preserves_only_valid_raw_enumeration_cursor() {
         cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
         DataUsageCachePrepareOutcome::Reused
     );
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
     assert_eq!(cache.info.scan_raw_enumeration_cursor, Some(cursor));
 
     let invalid = DataUsageRawEnumerationCursor::new("other/raw".to_string(), Some("entry-001".to_string()), 1, [9; 32]);
     let mut cache = cache_with_raw_cursor(invalid);
     cache.info.scan_identity = Some(identity);
     assert_eq!(
-        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
-        DataUsageCachePrepareOutcome::Reused
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reset
     );
     assert!(cache.info.scan_raw_enumeration_cursor.is_none());
     assert!(cache.info.scan_progress.is_some());
@@ -1410,13 +1594,17 @@ fn prepare_bucket_checkpoint_preserves_only_valid_raw_page_index() {
         cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
         DataUsageCachePrepareOutcome::Reused
     );
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
     assert_eq!(cache.info.scan_raw_enumeration_page_index, Some(page_index));
 
     let invalid = raw_page_index_fixture("other/raw", &["entry-001"], false);
     cache.info.scan_raw_enumeration_page_index = Some(invalid);
     assert_eq!(
-        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
-        DataUsageCachePrepareOutcome::Reused
+        cache.prepare_bucket_checkpoint("bucket", 3, 3, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reset
     );
     assert!(cache.info.scan_raw_enumeration_page_index.is_none());
     assert!(cache.info.scan_progress.is_some());
@@ -2034,6 +2222,73 @@ fn data_usage_cache_prepare_for_scan_fences_leader_epochs() {
 }
 
 #[test]
+fn prepare_bucket_checkpoint_migrates_legacy_epoch_bound_receipt() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 8,
+            leader_epoch: 1,
+            source: Some(source),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(identity),
+            tier_registry_generation: Some(identity.tier_registry_generation),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_resume_after: Some("bucket/a".to_string()),
+            scan_checkpoint: Some(DataUsageScanCheckpoint::new(
+                "bucket/a".to_string(),
+                DataUsageScanCheckpointReason::Objects,
+            )),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace("bucket", "", DataUsageEntry::default());
+    cache.replace(
+        "bucket/a",
+        "bucket",
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    for legacy_digest in [
+        cache
+            .legacy_coverage_prefix_digest("bucket/a")
+            .expect("epoch-bound receipt digest"),
+        cache.v2_coverage_prefix_digest("bucket/a").expect("v2 receipt digest"),
+    ] {
+        let mut cache = cache.clone();
+        cache.info.scan_coverage_receipt = Some(DataUsageScanCoverageReceipt {
+            through: "bucket/a".to_string(),
+            digest: legacy_digest,
+        });
+        assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+        assert_eq!(
+            cache.prepare_bucket_checkpoint("bucket", 9, 2, source, TEST_PLAN_DIGEST, identity),
+            DataUsageCachePrepareOutcome::Reused
+        );
+        assert_eq!(cache.info.leader_epoch, 2);
+        assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+        let digest = cache.info.scan_coverage_receipt.as_ref().expect("migrated receipt").digest;
+        assert_ne!(digest, legacy_digest);
+        assert_ne!(digest, cache.v2_coverage_prefix_digest("bucket/a").expect("old reader v2 digest"));
+        assert_ne!(
+            digest,
+            cache
+                .legacy_coverage_prefix_digest("bucket/a")
+                .expect("old reader epoch digest")
+        );
+        cache.cache.get_mut("bucket/a").expect("covered entry").failed_objects = 1;
+        assert!(cache.validated_scan_frontier().is_none(), "tampered health debt invalidates coverage");
+    }
+}
+
+#[test]
 fn test_data_usage_cache_mutations_update_in_place() {
     let mut cache = DataUsageCache {
         info: DataUsageCacheInfo {
@@ -2171,6 +2426,69 @@ fn test_data_usage_cache_recursive_helpers_tolerate_cycles() {
     copied.delete_recursive(&root_hash);
     assert!(!copied.cache.contains_key(&root_hash.key()));
     assert!(!copied.cache.contains_key(&child_hash.key()));
+}
+
+#[test]
+fn delete_recursive_preserves_depth_boundary_and_unrelated_entries() {
+    let mut cache = DataUsageCache::default();
+    for depth in 0..=MAX_DATA_USAGE_CACHE_DEPTH + 1 {
+        let mut entry = DataUsageEntry::default();
+        if depth <= MAX_DATA_USAGE_CACHE_DEPTH {
+            entry.children.insert(format!("node-{}", depth + 1));
+        }
+        cache.cache.insert(format!("node-{depth}"), entry);
+    }
+    cache.cache.insert("unrelated".to_string(), DataUsageEntry::default());
+
+    cache.delete_recursive(&DataUsageHash("node-0".to_string()));
+
+    assert_eq!(cache.cache.len(), 2, "delete only reachable entries within the depth limit");
+    assert!(cache.cache.contains_key(&format!("node-{}", MAX_DATA_USAGE_CACHE_DEPTH + 1)));
+    assert!(cache.cache.contains_key("unrelated"));
+}
+
+#[test]
+fn scanner_summary_releases_wide_child_sets() {
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache::default();
+    cache.replace_hashed(
+        &root,
+        &None,
+        &DataUsageEntry {
+            size: 17,
+            objects: 1,
+            versions: 2,
+            delete_markers: 1,
+            failed_objects: 1,
+            all_tier_stats: Some(AllTierStats::new()),
+            ..Default::default()
+        },
+    );
+    for index in 0..10_000 {
+        let child = hash_path(&format!("bucket/{index:05}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                size: 3,
+                objects: 1,
+                versions: 2,
+                ..Default::default()
+            },
+        );
+    }
+
+    let summary = cache.size_recursive("bucket").expect("wide bucket summary");
+    assert_eq!((summary.size, summary.objects, summary.versions), (30_017, 10_001, 20_002));
+    assert_eq!((summary.delete_markers, summary.failed_objects), (1, 1));
+    assert_eq!(summary.children.capacity(), 0, "summaries must not retain the wide namespace allocation");
+    assert!(summary.all_tier_stats.is_some(), "preserve the root's optional statistics representation");
+    assert_eq!(cache.find("bucket").expect("unchanged root").children.len(), 10_000);
+
+    cache.cache.insert("unrelated".to_string(), DataUsageEntry::default());
+    cache.delete_recursive(&root);
+    assert_eq!(cache.cache.len(), 1, "wide subtree deletion must consume every child exactly once");
+    assert!(cache.cache.contains_key("unrelated"));
 }
 
 #[test]
@@ -2430,12 +2748,32 @@ fn checked_flatten_accepts_depth_limit_and_rejects_deeper_tree() {
 }
 
 #[test]
-fn test_find_children_copy_preserves_missing_entry_behavior() {
-    let mut cache = DataUsageCache::default();
+fn test_find_children_copy_does_not_insert_missing_entries() {
+    let cache = DataUsageCache::default();
     let missing_hash = hash_path("missing");
 
-    assert!(cache.find_children_copy(missing_hash.clone()).is_empty());
-    assert!(cache.cache.contains_key(&missing_hash.key()));
+    assert!(cache.find_children_copy(&missing_hash).is_empty());
+    assert!(cache.cache.is_empty());
+    assert_eq!(cache.cache.capacity(), 0);
+}
+
+#[test]
+fn test_find_children_copy_preserves_existing_children() {
+    let hash = hash_path("bucket");
+    let children = HashSet::from(["bucket/child".to_string()]);
+    let mut cache = DataUsageCache::default();
+    cache.cache.insert(
+        hash.key(),
+        DataUsageEntry {
+            children: children.clone(),
+            ..Default::default()
+        },
+    );
+    let mut copied = cache.find_children_copy(&hash);
+    assert_eq!(copied, children);
+    copied.clear();
+    assert_eq!(cache.cache[&hash.0].children, children);
+    assert_eq!(cache.cache.len(), 1);
 }
 
 #[test]
@@ -2472,6 +2810,88 @@ fn test_cache_path_type_distinguishes_main_and_backup() {
     assert_eq!(DataUsageCache::cache_path_type("buckets/.usage-cache.bin.bkp"), "backup");
 }
 
+#[tokio::test(start_paused = true)]
+#[serial_test::serial]
+async fn test_save_backup_budget_tracks_primary_cost() {
+    temp_env::async_with_vars([(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("14"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        let mut store = BackupFallbackStore::new(b"old backup".to_vec(), true);
+        store.put_delays = [Duration::from_secs(6); 2];
+        let store = Arc::new(store);
+        let revisions = DataUsageCacheRevisions {
+            main: DataUsageCacheRevision::Missing,
+            backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
+        };
+        DataUsageCache::default()
+            .save_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME, &revisions)
+            .await
+            .expect("a backup with the observed primary cost should complete");
+        let puts = store.puts.lock().await;
+        assert_eq!(puts.len(), 2, "best-effort save success must not hide a stale backup");
+        assert!(puts[1].object.ends_with(".bkp"));
+        assert_eq!(puts[0].if_none_match.as_deref(), Some("*"));
+        assert_eq!(puts[1].if_match.as_deref(), Some("backup-etag"));
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[tokio::test(start_paused = true)]
+#[serial_test::serial]
+async fn test_save_backup_budget_still_bounds_a_stalled_backup() {
+    temp_env::async_with_vars([(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("14"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        let mut store = BackupFallbackStore::new(b"old backup".to_vec(), true);
+        store.put_delays = [Duration::from_secs(6), Duration::from_secs(60)];
+        let store = Arc::new(store);
+        let started = Instant::now();
+        DataUsageCache::default()
+            .save(store.clone(), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("backup failure remains best effort after a successful main save");
+        assert_eq!(store.puts.lock().await.len(), 1, "stalled backup must not commit");
+        assert_eq!(*store.backup_reads.lock().await, 1, "one bounded reconciliation, no backup retry");
+        assert!(started.elapsed() <= Duration::from_secs(6) + DataUsageCache::cache_save_timeout() + Duration::from_millis(10));
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[tokio::test(start_paused = true)]
+#[serial_test::serial]
+async fn test_checkpoint_budget_covers_retries_and_reconciliation() {
+    temp_env::async_with_vars([(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("14"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        let cache = DataUsageCache::default();
+        let encoded = rmp_serde::to_vec(&cache).expect("checkpoint should encode");
+        for main_put_failures in [2, 3] {
+            let mut store = BackupFallbackStore::with_recovered_main(b"old backup".to_vec(), encoded.clone());
+            store.put_delays = [Duration::from_secs(13), Duration::from_secs(60)];
+            store.read_delays = [Duration::from_secs(13); 2];
+            store.main_put_failures = main_put_failures;
+            let store = Arc::new(store);
+            let revisions = DataUsageCacheRevisions {
+                main: DataUsageCacheRevision::Missing,
+                backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
+            };
+            let started = Instant::now();
+            timeout(
+                DataUsageCache::persistence_timeout(),
+                cache.save_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME, &revisions),
+            )
+            .await
+            .expect("the outer checkpoint budget must cover save and reconciliation")
+            .expect("a successful or reconciled primary must survive a best-effort backup failure");
+            assert_eq!(store.put_attempts[0].load(Ordering::SeqCst), 3);
+            assert_eq!(store.put_attempts[1].load(Ordering::SeqCst), 1, "backup writes must not retry");
+            assert_eq!(*store.backup_reads.lock().await, 1, "backup must finish its bounded reconciliation");
+            assert!(started.elapsed() < DataUsageCache::persistence_timeout());
+        }
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
 #[test]
 fn test_cache_save_timeout_uses_default_when_env_missing() {
     with_var_unset(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, || {
@@ -2480,7 +2900,7 @@ fn test_cache_save_timeout_uses_default_when_env_missing() {
             DataUsageCache::cache_save_timeout(),
             Duration::from_secs(rustfs_config::DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)
         );
-        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(52_350));
+        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(117_500));
     });
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
@@ -2500,10 +2920,10 @@ fn test_cache_save_timeout_respects_env_and_minimum_bound() {
 }
 
 #[test]
-fn test_cache_persistence_timeout_covers_all_save_attempts() {
+fn test_cache_persistence_timeout_covers_all_save_and_reconciliation_attempts() {
     with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("7"), || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(31_350));
+        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(61_500));
     });
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
@@ -2759,4 +3179,40 @@ async fn test_retry_save_op_times_out_and_returns_error_after_retries() {
 
     assert!(result.is_err());
     assert_eq!(attempts.load(Ordering::SeqCst), (DATA_USAGE_CACHE_SAVE_RETRIES + 1) as usize);
+}
+
+#[test]
+fn scan_frontier_receipt_binds_nested_debt_outside_raw_lexical_prefix() {
+    let mut cache = DataUsageCache::default();
+    cache.prepare_bucket_checkpoint("bucket", 8, 1, DataUsageCacheSource::new(0, 0), TEST_PLAN_DIGEST, valid_scan_identity());
+    cache.replace("bucket", "", DataUsageEntry::default());
+    cache.replace("bucket/a", "bucket", DataUsageEntry::default());
+    cache.replace(
+        "bucket/a/z",
+        "bucket/a",
+        DataUsageEntry {
+            failed_objects: 1,
+            ..Default::default()
+        },
+    );
+    cache.replace(
+        "bucket/a-",
+        "bucket",
+        DataUsageEntry {
+            objects: 1,
+            size: 1,
+            ..Default::default()
+        },
+    );
+    cache
+        .seal_scan_frontier(Some("bucket/a-"))
+        .expect("seal traversal after failed subtree");
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a-"));
+    let digest = cache.info.scan_coverage_receipt.as_ref().expect("new receipt").digest;
+    assert_ne!(digest, cache.v2_coverage_prefix_digest("bucket/a-").expect("old reader digest"));
+    cache.cache.get_mut("bucket/a/z").expect("nested failure").failed_objects = 0;
+    assert!(
+        cache.validated_scan_frontier().is_none(),
+        "nested debt must be signed even when '/' sorts after '-'"
+    );
 }

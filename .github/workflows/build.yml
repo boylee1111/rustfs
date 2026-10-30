@@ -22,12 +22,16 @@
 # 3. Trigger docker.yml to build and push images using the uploaded binaries
 #
 # Platform scope:
-# - Pushes to main (development builds) build the Linux targets only — they
-#   feed the dev download channel and Docker dev images. Tags, the weekly
-#   schedule and manual dispatch build the full platform matrix.
+# - Development builds come from the nightly schedule and manual dispatch and
+#   cover the full platform matrix; they feed the dev download channel
+#   (artifacts/rustfs/dev on R2, the *-main-latest packages). Tags build the
+#   release matrix. Main pushes do not build: at the usual merge rate most
+#   per-merge builds were cancelled by the next merge before publishing
+#   anything, and the dev channel does not need per-merge granularity.
 #
 # Manual Parameters:
-# - build_docker: Build and push Docker images (default: true)
+# - publish: Publish binaries/releases for manual runs (default: false)
+# - build_docker: Advisory only; manual runs do not trigger Docker publishing
 # - platforms: Comma-separated platform IDs or 'all' (default: all)
 
 name: Build and Release
@@ -35,32 +39,20 @@ name: Build and Release
 on:
   push:
     tags: [ "*.*.*" ]
-    branches: [ main ]
-    paths-ignore:
-      - "**.md"
-      - "**.txt"
-      - ".github/**"
-      - "docs/**"
-      - "deploy/**"
-      - "scripts/dev_*.sh"
-      - "LICENSE*"
-      - "README*"
-      - "**/*.png"
-      - "**/*.jpg"
-      - "**/*.svg"
-      - ".gitignore"
-      - ".dockerignore"
-      - "flake.lock"
   schedule:
-    - cron: "13 1 * * 0" # Weekly on Sunday 01:13 UTC
+    - cron: "13 1 * * *" # Nightly 01:13 UTC
   workflow_dispatch:
     inputs:
+      publish:
+        description: "Publish to download channels and GitHub Releases (false keeps only workflow artifacts)"
+        required: false
+        default: false
+        type: boolean
       build_docker:
         # Advisory only. docker.yml triggers on workflow_run and its job-level
         # condition requires the triggering event to be a tag push, so a manual
         # dispatch of this workflow never produces images regardless of this
-        # value. Kept because the summary step reports it; wiring it up would
-        # mean teaching docker.yml's version parser a second event shape.
+        # value. Publishing remains controlled by the explicit publish input.
         description: "Build and push Docker images after binary build (ignored: dispatch runs never reach docker.yml)"
         required: false
         default: true
@@ -92,13 +84,14 @@ jobs:
     timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
+      should_publish: ${{ github.event_name != 'workflow_dispatch' || inputs.publish == true }}
       build_type: ${{ steps.check.outputs.build_type }}
       version: ${{ steps.check.outputs.version }}
       short_sha: ${{ steps.check.outputs.short_sha }}
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -138,12 +131,6 @@ jobs:
               build_type="release"
               echo "📦 Release build detected: $tag_name"
             fi
-          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            # Main branch push - development build
-            should_build=true
-            build_type="development"
-            version="dev-${short_sha}"
-            echo "🛠️  Development build detected"
           elif [[ "${{ github.event_name }}" == "schedule" ]] || \
                [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             # Scheduled or manual build
@@ -194,25 +181,20 @@ jobs:
             selected="all"
           fi
 
-          # Per-merge development builds only feed the dev download channel
-          # and the Docker dev images, which consume the Linux binaries; at
-          # the usual merge cadence most per-merge builds are cancelled by the
-          # next merge anyway. macOS and Windows stay covered by tag builds,
-          # the weekly scheduled build and manual dispatch.
-          if [[ "${selected}" == "all" \
-            && "${{ github.event_name }}" == "push" \
-            && "${{ needs.build-check.outputs.build_type }}" == "development" ]]; then
-            selected="linux-x86_64-musl,linux-aarch64-musl,linux-x86_64-gnu,linux-aarch64-gnu"
-            echo "Development (main push) build: restricting to Linux targets"
-          fi
-
+          # linux-aarch64-* need a real aarch64 host (placement rule: hardware)
+          # so the packaged binary and console smoke execute the artifact.
+          # ubicloud-standard-16-arm is that host: Ubuntu 24.04 arm64, alias of
+          # ubicloud-standard-16-arm-ubuntu-2404 (16 vCPU, 48 GB). linux-x86_64-* stay on the
+          # ARC sm-standard-4 pool. GNU rows keep cross=true so cargo-zigbuild
+          # pins the glibc 2.31 floor on the same architecture; musl stays a
+          # native cargo build.
           all='{"include":[
-            {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
-            {"target_id":"linux-aarch64-musl","os":"sm-standard-4","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":"","features":""},
-            {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
-            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope"},
-            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope"},
-            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":""}
+            {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
+            {"target_id":"linux-aarch64-musl","os":"ubicloud-standard-16-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
+            {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
+            {"target_id":"linux-aarch64-gnu","os":"ubicloud-standard-16-arm","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
+            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope","glibc":""},
+            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":"","glibc":""}
           ]}'
 
           if [[ "${selected}" == "all" ]]; then
@@ -240,7 +222,8 @@ jobs:
           echo "Selected platforms: ${selected}"
 
   build-rustfs:
-    name: Build RustFS
+    # Acceptance workflows select artifacts by this stable platform name.
+    name: Build RustFS (${{ matrix.target_id }})
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
     runs-on: ${{ matrix.os }}
@@ -257,7 +240,7 @@ jobs:
       matrix: ${{ fromJson(needs.prepare-platform-matrix.outputs.matrix) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -267,7 +250,11 @@ jobs:
         with:
           rust-version: stable
           target: ${{ matrix.target }}
-          cache-shared-key: build-${{ matrix.target }}
+          # rust-cache keys include OS and architecture but not the runner image.
+          # The Ubicloud aarch64 legs therefore use their own suffix so they
+          # cannot restore a cache written on a different arm64 image.
+          # x86_64, macOS, and Windows keys stay unsuffixed.
+          cache-shared-key: build-${{ matrix.target }}${{ matrix.glibc && format('-glibc-{0}', matrix.glibc) || '' }}${{ matrix.os == 'ubicloud-standard-16-arm' && '-ubicloud-arm' || '' }}
           # main only. A cache saved on refs/tags/X is scoped to that tag: no
           # other tag, no main run and no PR can restore it, so every release
           # cycle wrote up to 12 entries of 1-2GB (preview tag plus final tag,
@@ -402,29 +389,83 @@ jobs:
 
       - name: Build RustFS
         shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_OS: ${{ matrix.platform }}-${{ startsWith(matrix.target, 'aarch64-') && 'aarch64' || 'x86_64' }}
         run: |
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
 
-          BINARY_NAMES=(rustfs)
-          if [[ "${{ matrix.platform }}" == "linux" ]]; then
-            BINARY_NAMES+=(rustfs-cli)
-          fi
           FEATURE_ARGS=()
           if [[ -n "${{ matrix.features }}" ]]; then
             FEATURE_ARGS=(--features "${{ matrix.features }}")
           fi
 
-          # Build one binary at a time so release LTO links cannot exhaust a
-          # self-hosted runner by running concurrently.
-          for binary in "${BINARY_NAMES[@]}"; do
-            if [[ "${{ matrix.cross }}" == "true" ]]; then
-              # All cross targets in the matrix are Linux; zigbuild handles them.
-              cargo zigbuild --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" -p rustfs --bin "$binary"
-            else
-              cargo build --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" -p rustfs --bin "$binary"
-            fi
-          done
+          # gnu targets pin an explicit glibc baseline (`<target>.<glibc>` for
+          # cargo-zigbuild) so release binaries link no symbols newer than it
+          # and run on older distros such as RHEL/Rocky 9 (glibc 2.34); #8062.
+          TARGET_ARG="$BUILD_TARGET"
+          if [[ -n "${{ matrix.glibc }}" ]]; then
+            TARGET_ARG="${TARGET_ARG}.${{ matrix.glibc }}"
+          fi
+
+          PROFILE_ARGS=()
+          if [[ "$BUILD_TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
+            # The in-process profiler resolves names from the final executable.
+            # Retain function symbols without enabling DWARF source information.
+            PROFILE_ARGS=(--config 'profile.release.strip="none"')
+          fi
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cargo zigbuild --release --locked --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin rustfs
+          else
+            cargo build --release --locked --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin rustfs
+          fi
+
+          # All release targets use same-architecture runners, including GNU
+          # builds that use Zig only to select the glibc ABI floor.
+          bin="target/${{ matrix.target }}/release/rustfs"
+          if [[ -f "${bin}.exe" ]]; then
+            bin="${bin}.exe"
+          fi
+          version_output=$("$bin" --version)
+          if ! grep -Fxq "build target : ${BUILD_TARGET}" <<< "$version_output" || \
+             ! grep -Fxq "build os     : ${BUILD_OS}" <<< "$version_output" || \
+             ! grep -Fxq "rust channel : stable-${BUILD_TARGET}" <<< "$version_output"; then
+            echo "release binary reports an unexpected compile target" >&2
+            exit 1
+          fi
+          if [[ -n "${{ matrix.glibc }}" ]]; then
+            python3 scripts/release/check_glibc.py "${{ matrix.glibc }}" \
+              "target/${{ matrix.target }}/release/rustfs"
+          fi
+
+      - name: Verify macOS binary has no dynamic liblzma dependency
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/rustfs"
+          if otool -L "$binary" | grep -E 'liblzma.*\.dylib'; then
+            echo "macOS release binary must not depend on a dynamic liblzma library" >&2
+            exit 1
+          fi
+          "$binary" --version
+
+      - name: Generate the CPU symbol catalog
+        if: endsWith(matrix.target, '-linux-gnu') && matrix.features == 'pyroscope'
+        shell: bash
+        run: |
+          cargo metadata --locked --format-version 1 --filter-platform '${{ matrix.target }}' \
+            --features rustfs/pyroscope > "$RUNNER_TEMP/cpu-catalog-metadata.json"
+          features=$(jq -ce '
+            (.packages[] | select(.name == "rustfs") | .id) as $id |
+            .resolve.nodes[] | select(.id == $id) | .features | map(select(. != "default")) | sort
+          ' "$RUNNER_TEMP/cpu-catalog-metadata.json")
+          release_dir="target/${{ matrix.target }}/release"
+          # These task-owned outputs may remain in a restored target cache.
+          rm -f "$release_dir/rustfs.cpu-symbol-catalog.json" "$release_dir/rustfs.cpu-symbol-catalog.sha256"
+          cargo run --locked -p rustfs-connect-symbol-catalog -- \
+            "$release_dir/rustfs" "$(git rev-parse HEAD)" '${{ matrix.target }}' "$features" \
+            "$release_dir/rustfs.cpu-symbol-catalog.json" > "$release_dir/rustfs.cpu-symbol-catalog.sha256"
 
       - name: Create release package
         id: package
@@ -512,8 +553,9 @@ jobs:
           fi
 
           BINARY_FILES=("$BINARY_NAME")
-          if [[ "${{ matrix.platform }}" == "linux" ]]; then
-            BINARY_FILES+=("rustfs-cli")
+
+          if [[ "$TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
+            BINARY_FILES+=(rustfs.cpu-symbol-catalog.json rustfs.cpu-symbol-catalog.sha256)
           fi
 
           # Verify the binaries exist before packaging
@@ -583,7 +625,7 @@ jobs:
               LATEST_FILES="$LATEST_FILE"
             fi
           elif [[ "$BUILD_TYPE" == "development" ]]; then
-            # Development builds (only main branch triggers development builds)
+            # Development builds (nightly schedule and manual dispatch)
             # Create main-latest version filename
             # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-main-latest
             MAIN_LATEST_FILE="${PACKAGE_BASENAME}-main-latest.zip"
@@ -625,7 +667,7 @@ jobs:
           echo "🔧 Build type: ${BUILD_TYPE}"
           echo "📊 Version: ${VERSION}"
 
-      - name: Verify packaged Linux CLI
+      - name: Verify packaged Linux binary
         if: matrix.platform == 'linux'
         shell: bash
         run: |
@@ -633,22 +675,29 @@ jobs:
 
           package_file="${{ steps.package.outputs.package_file }}"
           archive_members="$(unzip -Z1 "$package_file" | sort)"
-          expected_members=$'rustfs\nrustfs-cli'
+          expected_members='rustfs'
+          target="${{ matrix.target }}"
+          features="${{ matrix.features }}"
+          if [[ "$target" == *-linux-gnu && "$features" == "pyroscope" ]]; then
+            expected_members+=$'\nrustfs.cpu-symbol-catalog.json\nrustfs.cpu-symbol-catalog.sha256'
+          fi
           if [[ "$archive_members" != "$expected_members" ]]; then
-            echo "Linux package must contain exactly rustfs and rustfs-cli" >&2
+            echo "Linux package does not contain the expected files" >&2
             printf '%s\n' "$archive_members" >&2
             exit 1
           fi
 
-          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
-            cli_dir="$(mktemp -d)"
-            trap 'rm -rf "$cli_dir"' EXIT
-            unzip -q "$package_file" rustfs-cli -d "$cli_dir"
-            "$cli_dir/rustfs-cli" --help >/dev/null
-          fi
+          # musl targets build natively; the gnu legs are same-arch
+          # cargo-zigbuild builds pinned to the release glibc baseline. Either
+          # way the binaries run on their runner, so executing them here
+          # proves each artifact matches its runner architecture.
+          binary_dir="$(mktemp -d)"
+          trap 'rm -rf "$binary_dir"' EXIT
+          unzip -q "$package_file" rustfs -d "$binary_dir"
+          "$binary_dir/rustfs" --version
 
       - name: Verify packaged console
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euo pipefail
@@ -702,14 +751,14 @@ jobs:
           exit 1
 
       - name: Upload to GitHub artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.package.outputs.package_name }}
           path: "rustfs-*.zip"
           retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
       - name: Upload to Cloudflare R2
-        if: env.R2_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')
+        if: needs.build-check.outputs.should_publish == 'true' && env.R2_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -725,13 +774,34 @@ jobs:
             exit 0
           fi
 
-          # The self-hosted Linux runners do not ship the aws CLI (GitHub-hosted
-          # images did). Install it on demand so R2 uploads survive a fresh runner
-          # instead of hard-failing here.
+          # ARC pods (the x86_64 legs) do not ship the aws CLI. Ubicloud arm64
+          # images follow the GitHub runner image and often do. Install the
+          # official CLI bundle when it is missing so R2 uploads work on either.
           if ! command -v aws >/dev/null 2>&1; then
             echo "aws CLI not found on runner; installing..."
             if command -v apt-get >/dev/null 2>&1; then
-              sudo apt-get update && sudo apt-get install -y awscli
+              aws_arch="$(uname -m)"
+              case "$aws_arch" in
+                x86_64) aws_arch="x86_64" ;;
+                aarch64|arm64) aws_arch="aarch64" ;;
+                *)
+                  echo "❌ Unsupported Linux architecture for AWS CLI: $aws_arch"
+                  exit 1
+                  ;;
+              esac
+
+              aws_install_root="${RUNNER_TEMP:-$PWD}/aws-cli"
+              rm -rf "$aws_install_root"
+              mkdir -p "$aws_install_root"
+              curl --fail --location --retry 3 \
+                "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" \
+                --output "$aws_install_root/awscliv2.zip"
+              unzip -q "$aws_install_root/awscliv2.zip" -d "$aws_install_root"
+              "$aws_install_root/aws/install" \
+                --install-dir "$aws_install_root/aws-cli" \
+                --bin-dir "$aws_install_root/bin"
+              export PATH="$aws_install_root/bin:$PATH"
+              aws --version
             elif command -v brew >/dev/null 2>&1; then
               brew install awscli
             else
@@ -776,64 +846,35 @@ jobs:
       - name: Build completion summary
         shell: bash
         env:
-          # dispatch input via env: free-form text must not be pasted into the
-          # script for bash to evaluate.
-          INPUT_BUILD_DOCKER: ${{ github.event.inputs.build_docker }}
+          SHOULD_PUBLISH: ${{ needs.build-check.outputs.should_publish }}
+          BUILD_TYPE: ${{ needs.build-check.outputs.build_type }}
+          VERSION: ${{ needs.build-check.outputs.version }}
+          BUILD_STATUS: ${{ needs.build-rustfs.result }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
-          VERSION="${{ needs.build-check.outputs.version }}"
-
-          echo "🎉 Build completed successfully!"
-          echo "📦 Build type: $BUILD_TYPE"
-          echo "🔢 Version: $VERSION"
-          echo ""
-
-          # Check build status
-          BUILD_STATUS="${{ needs.build-rustfs.result }}"
-
-          echo "📊 Build Results:"
-          echo "  📦 All platforms: $BUILD_STATUS"
-          echo ""
-
-          case "$BUILD_TYPE" in
-            "preview")
-              echo "🔍 Preview artifacts are published in a GitHub prerelease"
-              echo "⏭️  Preview releases do not update latest channels"
-              ;;
-            "development")
-              echo "🛠️  Development build artifacts have been uploaded to OSS dev directory"
-              echo "⚠️  This is a development build - not suitable for production use"
-              ;;
-            "release")
-              echo "🚀 Release build artifacts have been uploaded to OSS release directory"
-              echo "✅ This build is ready for production use"
-              echo "🏷️  GitHub Release will be created in this workflow"
-              ;;
-            "prerelease")
-              echo "🧪 Prerelease build artifacts have been uploaded to OSS release directory"
-              echo "⚠️  This is a prerelease build - use with caution"
-              echo "🏷️  GitHub Release will be created in this workflow"
-              ;;
-          esac
-
-          echo ""
-          echo "🐳 Docker Images:"
-          if [[ "$BUILD_TYPE" == "preview" ]]; then
-            echo "⏭️  Preview tags do not publish Docker images"
-          elif [[ "$INPUT_BUILD_DOCKER" == "false" ]]; then
-            echo "⏭️  Docker image build was skipped (binary only build)"
+          echo "Build type: $BUILD_TYPE"
+          echo "Version: $VERSION"
+          echo "Build result: $BUILD_STATUS"
+          if [[ "$SHOULD_PUBLISH" != "true" ]]; then
+            echo "Artifact-only run: no download channels or GitHub Releases are updated."
+            echo "Successful platform packages are available as workflow artifacts."
           elif [[ "$BUILD_STATUS" == "success" ]]; then
-            echo "🔄 Docker images will be built and pushed automatically via workflow_run event"
+            echo "Publishing enabled; check the upload and release jobs for their results."
           else
-            echo "❌ Docker image build will be skipped due to build failure"
+            echo "Build incomplete; check individual platform jobs for any completed uploads."
+          fi
+          if [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/* && "$BUILD_STATUS" == "success" ]]; then
+            echo "Docker publishing is eligible through the downstream workflow."
+          else
+            echo "This run does not trigger Docker publishing."
           fi
 
   # Create GitHub Release for every valid release tag, including previews
   create-release:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
-    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
       contents: write
@@ -842,7 +883,7 @@ jobs:
       release_url: ${{ steps.create.outputs.release_url }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -893,20 +934,20 @@ jobs:
   upload-release-assets:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
-    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
       contents: write
       actions: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: ./artifacts
           pattern: rustfs-*
@@ -987,7 +1028,7 @@ jobs:
   update-latest-version:
     name: Update Latest Version
     needs: [ build-check, publish-release ]
-    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1047,8 +1088,8 @@ jobs:
   publish-release:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
-    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
       contents: write
@@ -1085,8 +1126,8 @@ jobs:
   cleanup-preview-releases:
     name: Cleanup Preview Releases
     needs: [ build-check, publish-release ]
-    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: ubuntu-latest
+    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
       contents: write
@@ -1140,7 +1181,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Open or update failure-tracking issue

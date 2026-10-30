@@ -18,6 +18,8 @@ DEFAULT_ICEBERG_VERSION = "1.7.1"
 DEFAULT_SCALA_VERSION = "2.12"
 DEFAULT_TRINO_VERSION = "477"
 DEFAULT_DUCKDB_VERSION = "1.5.5"
+PYICEBERG_BACKING_SCENARIO = "create-append-reload-scan-backing-contracts-v2"
+PYICEBERG_CORE_SCENARIO = "create-append-reload-scan-core"
 DEFAULT_SNOWFLAKE_CLIENT_VERSION = "operator-recorded"
 DEFAULT_DATABEND_VERSION = "operator-recorded"
 DEFAULT_TRINO_SERVER = "http://127.0.0.1:8080"
@@ -136,8 +138,8 @@ def engine_compatibility_matrix() -> list[dict[str, Any]]:
             "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-live-conformance",
             "scenarios": [
                 scenario("create-namespace", "manual-live-harness", "CREATE NAMESPACE IF NOT EXISTS"),
-                scenario("create-table", "manual-live-harness", "CREATE TABLE USING iceberg"),
-                scenario("append", "manual-live-harness", "INSERT INTO"),
+                scenario("create-table", "manual-live-harness", "CREATE TABLE USING iceberg AS SELECT"),
+                scenario("staged-create", "manual-live-harness", "atomic CTAS through the REST staged-create flow"),
                 scenario("reload-table", "manual-live-harness", "REFRESH TABLE and SELECT COUNT"),
                 scenario("drop-table", "manual-live-harness", "DROP TABLE and optional DROP NAMESPACE"),
                 scenario("commit-conflict", "manual-validation-required", "requires a two-writer Spark or REST conflict harness"),
@@ -162,7 +164,7 @@ def engine_compatibility_matrix() -> list[dict[str, Any]]:
                 scenario("catalog-attach", "automated", "attach `/iceberg` with s3 signing and `/_iceberg` with s3tables signing"),
                 scenario("read-table", "automated", "read a PyIceberg-created table through the attached catalog"),
                 scenario("write-table", "automated", "exercise single-table DDL, DML, schema evolution, snapshots, and PyIceberg cross-read"),
-                scenario("unsupported-boundaries", "automated", "verify staged create, purge, and format v3 fail closed"),
+                scenario("unsupported-boundaries", "automated", "verify purge and format v3 fail closed"),
                 scenario("multi-table-mode", "automated", "verify DuckDB can avoid the multi-table commit endpoint without claiming cross-table atomicity"),
             ],
         },
@@ -363,8 +365,8 @@ def spark_sql_smoke(
     statements = [
         f"CREATE NAMESPACE IF NOT EXISTS {namespace_identifier};",
         f"DROP TABLE IF EXISTS {table_identifier};",
-        f"CREATE TABLE {table_identifier} (id BIGINT, payload STRING) USING iceberg;",
-        f"INSERT INTO {table_identifier} VALUES (1, 'alpha'), (2, 'beta');",
+        f"CREATE TABLE {table_identifier} USING iceberg AS "
+        "SELECT * FROM VALUES (1L, 'alpha'), (2L, 'beta') AS source(id, payload);",
         f"REFRESH TABLE {table_identifier};",
         f"SELECT COUNT(*) AS row_count FROM {table_identifier};",
     ]
@@ -665,7 +667,7 @@ def live_conformance_evidence(
                     OrderedDict(
                         [
                             ("client", "Spark Iceberg REST catalog"),
-                            ("scenario", "create-namespace-create-table-append-refresh-count-cleanup"),
+                            ("scenario", "create-namespace-staged-ctas-refresh-count-cleanup"),
                             ("expected_status", "pass"),
                             ("expected_row_count", 2),
                             ("claim_after_pass", "manual-live-verified"),
@@ -736,6 +738,21 @@ def live_conformance_evidence(
             ),
         ]
     )
+
+
+def pyiceberg_catalog_probe_results(backing: str, *, skipped: bool, vended: bool) -> dict[str, str]:
+    if backing not in {"object", "durable-strong"}:
+        raise ValueError("PyIceberg probe evidence requires an observed RustFS backing")
+    if skipped:
+        return {"direct-rest": "skipped"}
+    probes = dict.fromkeys(("metadata-location", "refs", "views-and-namespace-properties", "rename", "load-table-delegation"), "pass")
+    probes["load-table-vended-credentials"] = "pass" if vended else "skipped"
+    probes.update(dict.fromkeys((
+        "maintenance-config", "maintenance-scheduler", "maintenance-worker-dry-run",
+        "maintenance-job", "maintenance-quarantine-inspect", "diagnostics", "export",
+    ), "pass"))
+    probes["metadata-maintenance"] = "expected-unsupported" if backing == "durable-strong" else "pass"
+    return probes
 
 
 def live_conformance_evidence_schema() -> OrderedDict[str, Any]:
@@ -878,6 +895,18 @@ def validate_live_conformance_evidence(record: dict[str, Any]) -> OrderedDict[st
         raise ValueError("live conformance evidence row_count must be a non-negative integer")
     if expected_status == "pass" and client_name in LIVE_EVIDENCE_ROW_COUNT_CLIENTS and row_count != 2:
         raise ValueError("live conformance evidence row_count must be 2 for successful table smoke/read probes")
+
+    if client_name == "PyIceberg" and record["scenario"] in {PYICEBERG_CORE_SCENARIO, PYICEBERG_BACKING_SCENARIO}:
+        vended = record.get("credential_vending_required")
+        if not isinstance(vended, bool):
+            raise ValueError("PyIceberg probe evidence requires the credential negotiation mode")
+        expected_probes = pyiceberg_catalog_probe_results(
+            record["catalog_backing"], skipped=record["scenario"] == PYICEBERG_CORE_SCENARIO, vended=vended
+        )
+        if record.get("catalog_probes") != expected_probes:
+            raise ValueError("PyIceberg probe evidence does not match the scenario and backing capabilities")
+        if record.get("rest_signing_name") not in {"s3", "s3tables"}:
+            raise ValueError("PyIceberg probe evidence requires the REST signing name")
 
     return OrderedDict(
         [

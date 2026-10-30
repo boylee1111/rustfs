@@ -17,17 +17,22 @@ use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::app_context_from_req;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
+use crate::admin::storage_api::error::StorageError;
+use crate::admin::storage_api::runtime::EndpointServerPools;
+use crate::admin::storage_api::s3::{S3ErrorCode, error as admin_error};
+use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use crate::storage::rpc::node_service::heal::{
     HealControlCoordinator, NodeHealStatusSnapshot, capture_node_heal_status, decode_node_heal_status,
-    decode_node_replacement_recovery_status, heal_control_coordinator, heal_topology_fingerprint,
+    decode_node_replacement_recovery_status, heal_control_coordinator, heal_topology_fingerprint, validate_heal_selector,
 };
 use bytes::Bytes;
 use futures_util::future::join_all;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
+use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_heal::heal::utils::format_set_disk_id;
 use rustfs_heal_contracts::heal_channel::{
@@ -35,13 +40,11 @@ use rustfs_heal_contracts::heal_channel::{
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
-use rustfs_utils::path::path_join;
 use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::{Duration, timeout};
@@ -54,7 +57,11 @@ const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
 const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
 const LEGACY_ROOT_HEAL_RESPONSE_ID: &str = ".";
 const PEER_HEAL_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const MRF_RESPONSIBILITY_LIST_DEFAULT_LIMIT: usize = 100;
+const MRF_RESPONSIBILITY_LIST_MAX_LIMIT: usize = 256;
 pub(crate) const REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX: &str = "/v4/heal/replacement-recovery";
+pub(crate) const MRF_LEGACY_RESPONSIBILITIES_ROUTE_SUFFIX: &str = "/v4/heal/mrf/responsibilities";
+pub(crate) const MRF_LEGACY_RESPONSIBILITIES_ACTIONS_ROUTE_SUFFIX: &str = "/v4/heal/mrf/responsibilities/actions";
 const REPLACEMENT_RECOVERY_STATUS_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -71,9 +78,17 @@ struct HealInitParams {
 }
 
 fn extract_heal_init_params(body: &Bytes, uri: &Uri, params: Params<'_, '_>) -> S3Result<HealInitParams> {
+    // matchit captures the original URI bytes. Decode once before validation
+    // so literal %2F keys remain distinct from actual path separators.
     let mut hip = HealInitParams {
-        bucket: params.get("bucket").map(|s| s.to_string()).unwrap_or_default(),
-        obj_prefix: params.get("prefix").map(|s| s.to_string()).unwrap_or_default(),
+        bucket: percent_decode_str(params.get("bucket").unwrap_or_default())
+            .decode_utf8()
+            .map_err(|_| ApiError::invalid_request("invalid bucket name encoding"))?
+            .into_owned(),
+        obj_prefix: percent_decode_str(params.get("prefix").unwrap_or_default())
+            .decode_utf8()
+            .map_err(|_| ApiError::invalid_request("invalid object name encoding"))?
+            .into_owned(),
         ..Default::default()
     };
     validate_heal_target(&hip.bucket, &hip.obj_prefix)?;
@@ -164,13 +179,13 @@ fn validate_heal_target(bucket: &str, obj_prefix: &str) -> S3Result<()> {
 }
 
 fn encode_heal_control_path(bucket: &str, obj_prefix: &str) -> String {
-    if bucket.is_empty() && obj_prefix.is_empty() {
-        return String::new();
+    if obj_prefix.is_empty() {
+        return bucket.to_owned();
     }
 
-    path_join(&[PathBuf::from(bucket), PathBuf::from(obj_prefix)])
-        .to_string_lossy()
-        .into_owned()
+    // This identifies an S3 target, not a filesystem path. In particular,
+    // a leading slash in the object must not alias the sibling without it.
+    format!("{bucket}/{obj_prefix}")
 }
 
 fn heal_control_response_id(heal_path: &str, client_token: &str) -> String {
@@ -200,7 +215,7 @@ pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
 
     r.insert(
         Method::POST,
-        format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}/{prefix}").as_str(),
+        format!("{}{}", ADMIN_PREFIX, "/v3/heal/{bucket}/{*prefix}").as_str(),
         AdminOperation(&HealHandler {}),
     )?;
 
@@ -208,6 +223,18 @@ pub fn register_heal_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
         Method::POST,
         format!("{}{}", ADMIN_PREFIX, "/v3/background-heal/status").as_str(),
         AdminOperation(&BackgroundHealStatusHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, MRF_LEGACY_RESPONSIBILITIES_ROUTE_SUFFIX).as_str(),
+        AdminOperation(&MrfLegacyResponsibilitiesHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, MRF_LEGACY_RESPONSIBILITIES_ACTIONS_ROUTE_SUFFIX).as_str(),
+        AdminOperation(&MrfLegacyResponsibilitiesActionHandler {}),
     )?;
 
     r.insert(
@@ -234,6 +261,40 @@ struct HealStartSuccess {
     start_time: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct HealStatusSettings {
+    recursive: bool,
+    dry_run: bool,
+    remove: bool,
+    recreate: bool,
+    scan_mode: HealScanMode,
+    update_parity: bool,
+    #[serde(rename = "nolock")]
+    no_lock: bool,
+    #[serde(rename = "readRepair")]
+    read_repair: bool,
+    pool: Option<usize>,
+    set: Option<usize>,
+}
+
+impl From<HealOpts> for HealStatusSettings {
+    fn from(settings: HealOpts) -> Self {
+        Self {
+            recursive: settings.recursive,
+            dry_run: settings.dry_run,
+            remove: settings.remove,
+            recreate: settings.recreate,
+            scan_mode: settings.scan_mode,
+            update_parity: settings.update_parity,
+            no_lock: settings.no_lock,
+            read_repair: settings.read_repair,
+            pool: settings.pool,
+            set: settings.set,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HealTaskStatus {
@@ -243,7 +304,7 @@ struct HealTaskStatus {
     failure_detail: String,
     start_time: String,
     #[serde(rename = "settings")]
-    heal_settings: HealOpts,
+    heal_settings: HealStatusSettings,
 }
 
 #[derive(Debug, Serialize)]
@@ -612,63 +673,80 @@ where
     }
 }
 
-fn canonical_replacement_records(
-    records: &[rustfs_heal::ReplacementRecoveryRecord],
-) -> Vec<rustfs_heal::ReplacementRecoveryRecord> {
-    let mut records = records.to_vec();
-    for record in &mut records {
-        record.target_slots.sort();
+fn reconcile_replacement_recovery_records(
+    snapshots: Vec<rustfs_heal::ReplacementRecoverySnapshot>,
+) -> (Vec<rustfs_heal::ReplacementRecoveryRecord>, bool) {
+    struct Observation {
+        record: rustfs_heal::ReplacementRecoveryRecord,
+        sources: Vec<usize>,
     }
-    records.sort_by(|left, right| {
-        (
-            &left.task_id,
-            &left.generation,
-            &left.set_disk_id,
-            left.state,
-            &left.target_slots,
-            &left.verified_at,
-            &left.reason,
-        )
-            .cmp(&(
-                &right.task_id,
-                &right.generation,
-                &right.set_disk_id,
-                right.state,
-                &right.target_slots,
-                &right.verified_at,
-                &right.reason,
-            ))
-    });
-    records
-}
 
-fn merge_replacement_recovery_records(
-    snapshots: &[rustfs_heal::ReplacementRecoverySnapshot],
-) -> Vec<rustfs_heal::ReplacementRecoveryRecord> {
-    let mut records = BTreeMap::<String, rustfs_heal::ReplacementRecoveryRecord>::new();
-    for snapshot in snapshots {
-        for record in canonical_replacement_records(&snapshot.records) {
-            match records.entry(record.task_id.clone()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(record);
-                }
-                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &record => {}
+    let mut observations = BTreeMap::<String, Observation>::new();
+    for (source, snapshot) in snapshots.into_iter().enumerate() {
+        for mut record in snapshot.records {
+            record.target_slots.sort();
+            let observation = match observations.entry(record.task_id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(Observation {
+                    record,
+                    sources: Vec::new(),
+                }),
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    let task_id = entry.key().clone();
-                    entry.insert(rustfs_heal::ReplacementRecoveryRecord {
-                        task_id,
-                        state: rustfs_heal::ReplacementRecoveryState::Unknown,
-                        generation: None,
-                        set_disk_id: None,
-                        target_slots: Vec::new(),
-                        reason: Some("peer replacement recovery records disagree".to_string()),
-                        verified_at: None,
-                    });
+                    if entry.get().record != record {
+                        entry.get_mut().record = rustfs_heal::ReplacementRecoveryRecord {
+                            task_id: entry.key().clone(),
+                            state: rustfs_heal::ReplacementRecoveryState::Unknown,
+                            generation: None,
+                            set_disk_id: None,
+                            target_slots: Vec::new(),
+                            reason: Some("peer replacement recovery records disagree".to_string()),
+                            verified_at: None,
+                        };
+                    }
+                    entry.into_mut()
                 }
+            };
+            // Snapshot order keeps sources sorted; repeated copies within one
+            // snapshot must not duplicate a generation's provenance.
+            if snapshot.definitive && observation.sources.last() != Some(&source) {
+                observation.sources.push(source);
             }
         }
     }
-    records.into_values().collect()
+
+    let conflict = if observations
+        .values()
+        .any(|observation| observation.record.state == rustfs_heal::ReplacementRecoveryState::Unknown)
+    {
+        true
+    } else {
+        let mut target_sources = BTreeMap::<&str, Vec<&[usize]>>::new();
+        for observation in observations.values() {
+            for target in &observation.record.target_slots {
+                target_sources.entry(target).or_default().push(&observation.sources);
+            }
+        }
+        target_sources.into_values().any(|sources| {
+            if sources.len() < 2 {
+                return false;
+            }
+            // A complete retained history normally has one common anchor.
+            // Checking that witness avoids comparing every historical pair.
+            if sources[0]
+                .iter()
+                .any(|source| sources[1..].iter().all(|other| other.binary_search(source).is_ok()))
+            {
+                return false;
+            }
+            // Pairwise shared history is sufficient even without one anchor
+            // containing the whole group. A transitive chain alone is not.
+            sources.iter().enumerate().any(|(index, left)| {
+                sources[index + 1..]
+                    .iter()
+                    .any(|right| !left.iter().any(|source| right.binary_search(source).is_ok()))
+            })
+        })
+    };
+    (observations.into_values().map(|observation| observation.record).collect(), conflict)
 }
 
 fn aggregate_replacement_recovery_cluster_status(
@@ -701,24 +779,15 @@ fn aggregate_replacement_recovery_cluster_status(
         reason.get_or_insert("peer_replacement_recovery_status_not_definitive");
     }
 
-    // Replacement recovery state is anchored on one surviving disk. Nodes
-    // without that disk legitimately report a definitive empty snapshot, so
-    // only non-empty snapshots must agree with each other.
-    let mut non_empty_records = snapshots
-        .iter()
-        .filter(|snapshot| !snapshot.records.is_empty())
-        .map(|snapshot| canonical_replacement_records(&snapshot.records));
-    if let Some(first_records) = non_empty_records.next()
-        && non_empty_records.any(|records| records != first_records)
-    {
-        reason.get_or_insert("peer_replacement_recovery_status_conflict");
-    }
-
-    let records = merge_replacement_recovery_records(&snapshots);
-    if records
-        .iter()
-        .any(|record| matches!(record.state, rustfs_heal::ReplacementRecoveryState::Unknown))
-    {
+    // Replacement completion proofs are anchored per generation on one
+    // surviving disk, so sequential automatic generations legitimately leave
+    // different completed tasks on different peers, and peers without an
+    // anchor report definitive empty snapshots. Peers conflict only when they
+    // disagree about one task (the merge marks those copies `Unknown`) or
+    // claim overlapping targets without a shared definitive local history.
+    // Retained histories and disjoint generations can be merged.
+    let (records, conflict) = reconcile_replacement_recovery_records(snapshots);
+    if conflict {
         reason.get_or_insert("peer_replacement_recovery_status_conflict");
     }
 
@@ -807,6 +876,7 @@ fn cluster_heal_control_unavailable(reason: &str) -> s3s::S3Error {
 }
 
 struct PreparedHealControlRoute {
+    endpoints: EndpointServerPools,
     remote_grid_hosts: Vec<String>,
     fingerprint: String,
     coordinator_epoch: u64,
@@ -831,6 +901,7 @@ fn prepare_heal_control_route(context: &crate::admin::runtime_sources::AppContex
         .map(|node| node.grid_host)
         .collect();
     Ok(PreparedHealControlRoute {
+        endpoints,
         remote_grid_hosts,
         fingerprint,
         coordinator_epoch,
@@ -900,9 +971,12 @@ async fn route_cluster_heal_control(
     coordinator_capability_verified: bool,
 ) -> S3Result<rustfs_protos::heal_control::Outcome> {
     let response = if route.coordinator.is_local {
-        crate::storage::rpc::node_service::execute_heal_control_envelope(envelope, route.coordinator_epoch)
+        crate::storage::rpc::node_service::execute_heal_control_envelope(envelope, route.coordinator_epoch, &route.endpoints)
             .await
             .map_err(|err| {
+                if err.code() == tonic::Code::InvalidArgument {
+                    return admin_error(S3ErrorCode::InvalidArgument, err.message().to_owned());
+                }
                 warn!(
                     event = EVENT_ADMIN_REQUEST_FAILED,
                     component = LOG_COMPONENT_ADMIN_API,
@@ -944,6 +1018,9 @@ async fn route_cluster_heal_control(
             .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, route.fingerprint.clone(), command)
             .await
             .map_err(|err| {
+                if let StorageError::InvalidArgument(_, _, message) = &err {
+                    return admin_error(S3ErrorCode::InvalidArgument, message.clone());
+                }
                 warn!(
                     event = EVENT_ADMIN_REQUEST_FAILED,
                     component = LOG_COMPONENT_ADMIN_API,
@@ -974,13 +1051,36 @@ async fn route_cluster_heal_control(
         })
 }
 
-async fn execute_after_heal_control_capability<P, PF, E, EF, T>(probe: P, execute: E) -> S3Result<T>
+async fn query_heal_status_on_owner<L, C, CF>(
+    local: L,
+    coordinator: C,
+) -> S3Result<rustfs_heal_contracts::heal_channel::HealChannelResponse>
+where
+    L: Future<Output = S3Result<Option<rustfs_heal_contracts::heal_channel::HealChannelResponse>>>,
+    C: FnOnce() -> CF,
+    CF: Future<Output = S3Result<rustfs_heal_contracts::heal_channel::HealChannelResponse>>,
+{
+    match local.await? {
+        Some(response) => Ok(response),
+        None => coordinator().await,
+    }
+}
+
+async fn execute_after_heal_start_preflight<P, PF, E, EF, T>(
+    endpoints: &EndpointServerPools,
+    options: &HealOpts,
+    probe: P,
+    execute: E,
+) -> S3Result<T>
 where
     P: FnOnce() -> PF,
     PF: Future<Output = S3Result<()>>,
     E: FnOnce() -> EF,
     EF: Future<Output = S3Result<T>>,
 {
+    validate_heal_start_options(options)?;
+    validate_heal_selector(endpoints, options.pool, options.set)
+        .map_err(|err| admin_error(S3ErrorCode::InvalidArgument, err.to_string()))?;
     probe().await?;
     execute().await
 }
@@ -990,7 +1090,9 @@ async fn submit_cluster_heal_start(
     hip: &HealInitParams,
 ) -> S3Result<HealAdmissionReceipt> {
     let route = prepare_heal_control_route(&context)?;
-    let result = execute_after_heal_control_capability(
+    let result = execute_after_heal_start_preflight(
+        &route.endpoints,
+        &hip.hs,
         || require_cluster_heal_control_capability(&context, &route),
         || async {
             let heal_request = build_heal_channel_request(hip);
@@ -1068,6 +1170,8 @@ async fn submit_cluster_heal_channel_command(
 struct HealTaskStatusPayload {
     #[serde(skip)]
     adapted_detail: Option<String>,
+    #[serde(default, rename = "settings", skip_serializing)]
+    heal_settings: Option<HealStatusSettings>,
     summary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
@@ -1122,9 +1226,10 @@ fn encode_heal_start_success(client_token: String, client_address: String) -> S3
 fn encode_heal_task_status(
     mut payload: HealTaskStatusPayload,
     failure_detail: String,
-    heal_settings: HealOpts,
+    fallback_heal_settings: HealOpts,
 ) -> S3Result<Vec<u8>> {
     let failure_detail = payload.adapted_detail.take().unwrap_or(failure_detail);
+    let heal_settings = payload.heal_settings.take().unwrap_or_else(|| fallback_heal_settings.into());
     encode_json(&HealTaskStatus {
         payload,
         failure_detail,
@@ -1281,6 +1386,17 @@ fn validate_heal_request_mode(hip: &HealInitParams) -> S3Result<()> {
     Ok(())
 }
 
+fn validate_heal_start_options(options: &HealOpts) -> S3Result<()> {
+    if options.read_repair {
+        return Err(admin_error(
+            S3ErrorCode::InvalidArgument,
+            "readRepair=true is not supported for Admin Heal",
+        ));
+    }
+
+    Ok(())
+}
+
 fn json_response(status: StatusCode, body: Vec<u8>) -> S3Response<(StatusCode, Body)> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -1297,6 +1413,10 @@ pub(crate) struct ReplacementRecoveryStatusResponse {
     pub path: String,
     pub scope: &'static str,
     pub local: rustfs_heal::ReplacementRecoverySnapshot,
+    /// Generations this node's discovery could not verify or resolve, with
+    /// reasons. Node-local and additive; it is not part of the peer merge.
+    pub local_blocked: Vec<rustfs_heal::ReplacementRecoveryBlock>,
+    pub local_diagnostics: rustfs_heal::LocalHealRecoveryDiagnostics,
     pub cluster: ReplacementRecoveryClusterStatus,
 }
 
@@ -1310,6 +1430,8 @@ pub(crate) struct ReplacementRecoveryClusterStatus {
 
 fn build_replacement_recovery_status_response(
     local: rustfs_heal::ReplacementRecoverySnapshot,
+    local_blocked: Vec<rustfs_heal::ReplacementRecoveryBlock>,
+    local_diagnostics: rustfs_heal::LocalHealRecoveryDiagnostics,
     cluster: ReplacementRecoveryClusterStatus,
 ) -> ReplacementRecoveryStatusResponse {
     ReplacementRecoveryStatusResponse {
@@ -1317,6 +1439,8 @@ fn build_replacement_recovery_status_response(
         path: format!("{}{}", ADMIN_PREFIX, REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX),
         scope: "cluster_survivor_disks",
         local,
+        local_blocked,
+        local_diagnostics,
         cluster,
     }
 }
@@ -1337,7 +1461,7 @@ fn encode_replacement_recovery_status(response: &ReplacementRecoveryStatusRespon
     })
 }
 
-async fn validate_heal_admin_request(req: &S3Request<Body>) -> S3Result<()> {
+async fn authenticate_heal_admin_request(req: &S3Request<Body>) -> S3Result<String> {
     let Some(input_cred) = req.credentials.as_ref() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
@@ -1352,7 +1476,12 @@ async fn validate_heal_admin_request(req: &S3Request<Body>) -> S3Result<()> {
         vec![Action::AdminAction(AdminAction::HealAdminAction)],
         req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
     )
-    .await
+    .await?;
+    Ok(cred.access_key)
+}
+
+async fn validate_heal_admin_request(req: &S3Request<Body>) -> S3Result<()> {
+    authenticate_heal_admin_request(req).await.map(|_| ())
 }
 
 pub struct HealHandler {}
@@ -1386,6 +1515,9 @@ impl Operation for HealHandler {
         };
         let hip = extract_heal_init_params(&bytes, &req.uri, params)?;
         validate_heal_request_mode(&hip)?;
+        if hip.client_token.is_empty() && !hip.force_stop {
+            validate_heal_start_options(&hip.hs)?;
+        }
         let response_operation = if hip.force_stop {
             "cancel_heal"
         } else if !hip.client_token.is_empty() && !hip.force_start {
@@ -1397,20 +1529,41 @@ impl Operation for HealHandler {
         let heal_path = encode_heal_control_path(&hip.bucket, &hip.obj_prefix);
         if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
             let client_token = hip.client_token.clone();
-            let request_id = uuid::Uuid::new_v4().to_string();
-            let context = app_context
-                .clone()
-                .ok_or_else(|| cluster_heal_control_unavailable("app_context_unavailable"))?;
-            let route = prepare_heal_control_route(&context)?;
-            let envelope = rustfs_protos::heal_control::Envelope::query(
-                request_id.clone(),
-                new_heal_control_metadata(&route)?,
-                heal_path,
-                client_token.clone(),
-                hip.since_seq,
+            // Automatic workers run on their owning node. Only an exact
+            // path/token/source snapshot can answer locally; Admin tokens and
+            // unknown identities retain the coordinator authority boundary.
+            let response = query_heal_status_on_owner(
+                async {
+                    let Some(manager) = rustfs_heal::get_heal_manager() else {
+                        return Ok(None);
+                    };
+                    let processor = rustfs_heal::HealChannelProcessor::new(manager.clone());
+                    timeout(
+                        PEER_HEAL_STATUS_TIMEOUT,
+                        processor.execute_local_automatic_query(&heal_path, &client_token, hip.since_seq),
+                    )
+                    .await
+                    .map_err(|_| cluster_heal_control_unavailable("local_task_query_expired"))?
+                    .map_err(|_| cluster_heal_control_unavailable("local_task_query_failed"))
+                },
+                || async {
+                    let request_id = uuid::Uuid::new_v4().to_string();
+                    let context = app_context
+                        .clone()
+                        .ok_or_else(|| cluster_heal_control_unavailable("app_context_unavailable"))?;
+                    let route = prepare_heal_control_route(&context)?;
+                    let envelope = rustfs_protos::heal_control::Envelope::query(
+                        request_id.clone(),
+                        new_heal_control_metadata(&route)?,
+                        heal_path.clone(),
+                        client_token.clone(),
+                        hip.since_seq,
+                    )
+                    .map_err(|err| s3_error!(InternalError, "encode heal control query failed: {err}"))?;
+                    submit_cluster_heal_channel_command(context, route, envelope, &request_id, client_token.clone()).await
+                },
             )
-            .map_err(|err| s3_error!(InternalError, "encode heal control query failed: {err}"))?;
-            let response = submit_cluster_heal_channel_command(context, route, envelope, &request_id, client_token).await?;
+            .await?;
             if !response.success {
                 return Err(s3_error!(
                     InternalError,
@@ -1496,6 +1649,267 @@ impl Operation for HealHandler {
 
 pub struct BackgroundHealStatusHandler {}
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MrfLegacyResponsibilityActionRequest {
+    action: MrfLegacyResponsibilityAction,
+    responsibility_id: uuid::Uuid,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    acknowledge_unverified_data_risk: Option<bool>,
+    #[serde(default)]
+    acknowledge_unknown_source_incarnation: Option<bool>,
+    #[serde(default)]
+    acknowledge_bucket_incarnation_mismatch: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    reference: Option<String>,
+    #[serde(default)]
+    request_id: Option<uuid::Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum MrfLegacyResponsibilityAction {
+    Refresh,
+    Recheck,
+    AcceptUnverifiedRisk,
+}
+
+fn validate_mrf_legacy_responsibility_action(action: &MrfLegacyResponsibilityActionRequest) -> Result<(), &'static str> {
+    if action.responsibility_id.is_nil() || action.expected_bucket_incarnation_id.is_some_and(|id| id.is_nil()) {
+        return Err("responsibility and bucket incarnation IDs must be non-nil");
+    }
+    if action.expected_bucket_incarnation_id.is_none() && !matches!(action.action, MrfLegacyResponsibilityAction::Refresh) {
+        return Err("a known bucket incarnation is required for recheck and risk acceptance");
+    }
+    match action.action {
+        MrfLegacyResponsibilityAction::Refresh | MrfLegacyResponsibilityAction::Recheck => {
+            if action.acknowledge_unverified_data_risk.is_some()
+                || action.acknowledge_unknown_source_incarnation.is_some()
+                || action.acknowledge_bucket_incarnation_mismatch.is_some()
+                || action.reason.is_some()
+                || action.reference.is_some()
+            {
+                return Err("recheck does not accept risk-acknowledgment fields");
+            }
+        }
+        MrfLegacyResponsibilityAction::AcceptUnverifiedRisk => {
+            if action.acknowledge_unverified_data_risk != Some(true) {
+                return Err("acknowledgeUnverifiedDataRisk must be true");
+            }
+            if action.acknowledge_unknown_source_incarnation.is_none() || action.acknowledge_bucket_incarnation_mismatch.is_none()
+            {
+                return Err("both source-incarnation acknowledgment fields are required");
+            }
+            if action
+                .reason
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty() || value.len() > 1024)
+            {
+                return Err("reason is required and limited to 1024 UTF-8 bytes");
+            }
+            if action
+                .reference
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty() || value.len() > 256)
+            {
+                return Err("reference is required and limited to 256 UTF-8 bytes");
+            }
+            if action.request_id.is_none_or(|request_id| request_id.is_nil()) {
+                return Err("requestId must be non-nil");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_mrf_legacy_responsibility_query(uri: &Uri) -> S3Result<(Option<uuid::Uuid>, usize)> {
+    let mut cursor = None;
+    let mut limit = MRF_RESPONSIBILITY_LIST_DEFAULT_LIMIT;
+    let mut seen = HashSet::with_capacity(2);
+    if let Some(query) = uri.query() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "cursor" if seen.insert("cursor") => {
+                    cursor = Some(
+                        value
+                            .parse()
+                            .map_err(|_| admin_error(S3ErrorCode::InvalidArgument, "cursor must be a UUID"))?,
+                    );
+                }
+                "limit" if seen.insert("limit") => {
+                    limit = value
+                        .parse::<usize>()
+                        .map_err(|_| admin_error(S3ErrorCode::InvalidArgument, "limit must be an integer between 1 and 256"))?;
+                    if limit == 0 || limit > MRF_RESPONSIBILITY_LIST_MAX_LIMIT {
+                        return Err(admin_error(S3ErrorCode::InvalidArgument, "limit must be between 1 and 256"));
+                    }
+                }
+                "cursor" | "limit" => {
+                    return Err(admin_error(S3ErrorCode::InvalidArgument, "duplicate MRF responsibility query parameter"));
+                }
+                _ => return Err(admin_error(S3ErrorCode::InvalidArgument, "unknown MRF responsibility query parameter")),
+            }
+        }
+    }
+    Ok((cursor, limit))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MrfLegacyResponsibilityActionResponse {
+    responsibility_id: uuid::Uuid,
+    state: &'static str,
+    data_verified: bool,
+    durable_responsibility_retained: bool,
+}
+
+fn map_mrf_lifecycle_control_error(error: rustfs_heal::heal::mrf_queue::MrfLifecycleControlError) -> s3s::S3Error {
+    use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
+    match error {
+        MrfLifecycleControlError::CheckpointUnreadable => admin_error(
+            S3ErrorCode::ServiceUnavailable,
+            "MRF checkpoint is unreadable; retain its files and restore a compatible reader",
+        ),
+        MrfLifecycleControlError::Unavailable | MrfLifecycleControlError::Persistence => {
+            admin_error(S3ErrorCode::ServiceUnavailable, "MRF lifecycle operation could not be completed")
+        }
+        MrfLifecycleControlError::StaleGeneration => {
+            admin_error(S3ErrorCode::InvalidRequest, "MRF responsibility generation changed")
+        }
+        MrfLifecycleControlError::NotHeld => {
+            admin_error(S3ErrorCode::InvalidRequest, "MRF responsibility is not held as unverified legacy")
+        }
+        MrfLifecycleControlError::IncarnationChanged => admin_error(
+            S3ErrorCode::InvalidRequest,
+            "bucket incarnation changed; refresh the MRF responsibility listing",
+        ),
+        MrfLifecycleControlError::BucketIdentityUnresolved => admin_error(
+            S3ErrorCode::InvalidRequest,
+            "current bucket identity is unresolved; the MRF responsibility remains held",
+        ),
+        MrfLifecycleControlError::BucketIdentityUnavailable(_) => admin_error(
+            S3ErrorCode::ServiceUnavailable,
+            "current bucket identity is unavailable; retry after storage recovers",
+        ),
+        MrfLifecycleControlError::InvalidAction(reason) => admin_error(S3ErrorCode::InvalidRequest, reason),
+    }
+}
+
+pub struct MrfLegacyResponsibilitiesHandler {}
+
+#[async_trait::async_trait]
+impl Operation for MrfLegacyResponsibilitiesHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_heal_admin_request(&req).await?;
+        let (cursor, limit) = parse_mrf_legacy_responsibility_query(&req.uri)?;
+        let snapshot = timeout(
+            Duration::from_secs(5),
+            rustfs_heal::heal::mrf_queue::list_legacy_responsibilities(cursor, limit),
+        )
+        .await
+        .map_err(|_| admin_error(S3ErrorCode::ServiceUnavailable, "MRF responsibility listing timed out"))?
+        .map_err(map_mrf_lifecycle_control_error)?;
+        let body = serde_json::to_vec(&snapshot)
+            .map_err(|_| admin_error(S3ErrorCode::InternalError, "failed to encode MRF responsibility listing"))?;
+        Ok(json_response(StatusCode::OK, body))
+    }
+}
+
+pub struct MrfLegacyResponsibilitiesActionHandler {}
+
+#[async_trait::async_trait]
+impl Operation for MrfLegacyResponsibilitiesActionHandler {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let actor = authenticate_heal_admin_request(&req).await?;
+        let bytes = req
+            .input
+            .store_all_limited(rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE)
+            .await
+            .map_err(|_| admin_error(S3ErrorCode::InvalidRequest, "MRF responsibility action body is too large or unreadable"))?;
+        let action: MrfLegacyResponsibilityActionRequest = serde_json::from_slice(&bytes)
+            .map_err(|_| admin_error(S3ErrorCode::InvalidRequest, "invalid MRF responsibility action body"))?;
+        validate_mrf_legacy_responsibility_action(&action).map_err(|reason| admin_error(S3ErrorCode::InvalidRequest, reason))?;
+        let (state, data_verified, durable_responsibility_retained) = match action.action {
+            MrfLegacyResponsibilityAction::Refresh => {
+                timeout(
+                    Duration::from_secs(30),
+                    rustfs_heal::heal::mrf_queue::refresh_legacy_responsibility(
+                        action.responsibility_id,
+                        action.expected_bucket_incarnation_id,
+                    ),
+                )
+                .await
+                .map_err(|_| admin_error(S3ErrorCode::ServiceUnavailable, "MRF responsibility refresh timed out"))?
+                .map_err(map_mrf_lifecycle_control_error)?;
+                ("refreshed", false, true)
+            }
+            MrfLegacyResponsibilityAction::Recheck => {
+                timeout(
+                    Duration::from_secs(30),
+                    rustfs_heal::heal::mrf_queue::recheck_legacy_responsibility(
+                        action.responsibility_id,
+                        action
+                            .expected_bucket_incarnation_id
+                            .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "expectedBucketIncarnationId is required"))?,
+                    ),
+                )
+                .await
+                .map_err(|_| admin_error(S3ErrorCode::ServiceUnavailable, "MRF responsibility recheck timed out"))?
+                .map_err(map_mrf_lifecycle_control_error)?;
+                ("active", false, true)
+            }
+            MrfLegacyResponsibilityAction::AcceptUnverifiedRisk => {
+                let reason = action
+                    .reason
+                    .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "reason is required"))?;
+                let reference = action
+                    .reference
+                    .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "reference is required"))?;
+                let request_id = action
+                    .request_id
+                    .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "requestId is required"))?;
+                timeout(
+                    Duration::from_secs(30),
+                    rustfs_heal::heal::mrf_queue::accept_unverified_legacy_risk(
+                        rustfs_heal::heal::mrf_queue::MrfLegacyRiskAcceptanceRequest {
+                            responsibility_id: action.responsibility_id,
+                            expected_bucket_incarnation_id: action.expected_bucket_incarnation_id.ok_or_else(|| {
+                                admin_error(S3ErrorCode::InvalidRequest, "expectedBucketIncarnationId is required")
+                            })?,
+                            acknowledge_unknown_source_incarnation: action.acknowledge_unknown_source_incarnation == Some(true),
+                            acknowledge_incarnation_mismatch: action.acknowledge_bucket_incarnation_mismatch == Some(true),
+                            actor,
+                            reason,
+                            reference,
+                            request_id,
+                        },
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    admin_error(
+                        S3ErrorCode::ServiceUnavailable,
+                        "MRF risk disposition timed out; read status before retrying",
+                    )
+                })?
+                .map_err(map_mrf_lifecycle_control_error)?;
+                ("operatorAcceptedUnverified", false, true)
+            }
+        };
+        let body = serde_json::to_vec(&MrfLegacyResponsibilityActionResponse {
+            responsibility_id: action.responsibility_id,
+            state,
+            data_verified,
+            durable_responsibility_retained,
+        })
+        .map_err(|_| admin_error(S3ErrorCode::InternalError, "failed to encode MRF responsibility action response"))?;
+        Ok(json_response(StatusCode::OK, body))
+    }
+}
+
 #[async_trait::async_trait]
 impl Operation for BackgroundHealStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -1567,7 +1981,9 @@ impl Operation for ReplacementRecoveryStatusHandler {
         let local = rustfs_heal::current_replacement_recovery_snapshot().await;
         let cluster =
             read_cluster_replacement_recovery_status(local.clone(), notification_system.as_deref(), expected_nodes).await?;
-        let response = build_replacement_recovery_status_response(local, cluster);
+        let local_blocked = rustfs_heal::current_replacement_recovery_blocks();
+        let local_diagnostics = rustfs_heal::current_local_heal_recovery_diagnostics().await;
+        let response = build_replacement_recovery_status_response(local, local_blocked, local_diagnostics, cluster);
         let body = encode_replacement_recovery_status(&response)?;
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
@@ -1587,13 +2003,14 @@ mod tests {
     use super::extract_heal_init_params;
     use super::{
         BackgroundHealCoverage, BackgroundHealCoverageReason, BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState,
-        aggregate_cluster_heal_status, aggregate_replacement_recovery_cluster_status, background_heal_runtime_state,
-        build_heal_channel_request, build_replacement_recovery_status_response, encode_background_heal_status,
-        encode_heal_control_path, encode_heal_start_success, encode_heal_task_status, execute_after_heal_control_capability,
-        heal_channel_response_items, heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id,
-        json_response, map_heal_response, merge_peer_heal_statuses, peer_topology_complete, query_peer_heal_status,
-        query_peer_replacement_recovery_status, read_cluster_heal_status, reject_heal_admission, validate_heal_request_mode,
-        validate_heal_target,
+        MrfLegacyResponsibilityAction, MrfLegacyResponsibilityActionRequest, aggregate_cluster_heal_status,
+        aggregate_replacement_recovery_cluster_status, background_heal_runtime_state, build_heal_channel_request,
+        build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_control_path,
+        encode_heal_start_success, encode_heal_task_status, execute_after_heal_start_preflight, heal_channel_response_items,
+        heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id, json_response,
+        map_heal_response, map_mrf_lifecycle_control_error, merge_peer_heal_statuses, parse_mrf_legacy_responsibility_query,
+        peer_topology_complete, query_peer_heal_status, query_peer_replacement_recovery_status, read_cluster_heal_status,
+        reject_heal_admission, validate_heal_request_mode, validate_heal_target, validate_mrf_legacy_responsibility_action,
     };
     use crate::storage::rpc::node_service::heal::{
         NodeHealProgress, NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, encode_node_replacement_recovery_status,
@@ -1612,9 +2029,341 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn local_automatic_heal_query_preserves_owner_and_coordinator_errors() {
+        let response = || rustfs_heal_contracts::heal_channel::HealChannelResponse {
+            request_id: "original-token".to_string(),
+            success: true,
+            data: Some(b"retained-owner-report".to_vec()),
+            error: None,
+        };
+        let called = AtomicBool::new(false);
+        let local = super::query_heal_status_on_owner(async { Ok(Some(response())) }, || async {
+            called.store(true, Ordering::SeqCst);
+            Ok(response())
+        })
+        .await
+        .expect("local automatic owner response");
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(local.request_id, "original-token");
+        assert_eq!(local.data.as_deref(), Some(b"retained-owner-report".as_slice()));
+
+        let fallback = super::query_heal_status_on_owner(async { Ok(None) }, || async {
+            called.store(true, Ordering::SeqCst);
+            Ok(response())
+        })
+        .await
+        .expect("unknown local identity uses coordinator");
+        assert!(called.swap(false, Ordering::SeqCst));
+        assert_eq!(fallback.data, local.data);
+
+        let error = super::query_heal_status_on_owner(
+            async { Err(super::admin_error(S3ErrorCode::InternalError, "local lookup failed")) },
+            || async {
+                called.store(true, Ordering::SeqCst);
+                Ok(response())
+            },
+        )
+        .await
+        .expect_err("local failure must not become coordinator success");
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert!(!called.load(Ordering::SeqCst));
+
+        let error = super::query_heal_status_on_owner(async { Ok(None) }, || async {
+            Err(super::admin_error(S3ErrorCode::ServiceUnavailable, "coordinator unavailable"))
+        })
+        .await
+        .expect_err("coordinator error must remain visible");
+        assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+    }
+
+    #[test]
+    fn mrf_legacy_only_refresh_accepts_an_unobserved_incarnation() {
+        for action in ["refresh", "recheck", "acceptUnverifiedRisk"] {
+            let request: MrfLegacyResponsibilityActionRequest = serde_json::from_value(json!({
+                "action": action,
+                "responsibilityId": Uuid::new_v4(),
+                "expectedBucketIncarnationId": null,
+            }))
+            .expect("decode explicit unknown observation");
+            assert_eq!(validate_mrf_legacy_responsibility_action(&request).is_ok(), action == "refresh");
+        }
+        let request: MrfLegacyResponsibilityActionRequest = serde_json::from_value(json!({
+            "action": "refresh",
+            "responsibilityId": Uuid::new_v4(),
+            "expectedBucketIncarnationId": Uuid::nil(),
+        }))
+        .expect("decode nil identity");
+        assert!(validate_mrf_legacy_responsibility_action(&request).is_err());
+    }
+
+    #[test]
+    fn mrf_legacy_risk_action_requires_explicit_acknowledgment_and_audit_fields() {
+        let base = json!({
+            "action": "acceptUnverifiedRisk",
+            "responsibilityId": Uuid::new_v4(),
+            "expectedBucketIncarnationId": Uuid::new_v4(),
+            "acknowledgeUnverifiedDataRisk": true,
+            "acknowledgeUnknownSourceIncarnation": false,
+            "acknowledgeBucketIncarnationMismatch": false,
+            "reason": "Verified against the retained canonical backup",
+            "reference": "INC-1234",
+            "requestId": Uuid::new_v4(),
+        });
+        let action: MrfLegacyResponsibilityActionRequest = serde_json::from_value(base.clone()).expect("valid risk action");
+        assert!(validate_mrf_legacy_responsibility_action(&action).is_ok());
+
+        let mut missing_ack = base.clone();
+        missing_ack["acknowledgeUnverifiedDataRisk"] = json!(false);
+        let missing_ack: MrfLegacyResponsibilityActionRequest = serde_json::from_value(missing_ack).expect("well-formed request");
+        assert!(validate_mrf_legacy_responsibility_action(&missing_ack).is_err());
+
+        let mut missing_reference = base.clone();
+        missing_reference.as_object_mut().expect("request object").remove("reference");
+        let missing_reference: MrfLegacyResponsibilityActionRequest =
+            serde_json::from_value(missing_reference).expect("well-formed request");
+        assert!(validate_mrf_legacy_responsibility_action(&missing_reference).is_err());
+
+        let mut missing_source_ack = base.clone();
+        missing_source_ack
+            .as_object_mut()
+            .expect("request object")
+            .remove("acknowledgeUnknownSourceIncarnation");
+        let missing_source_ack: MrfLegacyResponsibilityActionRequest =
+            serde_json::from_value(missing_source_ack).expect("well-formed request");
+        assert!(validate_mrf_legacy_responsibility_action(&missing_source_ack).is_err());
+
+        let mut oversized_reason = base.clone();
+        oversized_reason["reason"] = json!("x".repeat(1025));
+        let oversized_reason: MrfLegacyResponsibilityActionRequest =
+            serde_json::from_value(oversized_reason).expect("well-formed request");
+        assert!(validate_mrf_legacy_responsibility_action(&oversized_reason).is_err());
+
+        let mut unknown_field = base;
+        unknown_field["clearJournal"] = json!(true);
+        assert!(serde_json::from_value::<MrfLegacyResponsibilityActionRequest>(unknown_field).is_err());
+
+        let recheck = MrfLegacyResponsibilityActionRequest {
+            action: MrfLegacyResponsibilityAction::Recheck,
+            responsibility_id: Uuid::new_v4(),
+            expected_bucket_incarnation_id: Some(Uuid::new_v4()),
+            acknowledge_unverified_data_risk: None,
+            acknowledge_unknown_source_incarnation: None,
+            acknowledge_bucket_incarnation_mismatch: None,
+            reason: None,
+            reference: None,
+            request_id: None,
+        };
+        assert!(validate_mrf_legacy_responsibility_action(&recheck).is_ok());
+        let refresh = MrfLegacyResponsibilityActionRequest {
+            action: MrfLegacyResponsibilityAction::Refresh,
+            ..recheck
+        };
+        assert!(validate_mrf_legacy_responsibility_action(&refresh).is_ok());
+    }
+
+    #[test]
+    fn mrf_legacy_listing_query_is_bounded_and_rejects_ambiguous_parameters() {
+        let cursor = Uuid::new_v4();
+        let uri = Uri::try_from(format!("/rustfs/admin/v4/heal/mrf/responsibilities?cursor={cursor}&limit=256"))
+            .expect("valid responsibility URI");
+        assert_eq!(parse_mrf_legacy_responsibility_query(&uri).expect("valid query"), (Some(cursor), 256));
+
+        for query in [
+            "limit=0",
+            "limit=257",
+            "limit=-1",
+            "cursor=bad",
+            "limit=1&limit=2",
+            "object=secret",
+        ] {
+            let uri = Uri::try_from(format!("/rustfs/admin/v4/heal/mrf/responsibilities?{query}")).expect("well-formed URI");
+            assert!(parse_mrf_legacy_responsibility_query(&uri).is_err(), "accepted invalid query {query}");
+        }
+    }
+
+    #[test]
+    fn mrf_lifecycle_errors_distinguish_unresolved_identity_and_storage_failure() {
+        use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
+
+        let unresolved = map_mrf_lifecycle_control_error(MrfLifecycleControlError::BucketIdentityUnresolved);
+        assert_eq!(unresolved.code(), &S3ErrorCode::InvalidRequest);
+        let unavailable = map_mrf_lifecycle_control_error(MrfLifecycleControlError::BucketIdentityUnavailable(Box::new(
+            rustfs_heal::Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "private storage detail")),
+        )));
+        assert_eq!(unavailable.code(), &S3ErrorCode::ServiceUnavailable);
+        assert!(!unavailable.to_string().contains("private storage detail"));
+        let unreadable = map_mrf_lifecycle_control_error(MrfLifecycleControlError::CheckpointUnreadable);
+        assert_eq!(unreadable.code(), &S3ErrorCode::ServiceUnavailable);
+    }
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::sync::mpsc;
     use tokio::time::Duration;
+
+    fn parse_registered_heal_request(uri: &Uri) -> s3s::S3Result<HealInitParams> {
+        let mut registered = super::S3Router::new(false);
+        super::register_heal_route(&mut registered).expect("register production Heal routes");
+        let mut router = Router::new();
+        for route in registered.registered_routes() {
+            router.insert(route.clone(), ()).expect("replay production route");
+        }
+        let path = format!("POST|{}", uri.path());
+        let matched = router.at(&path).expect("request must match a production Heal route");
+        let body = Bytes::from_static(
+            br#"{"recursive":false,"dryRun":true,"remove":false,"recreate":false,"scanMode":2,"updateParity":false,"nolock":false,"readRepair":false,"pool":0,"set":0}"#,
+        );
+        extract_heal_init_params(&body, uri, matched.params)
+    }
+
+    #[test]
+    fn test_heal_routes_accept_nested_and_encoded_object_paths() {
+        let mut router = super::S3Router::new(false);
+        super::register_heal_route(&mut router).expect("register production Heal routes");
+        for prefix in ["/rustfs/admin", "/minio/admin"] {
+            for target in [
+                "",
+                "test-bucket",
+                "test-bucket/object.bin",
+                "test-bucket/dir/sub/object.bin",
+                "test-bucket/dir%2Fobject.bin",
+            ] {
+                let path = format!("{prefix}/v3/heal/{target}");
+                assert!(router.contains_compatible_route(http::Method::POST, &path), "{path}");
+                assert!(!router.contains_compatible_route(http::Method::GET, &path), "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_heal_target_decodes_once_and_keeps_start_status_stop_identity() {
+        for (wire, object) in [
+            ("object.bin", "object.bin"),
+            ("dir/sub/object.bin", "dir/sub/object.bin"),
+            ("dir%2Fsub%2Fobject.bin", "dir/sub/object.bin"),
+            ("dir%2fsub/object.bin", "dir/sub/object.bin"),
+            ("%2Fobject.bin", "/object.bin"),
+            ("dir/", "dir/"),
+            ("dir%2F", "dir/"),
+            ("literal%252Fslash", "literal%2Fslash"),
+            ("space%20key%2Bplus", "space key+plus"),
+            ("literal+plus", "literal+plus"),
+            ("%E4%B8%AD%E6%96%87%2F%E6%96%87%E4%BB%B6", "中文/文件"),
+            ("query%3Fhash%23percent%25", "query?hash#percent%"),
+        ] {
+            for query in ["", "?clientToken=task", "?clientToken=task&forceStop=true"] {
+                let uri = format!("/rustfs/admin/v3/heal/test%2Dbucket/{wire}{query}")
+                    .parse()
+                    .expect("valid encoded URI");
+                let parsed = parse_registered_heal_request(&uri).expect("valid Heal target");
+                assert_eq!(parsed.bucket, "test-bucket");
+                assert_eq!(parsed.obj_prefix, object, "wire target: {wire}");
+                assert_eq!(
+                    encode_heal_control_path(&parsed.bucket, &parsed.obj_prefix),
+                    format!("test-bucket/{object}")
+                );
+                assert_eq!(parsed.client_token, if query.is_empty() { "" } else { "task" });
+                assert_eq!(parsed.force_stop, query.ends_with("forceStop=true"));
+                if query.is_empty() {
+                    let request = build_heal_channel_request(&parsed);
+                    assert_eq!(request.bucket, "test-bucket");
+                    assert_eq!(request.object_prefix.as_deref(), Some(object));
+                    assert_eq!(request.pool_index, Some(0));
+                    assert_eq!(request.set_index, Some(0));
+                    assert_eq!(request.dry_run, Some(true));
+                    assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_heal_target_validates_decoded_paths_before_admission() {
+        for target in [
+            "test%2Fbucket/object",
+            "test%00bucket/object",
+            "test%FFbucket/object",
+            "test-bucket/dir%2F..%2Fobject",
+            "test-bucket/dir/%2e/object",
+            "test-bucket/dir%5C..%5Cobject",
+            "test-bucket/dir%2F%2Fobject",
+            "test-bucket/object%00",
+            "test-bucket/object%FF",
+        ] {
+            let uri = format!("/rustfs/admin/v3/heal/{target}").parse().expect("encoded URI");
+            let err = parse_registered_heal_request(&uri).expect_err("decoded invalid target must fail closed");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest, "target: {target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nested_heal_routes_still_require_authentication() {
+        use s3s::route::S3Route;
+
+        let mut router = super::S3Router::new(false);
+        super::register_heal_route(&mut router).expect("register production Heal routes");
+        for prefix in ["/rustfs/admin", "/minio/admin"] {
+            for object in ["dir/object.bin", "dir%2Fobject.bin", "literal%252Fslash"] {
+                let mut req = s3s::S3Request {
+                    input: s3s::Body::empty(),
+                    method: http::Method::POST,
+                    uri: format!("{prefix}/v3/heal/test-bucket/{object}").parse().expect("Heal URI"),
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                let err = router
+                    .check_access(&mut req)
+                    .await
+                    .expect_err("router must require a signature");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+                let err = router
+                    .call(req)
+                    .await
+                    .expect_err("handler must independently require authentication");
+                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+                assert!(err.to_string().contains("authentication required"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_recovery_diagnostics_require_authentication() {
+        use s3s::route::S3Route;
+
+        let mut router = super::S3Router::new(false);
+        super::register_heal_route(&mut router).expect("register production Heal routes");
+        for prefix in ["/rustfs/admin", "/minio/admin"] {
+            let path = format!("{prefix}/v4/heal/replacement-recovery");
+            assert!(router.contains_compatible_route(http::Method::GET, &path));
+            let mut req = s3s::S3Request {
+                input: s3s::Body::empty(),
+                method: http::Method::GET,
+                uri: path.parse().expect("replacement diagnostics URI"),
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let err = router
+                .check_access(&mut req)
+                .await
+                .expect_err("diagnostics router must require a signature");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            let err = router
+                .call(req)
+                .await
+                .expect_err("diagnostics handler must authenticate before inspecting local records");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+            assert!(err.to_string().contains("authentication required"));
+        }
+    }
 
     fn replacement_record(task_id: &str) -> rustfs_heal::ReplacementRecoveryRecord {
         rustfs_heal::ReplacementRecoveryRecord {
@@ -1636,10 +2385,66 @@ mod tests {
         }
     }
 
+    fn replacement_snapshot_with_retained_history() -> rustfs_heal::ReplacementRecoverySnapshot {
+        let mut snapshot = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        snapshot
+            .records
+            .push(replacement_record("22222222-2222-4222-8222-222222222222"));
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn heal_selector_preflight_rejects_before_probe_and_token_creation() {
+        use crate::admin::storage_api::runtime::PoolEndpoints;
+
+        let endpoints = super::EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Default::default(),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+        for (pool, set) in [(99, 99), (1, 0), (0, 1)] {
+            let hip = HealInitParams {
+                hs: HealOpts {
+                    pool: Some(pool),
+                    set: Some(set),
+                    recursive: true,
+                    ..Default::default()
+                },
+                force_start: true,
+                ..Default::default()
+            };
+            let probed = AtomicBool::new(false);
+            let mut token = None;
+            let error = execute_after_heal_start_preflight(
+                &endpoints,
+                &hip.hs,
+                || async {
+                    probed.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+                || async {
+                    token = Some(build_heal_channel_request(&hip).id);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("invalid selector must be rejected synchronously");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(error.code().status_code(), Some(StatusCode::BAD_REQUEST));
+            assert!(!probed.load(Ordering::SeqCst));
+            assert!(token.is_none(), "rejected START must not allocate a client token");
+        }
+    }
+
     #[tokio::test]
     async fn cluster_capability_gate_runs_before_execution() {
         let executed = AtomicBool::new(false);
-        let rejected = execute_after_heal_control_capability(
+        let rejected = execute_after_heal_start_preflight(
+            &super::EndpointServerPools::default(),
+            &HealOpts::default(),
             || async { Err(super::cluster_heal_control_unavailable("test_capability_failure")) },
             || async {
                 executed.store(true, Ordering::SeqCst);
@@ -1650,7 +2455,9 @@ mod tests {
         assert!(rejected.is_err());
         assert!(!executed.load(Ordering::SeqCst));
 
-        execute_after_heal_control_capability(
+        execute_after_heal_start_preflight(
+            &super::EndpointServerPools::default(),
+            &HealOpts::default(),
             || async { Ok(()) },
             || async {
                 executed.store(true, Ordering::SeqCst);
@@ -1663,6 +2470,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_repair_admin_start_is_rejected_before_probe_or_execution() {
+        let probed = AtomicBool::new(false);
+        let executed = AtomicBool::new(false);
+        let options = HealOpts {
+            read_repair: true,
+            ..Default::default()
+        };
+
+        let error = execute_after_heal_start_preflight(
+            &super::EndpointServerPools::default(),
+            &options,
+            || async {
+                probed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || async {
+                executed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("Admin Heal must reject the internal read-repair mode");
+
+        assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(error.code().status_code(), Some(StatusCode::BAD_REQUEST));
+        assert!(!probed.load(Ordering::SeqCst), "rejected options must precede capability probing");
+        assert!(!executed.load(Ordering::SeqCst), "rejected options must not execute a heal");
+    }
+
+    #[tokio::test]
     async fn heal_start_retry_preflight_failures_do_not_create_request_identities() {
         let hip = HealInitParams {
             bucket: "bucket".to_string(),
@@ -1672,7 +2509,9 @@ mod tests {
         for attempt in 0..3 {
             let executed_ids = &mut request_ids;
             let request_params = &hip;
-            let result = execute_after_heal_control_capability(
+            let result = execute_after_heal_start_preflight(
+                &super::EndpointServerPools::default(),
+                &HealOpts::default(),
                 || async {
                     if attempt < 2 {
                         Err(super::cluster_heal_control_unavailable("test_capability_failure"))
@@ -1704,7 +2543,28 @@ mod tests {
     fn replacement_recovery_status_response_reports_cluster_proof() {
         let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
         let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], Vec::new(), 1, true);
-        let response = build_replacement_recovery_status_response(local, cluster);
+        let response = build_replacement_recovery_status_response(
+            local,
+            Vec::new(),
+            rustfs_heal::LocalHealRecoveryDiagnostics {
+                scope: "local_disks",
+                definitive: true,
+                reason: None,
+                root_blocked: vec![rustfs_heal::RootHealRecoveryBlock {
+                    task_id: "root-task".to_owned(),
+                    reason: "conflicting owners".to_owned(),
+                }],
+                checkpoint_blocked: vec![rustfs_heal::BlockedCheckpointRecord {
+                    task_id: "checkpoint-task".to_owned(),
+                    disk_id: None,
+                    reason: "digest mismatch".to_owned(),
+                    blocked_at: Some(10),
+                    revalidate_after: Some(3610),
+                    validation: rustfs_heal::CheckpointValidation::default(),
+                }],
+            },
+            cluster,
+        );
         let value = serde_json::to_value(response).expect("replacement status response should serialize");
 
         assert_eq!(value["contractVersion"], 2);
@@ -1712,9 +2572,46 @@ mod tests {
         assert_eq!(value["scope"], "cluster_survivor_disks");
         assert_eq!(value["local"]["definitive"], true);
         assert_eq!(value["local"]["records"][0]["state"], "completed");
+        assert_eq!(value["localBlocked"], serde_json::json!([]));
+        assert_eq!(value["localDiagnostics"]["scope"], "local_disks");
+        assert_eq!(value["localDiagnostics"]["rootBlocked"][0]["taskId"], "root-task");
+        assert_eq!(value["localDiagnostics"]["rootBlocked"][0]["reason"], "conflicting owners");
+        assert_eq!(value["localDiagnostics"]["checkpointBlocked"][0]["reason"], "digest mismatch");
+        let validation = &value["localDiagnostics"]["checkpointBlocked"][0]["validation"];
+        assert_eq!(validation["stage"], "read_unavailable");
+        assert!(validation["schemaVersion"].is_null());
+        assert!(validation["signaturePresent"].is_null());
+        assert!(validation["signatureValid"].is_null());
+        assert!(validation["taskIdentityMatches"].is_null());
+        assert!(validation["legacyRewind"].is_null());
+        assert!(validation["readerAccepted"].is_null());
+        assert_eq!(validation["recoveryStatus"], "unknown");
+        assert_eq!(validation["ownerFence"], "unknown");
+        assert_eq!(validation["executionAuthorized"], false);
+        assert_eq!(value["cluster"]["records"].as_array().expect("cluster records").len(), 1);
         assert_eq!(value["cluster"]["definitive"], true);
         assert!(value["cluster"]["reason"].is_null());
         assert_eq!(value["cluster"]["records"][0]["state"], "completed");
+    }
+
+    #[test]
+    fn replacement_recovery_status_keeps_local_diagnostic_failure_separate_from_cluster_proof() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], Vec::new(), 1, true);
+        let diagnostics = rustfs_heal::LocalHealRecoveryDiagnostics {
+            scope: "local_disks",
+            definitive: false,
+            reason: Some("local_recovery_inventory_unavailable".to_owned()),
+            root_blocked: Vec::new(),
+            checkpoint_blocked: Vec::new(),
+        };
+        let response = build_replacement_recovery_status_response(local, Vec::new(), diagnostics, cluster);
+        let value = serde_json::to_value(response).expect("local diagnostic failure should serialize");
+        assert_eq!(value["localDiagnostics"]["definitive"], false);
+        assert_eq!(value["localDiagnostics"]["reason"], "local_recovery_inventory_unavailable");
+        assert_eq!(value["cluster"]["definitive"], true);
+        assert!(value["cluster"].get("rootBlocked").is_none());
+        assert!(value["cluster"].get("checkpointBlocked").is_none());
     }
 
     #[test]
@@ -1728,7 +2625,9 @@ mod tests {
     }
 
     #[test]
-    fn replacement_recovery_cluster_requires_matching_peer_records() {
+    fn replacement_recovery_cluster_rejects_overlapping_targets_without_shared_history() {
+        // Separate anchors cannot establish that these overlapping records
+        // describe compatible historical replacement instances.
         let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
         let peer = replacement_snapshot("22222222-2222-4222-8222-222222222222");
         let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
@@ -1736,6 +2635,247 @@ mod tests {
         assert!(!cluster.definitive);
         assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
         assert_eq!(cluster.records.len(), 2);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_merges_disjoint_generations_across_anchors() {
+        // rustfs/rustfs#8366: sequential automatic generations anchor their
+        // completion proofs on different surviving disks, so peers hold
+        // disjoint completed tasks and the remaining peers hold none at all.
+        let mut rebuilt_record = replacement_record("11111111-1111-4111-8111-111111111111");
+        rebuilt_record.target_slots = vec!["http://node-a:9000/mnt/disk2".to_string()];
+        let mut anchor_record = replacement_record("22222222-2222-4222-8222-222222222222");
+        anchor_record.target_slots = vec!["http://node-a:9000/mnt/disk1".to_string()];
+        let rebuilt = rustfs_heal::ReplacementRecoverySnapshot {
+            records: vec![rebuilt_record],
+            definitive: true,
+            reason: None,
+        };
+        let anchor = rustfs_heal::ReplacementRecoverySnapshot {
+            records: vec![anchor_record],
+            definitive: true,
+            reason: None,
+        };
+        let empty = rustfs_heal::ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: true,
+            reason: None,
+        };
+        let cluster =
+            aggregate_replacement_recovery_cluster_status(vec![rebuilt], vec![Ok(Some(anchor)), Ok(Some(empty))], 3, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records.len(), 2);
+        assert!(
+            cluster
+                .records
+                .iter()
+                .all(|record| matches!(record.state, rustfs_heal::ReplacementRecoveryState::Completed))
+        );
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_rejects_peer_disagreement_about_one_task() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let mut disagreeing = replacement_record("11111111-1111-4111-8111-111111111111");
+        disagreeing.set_disk_id = Some("pool_0_set_1".to_string());
+        let peer = rustfs_heal::ReplacementRecoverySnapshot {
+            records: vec![disagreeing],
+            definitive: true,
+            reason: None,
+        };
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Unknown);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_accepts_retained_history_on_one_anchor() {
+        let local = replacement_snapshot_with_retained_history();
+        let empty = rustfs_heal::ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: true,
+            reason: None,
+        };
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], vec![Ok(Some(empty))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, local.records);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_accepts_matching_retained_histories() {
+        let local = replacement_snapshot_with_retained_history();
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], vec![Ok(Some(local.clone()))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, local.records);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_accepts_committed_handoff_history() {
+        let mut local = replacement_snapshot_with_retained_history();
+        let successor = local.records[1].task_id.clone();
+        let predecessor = &mut local.records[0];
+        predecessor.state = rustfs_heal::ReplacementRecoveryState::Unrecoverable;
+        predecessor.reason = Some(format!("replacement responsibility transferred to {successor}"));
+        predecessor.verified_at = None;
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], Vec::new(), 1, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, local.records);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_merges_retained_history_with_disjoint_peer_generation() {
+        let local = replacement_snapshot_with_retained_history();
+        let mut peer = replacement_snapshot("33333333-3333-4333-8333-333333333333");
+        peer.records[0].target_slots = vec!["http://node-a:9000/mnt/disk2".to_string()];
+        let mut expected = local.records.clone();
+        expected.extend(peer.records.clone());
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, expected);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_accepts_retained_history_reported_only_by_peer() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let peer = replacement_snapshot_with_retained_history();
+        let expected = peer.records.clone();
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, expected);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_rejects_overlap_outside_retained_history() {
+        let local = replacement_snapshot_with_retained_history();
+        let peer = replacement_snapshot("33333333-3333-4333-8333-333333333333");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records.len(), 3);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_rejects_disagreeing_copies_in_retained_history() {
+        let local = replacement_snapshot_with_retained_history();
+        let mut peer = local.clone();
+        peer.records[0].verified_at = Some(43);
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records.len(), 2);
+        assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Unknown);
+        assert_eq!(cluster.records[1].state, rustfs_heal::ReplacementRecoveryState::Completed);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_reconciles_target_and_source_matrix() {
+        let task_ids = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+        ];
+        for targets in 0u8..8 {
+            let mut records = task_ids.map(replacement_record);
+            for (task, record) in records.iter_mut().enumerate() {
+                record.target_slots = vec![format!("http://node-a:9000/mnt/disk{}", (targets >> task) & 1)];
+            }
+            // All non-empty source subsets cover pairwise histories without
+            // one common anchor, transitive-only histories, and empty peers.
+            for a in 1u8..8 {
+                for b in 1u8..8 {
+                    for c in 1u8..8 {
+                        let masks = [a, b, c];
+                        let mut snapshots = (0..3).map(|source| rustfs_heal::ReplacementRecoverySnapshot {
+                            records: records
+                                .iter()
+                                .enumerate()
+                                .filter(|(task, _)| masks[*task] & (1 << source) != 0)
+                                .map(|(_, record)| record.clone())
+                                .collect(),
+                            definitive: true,
+                            reason: None,
+                        });
+                        let expected = (0..3).all(|left| {
+                            (left + 1..3).all(|right| {
+                                records[left].target_slots != records[right].target_slots || masks[left] & masks[right] != 0
+                            })
+                        });
+                        let local = snapshots.next().expect("three source snapshots");
+                        let cluster = aggregate_replacement_recovery_cluster_status(
+                            vec![local],
+                            snapshots.map(|snapshot| Ok(Some(snapshot))).collect(),
+                            3,
+                            true,
+                        );
+
+                        assert_eq!(cluster.definitive, expected, "targets={targets}, sources={masks:?}");
+                        assert_eq!(cluster.reason.is_none(), expected);
+                        assert_eq!(cluster.records, records);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_rejects_overlap_on_a_secondary_target() {
+        let mut local = replacement_snapshot_with_retained_history();
+        local.records[0].target_slots.push("http://node-a:9000/mnt/disk2".to_string());
+        let mut peer = replacement_snapshot("33333333-3333-4333-8333-333333333333");
+        peer.records[0].target_slots = vec!["http://node-a:9000/mnt/disk2".to_string()];
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(!cluster.definitive);
+        assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
+        assert_eq!(cluster.records.len(), 3);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_deduplicates_reordered_targets() {
+        let mut local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        local.records[0].target_slots.push("http://node-a:9000/mnt/disk2".to_string());
+        let mut peer = local.clone();
+        peer.records[0].target_slots.reverse();
+        let expected = local.records.clone();
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, expected);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_accepts_history_from_a_high_index_peer() {
+        let empty = rustfs_heal::ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: true,
+            reason: None,
+        };
+        let mut peers = vec![Ok(Some(empty.clone())); 80];
+        let history = replacement_snapshot_with_retained_history();
+        let expected = history.records.clone();
+        peers.push(Ok(Some(history)));
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![empty], peers, 82, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records, expected);
     }
 
     #[test]
@@ -1815,6 +2955,7 @@ mod tests {
         ] {
             let error = reject_heal_admission(HealAdmissionResult::Dropped(reason));
             assert_eq!(error.code(), &S3ErrorCode::OperationAborted);
+            assert_eq!(error.code().status_code(), Some(StatusCode::CONFLICT));
             assert!(
                 error.to_string().contains(label),
                 "the caller must distinguish conflicts from transient coordination failure"
@@ -2820,6 +3961,50 @@ mod tests {
         assert!(json["settings"].is_object());
         let start_time = json["startTime"].as_str().expect("startTime should be a string");
         OffsetDateTime::parse(start_time, &Rfc3339).expect("startTime should be RFC3339");
+    }
+
+    #[test]
+    fn test_encode_heal_task_status_uses_settings_from_channel_payload() {
+        let response = rustfs_heal_contracts::heal_channel::HealChannelResponse {
+            request_id: "token".into(),
+            success: true,
+            data: Some(
+                br#"{"summary":"running","settings":{"recursive":true,"dryRun":true,"remove":true,"recreate":false,"scanMode":2,"updateParity":false,"nolock":false,"readRepair":false,"pool":1,"set":2}}"#
+                    .to_vec(),
+            ),
+            error: None,
+        };
+        let payload = super::heal_channel_response_status(&response).expect("channel status should decode");
+        let encoded =
+            encode_heal_task_status(payload, String::new(), HealOpts::default()).expect("public status should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("public status should decode");
+
+        assert_eq!(json["settings"]["scanMode"], 2);
+        assert_eq!(json["settings"]["dryRun"], true);
+        assert_eq!(json["settings"]["remove"], true);
+        assert_eq!(json["settings"]["recreate"], false);
+        assert_eq!(json["settings"]["updateParity"], false);
+        assert_eq!(json["settings"]["recursive"], true);
+        assert_eq!(json["settings"]["pool"], 1);
+        assert_eq!(json["settings"]["set"], 2);
+    }
+
+    #[test]
+    fn test_encode_heal_task_status_defaults_settings_for_legacy_channel_payload() {
+        let response = rustfs_heal_contracts::heal_channel::HealChannelResponse {
+            request_id: "token".into(),
+            success: true,
+            data: Some(br#"{"summary":"running"}"#.to_vec()),
+            error: None,
+        };
+        let payload = super::heal_channel_response_status(&response).expect("legacy channel status should decode");
+        let encoded =
+            encode_heal_task_status(payload, String::new(), HealOpts::default()).expect("legacy public status should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("public status should decode");
+
+        assert_eq!(json["settings"]["scanMode"], 1);
+        assert_eq!(json["settings"]["dryRun"], false);
+        assert_eq!(json["settings"]["remove"], false);
     }
 
     #[test]

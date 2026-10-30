@@ -22,7 +22,7 @@ use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
-use rustfs_iam::{federation::FederatedIdentityService, store::object::ObjectStore, sys::IamSys};
+use rustfs_iam::{federation::FederatedIdentityService, oidc::OidcConfigQuery, store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
@@ -43,10 +43,21 @@ pub trait IamInterface: Send + Sync {
     }
 }
 
-/// Federated identity service interface for admin and runtime consumers.
+/// Published federation runtime handles for authentication and OIDC configuration consumers.
+pub type FederatedIdentityRuntimeSnapshot = (Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>);
+
 pub trait FederatedIdentityInterface: Send + Sync {
-    fn handle(&self) -> Option<Arc<FederatedIdentityService>>;
-    fn publish_handle(&self, _service: Arc<FederatedIdentityService>) -> bool {
+    fn runtime_snapshot(&self) -> Option<FederatedIdentityRuntimeSnapshot>;
+
+    fn handle(&self) -> Option<Arc<FederatedIdentityService>> {
+        self.runtime_snapshot().map(|(service, _)| service)
+    }
+
+    fn oidc_config_query(&self) -> Option<Arc<dyn OidcConfigQuery>> {
+        self.runtime_snapshot().map(|(_, oidc_config_query)| oidc_config_query)
+    }
+
+    fn publish_runtime(&self, _service: Arc<FederatedIdentityService>, _oidc_config_query: Arc<dyn OidcConfigQuery>) -> bool {
         false
     }
 }
@@ -72,6 +83,13 @@ pub trait OutboundTlsRuntimeInterface: Send + Sync {
 #[async_trait]
 pub trait NotifyInterface: Send + Sync {
     async fn notify(&self, args: EventArgs);
+
+    async fn validate_event_specific_rules(
+        &self,
+        bucket_name: &str,
+        region: &str,
+        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
+    ) -> Result<(), NotificationError>;
 
     async fn add_event_specific_rules(
         &self,

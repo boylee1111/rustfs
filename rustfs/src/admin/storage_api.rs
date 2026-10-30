@@ -16,6 +16,12 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use rustfs_storage_api as storage_contracts;
+
+pub(crate) mod integrity {
+    pub(crate) use crate::storage::storage_api::ecstore_integrity::{
+        IntegrityError, JobRequest, control_job, create_job, get_job, inventory, readiness, resume_job,
+    };
+}
 use time::OffsetDateTime;
 
 mod ecstore_bucket {
@@ -78,10 +84,12 @@ mod ecstore_notification {
 #[allow(unused_imports)]
 pub(crate) mod ecstore_rebalance {
     #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_rebalance::RebalSaveOpt;
+    #[cfg(test)]
     pub(crate) use crate::storage::storage_api::ecstore_rebalance::test_util;
     pub(crate) use crate::storage::storage_api::ecstore_rebalance::{
-        DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
-        RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
+        DiskStat, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
+        RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
         encode_rebalance_stop_propagation_record,
     };
 }
@@ -110,6 +118,7 @@ pub(crate) type MetricType = ecstore_metrics::MetricType;
 pub(crate) type NotificationSys = ecstore_notification::NotificationSys;
 pub(crate) type ClusterTierDailyStats = ecstore_notification::ClusterTierDailyStats;
 pub(crate) type PeerRestClient = ecstore_rpc::PeerRestClient;
+#[cfg(test)]
 pub(crate) type RebalSaveOpt = ecstore_rebalance::RebalSaveOpt;
 pub(crate) type RebalanceCleanupWarnings = ecstore_rebalance::RebalanceCleanupWarnings;
 pub(crate) type RebalanceMeta = ecstore_rebalance::RebalanceMeta;
@@ -523,11 +532,16 @@ pub(crate) mod metadata_sys {
 pub(crate) mod quota {
     pub(crate) mod checker {
         pub(crate) type QuotaChecker = super::super::ecstore_bucket::quota::checker::QuotaChecker;
+        pub(crate) use super::super::ecstore_bucket::quota::checker::record_reservation_protocol_migration;
     }
 
     pub(crate) type BucketQuota = super::ecstore_bucket::quota::BucketQuota;
     pub(crate) type QuotaError = super::ecstore_bucket::quota::QuotaError;
     pub(crate) type QuotaOperation = super::ecstore_bucket::quota::QuotaOperation;
+    pub(crate) type QuotaProtocolMigration = super::ecstore_bucket::quota::QuotaProtocolMigration;
+    #[cfg(test)]
+    pub(crate) type QuotaMigrationSkipReason = super::ecstore_bucket::quota::QuotaMigrationSkipReason;
+    pub(crate) use super::ecstore_bucket::quota::{QUOTA_RESERVATION_PROTOCOL_V1, QUOTA_RESERVATION_PROTOCOL_V2};
 }
 
 pub(crate) mod replication {
@@ -812,13 +826,22 @@ pub(crate) async fn read_admin_config_without_migrate(api: Arc<ECStore>) -> Resu
     ecstore_config::com::read_config_without_migrate(api).await
 }
 
+pub(crate) async fn read_admin_server_config_with_generation(
+    api: Arc<ECStore>,
+) -> Result<(rustfs_config::server_config::Config, Option<uuid::Uuid>)> {
+    crate::storage::storage_api::read_server_config_with_generation(api).await
+}
+
 pub(crate) async fn read_existing_admin_server_config_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {
     ecstore_config::com::read_existing_server_config_no_lock(api).await
 }
 
 #[cfg(test)]
-pub(crate) async fn read_admin_config_without_migrate_no_lock(api: Arc<ECStore>) -> Result<rustfs_config::server_config::Config> {
-    ecstore_config::com::read_config_without_migrate_no_lock(api).await
+pub(crate) async fn read_admin_config_without_migrate_no_lock(
+    api: Arc<ECStore>,
+    guard: &crate::storage::storage_api::ecstore_object::WriteCommitGuard,
+) -> Result<rustfs_config::server_config::Config> {
+    ecstore_config::com::read_config_without_migrate_no_lock(api, guard).await
 }
 
 pub(crate) type AdminServerConfigSnapshot = ecstore_config::com::ServerConfigSnapshot;
@@ -841,14 +864,15 @@ pub(crate) async fn save_admin_server_config(api: Arc<ECStore>, cfg: &rustfs_con
 pub(crate) async fn save_admin_server_config_no_lock(
     api: Arc<ECStore>,
     cfg: &rustfs_config::server_config::Config,
+    guard: &crate::storage::storage_api::ecstore_object::WriteCommitGuard,
 ) -> Result<()> {
-    ecstore_config::com::save_server_config_no_lock(api, cfg).await
+    ecstore_config::com::save_server_config_no_lock(api, cfg, guard).await
 }
 
 #[cfg(test)]
 pub(crate) async fn with_admin_server_config_write_lock<F, Fut, T>(api: Arc<ECStore>, operation: F) -> Result<T>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(crate::storage::storage_api::ecstore_object::WriteCommitGuard) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
@@ -983,8 +1007,8 @@ pub(crate) mod config {
     pub(crate) use super::{
         AdminServerConfigSaveResult, AdminServerConfigSnapshot, RUSTFS_META_BUCKET, STORAGE_CLASS_SUB_SYS, delete_admin_config,
         init_admin_config_defaults, read_admin_config, read_admin_config_without_migrate, read_admin_server_config_snapshot,
-        read_existing_admin_server_config_no_lock, save_admin_config, save_admin_server_config_snapshot,
-        with_admin_server_config_read_lock,
+        read_admin_server_config_with_generation, read_existing_admin_server_config_no_lock, save_admin_config,
+        save_admin_server_config_snapshot, with_admin_server_config_read_lock,
     };
     #[cfg(test)]
     pub(crate) use super::{
@@ -1024,11 +1048,14 @@ pub(crate) mod metrics {
 
 pub(crate) mod object {
     pub(crate) use crate::storage::storage_api::StorageObjectOptions;
+    pub(crate) use crate::storage::storage_api::ecstore_object::WriteCommitGuard;
 }
 
 pub(crate) mod rebalance {
+    #[cfg(test)]
+    pub(crate) use super::RebalSaveOpt;
     pub(crate) use super::{
-        DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord,
+        DiskStat, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord,
         decode_rebalance_stop_propagation_record,
     };
 
@@ -1048,7 +1075,9 @@ pub(crate) mod runtime {
 }
 
 pub(crate) mod s3 {
-    #[cfg(test)]
+    // Keep auth types behind the existing s3 facade so test-only callers do
+    // not widen the repository's direct s3s import footprint.
+    #[allow(unused_imports)]
     pub(crate) use s3s::auth;
     pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header};
 
@@ -1065,6 +1094,7 @@ pub(crate) mod s3 {
 }
 
 pub(crate) mod tier {
+    pub(crate) use super::ecstore_bucket::lifecycle::tier_free_version_recovery::retry_tier_free_version_cleanup;
     pub(crate) use super::{
         AdminError, ClusterTierDailyStats, DailyAllTierStats, ECStore, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE,
         ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CONFIG, ERR_TIER_INVALID_CREDENTIALS,

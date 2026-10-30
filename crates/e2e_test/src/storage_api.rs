@@ -15,7 +15,11 @@
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::disk::{RUSTFS_META_BUCKET, VolumeInfo, WalkDirOptions};
+pub(crate) const OBJECT_LOCK_TRACE_FILTER: &str = "info,rustfs_ecstore::object_lock_diag=trace";
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::disk::{
+    DiskOption, Endpoint, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, VolumeInfo, WalkDirOptions, new_disk,
+};
 pub(crate) use rustfs_ecstore::api::rpc::{AuthenticatedChannel, TonicInterceptor, node_service_time_out_client_no_auth};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::rpc::{
@@ -51,4 +55,42 @@ pub(crate) mod internode_rpc_signature {
 #[cfg(test)]
 pub(crate) mod replication_extension {
     pub(crate) use super::BucketTargetSys;
+}
+
+#[cfg(test)]
+pub(crate) mod upgrade_compatibility {
+    pub(crate) use super::{DiskOption, Endpoint, RUSTFS_META_MULTIPART_BUCKET, new_disk};
+}
+
+#[cfg(test)]
+pub(crate) mod multipart_rpc_delay {
+    pub(crate) use super::RUSTFS_META_MULTIPART_BUCKET;
+}
+
+#[cfg(test)]
+pub(crate) mod multipart_fence_acceptance {
+    pub(crate) use super::RUSTFS_META_MULTIPART_BUCKET;
+
+    /// Targeted lock diagnostics for the metadata-delay quorum case.
+    pub(crate) const LOCK_DIAGNOSTICS_FILTER: &str = "warn,rustfs_lock::distributed_lock=debug,rustfs_ecstore::object_lock_diag=trace,rustfs_ecstore::cluster::rpc::remote_locker=info";
+}
+
+#[cfg(test)]
+pub(crate) mod multipart_source_rpc {
+    pub(crate) use rustfs_ecstore::api::disk::{
+        MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartAbortCertificate, MultipartAbortProof, MultipartAbortProofKind,
+        MultipartAbortRound, MultipartSourceOperation, MultipartSourcePhase, MultipartSourceRequest, MultipartSourceSnapshot,
+        PublicationIdentity, SourceGeneration, SourceGeometry, SourceLineage,
+    };
+}
+
+#[cfg(test)]
+pub(crate) mod scanner_peer_bucket {
+    use rustfs_ecstore::api::disk as ecstore_disk;
+    use rustfs_ecstore::api::erasure as ecstore_erasure;
+    use rustfs_ecstore::api::rpc as ecstore_rpc;
+
+    pub(crate) use ecstore_disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+    pub(crate) use ecstore_erasure::{ReedSolomonEncoder, calc_shard_size};
+    pub(crate) use ecstore_rpc::PeerRestClient;
 }

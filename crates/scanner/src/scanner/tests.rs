@@ -12,10 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::heal_info::{classify_background_heal_read_error, decode_background_heal_info};
+use super::heal_info::{
+    ScannerBitrotStart, classify_background_heal_read_error, decode_background_heal_info, record_scanner_bitrot_status,
+    reset_bitrot_cadence_anchor_for_test, resolve_background_heal_info, scanner_bitrot_start_for_cycle,
+};
 use super::*;
+
+mod startup_gate;
+mod startup_observation;
 use crate::EcstoreResult;
-use crate::storage_api::owner::ecstore_hold_namespace_commit;
+use crate::storage_api::owner::{
+    WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit, ecstore_namespace_commits_pending,
+};
 use crate::storage_api::scan::{BucketOperations as _, ObjectIO as _};
 use crate::{
     DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_CACHE_KEY_FORMAT, DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT,
@@ -23,6 +31,9 @@ use crate::{
     Endpoints, InstanceContext, PoolEndpoints, ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo,
     ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader, init_bucket_metadata_sys_for_scanner_tests,
     init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx,
+};
+use rustfs_scanner_metrics::metrics::{
+    ScannerUsagePublicationClass, ScannerUsagePublicationOutcome, ScannerUsagePublicationStatus,
 };
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
@@ -37,10 +48,14 @@ use tokio::time::{Duration, advance};
 
 const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
+mod cycle_budget_publication;
+pub(super) mod cycle_persist_failure;
+mod gate_self_heal;
 mod quota_reset_preservation;
 
 mod recovery_control;
 mod scoped_ack_publication;
+mod wakeup_metrics;
 
 async fn setup_scanner_cycle_store() -> (tempfile::TempDir, Arc<ECStore>) {
     setup_scanner_cycle_store_with_usage_baseline(true).await
@@ -137,6 +152,11 @@ pub(super) async fn setup_scanner_cycle_store_at_path_with_layout_and_disk_prein
     let endpoint_pools = EndpointServerPools::from(pools);
     let instance_ctx = Arc::new(InstanceContext::new());
     instance_ctx.set_endpoints(endpoint_pools.clone());
+    if pool_count == 1 && sets_per_pool == 1 && drives_per_set == 1 {
+        instance_ctx
+            .update_erasure_type(crate::storage_api::EcstoreSetupType::ErasureSD)
+            .await;
+    }
     if preinitialize_disks {
         init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
             .await
@@ -368,9 +388,14 @@ async fn running_main_loop_catches_up_pause_cleared_after_startup_observe() {
         let pause_status = store.scanner_data_movement_pause_status().await;
         assert!(pause_status.paused);
         assert_eq!(
-            scanner_local_publication_defer_reason(store.as_ref()).await,
+            scanner_local_publication_defer_reason(store.as_ref(), false).await,
             Some(ScannerCycleDeferReason::DataMovement),
             "an actual data-movement pause must retain durable catch-up tracking"
+        );
+        assert_eq!(
+            scanner_local_publication_defer_reason(store.as_ref(), true).await,
+            Some(ScannerCycleDeferReason::DataMovement),
+            "an observational lease must retain the data-movement fence"
         );
         paused_probe.wait().await;
         drop(paused_probe);
@@ -635,8 +660,8 @@ async fn cycle_budget_fence_accepts_bootstrap_pending_usage_marker() {
 
 #[tokio::test]
 async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
-    let (_temp_dir, store) = setup_scanner_cycle_store().await;
-    let lock = store
+    let (_temp_dir, lock_store) = setup_scanner_cycle_store().await;
+    let lock = lock_store
         .new_ns_lock(RUSTFS_META_BUCKET, "leader.lock")
         .await
         .expect("scanner leader lock should be created");
@@ -644,6 +669,17 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
         .get_write_lock(Duration::from_secs(1))
         .await
         .expect("scanner leader lock should be acquired");
+
+    // Keep the real guard, but isolate the fencing deadline from filesystem I/O.
+    let store = Arc::new(MemoryConfigStore::default());
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0))
+            .expect("scanner cycle usage baseline should encode"),
+    )
+    .await
+    .expect("scanner cycle usage baseline should persist");
 
     let ctx = CancellationToken::new();
     let mut cycle_info = CurrentCycle {
@@ -678,12 +714,151 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
     .await;
 
     assert!(guard.is_released());
+    assert_eq!(leader_epoch, 2, "deadline handler should claim the next epoch");
+    assert!(matches!(cycle_revision, DataUsageCacheRevision::Etag(_)));
     let persisted = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
         .await
         .expect("deadline handler should persist a fenced cursor");
     let (_, persisted_epoch) = decode_scanner_cycle_state(&persisted).expect("fenced cursor should decode");
     assert_eq!(persisted_epoch, 2);
     global_metrics().set_cycle(None).await;
+}
+
+async fn checkpoint_runtime_handoff(store: Arc<MemoryConfigStore>, expected_cycle: u64, mut epoch: u64) -> (u64, u64) {
+    let (encoded, mut revision) = read_config_with_revision(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("read the previous durable generation");
+    let (mut cycle, saved_epoch) =
+        decode_scanner_cycle_state(&encoded.expect("a preceding generation must exist")).expect("decode preceding cycle");
+    assert_eq!((cycle.next, saved_epoch), (expected_cycle, epoch));
+    cycle.current = cycle.next;
+    let ctx = CancellationToken::new();
+    let mut metrics = ScannerCycleMetricsGuard::new(cycle.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
+    tokio::time::pause();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(5)),
+            ..Default::default()
+        },
+    );
+    let worker = async {
+        budget.token().cancelled().await;
+        assert!(
+            finalize_partial_scan_cycle_for_epoch(&ctx, store.clone(), &mut cycle, &mut revision, epoch, &mut metrics, Some(0),)
+                .await,
+            "runtime expiry must durably advance the partial cycle"
+        );
+        budget.mark_cycle_state_persisted();
+    };
+    let outcome = await_scanner_cycle_with_budget_fence(&ctx, &budget, worker, std::future::pending()).await;
+    tokio::time::resume();
+    assert_eq!(outcome, ScannerCycleWaitOutcome::Deadline { worker_stopped: true });
+    assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Runtime));
+    assert!(budget.cycle_state_persisted());
+    assert!(
+        fence_scanner_epoch_after_cycle_timeout(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut epoch,
+            false,
+            std::future::pending(),
+        )
+        .await
+    );
+    assert!(
+        claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await
+    );
+    let persisted = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+        .await
+        .expect("read durable takeover fence");
+    let (saved, saved_epoch) = decode_scanner_cycle_state(&persisted).expect("decode takeover fence");
+    assert_eq!((saved.next, saved_epoch), (cycle.next, epoch));
+    (cycle.next, epoch)
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_fixture_runtime_deadline_save_reload_resume() {
+    // One control store survives every handoff, as it does across real cycles.
+    let store = Arc::new(MemoryConfigStore::default());
+    let ctx = CancellationToken::new();
+    let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    usage.scanner_epoch = Some(7);
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&usage).expect("usage baseline"),
+    )
+    .await
+    .expect("seed usage fence once");
+    let mut cycle = CurrentCycle {
+        next: 11,
+        ..Default::default()
+    };
+    let mut revision = DataUsageCacheRevision::Missing;
+    assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 7).await);
+    let checkpoint = crate::scanner_folder::run_checkpoint_fixture(false, |cycle, epoch| {
+        checkpoint_runtime_handoff(store.clone(), cycle, epoch)
+    })
+    .await;
+    let persisted = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
+        .await
+        .expect("final durable control state");
+    let (saved, epoch) = decode_scanner_cycle_state(&persisted).expect("final control state");
+    assert_eq!((saved.next, epoch), (checkpoint.info.next_cycle, checkpoint.info.leader_epoch));
+    assert!(saved.next > 11 && epoch > 7);
+    let cache_name = "bucket/.usage-cache.bin";
+    let cache_revisions = crate::DataUsageCache::read_revisions(store.clone(), cache_name)
+        .await
+        .expect("initial cache revisions");
+    checkpoint
+        .save_with_revisions_for_epoch(store.clone(), cache_name, &cache_revisions, 0)
+        .await
+        .expect("publish the current checkpoint into the fenced store");
+    let cache_path = rustfs_utils::path::path_join_buf(&[crate::BUCKET_META_PREFIX, cache_name]);
+    let key = memory_config_key(RUSTFS_META_BUCKET, &cache_path);
+    let before = store.objects.lock().await.get(&key).cloned().expect("saved checkpoint bytes");
+    let mut revisions = crate::DataUsageCache::read_revisions(store.clone(), cache_name)
+        .await
+        .expect("current cache revisions");
+    let mut stale = checkpoint.clone();
+    stale.info.next_cycle = 11;
+    stale.info.leader_epoch = 7;
+    stale.info.snapshot_complete = false;
+    for late_cycle in [11, saved.next] {
+        let late = crate::scanner_io::persist_scanner_checkpoint(
+            store.clone(),
+            store.clone(),
+            crate::scanner_io::ScannerCheckpointPersistContext {
+                ctx: &ctx,
+                expected_publication_epoch: 0,
+                cycle: late_cycle,
+                leader_epoch: 7,
+            },
+            cache_name,
+            &stale,
+            &mut revisions,
+        )
+        .await;
+        assert!(matches!(late, crate::scanner_io::ScannerCheckpointPersistResult::FenceChanged));
+        assert_eq!(
+            store.objects.lock().await.get(&key),
+            Some(&before),
+            "late writes cannot overwrite the current checkpoint"
+        );
+    }
 }
 
 #[tokio::test]
@@ -727,13 +902,22 @@ impl Drop for ScannerDefaultCycleGuard {
 
 #[derive(Debug, Default)]
 struct MemoryConfigStore {
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    write_entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    pending_diagnostic_write: AtomicBool,
     objects: Mutex<HashMap<String, Vec<u8>>>,
+    bucket_list_calls: AtomicUsize,
     revisions: Mutex<HashMap<String, u64>>,
     insert_after_gets: Mutex<HashMap<String, Vec<u8>>>,
     read_errors: Mutex<HashMap<String, EcstoreError>>,
     delayed_gets: Mutex<HashMap<String, Duration>>,
     non_regular_objects: Mutex<HashSet<String>>,
     fail_put_number: Mutex<HashMap<String, usize>>,
+    /// Fail every put whose number is at least the stored value.
+    fail_puts_from: Mutex<HashMap<String, usize>>,
     object_not_found_put_number: Mutex<HashMap<String, usize>>,
     error_after_commit_put_number: Mutex<HashMap<String, usize>>,
     interleaving_puts: Mutex<HashMap<String, (usize, Vec<u8>)>>,
@@ -781,6 +965,11 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
         _h: http::HeaderMap,
         _opts: &ObjectOptions,
     ) -> EcstoreResult<GetObjectReader> {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        self.entry_sources
+            .lock()
+            .await
+            .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
         let key = memory_config_key(bucket, object);
         if let Some(error) = self.read_errors.lock().await.get(&key).cloned() {
             return Err(error);
@@ -827,6 +1016,16 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> EcstoreResult<ObjectInfo> {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        {
+            self.write_entry_sources
+                .lock()
+                .await
+                .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
+            if self.pending_diagnostic_write.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
+        }
         let mut buf = Vec::new();
         data.stream.read_to_end(&mut buf).await?;
         let key = memory_config_key(bucket, object);
@@ -837,7 +1036,14 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
             *put_count
         };
 
-        if self.fail_put_number.lock().await.get(&key) == Some(&put_count) {
+        if self.fail_put_number.lock().await.get(&key) == Some(&put_count)
+            || self
+                .fail_puts_from
+                .lock()
+                .await
+                .get(&key)
+                .is_some_and(|from| put_count >= *from)
+        {
             return Err(EcstoreError::other("injected put failure"));
         }
         if self.object_not_found_put_number.lock().await.get(&key) == Some(&put_count) {
@@ -971,56 +1177,106 @@ fn test_randomized_cycle_delay_bounds_extreme_interval() {
 
 #[test]
 fn test_initial_scanner_delay_uses_configured_start_delay() {
-    let delay = initial_scanner_delay_for(Some(120));
-    assert!(delay >= Duration::from_secs(108));
-    assert!(delay <= Duration::from_secs(132));
+    let delay = scanner_startup_delay_policy(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        false,
+        true,
+        false,
+    );
+    assert_eq!(delay, Some(Duration::from_secs(120)));
 }
 
 #[test]
 #[serial]
-fn test_initial_scanner_delay_uses_cycle_without_explicit_start_delay() {
-    with_var(ENV_SCANNER_CYCLE, Some("120"), || {
-        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-        let delay = initial_scanner_delay_for(None);
-        assert!(delay >= Duration::from_secs(108));
-        assert!(delay <= Duration::from_secs(132));
+fn test_initial_scanner_delay_bounds_warm_startup_without_changing_cycle() {
+    with_unset_scanner_timing_env(|| {
+        for (cycle, startup) in [(1, 1), (30, 30), (60, 60), (21600, 60)] {
+            with_var(ENV_SCANNER_CYCLE, Some(cycle.to_string().as_str()), || {
+                crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+                let delay = scanner_startup_delay_policy(&resolve_scanner_runtime_config(), false, true, false);
+                let expected = Duration::from_secs(startup);
+                assert_eq!(delay, Some(expected), "cycle {cycle}");
+                assert_eq!(scanner_cycle_interval(), Duration::from_secs(cycle));
+            });
+        }
     });
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
 
 #[test]
 fn test_initial_scanner_delay_skips_for_cold_usage_cache_with_buckets() {
-    let delay = initial_scanner_delay_for_startup(Some(120), true, true, false);
-    assert_eq!(delay, Duration::ZERO);
+    let delay = scanner_startup_delay_policy(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        true,
+        true,
+        false,
+    );
+    assert_eq!(delay, None);
 }
 
 #[test]
 fn test_initial_scanner_delay_keeps_configured_delay_for_warm_usage_cache_no_replication() {
-    let delay = initial_scanner_delay_for_startup(Some(120), false, true, false);
-    assert!(delay >= Duration::from_secs(108));
-    assert!(delay <= Duration::from_secs(132));
+    let delay = scanner_startup_delay_policy(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        false,
+        true,
+        false,
+    );
+    assert_eq!(delay, Some(Duration::from_secs(120)));
 }
 
 #[test]
 fn test_initial_scanner_delay_skips_for_cold_usage_cache_without_buckets() {
-    let delay = initial_scanner_delay_for_startup(Some(120), true, false, false);
-    assert_eq!(delay, Duration::ZERO);
+    let delay = scanner_startup_delay_policy(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        true,
+        false,
+        false,
+    );
+    assert_eq!(delay, None);
 }
 
 #[test]
 fn test_initial_scanner_delay_skips_for_active_replication_warm_cache() {
     // Warm cache + active replication rules → skip startup delay so that FAILED-status objects
     // from a crash are healed on the first cycle, not after a 27-33 min sleep.
-    let delay = initial_scanner_delay_for_startup(Some(120), false, true, true);
-    assert_eq!(delay, Duration::ZERO);
+    let delay = scanner_startup_delay_policy(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        false,
+        true,
+        true,
+    );
+    assert_eq!(delay, None);
 }
 
 #[test]
 fn test_initial_scanner_delay_keeps_delay_for_replication_without_buckets() {
     // Active replication but no buckets → no objects to scan, keep normal delay.
-    let delay = initial_scanner_delay_for_startup(Some(120), false, false, true);
-    assert!(delay >= Duration::from_secs(108));
-    assert!(delay <= Duration::from_secs(132));
+    let delay = scanner_startup_delay_policy(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        false,
+        false,
+        true,
+    );
+    assert_eq!(delay, Some(Duration::from_secs(120)));
 }
 
 #[test]
@@ -1133,7 +1389,8 @@ async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
     };
 
     global_metrics().set_current_scan_mode(HealScanMode::Deep);
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     mark_scan_cycle_idle(&mut cycle_info, &mut cycle_metrics_guard).await;
 
@@ -1153,6 +1410,33 @@ async fn test_mark_scan_cycle_idle_clears_published_cycle_state() {
 
 #[tokio::test]
 #[serial]
+async fn scanner_cycle_metrics_guard_installs_budget_remote_progress() {
+    let parent = CancellationToken::new();
+    let old_budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+    let mut guard = ScannerCycleMetricsGuard::new(CurrentCycle::default(), 1, old_budget.remote_scan_progress()).await;
+    old_budget.record_remote_progress(3, 2);
+    guard.finish(CurrentCycle::default()).await;
+    let previous = global_metrics().report().await;
+    assert_eq!(previous.last_cycle_objects_scanned, 3);
+    assert_eq!(previous.last_cycle_directories_scanned, 2);
+
+    let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
+    let mut guard = ScannerCycleMetricsGuard::new(CurrentCycle::default(), 1, budget.remote_scan_progress()).await;
+    budget.record_remote_progress(2, 1);
+    old_budget.record_remote_progress(9, 7);
+    let active = global_metrics().report().await;
+    assert_eq!(active.current_cycle_objects_scanned, 2);
+    assert_eq!(active.current_cycle_directories_scanned, 1);
+    guard.finish(CurrentCycle::default()).await;
+    old_budget.record_remote_progress(11, 5);
+    let finished = global_metrics().report().await;
+    assert_eq!(finished.last_cycle_objects_scanned, 2);
+    assert_eq!(finished.last_cycle_directories_scanned, 1);
+    global_metrics().set_cycle(None).await;
+}
+
+#[tokio::test]
+#[serial]
 async fn scanner_cycle_metrics_guard_covers_published_first_cycle_lifetime() {
     let cycle_started = Utc::now() - chrono::Duration::seconds(5);
     let mut cycle_info = CurrentCycle {
@@ -1161,7 +1445,7 @@ async fn scanner_cycle_metrics_guard_covers_published_first_cycle_lifetime() {
         started: cycle_started,
         ..Default::default()
     };
-    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
     let setup_report = global_metrics().report().await;
     assert!(setup_report.current_cycle_active);
     assert_eq!(setup_report.current_cycle, 0);
@@ -1187,7 +1471,7 @@ async fn scanner_cycle_metrics_guard_keeps_active_cycle_published_during_finaliz
         started: Utc::now(),
         ..Default::default()
     };
-    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     cycle_info.current = 0;
     tokio::task::yield_now().await;
@@ -1206,18 +1490,25 @@ async fn scanner_cycle_metrics_guard_keeps_active_cycle_published_during_finaliz
 #[tokio::test]
 #[serial]
 async fn scanner_cycle_metrics_guard_drop_clears_activity() {
-    let guard = ScannerCycleMetricsGuard::new(CurrentCycle {
-        current: 12,
-        next: 13,
-        started: Utc::now(),
-        ..Default::default()
-    })
+    let guard = ScannerCycleMetricsGuard::new(
+        CurrentCycle {
+            current: 12,
+            next: 13,
+            started: Utc::now(),
+            ..Default::default()
+        },
+        1,
+        Arc::new(RemoteScanProgress::default()),
+    )
     .await;
     assert!(global_metrics().report().await.current_cycle_active);
 
     drop(guard);
 
-    assert!(!global_metrics().report().await.current_cycle_active);
+    let report = global_metrics().report().await;
+    assert!(!report.current_cycle_active);
+    assert_eq!(report.usage_publication.outcome, ScannerUsagePublicationOutcome::Interrupted);
+    assert_eq!(report.usage_publication.pending_bucket_count, None);
     global_metrics().set_cycle(None).await;
 }
 
@@ -1274,9 +1565,25 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
 
 #[tokio::test]
 #[serial]
-async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledging_usage() {
+async fn coordinator_publishes_authority_during_pending_put() {
+    for drives_per_set in [1, 4] {
+        assert_bootstrap_authority_during_pending_put(drives_per_set).await;
+    }
+}
+
+/// A PUT whose rename fanout is still pending when the walk finishes used to
+/// turn the first cycle into an observation and keep authority bootstrap
+/// pending until a quiet retry (rustfs/rustfs#8494). The tail is ordinary
+/// namespace activity: the cycle publishes authority, discharges bootstrap,
+/// and the object the tail commits afterwards is the next cycle's work.
+async fn assert_bootstrap_authority_during_pending_put(drives_per_set: usize) {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
-    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let temp_dir = tempfile::tempdir().expect("bootstrap directory should be created");
+    let store = setup_scanner_cycle_store_at_path_with_layout(temp_dir.path(), false, 1, 1, drives_per_set).await;
+    initialize_usage_baseline_bootstrap(store.clone())
+        .await
+        .expect("cold startup should persist its bootstrap identity");
+    let mut bootstrap = ScannerUsageBootstrapRebuild::from_startup(PersistedUsageFloorStartup::BootstrapPending);
     let mut pause_backlog = ScannerPauseBacklogController::claim(store.clone(), scanner_pause_backlog_now())
         .await
         .expect("scanner pause backlog should be available");
@@ -1286,28 +1593,54 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
         .await
         .expect("fixture bucket should be created");
     let mut reader = PutObjReader::from_vec(b"first".to_vec());
+    {
+        let set = &store.pools[0].disk_set[0];
+        let lock = set.new_ns_lock(&bucket, "object").await.expect("fixture namespace lock");
+        let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
+            .await
+            .expect("fixture write owner");
+        let mut opts = ObjectOptions {
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        opts.add_write_commit_guard(&guard);
+        set.put_object(&bucket, "object", &mut reader, &opts)
+            .await
+            .expect("fixture object should finish its rename fanout");
+    }
+    let cold_bucket = "scanner-coordinator-cold";
+    store
+        .make_bucket(cold_bucket, &crate::storage_api::scan::MakeBucketOptions::default())
+        .await
+        .expect("cold bucket should be created");
+    let mut cold_reader = PutObjReader::from_vec(b"cold".to_vec());
     store.pools[0].disk_set[0]
         .put_object(
-            &bucket,
+            cold_bucket,
             "object",
-            &mut reader,
+            &mut cold_reader,
             &ObjectOptions {
-                no_lock: true,
+                write_completion: WriteCompletion::TailDrained,
                 ..Default::default()
             },
         )
         .await
-        .expect("fixture object should finish its rename fanout");
+        .expect("cold object should persist before scanning");
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     crate::scanner_io::record_dirty_usage_bucket(&bucket);
-    let dirty_before = crate::scanner_io::dirty_usage_buckets_for_tests();
     let baseline = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
         .expect("fixture usage baseline should be readable");
     let pending = ecstore_hold_namespace_commit(store.as_ref());
     assert_eq!(
-        scanner_local_publication_defer_reason(store.as_ref()).await,
-        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
-        "an ordinary namespace commit must not be classified as data movement"
+        scanner_local_publication_defer_reason(store.as_ref(), false).await,
+        None,
+        "an ordinary namespace commit is neither data movement nor a publication fence"
+    );
+    assert_eq!(
+        scanner_local_publication_defer_reason(store.as_ref(), true).await,
+        None,
+        "an observational snapshot may publish while only an ordinary namespace commit is pending"
     );
     let pause_backlog_attempt = pause_backlog.begin_attempt(scanner_pause_backlog_now()).await;
     assert_eq!(pause_backlog_attempt, ScannerPauseBacklogAttemptDecision::Untracked);
@@ -1330,49 +1663,77 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
             ScannerCycleScheduling {
                 requires_full_scan: true,
                 service_cohort: None,
+                scope_fallback: None,
             },
         ),
     )
     .await
     .expect("the coordinator must finish its namespace walk while a PUT is pending");
-    assert_eq!(budget.progress().0, 1, "the coordinator must reach actual object traversal");
-    assert_eq!(
-        outcome,
-        ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    assert_eq!(budget.progress().0, 2, "the coordinator must reach actual object traversal");
+    assert!(
+        matches!(
+            outcome,
+            ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
+        ),
+        "a pending PUT tail must not withhold authority from a complete walk: {outcome:?}"
     );
     finish_scanner_pause_backlog_cycle(&mut pause_backlog, &store, pause_backlog_attempt, outcome).await;
     let pause_backlog_status = scanner_pause_backlog_status(store.clone()).await;
     assert_eq!(pause_backlog_status.phase, ScannerPauseBacklogPhase::Idle);
     assert!(!pause_backlog_status.pending_full_scan);
     assert_eq!(pause_backlog_status.catch_up_attempts, 0);
-    assert_eq!(cycle_info.next, 1, "a rejected publication must not advance the cycle");
-    assert_eq!(revision, DataUsageCacheRevision::Missing);
-    assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
-    assert_eq!(
-        read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
-            .await
-            .expect("the prior authoritative usage must remain readable"),
-        baseline,
-        "the pending candidate must not replace the authoritative baseline"
+    assert!(
+        !crate::scanner_io::dirty_usage_buckets_for_tests().contains_key(&bucket),
+        "a certified bucket leaves the dirty map"
     );
+    assert!(
+        matches!(revision, DataUsageCacheRevision::Etag(_)),
+        "the cycle-state floor should advance after its durable publication"
+    );
+    let published = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("the authoritative usage should be persisted");
+    assert_ne!(published, baseline, "the complete cycle replaces the bootstrap baseline");
+    let published: DataUsageInfo = serde_json::from_slice(&published).expect("published usage should decode");
+    assert_eq!(published.usage_snapshot_converged, Some(true));
+    assert!(!published.usage_snapshot_observational);
+    assert!(published.is_complete_bucket_usage_snapshot());
+    assert_eq!(published.objects_total_count, 2);
+    assert!(bootstrap.record_cycle(outcome));
+    assert!(
+        !bootstrap.pending(),
+        "a complete cycle under a pending PUT tail discharges authority bootstrap"
+    );
+    crate::storage_api::ecstore_invalidate_data_usage_snapshot_cache().await;
+    let displayed = crate::storage_api::scanner_io::load_admin_data_usage_from_backend_cached(store.clone())
+        .await
+        .expect("admin should load the durable authoritative snapshot");
+    assert_eq!(displayed.objects_total_count, 2);
+    assert_eq!(displayed.usage_snapshot_converged, Some(true));
 
+    // The tail commits a larger body after the walk. Its bucket is shaded
+    // for the next cycle exactly as the production mutation observer does.
     let committed_body = b"committed-after-walk";
     let mut reader = PutObjReader::from_vec(committed_body.to_vec());
-    store.pools[0].disk_set[0]
-        .put_object(
-            &bucket,
-            "object",
-            &mut reader,
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("the pending tail must change the physical object before it drains");
-    assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
+    {
+        let set = &store.pools[0].disk_set[0];
+        let lock = set.new_ns_lock(&bucket, "object").await.expect("fixture namespace lock");
+        let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
+            .await
+            .expect("fixture write owner");
+        let mut opts = ObjectOptions {
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        opts.add_write_commit_guard(&guard);
+        set.put_object(&bucket, "object", &mut reader, &opts)
+            .await
+            .expect("the pending tail must change the physical object before it drains");
+    }
+    crate::scanner_io::record_dirty_usage_bucket(&bucket);
     drop(pending);
     let retry_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
+    let retry_cycle = cycle_info.next;
     let outcome = tokio::time::timeout(
         Duration::from_secs(30),
         run_data_scanner_cycle_with_budget(
@@ -1383,34 +1744,48 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
             1,
             Arc::clone(&retry_budget),
             ScannerCycleScheduling {
-                requires_full_scan: true,
+                requires_full_scan: ScannerMaintenanceFeatures::default().requires_full_scan(
+                    Some(scanner_maintenance_generation()),
+                    scanner_maintenance_generation(),
+                    ScannerCycleWakeReason::Timer,
+                    true,
+                ),
                 service_cohort: None,
+                scope_fallback: None,
             },
         ),
     )
     .await
     .expect("the same cycle must converge after the pending PUT drains");
+    // Without a recorded Deep window both layouts run Normal (an erasure set
+    // used to open a Deep window here and revisit every bucket), so the
+    // retry reuses the cold inventory and only walks the dirty bucket.
     assert_eq!(
         retry_budget.progress().0,
         1,
-        "the same-cycle retry must not reuse the pre-tail bucket cache"
+        "Normal retries reuse cold inventory (drives_per_set={drives_per_set})"
     );
     assert!(matches!(
         outcome,
         ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
     ));
-    assert_eq!(cycle_info.next, 2);
+    assert!(
+        !bootstrap.record_cycle(outcome),
+        "authority bootstrap was already discharged by the first cycle"
+    );
+    assert!(!bootstrap.pending());
+    assert_eq!(cycle_info.next, retry_cycle + 1);
     assert!(!crate::scanner_io::dirty_usage_buckets_for_tests().contains_key(&bucket));
     let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
         .expect("the converged usage should be persisted");
     let usage: DataUsageInfo = serde_json::from_slice(&usage).expect("the persisted usage should decode");
     assert_eq!(usage.usage_snapshot_converged, Some(true));
-    assert_eq!(usage.scanner_cycle, Some(1));
-    assert_eq!(usage.objects_total_count, 1);
+    assert_eq!(usage.scanner_cycle, Some(retry_cycle));
+    assert_eq!(usage.objects_total_count, 2);
     assert_eq!(
         usage.objects_total_size,
-        u64::try_from(committed_body.len()).expect("fixture body length")
+        u64::try_from(committed_body.len() + 4).expect("fixture total body length")
     );
     let bucket_usage = usage
         .buckets_usage
@@ -1420,6 +1795,66 @@ async fn coordinator_walks_during_pending_put_without_persisting_or_acknowledgin
     assert_eq!(bucket_usage.size, u64::try_from(committed_body.len()).expect("fixture body length"));
     global_metrics().set_cycle(None).await;
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial]
+async fn complete_cycle_keeps_movement_fence_with_observational_flag() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let pending = ecstore_hold_namespace_commit(store.as_ref());
+
+    let uses_observation = |status| {
+        ScannerCyclePublicationPlan::for_result(&ScannerCycleResult::new(status, None).with_usage_update_emitted(true))
+            .is_observational()
+    };
+    let complete_uses_observation = uses_observation(ScannerCycleStatus::Complete);
+    assert!(!complete_uses_observation, "a converged Complete snapshot is authoritative");
+    assert_eq!(
+        scanner_local_publication_defer_reason(store.as_ref(), complete_uses_observation).await,
+        None,
+        "an ordinary namespace commit shades its bucket; it is not a publication fence"
+    );
+    drop(pending);
+
+    // A terminal decommission entry is storage movement the operator must
+    // clear: it fences the authoritative and the observational route alike.
+    store.pool_meta.write().await.pools[0].decommission = Some(crate::storage_api::owner::EcstorePoolDecommissionInfo {
+        failed: true,
+        ..Default::default()
+    });
+    for observational_only in [false, true] {
+        assert_eq!(
+            scanner_local_publication_defer_reason(store.as_ref(), observational_only).await,
+            Some(ScannerCycleDeferReason::DataMovement),
+            "observational_only={observational_only}"
+        );
+    }
+    store.pool_meta.write().await.pools[0].decommission = None;
+
+    assert!(uses_observation(ScannerCycleStatus::Superseded));
+    assert!(uses_observation(ScannerCycleStatus::Deferred(
+        ScannerCycleDeferReason::ActivityBaselineUnavailable
+    )));
+    assert!(!uses_observation(ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement)));
+}
+
+#[tokio::test]
+#[serial]
+async fn incomplete_observation_uses_observational_lease_during_pending_namespace_commit() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let pending = ecstore_hold_namespace_commit(store.as_ref());
+    let result = ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None);
+    assert!(!ScannerCyclePublicationPlan::for_result(&result).is_observational());
+    let uses_observation = ScannerCyclePublicationPlan::for_result(&result.with_usage_update_emitted(true)).is_observational();
+
+    assert!(uses_observation);
+    assert_eq!(
+        scanner_local_publication_defer_reason(store.as_ref(), uses_observation).await,
+        None,
+        "an incomplete cycle's observation must not be blocked by an ordinary namespace commit"
+    );
+
+    drop(pending);
 }
 
 #[tokio::test]
@@ -1434,7 +1869,8 @@ async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
         cycle_completed: vec![],
         started: Utc::now(),
     };
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     assert!(finalize_partial_scan_cycle(&ctx, store.clone(), &mut cycle_info, &mut revision, 1, &mut cycle_metrics_guard,).await);
 
@@ -1470,7 +1906,8 @@ async fn scanner_cycle_recovers_to_newer_durable_cache_floor() {
         cycle_completed: vec![],
         started: Utc::now(),
     };
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     assert!(
         persist_required_scanner_cycle_floor(
@@ -1510,7 +1947,8 @@ async fn scanner_cycle_rejects_invalid_cache_floor() {
         cycle_completed: vec![],
         started: Utc::now(),
     };
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     assert!(
         !persist_required_scanner_cycle_floor(
@@ -1531,7 +1969,8 @@ async fn scanner_cycle_rejects_invalid_cache_floor() {
         next: 12,
         ..Default::default()
     };
-    let mut max_cycle_metrics_guard = ScannerCycleMetricsGuard::new(max_cycle_info.clone()).await;
+    let mut max_cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(max_cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
     assert!(
         !persist_required_scanner_cycle_floor(
             &ctx,
@@ -1598,6 +2037,140 @@ fn scanner_startup_fails_closed_on_nonempty_corrupt_cycle_state() {
     assert!(encode_scanner_cycle_state(&exhausted, 7).is_err());
 }
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[tokio::test]
+#[serial]
+async fn diagnostic_scanner_config_writes_preserve_origin_for_both_helpers_and_cancellation() {
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
+
+    for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
+        for shared in [false, true] {
+            for case in ["success", "error", "cancelled"] {
+                let store = Arc::new(MemoryConfigStore::default());
+                let path = "buckets/diagnostic/write-state";
+                let key = memory_config_key(RUSTFS_META_BUCKET, path);
+                if case == "error" {
+                    store.fail_put_number.lock().await.insert(key.clone(), 1);
+                }
+                store.pending_diagnostic_write.store(case == "cancelled", Ordering::Relaxed);
+                let write = async {
+                    let operation = async {
+                        let preconditions = crate::HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        };
+                        if shared {
+                            crate::save_config_shared_with_preconditions_and_lease_fence_and_scope(
+                                store.clone(),
+                                path,
+                                bytes::Bytes::from_static(b"state"),
+                                None,
+                                preconditions,
+                                None,
+                                None,
+                            )
+                            .await
+                        } else {
+                            crate::save_config_with_preconditions(store.clone(), path, b"state".to_vec(), preconditions).await
+                        }
+                    };
+                    let result = tokio::time::timeout(Duration::from_secs(1), operation).await;
+                    match case {
+                        "success" => assert!(result.expect("write completes").is_ok()),
+                        "error" => assert!(result.expect("error completes").is_err()),
+                        _ => assert!(result.is_err(), "pending write is cancelled"),
+                    }
+                };
+                match earlier {
+                    Some(source) => with_read_version_entry(source, write).await,
+                    None => write.await,
+                }
+                assert_eq!(
+                    *store.write_entry_sources.lock().await,
+                    vec![Some(earlier.unwrap_or(ReadVersionEntrySource::ScannerConfigWrite))]
+                );
+                assert_eq!(current_read_version_entry_source(), None, "scope restores: {case}");
+                let stored = store.objects.lock().await.get(&key).cloned();
+                assert_eq!(stored, (case == "success").then(|| b"state".to_vec()), "write result preserved: {case}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[tokio::test]
+#[serial]
+async fn diagnostic_cycle_state_load_preserves_entry_for_results_and_cancellation() {
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
+
+    for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
+        for case in ["missing", "valid", "error", "cancelled"] {
+            let store = Arc::new(MemoryConfigStore::default());
+            let marker = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
+            let state = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+            if case == "valid" {
+                let cycle = CurrentCycle {
+                    next: 9,
+                    ..Default::default()
+                };
+                store
+                    .objects
+                    .lock()
+                    .await
+                    .insert(state.clone(), encode_scanner_cycle_state(&cycle, 3).expect("cycle fixture"));
+                store.revisions.lock().await.insert(state, 7);
+            } else if case == "error" {
+                store
+                    .read_errors
+                    .lock()
+                    .await
+                    .insert(marker.clone(), EcstoreError::ErasureReadQuorum);
+            } else if case == "cancelled" {
+                store.delayed_gets.lock().await.insert(marker, Duration::from_secs(1));
+            }
+            let load = async {
+                if case == "cancelled" {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(1), load_scanner_cycle_state_for_startup(store.clone()))
+                            .await
+                            .is_err()
+                    );
+                    return;
+                }
+                let result = load_scanner_cycle_state_for_startup(store.clone()).await;
+                match (case, result) {
+                    ("missing", ScannerCycleStateStartup::Ready { .. }) => {}
+                    (
+                        "valid",
+                        ScannerCycleStateStartup::Ready {
+                            cycle, leader_epoch: 3, ..
+                        },
+                    ) => assert_eq!(cycle.next, 9),
+                    ("error", ScannerCycleStateStartup::Transient(_)) => {}
+                    _ => panic!("unexpected cycle load outcome: {case}"),
+                }
+            };
+            match earlier {
+                Some(source) => with_read_version_entry(source, load).await,
+                None => load.await,
+            }
+            let observed = store.entry_sources.lock().await;
+            assert!(!observed.is_empty(), "load must enter a reader: {case}");
+            assert!(
+                observed
+                    .iter()
+                    .all(|source| *source == Some(earlier.unwrap_or(ReadVersionEntrySource::ScannerCycleStateRead))),
+                "all readers preserve the original source: {case}"
+            );
+            assert_eq!(current_read_version_entry_source(), None, "scope restores for all outcomes: {case}");
+        }
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn corrupt_cycle_state_is_quarantined_once() {
@@ -1624,11 +2197,19 @@ async fn corrupt_cycle_state_is_quarantined_once() {
     assert_eq!(marker.quarantine_path, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
     assert_eq!(marker.classification, "corrupt");
 
-    // A second startup sees the matching marker before consuming the poison body.
+    // A second startup sees the durable marker before consuming the poison
+    // body and schedules the automatic rebuild instead of blocking again.
     assert!(matches!(
         load_scanner_cycle_state_for_startup(store.clone()).await,
-        ScannerCycleStateStartup::Blocked
+        ScannerCycleStateStartup::RebuildFromQuarantine {
+            revision: DataUsageCacheRevision::Etag(ref revision)
+        } if revision == "memory-7"
     ));
+    assert_eq!(
+        store.objects.lock().await.get(&marker_key),
+        Some(&marker_data),
+        "scheduling the rebuild must not rewrite the marker"
+    );
 
     // Replacing the primary object advances its revision; the stale marker must
     // not quarantine the newer, valid state.
@@ -1701,8 +2282,24 @@ async fn concurrent_leaders_cannot_quarantine_newer_cycle_state() {
         load_scanner_cycle_state_for_startup(store.clone()),
         load_scanner_cycle_state_for_startup(store.clone()),
     );
-    assert!(matches!(first, ScannerCycleStateStartup::Blocked));
-    assert!(matches!(second, ScannerCycleStateStartup::Blocked));
+    // Whichever contender publishes the marker blocks; the other either races
+    // the marker write (blocked or transient) or sees the durable marker and
+    // schedules the rebuild. Neither may quarantine a different revision.
+    for outcome in [&first, &second] {
+        assert!(
+            matches!(
+                outcome,
+                ScannerCycleStateStartup::Blocked
+                    | ScannerCycleStateStartup::Transient(_)
+                    | ScannerCycleStateStartup::RebuildFromQuarantine { .. }
+            ),
+            "{outcome:?}"
+        );
+    }
+    assert!(
+        matches!(first, ScannerCycleStateStartup::Blocked) || matches!(second, ScannerCycleStateStartup::Blocked),
+        "one contender must publish the marker: {first:?} / {second:?}"
+    );
 
     let marker_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
     let marker_data = store
@@ -3229,7 +3826,7 @@ async fn scanner_usage_floor_recovery_retry_budget_uses_marker_epoch_identity() 
     persisted_usage_floor_for_startup(store.clone(), true)
         .await
         .expect("legacy empty primary should enter recovery");
-    assert!(record_scanner_cycle_recovery_retry(3));
+    assert_eq!(record_scanner_cycle_recovery_retry(3, Duration::from_secs(1)).attempt, 3);
     let first_detected = scanner_cycle_recovery_status().first_detected_at_unix_secs;
 
     let primary = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
@@ -3392,10 +3989,22 @@ fn scanner_usage_floor_failure_is_exposed_and_cleared() {
     assert_eq!(blocked.reason.as_deref(), Some("persisted usage floor is invalid"));
     let first_detected = blocked.first_detected_at_unix_secs;
 
-    assert!(record_scanner_cycle_recovery_retry(2));
+    let retry = record_scanner_cycle_recovery_retry(2, Duration::from_secs(1));
+    assert_eq!(retry.attempt, 2);
+    assert_eq!(retry.delay, Duration::from_secs(2));
+    let scheduled = scanner_cycle_recovery_status();
+    assert_eq!(scheduled.retry_count, 2);
+    assert!(scheduled.next_attempt_at_unix_secs.is_some());
+    assert!(
+        scheduled
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("persisted usage floor is invalid; next automatic attempt at unix "))
+    );
     record_scanner_usage_floor_failure("persisted usage floor remains invalid".to_string());
     let retried = scanner_cycle_recovery_status();
-    assert_eq!(retried.retry_count, 2);
+    assert_eq!(retried.retry_count, 0, "the supervisor owns the retry budget across attempts");
+    assert!(retried.next_attempt_at_unix_secs.is_none());
     assert_eq!(retried.first_detected_at_unix_secs, first_detected);
 
     clear_scanner_usage_floor_failure();
@@ -3417,7 +4026,7 @@ fn scanner_usage_floor_recovery_stays_retryable_until_claim_cleanup() {
     assert_eq!(pending.quarantine_path.as_deref(), Some(DATA_USAGE_RECOVERY_PATH.as_str()));
     let first_detected = pending.first_detected_at_unix_secs;
 
-    assert!(record_scanner_cycle_recovery_retry(3));
+    assert_eq!(record_scanner_cycle_recovery_retry(3, Duration::from_secs(1)).attempt, 3);
     record_legacy_incomplete_usage_floor_recovery_pending(7);
     let retried = scanner_cycle_recovery_status();
     assert_eq!(retried.retry_count, 3);
@@ -3449,7 +4058,7 @@ fn scanner_cache_cycle_ahead_is_visible_until_a_later_scan_clears_it() {
     assert_eq!(observed_again.retry_count, 0);
     assert_eq!(observed_again.first_detected_at_unix_secs, first_detected);
 
-    assert!(record_scanner_cycle_recovery_retry(4));
+    assert_eq!(record_scanner_cycle_recovery_retry(4, Duration::from_secs(1)).attempt, 4);
     assert_eq!(scanner_cycle_recovery_status().retry_count, 0);
 
     record_scanner_cache_cycle_recovery_attempt();
@@ -4387,7 +4996,8 @@ async fn test_finalize_partial_scan_cycle_reports_persist_failure() {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
-    store.fail_put_number.lock().await.insert(key, 1);
+    // Every attempt of the bounded in-save retry fails.
+    store.fail_puts_from.lock().await.insert(key, 1);
     let mut revision = DataUsageCacheRevision::Missing;
     let mut cycle_info = CurrentCycle {
         current: 12,
@@ -4395,7 +5005,8 @@ async fn test_finalize_partial_scan_cycle_reports_persist_failure() {
         cycle_completed: vec![],
         started: Utc::now(),
     };
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut cycle_metrics_guard =
+        ScannerCycleMetricsGuard::new(cycle_info.clone(), 1, Arc::new(RemoteScanProgress::default())).await;
 
     assert!(!finalize_partial_scan_cycle(&ctx, store, &mut cycle_info, &mut revision, 1, &mut cycle_metrics_guard,).await);
     assert_eq!(cycle_info.next, 13);
@@ -4829,8 +5440,8 @@ async fn scanner_legacy_usage_backup_survives_fencing_and_restart_after_real_met
         .await
         .expect_err("truncated primary must fail in the real object reader");
     assert!(
-        error.to_string().contains("InlineData value out of range"),
-        "unexpected truncated-primary error: {error}"
+        matches!(error, EcstoreError::FileCorrupt),
+        "unexpected truncated-primary error: {error:?}"
     );
     assert_eq!(
         read_config_with_revision(store.clone(), &backup_path)
@@ -5067,9 +5678,30 @@ async fn scanner_usage_state_reset_publishes_fenced_bootstrap_marker() {
             .expect("usage slot should persist");
     }
 
+    let metrics_guard = ScannerCycleMetricsGuard::new(cycle.clone(), 7, Arc::new(RemoteScanProgress::default())).await;
+    let old_publication = ScannerUsagePublicationStatus {
+        scanner_epoch: Some(7),
+        cycle: Some(41),
+        class: ScannerUsagePublicationClass::CompleteConverged,
+        outcome: ScannerUsagePublicationOutcome::Saved,
+        pending_bucket_count: Some(0),
+        ..Default::default()
+    };
+    metrics_guard.publication.record(old_publication.clone());
     let result = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
         .await
         .expect("usage state reset should publish a fenced bootstrap marker");
+    assert_eq!(
+        global_metrics().report().await.usage_publication,
+        ScannerUsagePublicationStatus::default()
+    );
+    metrics_guard.publication.record(old_publication);
+    assert_eq!(
+        global_metrics().report().await.usage_publication,
+        ScannerUsagePublicationStatus::default()
+    );
+    drop(metrics_guard);
+    global_metrics().set_cycle(None).await;
 
     assert_eq!(result.status, "reset");
     assert_eq!(result.mode, "full-rebuild");
@@ -5549,30 +6181,47 @@ async fn scanner_usage_state_reset_cancels_during_publication_admission() {
     }
 }
 
+/// Corrupt slots without any cycle state are the rustfs/rustfs#8670 shape. The
+/// full rebuild starts from the empty baseline exactly as a missing floor
+/// does: the result is a bootstrap-pending marker, never an authoritative zero
+/// floor, so quota-bearing buckets keep failing closed until a complete
+/// publication. A valid backup still supplies the recovery floor instead.
 #[tokio::test]
 #[serial]
-async fn scanner_usage_state_reset_rejects_corruption_without_a_trusted_floor() {
+async fn scanner_usage_state_reset_rebuilds_corruption_without_a_trusted_floor_from_empty_baseline() {
     let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
     save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), b"{corrupt".to_vec())
         .await
         .expect("corrupt primary should persist");
-    let before = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+    let result = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
         .await
-        .expect("evidence should load");
-    let err = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
+        .expect("corrupt slots without a cycle state start from the empty baseline");
+    assert_eq!(result.leader_epoch, 1);
+    assert_eq!(result.next_cycle, 0);
+    assert_eq!(result.usage_state, "bootstrap-pending");
+    let primary = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
-        .expect_err("corruption must not become a zero floor");
-    assert!(err.to_string().contains("no trusted cycle or usage floor"), "{err}");
-    assert_eq!(
-        read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .expect("reset should replace the corrupt primary with a bootstrap marker");
+    let primary: DataUsageInfo = serde_json::from_slice(&primary).expect("bootstrap marker should decode");
+    assert!(data_usage_info_is_bootstrap_pending(&primary), "corruption must not become a zero floor");
+    assert!(!data_usage_info_has_persisted_baseline_identity(&primary));
+    let (cycle, leader_epoch) = decode_scanner_cycle_state(
+        &read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
             .await
-            .expect("evidence should remain"),
-        before
-    );
-    assert!(matches!(
-        read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str()).await,
-        Err(EcstoreError::ConfigNotFound)
-    ));
+            .expect("reset should fence a fresh cycle state"),
+    )
+    .expect("fenced cycle state should decode");
+    assert_eq!((cycle.next, leader_epoch), (0, 1));
+    let (floor, startup) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("startup should accept the bootstrap marker");
+    assert_eq!(startup, PersistedUsageFloorStartup::BootstrapPending);
+    assert_eq!(floor.leader_epoch, 1);
+
+    let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
+    save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), b"{corrupt".to_vec())
+        .await
+        .expect("corrupt primary should persist");
     let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
     backup.scanner_epoch = Some(7);
     backup.scanner_cycle = Some(40);
@@ -5624,10 +6273,12 @@ async fn scanner_usage_state_reset_rejects_replaced_intent_and_newer_cleanup_slo
     assert_eq!(read_config(store, &path).await.expect("newer snapshot should remain"), bytes);
 }
 
+/// Valid JSON without a baseline identity proves no floor either. The full
+/// rebuild treats it like corruption: it starts from the empty baseline with
+/// a bootstrap-pending marker instead of promoting the untrusted values.
 #[tokio::test]
 #[serial]
-async fn scanner_usage_state_reset_rejects_decodable_untrusted_floor() {
-    let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
+async fn scanner_usage_state_reset_rebuilds_decodable_untrusted_floor_from_empty_baseline() {
     let invalid_identity = DataUsageInfo {
         usage_snapshot_complete: true,
         buckets_count: 1,
@@ -5635,6 +6286,7 @@ async fn scanner_usage_state_reset_rejects_decodable_untrusted_floor() {
         ..Default::default()
     };
     for usage in [DataUsageInfo::default(), invalid_identity] {
+        let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
         save_config(
             store.clone(),
             DATA_USAGE_OBJ_NAME_PATH.as_str(),
@@ -5642,23 +6294,22 @@ async fn scanner_usage_state_reset_rejects_decodable_untrusted_floor() {
         )
         .await
         .expect("untrusted primary should persist");
-        let before = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        let result = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
             .await
-            .expect("primary should load");
-        let err = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
+            .expect("an untrusted floor without a cycle state starts from the empty baseline");
+        assert_eq!((result.leader_epoch, result.next_cycle), (1, 0));
+        assert_eq!(result.usage_state, "bootstrap-pending");
+        let primary = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
             .await
-            .expect_err("valid JSON alone cannot prove a usage floor");
-        assert!(err.to_string().contains("no trusted cycle or usage floor"), "{err}");
-        assert_eq!(
-            read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
-                .await
-                .expect("evidence should remain"),
-            before
-        );
-        assert!(matches!(
-            read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str()).await,
-            Err(EcstoreError::ConfigNotFound)
-        ));
+            .expect("reset should replace the untrusted primary with a bootstrap marker");
+        let primary: DataUsageInfo = serde_json::from_slice(&primary).expect("bootstrap marker should decode");
+        assert!(data_usage_info_is_bootstrap_pending(&primary), "valid JSON alone must not become a floor");
+        assert_eq!(primary.buckets_count, 0, "untrusted values must not be promoted");
+        let (floor, startup) = persisted_usage_floor_for_startup(store.clone(), true)
+            .await
+            .expect("startup should accept the bootstrap marker");
+        assert_eq!(startup, PersistedUsageFloorStartup::BootstrapPending);
+        assert_eq!(floor.leader_epoch, 1);
     }
 }
 
@@ -6139,6 +6790,7 @@ async fn test_observational_usage_defers_when_authoritative_baseline_is_missing(
     let (sender, receiver) = mpsc::channel(1);
     let mut observation = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
     observation.usage_snapshot_converged = Some(false);
+    observation.usage_snapshot_observational = true;
     sender.send(observation).await.expect("observation should enqueue");
     drop(sender);
 
@@ -6187,6 +6839,7 @@ async fn test_observational_usage_uses_fenced_backup_when_v2_primary_has_no_iden
     let (sender, receiver) = mpsc::channel(1);
     let mut observation = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
     observation.usage_snapshot_converged = Some(false);
+    observation.usage_snapshot_observational = true;
     sender.send(observation).await.expect("observation should enqueue");
     drop(sender);
 
@@ -6228,6 +6881,7 @@ async fn test_observational_usage_uses_bootstrap_pending_primary_as_baseline() {
     let (sender, receiver) = mpsc::channel(1);
     let mut observation = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
     observation.usage_snapshot_converged = Some(false);
+    observation.usage_snapshot_observational = true;
     sender.send(observation).await.expect("observation should enqueue");
     drop(sender);
 
@@ -6841,6 +7495,9 @@ async fn test_store_data_usage_in_backend_advances_past_changed_same_epoch_cycle
         last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
         scanner_epoch: Some(8),
         scanner_cycle: Some(12),
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_pending_buckets: (0..7).map(|index| format!("pending-{index}")).collect(),
+        usage_snapshot_pending_bucket_count: 7,
         ..complete_usage_with_bucket_count(None, 2)
     };
     store
@@ -6855,16 +7512,42 @@ async fn test_store_data_usage_in_backend_advances_past_changed_same_epoch_cycle
             last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
             scanner_epoch: Some(8),
             scanner_cycle: Some(12),
+            usage_snapshot_converged: Some(true),
             ..complete_usage_with_bucket_count(None, 3)
         })
         .await
         .expect("changed retry snapshot should enqueue");
     drop(sender);
 
-    let outcome =
-        store_data_usage_in_backend_with_outcome_for_epoch(CancellationToken::new(), store.clone(), receiver, Some(8)).await;
+    let publication =
+        store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
+            CancellationToken::new(),
+            store.clone(),
+            receiver,
+            Some(8),
+            None,
+            ScannerPublicationFence::new(None, None, None),
+            || async { None },
+        )
+        .await;
 
-    assert_eq!(outcome, DataUsagePersistOutcome::PriorCycleDurable);
+    assert_eq!(publication.outcome(), DataUsagePersistOutcome::PriorCycleDurable);
+    let status = publication.observation_for_attempt(8, 12, false, publication.outcome());
+    assert_eq!(status.class, ScannerUsagePublicationClass::CompletePending);
+    assert_eq!(
+        status.pending_bucket_count,
+        Some(7),
+        "read the existing snapshot, not the converged retry"
+    );
+    assert_eq!(status.snapshot_updated_at_unix_secs, Some(20));
+    let fenced = publication.observation_for_attempt(
+        8,
+        12,
+        false,
+        DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseReleaseFailed),
+    );
+    assert_eq!(fenced.outcome, ScannerUsagePublicationOutcome::Deferred);
+    assert_eq!(fenced.pending_bucket_count, None);
     assert_eq!(store.put_counts.lock().await.get(&key), None);
     let saved = store
         .objects
@@ -7110,6 +7793,7 @@ async fn test_store_data_usage_in_backend_preserves_superseded_status() {
             scanner_epoch: Some(7),
             scanner_cycle: Some(11),
             usage_snapshot_converged: Some(false),
+            usage_snapshot_observational: true,
             ..complete_usage_with_bucket_count(None, 1)
         })
         .await
@@ -7138,6 +7822,56 @@ async fn test_store_data_usage_in_backend_preserves_superseded_status() {
 }
 
 #[tokio::test]
+async fn test_store_data_usage_in_backend_publishes_pending_bucket_certification_as_authoritative() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let authoritative_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let observed_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str());
+    let authoritative = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(10),
+        usage_snapshot_converged: Some(true),
+        ..complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 1)
+    };
+    store.objects.lock().await.insert(
+        authoritative_key.clone(),
+        serde_json::to_vec(&authoritative).expect("authoritative snapshot should encode"),
+    );
+    store.revisions.lock().await.insert(authoritative_key.clone(), 1);
+
+    let (sender, receiver) = mpsc::channel(1);
+    sender
+        .send(DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            scanner_epoch: Some(7),
+            scanner_cycle: Some(11),
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_pending_buckets: vec!["bucket-0".to_string()],
+            usage_snapshot_pending_bucket_count: 1,
+            ..complete_usage_with_bucket_count(None, 1)
+        })
+        .await
+        .expect("certified usage snapshot should enqueue");
+    drop(sender);
+
+    let outcome = store_data_usage_in_backend_with_outcome(CancellationToken::new(), store.clone(), receiver).await;
+    assert_eq!(outcome, DataUsagePersistOutcome::Saved);
+    let objects = store.objects.lock().await;
+    assert!(
+        !objects.contains_key(&observed_key),
+        "pending buckets do not make a snapshot observational"
+    );
+    let saved = serde_json::from_slice::<DataUsageInfo>(objects.get(&authoritative_key).expect("authoritative snapshot"))
+        .expect("persisted usage snapshot should decode");
+    assert_eq!(saved.scanner_cycle, Some(11));
+    assert_eq!(saved.usage_snapshot_converged, Some(false));
+    assert_eq!(saved.usage_snapshot_pending_buckets, vec!["bucket-0".to_string()]);
+    assert_eq!(saved.usage_snapshot_pending_bucket_count, 1);
+    assert!(!saved.usage_snapshot_observational);
+    assert_eq!(saved.usage_snapshot_authoritative_baseline, None);
+    assert!(data_usage_info_has_persisted_baseline_identity(&saved));
+}
+
+#[tokio::test]
 #[serial]
 async fn test_store_data_usage_in_backend_removes_observed_after_authoritative_save() {
     let store = Arc::new(MemoryConfigStore::default());
@@ -7160,6 +7894,7 @@ async fn test_store_data_usage_in_backend_removes_observed_after_authoritative_s
             scanner_epoch: Some(7),
             scanner_cycle: Some(11),
             usage_snapshot_converged: Some(false),
+            usage_snapshot_observational: true,
             ..complete_usage_with_bucket_count(None, 1)
         })
         .await
@@ -7575,7 +8310,7 @@ fn finalizing_post_scan_observation_advances_partially_without_dirty_ack() {
         ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
         Some(dirty_snapshot),
     )
-    .with_observational_snapshot_published(true);
+    .with_usage_update_emitted(true);
 
     let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(observed, DataUsagePersistOutcome::Saved.into());
 
@@ -8196,7 +8931,7 @@ fn superseded_retry_preserves_explicit_cycle_cadence() {
         ..Default::default()
     };
     assert_eq!(
-        scanner_superseded_retry_interval(backoff, &default_config),
+        scanner_superseded_retry_interval(backoff, &default_config, ScannerMaintenanceFeatures::default()),
         Some(SCANNER_RETRY_BASE_INTERVAL),
         "the default adaptive cadence must retain fast convergence"
     );
@@ -8212,12 +8947,200 @@ fn superseded_retry_preserves_explicit_cycle_cadence() {
             ..Default::default()
         };
 
+        for features in [
+            ScannerMaintenanceFeatures::default(),
+            ScannerMaintenanceFeatures {
+                lifecycle: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                scanner_superseded_retry_interval(backoff, &runtime_config, features),
+                Some(runtime_config.cycle_interval),
+                "{source:?} cycle cadence must not be shortened by convergence retries"
+            );
+        }
+    }
+}
+
+#[test]
+fn superseded_retry_does_not_delay_required_maintenance() {
+    let features = ScannerMaintenanceFeatures {
+        lifecycle: true,
+        ..Default::default()
+    };
+    assert!(features.needs_regular_cycle());
+    let config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(2),
+        cycle_interval_source: ScannerRuntimeConfigSource::Env,
+        ..Default::default()
+    };
+    let mut backoff = ScannerRetryBackoff::default();
+    for consecutive_cycles in 1..=12 {
+        backoff.record_retryable_cycle(true);
         assert_eq!(
-            scanner_superseded_retry_interval(backoff, &runtime_config),
-            Some(runtime_config.cycle_interval),
-            "{source:?} cycle cadence must not be shortened by convergence retries"
+            scanner_superseded_retry_interval(backoff, &config, features),
+            Some(config.cycle_interval),
+            "superseded cycle {consecutive_cycles} must preserve regular maintenance"
         );
     }
+}
+
+#[test]
+fn scope_fallback_retry_paces_full_walks_up_to_the_cycle_interval() {
+    let config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let mut backoff = ScannerRetryBackoff::default();
+    assert_eq!(scanner_scope_fallback_retry_interval(backoff, &config), None);
+
+    // Repeated fallbacks back off from seconds and settle on the ordinary
+    // cadence: never back to back, never starved by the 30-minute cap.
+    for expected in [5, 10, 20, 40, 60, 60] {
+        backoff.record_retryable_cycle(true);
+        assert_eq!(
+            scanner_scope_fallback_retry_interval(backoff, &config),
+            Some(Duration::from_secs(expected))
+        );
+    }
+    for _ in 0..40 {
+        backoff.record_retryable_cycle(true);
+    }
+    assert_eq!(scanner_scope_fallback_retry_interval(backoff, &config), Some(config.cycle_interval));
+
+    // The wait disables the immediate dirty-usage wake and defers cluster
+    // activity, which is what keeps full walks from running back to back.
+    let generations = ScannerCycleObservedGenerations::for_wait(
+        &config,
+        scanner_scope_fallback_retry_interval(backoff, &config),
+        crate::scanner_io::dirty_usage_generation(),
+        crate::runtime_config::scanner_runtime_config_generation(),
+        crate::scanner_io::scanner_maintenance_generation(),
+    );
+    assert!(generations.dirty_usage.is_none());
+    assert!(generations.defer_cluster_activity);
+    // The paced timer wake still requests a scope, so a scoped cycle resumes
+    // as soon as one is admitted.
+    assert!(!ScannerMaintenanceFeatures::default().requires_full_scan(
+        Some(scanner_maintenance_generation()),
+        scanner_maintenance_generation(),
+        ScannerCycleWakeReason::Timer,
+        true,
+    ));
+
+    // A scoped (or otherwise non-fallback) cycle resets the schedule.
+    backoff.record_retryable_cycle(false);
+    assert_eq!(scanner_scope_fallback_retry_interval(backoff, &config), None);
+}
+
+#[test]
+fn scope_fallback_retry_preserves_explicit_and_fast_cycle_cadence() {
+    let mut backoff = ScannerRetryBackoff::default();
+    backoff.record_retryable_cycle(true);
+    for source in [
+        ScannerRuntimeConfigSource::Env,
+        ScannerRuntimeConfigSource::Config,
+        ScannerRuntimeConfigSource::ScannerCompatConfig,
+    ] {
+        let config = ScannerRuntimeConfig {
+            cycle_interval: Duration::from_secs(6 * 60 * 60),
+            cycle_interval_source: source,
+            ..Default::default()
+        };
+        assert_eq!(
+            scanner_scope_fallback_retry_interval(backoff, &config),
+            Some(config.cycle_interval),
+            "{source:?} cycle cadence is a duty-cycle floor for fallback walks"
+        );
+    }
+    let fastest = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(1),
+        ..Default::default()
+    };
+    for _ in 0..8 {
+        backoff.record_retryable_cycle(true);
+    }
+    assert_eq!(scanner_scope_fallback_retry_interval(backoff, &fastest), Some(Duration::from_secs(1)));
+}
+
+#[test]
+fn superseded_retry_only_caps_regular_maintenance() {
+    let config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let mut backoff = ScannerRetryBackoff::default();
+    for _ in 0..6 {
+        backoff.record_retryable_cycle(true);
+    }
+    assert_eq!(
+        scanner_superseded_retry_interval(backoff, &config, ScannerMaintenanceFeatures::default()),
+        Some(Duration::from_secs(160)),
+    );
+    for features in [
+        ScannerMaintenanceFeatures {
+            lifecycle: true,
+            ..Default::default()
+        },
+        ScannerMaintenanceFeatures {
+            replication: true,
+            ..Default::default()
+        },
+        ScannerMaintenanceFeatures {
+            inspection_failed: true,
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(scanner_superseded_retry_interval(backoff, &config, features), Some(config.cycle_interval));
+        assert_eq!(scanner_superseded_retry_interval(ScannerRetryBackoff::default(), &config, features), None);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
+async fn superseded_maintenance_wait_keeps_convergence_fencing() {
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    let config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let features = ScannerMaintenanceFeatures {
+        lifecycle: true,
+        ..Default::default()
+    };
+    let mut backoff = ScannerRetryBackoff::default();
+    for _ in 0..12 {
+        backoff.record_retryable_cycle(true);
+    }
+    let interval = scanner_superseded_retry_interval(backoff, &config, features);
+    assert_eq!(interval, Some(config.cycle_interval));
+    let generations = ScannerCycleObservedGenerations::for_wait(
+        &config,
+        interval,
+        crate::scanner_io::dirty_usage_generation(),
+        crate::runtime_config::scanner_runtime_config_generation(),
+        crate::scanner_io::scanner_maintenance_generation(),
+    );
+    assert!(generations.dirty_usage.is_none());
+    assert!(generations.defer_cluster_activity);
+    let ctx = CancellationToken::new();
+    let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]));
+    let changed = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 8, 3))]);
+    let started = tokio::time::Instant::now();
+    let reason = wait_for_next_scanner_cycle_with_activity(
+        &ctx,
+        interval.expect("maintenance must retain its convergence interval"),
+        Some(Duration::from_secs(1)),
+        &mut seen,
+        generations,
+        || false,
+        || std::future::ready(Ok(changed.clone())),
+    )
+    .await;
+    assert_eq!(reason, ScannerCycleWakeReason::Timer);
+    assert_eq!(started.elapsed(), config.cycle_interval);
+    assert_eq!(seen, Some(changed));
 }
 
 #[test]
@@ -8254,6 +9177,8 @@ fn publication_lease_retry_preserves_only_recoverable_candidates() {
     for error in [
         "scanner publication lease acquisition failed: scanner publication lease capacity is exhausted",
         "scanner publication lease acquisition failed: scanner publication lease response arrived after its safety window",
+        "scanner publication lease acquisition failed: scanner publication lease is blocked by pending namespace commit",
+        "scanner publication lease acquisition failed: scanner publication lease namespace changed during acquisition",
         "scanner publication lease acquisition failed: peer node3 is temporarily offline",
     ] {
         assert!(scanner_publication_lease_error_is_retryable(error), "{error}");
@@ -8263,10 +9188,41 @@ fn publication_lease_retry_preserves_only_recoverable_candidates() {
         "scanner publication lease acquisition failed: scanner publication lease generation is stale",
         "scanner publication lease acquisition failed: peer returned a different scanner publication lease session",
         "scanner publication lease acquisition failed: scanner publication lease is blocked by data movement",
+        "scanner publication lease acquisition failed: scanner publication lease generation is exhausted",
         "scanner publication lease acquisition failed: peer returned an invalid scanner publication lease proof",
     ] {
         assert!(!scanner_publication_lease_error_is_retryable(error), "{error}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_lease_retries_pending_namespace_commit_until_it_clears() {
+    let ctx = CancellationToken::new();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let proof_attempts = attempts.clone();
+    let started_at = Instant::now();
+
+    let result = await_scanner_publication_proof(
+        &ctx,
+        17,
+        "lease_acquire",
+        move || {
+            let attempt = proof_attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err("scanner publication lease is blocked by pending namespace commit".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        },
+        |error| scanner_publication_lease_error_is_retryable(error),
+    )
+    .await;
+
+    assert!(matches!(result, ScannerPublicationProofWait::Ready(())));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(started_at.elapsed(), scanner_publication_proof_retry_delay(1));
 }
 
 #[tokio::test(start_paused = true)]
@@ -8442,13 +9398,14 @@ fn scanner_cycle_wait_plan_drives_growth_resets_and_bitrot_cap() {
 #[test]
 #[serial]
 fn scanner_cycle_schedule_status_reports_effective_backoff() {
-    record_scanner_cycle_schedule(Duration::from_millis(86_400_001), true, 2_048, true, 7);
+    record_scanner_cycle_schedule(Duration::from_millis(86_400_001), true, true, 2_048, true, 7);
 
     let status = scanner_cycle_schedule_status();
 
     assert_eq!(status.execution_role, "leader");
     assert!(status.effective_interval_available);
     assert_eq!(status.effective_interval_seconds, 86_401);
+    assert!(status.usage_bootstrap_rebuild_pending);
     assert!(status.clean_idle_backoff_enabled);
     assert_eq!(status.clean_idle_backoff_multiplier, 2_048);
     assert!(status.superseded_retry_backoff_enabled);
@@ -8459,12 +9416,14 @@ fn scanner_cycle_schedule_status_reports_effective_backoff() {
     assert_eq!(status.execution_role, "follower");
     assert!(!status.effective_interval_available);
     assert_eq!(status.effective_interval_seconds, 0);
+    assert!(!status.usage_bootstrap_rebuild_pending);
 
     reset_scanner_cycle_schedule();
     let status = scanner_cycle_schedule_status();
     assert_eq!(status.execution_role, "unknown");
     assert!(!status.effective_interval_available);
     assert_eq!(status.effective_interval_seconds, 0);
+    assert!(!status.usage_bootstrap_rebuild_pending);
     assert!(!status.clean_idle_backoff_enabled);
     assert_eq!(status.clean_idle_backoff_multiplier, 1);
     assert!(!status.superseded_retry_backoff_enabled);
@@ -8712,6 +9671,83 @@ fn clean_idle_backoff_policy_preserves_explicit_and_maintenance_cycles() {
     }
 }
 
+#[test]
+fn usage_bootstrap_rebuild_bypasses_clean_idle_until_authoritative_cycle() {
+    let config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let mut clean_idle_backoff = ScannerCleanIdleBackoff { interval_multiplier: 8 };
+    let mut rebuild = ScannerUsageBootstrapRebuild::from_startup(PersistedUsageFloorStartup::BootstrapPending);
+
+    assert!(!rebuild.clean_idle_backoff_enabled(true));
+
+    let plan = rebuild.wait_plan(scanner_cycle_wait_plan(&config, clean_idle_backoff, true, std::convert::identity), None);
+    assert_eq!(plan.delay, Duration::ZERO);
+
+    assert!(!rebuild.record_cycle(ScannerCycleOutcome::Partial));
+    assert!(rebuild.pending());
+    assert!(rebuild.record_cycle(ScannerCycleOutcome::CompletedWithPendingMaintenance));
+    assert!(!rebuild.pending());
+
+    let mut rebuild = ScannerUsageBootstrapRebuild::from_startup(PersistedUsageFloorStartup::BootstrapPending);
+    assert!(rebuild.record_cycle(ScannerCycleOutcome::Completed));
+    assert!(!rebuild.pending());
+    assert!(rebuild.clean_idle_backoff_enabled(true));
+
+    clean_idle_backoff.reset();
+    record_scanner_cycle_result(
+        &mut clean_idle_backoff,
+        &config,
+        rebuild.clean_idle_backoff_enabled(true),
+        ScannerCycleWakeReason::Timer,
+        ScannerCycleOutcome::Completed,
+        true,
+    );
+    assert_eq!(
+        clean_idle_backoff.effective_interval(
+            config.cycle_interval,
+            scanner_clean_idle_max_interval(config.cycle_interval, &config),
+            true,
+        ),
+        Duration::from_secs(60)
+    );
+}
+
+#[test]
+fn superseded_retry_preserves_full_maintenance_boundaries() {
+    let features = ScannerMaintenanceFeatures::default();
+    for (wake, ordinary_full, retry_full) in [
+        (ScannerCycleWakeReason::Timer, true, false),
+        (ScannerCycleWakeReason::DirtyUsage, false, false),
+        (ScannerCycleWakeReason::ClusterActivity, false, false),
+        (ScannerCycleWakeReason::ClusterMaintenance, true, true),
+        (ScannerCycleWakeReason::MovementGeneration, true, true),
+        (ScannerCycleWakeReason::Recovery, true, true),
+    ] {
+        assert_eq!(features.requires_full_scan(Some(7), 7, wake, false), ordinary_full, "{wake:?}");
+        assert_eq!(features.requires_full_scan(Some(7), 7, wake, true), retry_full, "{wake:?} retry");
+        assert!(features.requires_full_scan(None, 7, wake, true));
+        assert!(features.requires_full_scan(Some(6), 7, wake, true));
+        for unsafe_features in [
+            ScannerMaintenanceFeatures {
+                lifecycle: true,
+                ..features
+            },
+            ScannerMaintenanceFeatures {
+                replication: true,
+                ..features
+            },
+            ScannerMaintenanceFeatures {
+                inspection_failed: true,
+                ..features
+            },
+        ] {
+            assert!(unsafe_features.requires_full_scan(Some(7), 7, wake, true));
+        }
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn scoped_scan_explicit_bitrot_keeps_dirty_planning_without_idle_backoff() {
@@ -8740,12 +9776,12 @@ async fn scoped_scan_explicit_bitrot_keeps_dirty_planning_without_idle_backoff()
             (ScannerCycleWakeReason::ClusterMaintenance, true),
         ] {
             assert_eq!(
-                features.requires_full_scan(generation, scanner_maintenance_generation(), wake),
+                features.requires_full_scan(generation, scanner_maintenance_generation(), wake, false),
                 full,
                 "{wake:?}"
             );
         }
-        assert!(features.requires_full_scan(None, scanner_maintenance_generation(), ScannerCycleWakeReason::DirtyUsage));
+        assert!(features.requires_full_scan(None, scanner_maintenance_generation(), ScannerCycleWakeReason::DirtyUsage, false));
         for unsafe_features in [
             ScannerMaintenanceFeatures {
                 lifecycle: true,
@@ -8763,18 +9799,25 @@ async fn scoped_scan_explicit_bitrot_keeps_dirty_planning_without_idle_backoff()
             assert!(unsafe_features.requires_full_scan(
                 generation,
                 scanner_maintenance_generation(),
-                ScannerCycleWakeReason::DirtyUsage
+                ScannerCycleWakeReason::DirtyUsage,
+                false
             ));
         }
         crate::scanner_io::record_scanner_maintenance_change("maintenance-proof-change");
-        assert!(features.requires_full_scan(generation, scanner_maintenance_generation(), ScannerCycleWakeReason::DirtyUsage));
+        assert!(features.requires_full_scan(
+            generation,
+            scanner_maintenance_generation(),
+            ScannerCycleWakeReason::DirtyUsage,
+            false
+        ));
         let (refreshed, refreshed_generation) = detect_stable_scanner_maintenance_features(&ctx, &store)
             .await
             .expect("changed maintenance generation should be inspected");
         assert!(!refreshed.requires_full_scan(
             Some(refreshed_generation),
             scanner_maintenance_generation(),
-            ScannerCycleWakeReason::DirtyUsage
+            ScannerCycleWakeReason::DirtyUsage,
+            false
         ));
         crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     })
@@ -9105,6 +10148,8 @@ async fn test_wait_for_next_scanner_cycle_wakes_for_repeated_dirty_bucket() {
 #[serial]
 async fn test_wait_for_next_scanner_cycle_reschedules_for_runtime_config() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    let config = startup_gate::startup_config(&[("alert_excess_versions", "1000")]);
+    crate::runtime_config::apply_scanner_runtime_config(&config).expect("initial scanner config should apply");
     let observed_generation = crate::runtime_config::scanner_runtime_config_generation();
     let ctx = CancellationToken::new();
     let mut wait = Box::pin(wait_for_next_scanner_cycle(
@@ -9117,9 +10162,8 @@ async fn test_wait_for_next_scanner_cycle_reschedules_for_runtime_config() {
     ));
     assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
 
-    let mut config = rustfs_config::server_config::Config::new();
-    config.set_defaults();
-    crate::runtime_config::apply_scanner_runtime_config(&config).expect("default scanner config should apply");
+    let config = startup_gate::startup_config(&[("alert_excess_versions", "1001")]);
+    crate::runtime_config::apply_scanner_runtime_config(&config).expect("changed scanner config should apply");
     let reason = tokio::time::timeout(Duration::from_secs(1), wait)
         .await
         .expect("runtime config should wake scanner before timer");
@@ -9188,6 +10232,7 @@ async fn movement_generation_wakes_deferred_wait_without_dirty_bucket() {
         movement_changed,
         current_movement_generation: move || movement_generation.load(Ordering::Acquire),
         is_lock_lost: || false,
+        recovery_wake: None,
     };
     let reason = wait_for_next_scanner_cycle_with_movement(
         &ctx,
@@ -9203,6 +10248,39 @@ async fn movement_generation_wakes_deferred_wait_without_dirty_bucket() {
     .await;
 
     assert_eq!(reason, ScannerCycleWakeReason::MovementGeneration);
+}
+
+#[tokio::test]
+async fn recovery_wake_interrupts_normal_cycle_wait() {
+    let ctx = CancellationToken::new();
+    let recovery_wake = Notify::new();
+    let movement = ScannerMovementWaitContext {
+        movement_generation_seen: None,
+        movement_changed: Arc::new(Notify::new()),
+        current_movement_generation: || 0,
+        is_lock_lost: || false,
+        recovery_wake: Some(&recovery_wake),
+    };
+
+    let mut wait = Box::pin(wait_for_next_scanner_cycle_with_movement(
+        &ctx,
+        Duration::from_secs(60),
+        ScannerCycleObservedGenerations {
+            dirty_usage: None,
+            runtime_config: crate::runtime_config::scanner_runtime_config_generation(),
+            maintenance: crate::scanner_io::scanner_maintenance_generation(),
+            defer_cluster_activity: false,
+        },
+        &movement,
+    ));
+    assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+
+    recovery_wake.notify_one();
+    let reason = tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("recovery wake should interrupt the scanner cycle wait");
+
+    assert_eq!(reason, ScannerCycleWakeReason::Recovery);
 }
 
 fn scanner_node_activity(epoch: &str, namespace_generation: u64, maintenance_generation: u64) -> ScannerNodeActivity {
@@ -9268,6 +10346,7 @@ fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
                 require_source: true,
                 tier_registry_generation: None,
                 checkpoint_identity: None,
+                checkpoint_plan_digest: None,
             },
         ),
         crate::scanner_io::DataUsageCacheScanState::Prepared {
@@ -9278,23 +10357,46 @@ fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
 }
 
 #[test]
-fn post_lease_activity_proof_rejects_a_put_tail_that_finished_before_lease_acquisition() {
-    let before = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
-    let expected_digest = Some(scanner_activity_snapshot_digest(&before));
-    assert_eq!(scanner_post_lease_activity_defer_reason(expected_digest, Ok(before.clone())), None);
+fn post_lease_activity_proof_rejects_a_peer_whose_dirty_usage_moved_before_lease_acquisition() {
+    let before = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3)),
+    ]);
+    assert_eq!(scanner_post_lease_activity_defer_reason(Some(&before), Ok(before.clone()), None), None);
 
+    // Local generation movement in the lease window is the next cycle's
+    // work: its buckets stay in the dirty map and the walk remains certified.
+    let mut local_shaded = before.clone();
+    let local = local_shaded
+        .get_mut(LOCAL_SCANNER_ACTIVITY_NODE)
+        .expect("local node should be present");
+    local.namespace_generation += 1;
+    local.dirty_usage_generation += 1;
+    local.dirty_usage_pending = true;
+    assert_eq!(scanner_post_lease_activity_defer_reason(Some(&before), Ok(local_shaded), None), None);
+
+    // A peer PUT tail that drained before the lease leaves the movement
+    // generation accepted by the lease unchanged, but the peer's dirty state
+    // moved and this phase cannot name its buckets.
     let mut after = before.clone();
-    after
-        .get_mut("node-2")
-        .expect("writer should be present")
-        .namespace_generation += 1;
+    let writer = after.get_mut("node-2").expect("writer should be present");
+    writer.namespace_generation += 1;
+    writer.dirty_usage_generation += 1;
     assert_eq!(
         before["node-2"].movement_generation, after["node-2"].movement_generation,
         "the existing movement-only lease remains valid after a PUT tail drains"
     );
     assert!(scanner_activity_allows_usage_publication(&after));
-    let reason = scanner_post_lease_activity_defer_reason(expected_digest, Ok(after));
+    let reason = scanner_post_lease_activity_defer_reason(Some(&before), Ok(after), None);
     assert_eq!(reason, Some(ScannerCycleDeferReason::ActivityBaselineUnavailable));
+
+    // A guardrail field moving in the window still defers.
+    let mut moved = before.clone();
+    moved.get_mut("node-2").expect("peer should be present").movement_generation += 1;
+    assert_eq!(
+        scanner_post_lease_activity_defer_reason(Some(&before), Ok(moved), None),
+        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    );
 
     let result = ScannerCycleResult::new(ScannerCycleStatus::Complete, None).with_remote_dirty_usage_acknowledgements(vec![
         ScannerDirtyUsageAcknowledgement {
@@ -9378,18 +10480,16 @@ fn remote_lease_validation_failure_preserves_movement_defer_for_remote_fence_los
 #[test]
 fn post_lease_activity_proof_requires_a_complete_matching_baseline() {
     let before = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
-    let digest = scanner_activity_snapshot_digest(&before);
     let mut blocked = before.clone();
     blocked.get_mut("node-2").expect("peer should be present").publication_blocked = true;
-    let blocked_digest = scanner_activity_snapshot_digest(&blocked);
     for (expected, observed) in [
-        (None, Ok(before)),
-        (Some(digest), Err("peer is unavailable".to_string())),
-        (Some(digest), Ok(BTreeMap::new())),
-        (Some(blocked_digest), Ok(blocked)),
+        (None, Ok(before.clone())),
+        (Some(&before), Err("peer is unavailable".to_string())),
+        (Some(&before), Ok(BTreeMap::new())),
+        (Some(&blocked), Ok(blocked.clone())),
     ] {
         assert_eq!(
-            scanner_post_lease_activity_defer_reason(expected, observed),
+            scanner_post_lease_activity_defer_reason(expected, observed, None),
             Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
         );
     }
@@ -9471,7 +10571,7 @@ fn scanner_activity_structural_digest_ignores_regular_bucket_writes() {
 }
 
 #[test]
-fn scanner_activity_structural_digest_fences_restart_and_maintenance() {
+fn scanner_activity_structural_digest_fences_restart_and_maintenance_but_not_publication_pauses() {
     let baseline = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
     let mut restarted = baseline.clone();
     restarted.get_mut("node-2").expect("node should exist").instance_id = "epoch-b".to_string();
@@ -9480,7 +10580,12 @@ fn scanner_activity_structural_digest_fences_restart_and_maintenance() {
         .get_mut("node-2")
         .expect("node should exist")
         .maintenance_generation = 4;
+    let mut paused = baseline.clone();
+    paused.get_mut("node-2").expect("node should exist").publication_blocked = true;
 
+    // A restarted peer may have lost its last dirty-hint window and a changed
+    // maintenance rule needs a maintenance pass, so both invalidate every
+    // reusable result (the baseline and the set caches).
     assert_ne!(
         scanner_activity_structural_digest(&baseline),
         scanner_activity_structural_digest(&restarted)
@@ -9489,8 +10594,145 @@ fn scanner_activity_structural_digest_fences_restart_and_maintenance() {
         scanner_activity_structural_digest(&baseline),
         scanner_activity_structural_digest(&maintained)
     );
+    // A publication pause describes nothing about the heap: it vetoes the
+    // cycle it moves in and is part of no identity.
+    assert_eq!(scanner_activity_structural_digest(&baseline), scanner_activity_structural_digest(&paused));
+    assert_eq!(scanner_activity_snapshot_digest(&baseline), scanner_activity_snapshot_digest(&paused));
+    assert_eq!(scanner_activity_coverage_digest(&baseline), scanner_activity_coverage_digest(&paused));
+    assert_eq!(
+        scanner_activity_guardrail_veto(&baseline, &paused).map(|veto| veto.field),
+        Some("publication_blocked")
+    );
 }
 
+#[test]
+fn scanner_activity_coverage_digest_survives_restart_and_maintenance_but_fences_the_heap() {
+    let baseline = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("process-1", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("remote-a", 7, 3)),
+    ]);
+    type Mutation = (&'static str, Box<dyn Fn(&mut ScannerNodeActivity)>);
+
+    // A coordinator restart, a maintenance publication, a publication pause
+    // or the local node's own generations do not change the namespace a
+    // sweep traverses, so a checkpoint resumes under the same plan; each of
+    // the first three is still a guardrail veto on its own.
+    let same_coverage: Vec<Mutation> = vec![
+        ("instance_id", Box::new(|activity| activity.instance_id = "restarted".to_string())),
+        ("maintenance_generation", Box::new(|activity| activity.maintenance_generation += 1)),
+        ("publication_blocked", Box::new(|activity| activity.publication_blocked = true)),
+    ];
+    for host in [LOCAL_SCANNER_ACTIVITY_NODE, "node-2"] {
+        for (field, mutate) in &same_coverage {
+            let mut changed = baseline.clone();
+            mutate(changed.get_mut(host).expect("host should be present"));
+            assert_eq!(
+                scanner_activity_coverage_digest(&baseline),
+                scanner_activity_coverage_digest(&changed),
+                "{field} on {host} must not change the coverage identity"
+            );
+            assert_eq!(
+                scanner_activity_guardrail_veto(&baseline, &changed).map(|veto| veto.field),
+                Some(*field),
+                "{field} on {host} still vetoes the cycle it moved in"
+            );
+        }
+    }
+    let local_generations: Vec<Mutation> = vec![
+        ("namespace_generation", Box::new(|activity| activity.namespace_generation += 1)),
+        ("dirty_usage_generation", Box::new(|activity| activity.dirty_usage_generation += 1)),
+        ("dirty_usage_pending", Box::new(|activity| activity.dirty_usage_pending = true)),
+    ];
+    for (field, mutate) in &local_generations {
+        let mut changed = baseline.clone();
+        mutate(changed.get_mut(LOCAL_SCANNER_ACTIVITY_NODE).expect("local activity"));
+        assert_eq!(
+            scanner_activity_coverage_digest(&baseline),
+            scanner_activity_coverage_digest(&changed),
+            "local {field} is certified per bucket through the bucket's own dirty generation"
+        );
+        // A peer's generations stay in: its dirty buckets are acknowledged
+        // per cycle, so a write there between two halves of a sweep must
+        // restart the sweep.
+        let mut peer_changed = baseline.clone();
+        mutate(peer_changed.get_mut("node-2").expect("peer activity"));
+        assert_ne!(
+            scanner_activity_coverage_digest(&baseline),
+            scanner_activity_coverage_digest(&peer_changed),
+            "remote {field} must change the coverage identity"
+        );
+    }
+    let heap: Vec<Mutation> = vec![
+        ("protocol_version", Box::new(|activity| activity.protocol_version += 1)),
+        ("topology_digest", Box::new(|activity| activity.topology_digest = [4; 32])),
+        ("data_movement_active", Box::new(|activity| activity.data_movement_active = true)),
+        ("movement_generation", Box::new(|activity| activity.movement_generation += 1)),
+    ];
+    for host in [LOCAL_SCANNER_ACTIVITY_NODE, "node-2"] {
+        for (field, mutate) in &heap {
+            let mut changed = baseline.clone();
+            mutate(changed.get_mut(host).expect("host should be present"));
+            assert_ne!(
+                scanner_activity_coverage_digest(&baseline),
+                scanner_activity_coverage_digest(&changed),
+                "{field} on {host} must change the coverage identity"
+            );
+            assert_ne!(
+                scanner_activity_structural_digest(&baseline),
+                scanner_activity_structural_digest(&changed),
+                "{field} on {host} must change the reuse identity"
+            );
+        }
+    }
+    let mut peer_lost = baseline.clone();
+    peer_lost.remove("node-2");
+    assert_ne!(scanner_activity_coverage_digest(&baseline), scanner_activity_coverage_digest(&peer_lost));
+}
+
+#[test]
+fn bucket_checkpoint_plan_survives_a_coordinator_restart() {
+    let bucket_info = |name: &str| crate::storage_api::scanner_io::BucketInfo {
+        name: name.to_string(),
+        created: None,
+        deleted: None,
+        versioning: false,
+        object_locking: false,
+    };
+    let buckets = vec![bucket_info("alpha"), bucket_info("beta")];
+    let before = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("process-1", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("remote-a", 7, 3)),
+    ]);
+    let mut restarted = before.clone();
+    let local = restarted
+        .get_mut(LOCAL_SCANNER_ACTIVITY_NODE)
+        .expect("local activity should exist");
+    local.instance_id = "process-2".to_string();
+    local.namespace_generation = 0;
+    local.maintenance_generation = 0;
+    local.dirty_usage_generation = 0;
+    local.dirty_usage_pending = false;
+    local.publication_blocked = true;
+
+    // The plan a bucket checkpoint was started under must be the plan the
+    // restarted coordinator requests, or every resumed sweep restarts as
+    // mixed coverage and the bucket can never certify (rustfs/rustfs#8494).
+    // The reuse plan does change: finished results are walked again.
+    let coverage_plan =
+        |snapshot| crate::scanner_io::scanner_bucket_plan_digest(&buckets, scanner_activity_coverage_digest(snapshot));
+    let reuse_plan =
+        |snapshot| crate::scanner_io::scanner_bucket_plan_digest(&buckets, scanner_activity_structural_digest(snapshot));
+    assert_eq!(coverage_plan(&before), coverage_plan(&restarted));
+    assert_ne!(reuse_plan(&before), reuse_plan(&restarted));
+
+    let mut extra_bucket = buckets.clone();
+    extra_bucket.push(bucket_info("gamma"));
+    assert_ne!(
+        coverage_plan(&before),
+        crate::scanner_io::scanner_bucket_plan_digest(&extra_bucket, scanner_activity_coverage_digest(&before)),
+        "the bucket list stays part of the plan"
+    );
+}
 #[test]
 fn scanner_dirty_usage_acknowledgements_exclude_local_and_clean_nodes() {
     let snapshot = BTreeMap::from([
@@ -9617,6 +10859,132 @@ fn remote_restart_is_distinct_from_deferred_cluster_activity() {
         ScannerActivityObservation::RemoteRestarted
     );
     assert!(scanner_activity_observed_work(ScannerActivityObservation::RemoteRestarted));
+}
+
+type ActivityFieldMutations = Vec<(&'static str, Box<dyn Fn(&mut ScannerNodeActivity)>)>;
+
+#[test]
+fn guardrail_veto_is_attributed_to_the_field_and_host_that_moved() {
+    let before = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("remote", 7, 3)),
+    ]);
+    assert_eq!(scanner_activity_guardrail_veto(&before, &before), None);
+
+    let cases: ActivityFieldMutations = vec![
+        ("instance_id", Box::new(|activity| activity.instance_id = "restarted".to_string())),
+        ("protocol_version", Box::new(|activity| activity.protocol_version += 1)),
+        ("topology_digest", Box::new(|activity| activity.topology_digest = [4; 32])),
+        ("maintenance_generation", Box::new(|activity| activity.maintenance_generation += 1)),
+        ("data_movement_active", Box::new(|activity| activity.data_movement_active = true)),
+        ("movement_generation", Box::new(|activity| activity.movement_generation += 1)),
+        ("publication_blocked", Box::new(|activity| activity.publication_blocked = true)),
+    ];
+    for host in [LOCAL_SCANNER_ACTIVITY_NODE, "node-2"] {
+        for (field, mutate) in &cases {
+            let mut after = before.clone();
+            mutate(after.get_mut(host).expect("host should be present"));
+            let veto = scanner_activity_guardrail_veto(&before, &after).unwrap_or_else(|| panic!("{field} on {host} must veto"));
+            assert_eq!(veto.field, *field, "{host}");
+            assert_eq!(veto.host, host);
+            assert_eq!(veto.reason(), format!("{field}@{host}"));
+            assert!(SCANNER_ACTIVITY_GUARDRAIL_VETO_FIELDS.contains(field));
+        }
+    }
+
+    let mut peer_lost = before.clone();
+    peer_lost.remove("node-2");
+    assert_eq!(
+        scanner_activity_guardrail_veto(&before, &peer_lost),
+        Some(ScannerActivityGuardrailVeto::new("node-2", "peer_set"))
+    );
+    let mut peer_added = before.clone();
+    peer_added.insert("node-3".to_string(), scanner_node_activity("third", 1, 1));
+    assert_eq!(
+        scanner_activity_guardrail_veto(&before, &peer_added),
+        Some(ScannerActivityGuardrailVeto::new("node-3", "peer_set"))
+    );
+}
+
+#[test]
+fn generation_movement_shades_buckets_without_a_guardrail_veto() {
+    let before = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("remote", 7, 3)),
+    ]);
+    let shade: ActivityFieldMutations = vec![
+        ("namespace_generation", Box::new(|activity| activity.namespace_generation += 1)),
+        ("dirty_usage_generation", Box::new(|activity| activity.dirty_usage_generation += 1)),
+        ("dirty_usage_pending", Box::new(|activity| activity.dirty_usage_pending = true)),
+    ];
+    for host in [LOCAL_SCANNER_ACTIVITY_NODE, "node-2"] {
+        for (field, mutate) in &shade {
+            let mut after = before.clone();
+            mutate(after.get_mut(host).expect("host should be present"));
+            assert_ne!(after, before);
+            assert_eq!(scanner_activity_guardrail_veto(&before, &after), None, "{field} on {host} must not veto");
+            assert!(SCANNER_ACTIVITY_SHADE_FIELDS.contains(field));
+            assert_eq!(
+                scanner_activity_structural_digest(&before),
+                scanner_activity_structural_digest(&after),
+                "{field} must stay outside the structural digest"
+            );
+        }
+    }
+
+    // Everything shaded at once on every host is still not a veto.
+    let mut all_shaded = before.clone();
+    for activity in all_shaded.values_mut() {
+        activity.namespace_generation += 3;
+        activity.dirty_usage_generation += 3;
+        activity.dirty_usage_pending = true;
+    }
+    assert_eq!(scanner_activity_guardrail_veto(&before, &all_shaded), None);
+}
+
+#[test]
+fn peer_dirty_usage_movement_is_reported_for_remote_hosts_only() {
+    let before = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("remote", 7, 3)),
+    ]);
+    assert_eq!(scanner_peer_dirty_usage_moved(&before, &before), None);
+
+    let mut local_moved = before.clone();
+    let local = local_moved
+        .get_mut(LOCAL_SCANNER_ACTIVITY_NODE)
+        .expect("local activity should exist");
+    local.dirty_usage_generation += 1;
+    local.dirty_usage_pending = true;
+    local.namespace_generation += 1;
+    assert_eq!(scanner_peer_dirty_usage_moved(&before, &local_moved), None);
+
+    let mut remote_namespace_only = before.clone();
+    remote_namespace_only
+        .get_mut("node-2")
+        .expect("remote activity should exist")
+        .namespace_generation += 1;
+    assert_eq!(scanner_peer_dirty_usage_moved(&before, &remote_namespace_only), None);
+
+    let mut remote_generation = before.clone();
+    remote_generation
+        .get_mut("node-2")
+        .expect("remote activity should exist")
+        .dirty_usage_generation += 1;
+    assert_eq!(
+        scanner_peer_dirty_usage_moved(&before, &remote_generation),
+        Some(ScannerActivityGuardrailVeto::new("node-2", "dirty_usage_generation"))
+    );
+
+    let mut remote_pending = before.clone();
+    remote_pending
+        .get_mut("node-2")
+        .expect("remote activity should exist")
+        .dirty_usage_pending = true;
+    assert_eq!(
+        scanner_peer_dirty_usage_moved(&before, &remote_pending),
+        Some(ScannerActivityGuardrailVeto::new("node-2", "dirty_usage_pending"))
+    );
 }
 
 #[test]
@@ -9927,7 +11295,11 @@ async fn scanner_activity_probe_wait_stops_after_leader_lock_loss() {
 #[serial]
 fn test_get_cycle_scan_mode_runs_deep_until_selection_window_completes() {
     with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"), || {
-        let mode = get_cycle_scan_mode(10, 0, Some(Utc::now()), bitrot_scan_cycle());
+        let start = ScannerBitrotStart::Window {
+            cycle: 0,
+            started: Utc::now(),
+        };
+        let mode = get_cycle_scan_mode(10, start, ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024));
         assert_eq!(mode, HealScanMode::Deep);
     });
 }
@@ -9939,8 +11311,19 @@ fn test_get_cycle_scan_mode_respects_elapsed_bitrot_cycle() {
         let recent = Utc::now() - chrono::Duration::minutes(30);
         let old = Utc::now() - chrono::Duration::hours(2);
 
-        assert_eq!(get_cycle_scan_mode(2048, 0, Some(recent), bitrot_scan_cycle()), HealScanMode::Normal);
-        assert_eq!(get_cycle_scan_mode(2048, 0, Some(old), bitrot_scan_cycle()), HealScanMode::Deep);
+        let recent = ScannerBitrotStart::Window {
+            cycle: 0,
+            started: recent,
+        };
+        let old = ScannerBitrotStart::Window { cycle: 0, started: old };
+        assert_eq!(
+            get_cycle_scan_mode(2048, recent, ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024)),
+            HealScanMode::Normal
+        );
+        assert_eq!(
+            get_cycle_scan_mode(2048, old, ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024)),
+            HealScanMode::Deep
+        );
     });
 }
 
@@ -9948,17 +11331,269 @@ fn test_get_cycle_scan_mode_respects_elapsed_bitrot_cycle() {
 #[serial]
 fn test_get_cycle_scan_mode_can_disable_periodic_deep_scan() {
     with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("off"), || {
-        assert_eq!(get_cycle_scan_mode(1, 0, None, bitrot_scan_cycle()), HealScanMode::Normal);
+        assert_eq!(
+            get_cycle_scan_mode(1, ScannerBitrotStart::None, ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1)),
+            HealScanMode::Normal
+        );
+        assert_eq!(
+            get_cycle_scan_mode(
+                1,
+                ScannerBitrotStart::Anchor(Utc::now() - chrono::Duration::days(400)),
+                ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1)
+            ),
+            HealScanMode::Normal
+        );
     });
+}
+
+#[test]
+fn scan_mode_without_recorded_bitrot_start_stays_normal_until_the_cycle_elapses() {
+    // Regression for rustfs/backlog#2905 (rustfs/rustfs#8015): a cycle that
+    // finds no recorded bitrot start (missing heal object, or a save that
+    // keeps failing) must not open a Deep window. Three consecutive cycles
+    // with the default `BackgroundHealInfo` used to run Deep through the
+    // selection window because `bitrot_start_cycle` defaults to 0.
+    let policy = ScannerBitrotPolicy::new(Some(Duration::from_secs(3600)), true, 1024);
+    let modes: Vec<_> = (1..=3)
+        .map(|cycle| get_cycle_scan_mode(cycle, ScannerBitrotStart::None, policy))
+        .collect();
+    assert_eq!(modes, vec![HealScanMode::Normal; 3]);
+
+    // An in-memory anchor counts the cadence without opening a selection
+    // window: Normal until the cycle elapses, Deep afterwards.
+    let anchored = ScannerBitrotStart::Anchor(Utc::now());
+    let modes: Vec<_> = (1..=3).map(|cycle| get_cycle_scan_mode(cycle, anchored, policy)).collect();
+    assert_eq!(modes, vec![HealScanMode::Normal; 3]);
+    assert_eq!(
+        get_cycle_scan_mode(4, ScannerBitrotStart::Anchor(Utc::now() - chrono::Duration::hours(2)), policy),
+        HealScanMode::Deep
+    );
+
+    // A recorded Deep window keeps its selection window, and an elapsed
+    // cadence still triggers the next window.
+    let started = Utc::now();
+    let window = ScannerBitrotStart::Window { cycle: 1, started };
+    assert_eq!(get_cycle_scan_mode(1, window, policy), HealScanMode::Deep);
+    assert_eq!(
+        get_cycle_scan_mode(
+            2048,
+            ScannerBitrotStart::Window {
+                cycle: 1,
+                started: started - chrono::Duration::hours(2),
+            },
+            policy
+        ),
+        HealScanMode::Deep
+    );
+    assert_eq!(get_cycle_scan_mode(2048, window, policy), HealScanMode::Normal);
+}
+
+#[test]
+#[serial]
+fn bitrot_cadence_anchor_is_remembered_in_memory_without_a_persisted_write() {
+    reset_bitrot_cadence_anchor_for_test();
+    let now = Utc::now();
+    let policy = ScannerBitrotPolicy::new(Some(Duration::from_secs(3600)), true, 1024);
+
+    // A Normal cycle without a recorded window writes nothing to storage ...
+    assert!(
+        background_heal_info_for_scan_start(BackgroundHealInfo::default(), 3, HealScanMode::Normal, now, policy).is_none(),
+        "a Normal cycle must not persist a start that would open a Deep window"
+    );
+
+    // ... but the process anchors the cadence at its first such cycle and
+    // keeps that anchor for later cycles.
+    let first = scanner_bitrot_start_for_cycle(&BackgroundHealInfo::default(), now);
+    assert_eq!(first, ScannerBitrotStart::Anchor(now));
+    let later = scanner_bitrot_start_for_cycle(&BackgroundHealInfo::default(), now + chrono::Duration::hours(2));
+    assert_eq!(later, ScannerBitrotStart::Anchor(now));
+    assert_eq!(get_cycle_scan_mode(4, later, policy), HealScanMode::Normal);
+
+    // A recorded window start takes precedence over the anchor.
+    let recorded = BackgroundHealInfo {
+        bitrot_start_time: Some(now),
+        bitrot_start_cycle: 7,
+        current_scan_mode: HealScanMode::Normal,
+    };
+    assert_eq!(
+        scanner_bitrot_start_for_cycle(&recorded, now),
+        ScannerBitrotStart::Window { cycle: 7, started: now }
+    );
+
+    // Once the cadence elapses on the anchor, the Deep cycle records the
+    // window start for persistence (and for the in-memory record).
+    let opened = background_heal_info_for_scan_start(BackgroundHealInfo::default(), 9, HealScanMode::Deep, now, policy)
+        .expect("opening a Deep window records its start");
+    assert_eq!(opened.bitrot_start_cycle, 9);
+    assert_eq!(opened.bitrot_start_time, Some(now));
+    assert_eq!(opened.current_scan_mode, HealScanMode::Deep);
+    reset_bitrot_cadence_anchor_for_test();
+}
+
+#[test]
+#[serial]
+fn bitrot_start_memory_record_outlives_a_skipped_persisted_save() {
+    reset_bitrot_cadence_anchor_for_test();
+    let now = Utc::now();
+    let policy = ScannerBitrotPolicy::new(Some(Duration::from_secs(3600)), true, 1024);
+    let recorded = BackgroundHealInfo {
+        bitrot_start_time: Some(now),
+        bitrot_start_cycle: 4,
+        current_scan_mode: HealScanMode::Normal,
+    };
+
+    // Storage never returned a start (missing object, or a save skipped
+    // without movement admission): the in-memory record keeps the cadence.
+    let (info, source) = resolve_background_heal_info(None, Some(&recorded));
+    assert_eq!(source, ScannerBitrotStartSource::Memory);
+    assert_eq!(info.bitrot_start_cycle, 4);
+    let start = scanner_bitrot_start_for_cycle(&info, now);
+    assert_eq!(start, ScannerBitrotStart::Window { cycle: 4, started: now });
+    assert_eq!(
+        get_cycle_scan_mode(5, start, policy),
+        HealScanMode::Deep,
+        "a remembered start keeps the Deep selection window it opened"
+    );
+    assert_eq!(
+        get_cycle_scan_mode(2048, start, policy),
+        HealScanMode::Normal,
+        "and stays Normal after the window until the cadence elapses"
+    );
+
+    // A persisted start wins ties and older in-memory records.
+    let stored = BackgroundHealInfo {
+        bitrot_start_time: Some(now),
+        bitrot_start_cycle: 4,
+        current_scan_mode: HealScanMode::Deep,
+    };
+    let (info, source) = resolve_background_heal_info(Some(&stored), Some(&recorded));
+    assert_eq!(source, ScannerBitrotStartSource::Persisted);
+    assert_eq!(info.current_scan_mode, HealScanMode::Deep);
+
+    // A newer in-memory start (a Deep window opened after the last
+    // successful save) wins over the stale persisted record.
+    let newer = BackgroundHealInfo {
+        bitrot_start_time: Some(now + chrono::Duration::seconds(1)),
+        bitrot_start_cycle: 9,
+        current_scan_mode: HealScanMode::Deep,
+    };
+    let (info, source) = resolve_background_heal_info(Some(&stored), Some(&newer));
+    assert_eq!(source, ScannerBitrotStartSource::Memory);
+    assert_eq!(info.bitrot_start_cycle, 9);
+
+    // Nothing recorded anywhere: the persisted record is used as-is, the
+    // source says so, and the cycle runs Normal instead of opening a window.
+    let legacy = BackgroundHealInfo {
+        bitrot_start_time: None,
+        bitrot_start_cycle: 0,
+        current_scan_mode: HealScanMode::Deep,
+    };
+    let (info, source) = resolve_background_heal_info(Some(&legacy), None);
+    assert_eq!(source, ScannerBitrotStartSource::None);
+    assert_eq!(info.current_scan_mode, HealScanMode::Deep);
+    let start = scanner_bitrot_start_for_cycle(&info, now);
+    assert_eq!(start, ScannerBitrotStart::Anchor(now));
+    assert_eq!(get_cycle_scan_mode(1, start, policy), HealScanMode::Normal);
+    reset_bitrot_cadence_anchor_for_test();
+}
+
+#[test]
+#[serial]
+fn scan_mode_status_reports_bitrot_start_source_and_topology_support() {
+    let now = Utc::now();
+    let info = BackgroundHealInfo {
+        bitrot_start_time: Some(now),
+        bitrot_start_cycle: 2,
+        current_scan_mode: HealScanMode::Normal,
+    };
+    record_scanner_bitrot_status(
+        scanner_bitrot_start_for_cycle(&info, now),
+        ScannerBitrotStartSource::Memory,
+        false,
+        HealScanMode::Normal,
+    );
+
+    let status = scanner_bitrot_status();
+    assert!(!status.deep_scan_supported);
+    assert_eq!(status.bitrot_start_source, ScannerBitrotStartSource::Memory);
+    assert_eq!(status.bitrot_start_source.as_str(), "memory");
+    assert_eq!(status.bitrot_start_kind, "deep_window");
+    assert_eq!(status.bitrot_start_cycle, 2);
+    assert_eq!(
+        status.bitrot_start_unix_secs,
+        u64::try_from(now.timestamp()).expect("current time is after the epoch")
+    );
+    assert_eq!(status.current_scan_mode, "normal");
+    let encoded = serde_json::to_value(status).expect("bitrot status serializes");
+    assert_eq!(encoded["bitrot_start_source"], "memory");
+    assert_eq!(encoded["deep_scan_supported"], false);
+
+    record_scanner_bitrot_status(ScannerBitrotStart::None, ScannerBitrotStartSource::None, true, HealScanMode::Deep);
+    let status = scanner_bitrot_status();
+    assert!(status.deep_scan_supported);
+    assert_eq!(status.bitrot_start_source, ScannerBitrotStartSource::None);
+    assert_eq!(status.bitrot_start_kind, "none");
+    assert_eq!(status.bitrot_start_unix_secs, 0);
+    assert_eq!(status.current_scan_mode, "deep");
+
+    record_scanner_bitrot_status(
+        ScannerBitrotStart::Anchor(now),
+        ScannerBitrotStartSource::Memory,
+        true,
+        HealScanMode::Normal,
+    );
+    let status = scanner_bitrot_status();
+    assert_eq!(status.bitrot_start_kind, "anchor");
+    assert_eq!(status.bitrot_start_cycle, 0);
+    assert_eq!(
+        status.bitrot_start_unix_secs,
+        u64::try_from(now.timestamp()).expect("current time is after the epoch")
+    );
+}
+
+#[test]
+fn test_erasure_sd_does_not_enter_deep_scan_mode() {
+    let started = Utc::now();
+    let cycle = Some(Duration::from_secs(3600));
+
+    let unsupported_policy = ScannerBitrotPolicy::new(cycle, false, 1024);
+    let window = ScannerBitrotStart::Window { cycle: 10, started };
+    assert_eq!(get_cycle_scan_mode(10, window, unsupported_policy), HealScanMode::Normal);
+    assert_eq!(
+        get_cycle_scan_mode(11, ScannerBitrotStart::None, unsupported_policy),
+        HealScanMode::Normal
+    );
+    assert_eq!(
+        get_cycle_scan_mode(11, ScannerBitrotStart::Anchor(started), unsupported_policy),
+        HealScanMode::Normal
+    );
+    assert_eq!(
+        get_cycle_scan_mode(10, ScannerBitrotStart::None, ScannerBitrotPolicy::new(Some(Duration::ZERO), false, 1024)),
+        HealScanMode::Normal
+    );
+
+    let info = BackgroundHealInfo {
+        bitrot_start_time: Some(started),
+        bitrot_start_cycle: 10,
+        current_scan_mode: HealScanMode::Deep,
+    };
+    let normalized = background_heal_info_for_scan_start(info, 11, HealScanMode::Normal, started, unsupported_policy)
+        .expect("ErasureSD should persist a legacy Deep state as Normal");
+    assert_eq!(normalized.current_scan_mode, HealScanMode::Normal);
 }
 
 #[test]
 #[serial]
 fn test_background_heal_info_for_scan_start_marks_deep_active() {
     let now = Utc::now();
-    let info =
-        background_heal_info_for_scan_start(BackgroundHealInfo::default(), 7, HealScanMode::Deep, now, bitrot_scan_cycle())
-            .expect("deep scan should update background heal info");
+    let info = background_heal_info_for_scan_start(
+        BackgroundHealInfo::default(),
+        7,
+        HealScanMode::Deep,
+        now,
+        ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024),
+    )
+    .expect("deep scan should update background heal info");
 
     assert_eq!(info.current_scan_mode, HealScanMode::Deep);
     assert_eq!(info.bitrot_start_cycle, 7);
@@ -9989,8 +11624,14 @@ fn test_background_heal_info_for_scan_start_keeps_deep_window_start() {
             current_scan_mode: HealScanMode::Normal,
         };
 
-        let info = background_heal_info_for_scan_start(info, 8, HealScanMode::Deep, Utc::now(), bitrot_scan_cycle())
-            .expect("deep scan should mark active status");
+        let info = background_heal_info_for_scan_start(
+            info,
+            8,
+            HealScanMode::Deep,
+            Utc::now(),
+            ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024),
+        )
+        .expect("deep scan should mark active status");
 
         assert_eq!(info.current_scan_mode, HealScanMode::Deep);
         assert_eq!(info.bitrot_start_cycle, 7);

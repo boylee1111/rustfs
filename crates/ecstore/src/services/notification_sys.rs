@@ -23,7 +23,6 @@ use crate::error::{Error, Result};
 use crate::layout::endpoints::EndpointServerPools;
 use crate::runtime::sources as runtime_sources;
 use crate::services::metrics_realtime::{CollectMetricsOpts, MetricType};
-use crate::services::rebalance::RebalSaveOpt;
 use crate::storage_api_contracts::admin::StorageAdminApi;
 use bytes::Bytes;
 use futures::future::join_all;
@@ -42,6 +41,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -61,6 +61,15 @@ const TIER_CONFIG_RELOAD_RETRY_CAP: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const REMOTE_VERSION_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROOF_TTL: Duration = Duration::from_secs(30);
+const MRF_LIFECYCLE_WRITER_FORMAT_VERSION: u8 = 2;
+/// Fallback poll cadence while startup has not yet published the notification
+/// system. IAM finalization starts the probe before `init_notification_runtime`
+/// runs, so the first pass always fails closed; waiting a full probe interval
+/// there left a single node without its durable quota capability for ten
+/// seconds after `/health` reported ok (rustfs/rustfs#8014). Publication wakes
+/// the probe immediately through `NOTIFICATION_SYS_PUBLISHED`; this bound only
+/// covers a wakeup that races the availability check.
+const REMOTE_VERSION_STATE_PROBE_BOOTSTRAP_INTERVAL: Duration = Duration::from_millis(100);
 const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 2;
 const TIER_DELETE_JOURNAL_POLICY_SUPPORTED_VERSION: u32 = 3;
 const DECOMMISSION_TARGET_FENCE_POLICY_SUPPORTED_VERSION: u32 = 4;
@@ -147,6 +156,18 @@ struct PeerAdminCache {
     /// cached `online` snapshot from being served indefinitely while a peer is
     /// actually down (rustfs/backlog#1049 P2).
     last_server_success: Option<SystemTime>,
+}
+
+fn scanner_publication_lease_acquisition_error(host: &str, observational_only: bool, error: Error) -> Error {
+    let purpose = if observational_only {
+        "observational"
+    } else {
+        "authoritative"
+    };
+    // Retry classification depends on the original error suffix.
+    Error::other(format!(
+        "scanner publication lease acquisition failed: peer={host}, purpose={purpose}: {error}"
+    ))
 }
 
 #[derive(Default)]
@@ -287,6 +308,7 @@ struct FleetCapabilityProofState {
     proof: Option<FleetCapabilityProof>,
     draining_generation: Option<Arc<FleetCapabilityProofGeneration>>,
     topology_conflict: bool,
+    published: Arc<Notify>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -337,7 +359,12 @@ static DECOMMISSION_TARGET_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCa
 static LEGACY_TRANSITION_STATE_RECONCILE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static ILM_RECOVERY_EXPORT_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static TRANSITION_TRANSACTION_COMPACTION_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static MRF_LIFECYCLE_WRITER_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static MRF_LIFECYCLE_READER_LOCAL_PROCESS_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 static REMOTE_VERSION_STATE_PROBE_TOPOLOGY: OnceLock<String> = OnceLock::new();
+/// Signalled once `GLOBAL_NOTIFICATION_SYS` is published so the fleet probe can
+/// run its first real pass without waiting for the bootstrap poll.
+static NOTIFICATION_SYS_PUBLISHED: Notify = Notify::const_new();
 static ILM_RECOVERY_EXPORT_LOCAL_PROCESS_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
 
 fn cross_pool_fence_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
@@ -366,6 +393,25 @@ fn ilm_recovery_export_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCap
 
 fn transition_transaction_compaction_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
     TRANSITION_TRANSACTION_COMPACTION_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn all_fleet_capability_proof_slots() -> [&'static std::sync::RwLock<FleetCapabilityProofState>; 8] {
+    [
+        remote_version_state_fleet_proof_slot(),
+        cross_pool_fence_fleet_proof_slot(),
+        tier_delete_journal_fleet_proof_slot(),
+        decommission_target_fence_fleet_proof_slot(),
+        legacy_transition_state_reconcile_fleet_proof_slot(),
+        ilm_recovery_export_fleet_proof_slot(),
+        transition_transaction_compaction_fleet_proof_slot(),
+        mrf_lifecycle_writer_fleet_proof_slot(),
+    ]
+}
+
+fn revoke_all_fleet_capability_proofs() {
+    for slot in all_fleet_capability_proof_slots() {
+        revoke_fleet_capability_proof(slot);
+    }
 }
 
 fn revoke_fleet_capability_proof_state(state: &mut FleetCapabilityProofState) {
@@ -410,6 +456,7 @@ fn publish_fleet_capability_probe_result(
                 .filter(|proof| proof.topology_fingerprint == topology_fingerprint && proof.peer_epochs.as_ref() == &peer_epochs)
             {
                 current.expires_at = observed_at + REMOTE_VERSION_STATE_PROOF_TTL;
+                state.published.notify_waiters();
                 return None;
             }
 
@@ -436,6 +483,7 @@ fn publish_fleet_capability_probe_result(
                 Arc::new(peer_epochs),
                 observed_at + REMOTE_VERSION_STATE_PROOF_TTL,
             ));
+            state.published.notify_waiters();
             None
         }
         Err(err) => {
@@ -451,6 +499,20 @@ pub(crate) fn acquire_remote_version_state_fleet_proof() -> Option<RemoteVersion
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(RemoteVersionStateFleetProofToken)
+}
+
+pub(crate) fn acquire_remote_version_state_writer_fleet_proof() -> Option<RemoteVersionStateFleetProofToken> {
+    let requested = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_WRITE,
+        rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE,
+    );
+    let fleet_confirmed = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+        rustfs_config::DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+    );
+    (requested && fleet_confirmed)
+        .then(acquire_remote_version_state_fleet_proof)
+        .flatten()
 }
 
 fn acquire_fleet_capability_proof_from(
@@ -501,6 +563,54 @@ pub fn acquire_cross_pool_fence_fleet_proof() -> Option<CrossPoolFenceFleetProof
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(CrossPoolFenceFleetProofToken)
+}
+
+async fn wait_for_fleet_capability_proof(
+    rx: &CancellationToken,
+    published: &Notify,
+    mut available: impl FnMut() -> bool,
+) -> bool {
+    loop {
+        let publication = published.notified();
+        tokio::pin!(publication);
+        // Register before checking authority: a publication between the check
+        // and the await must wake us even when no further probe is needed.
+        publication.as_mut().enable();
+        if rx.is_cancelled() {
+            return false;
+        }
+        if available() {
+            return true;
+        }
+        tokio::select! {
+            biased;
+            _ = rx.cancelled() => return false,
+            _ = publication => {}
+        }
+    }
+}
+
+/// Wait only for readiness; callers must reacquire and validate authority at
+/// their operation boundary because a published proof may already be revoked.
+pub(crate) async fn wait_for_cross_pool_fence_fleet_proof(rx: CancellationToken) -> bool {
+    let published = Arc::clone(
+        &cross_pool_fence_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .published,
+    );
+    wait_for_fleet_capability_proof(&rx, &published, || acquire_cross_pool_fence_fleet_proof().is_some()).await
+}
+
+/// Startup layout identity remains available when peers or the live fleet proof are unavailable.
+pub fn configured_fleet_topology_fingerprint() -> Option<&'static str> {
+    let state = cross_pool_fence_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.topology_conflict {
+        return None;
+    }
+    REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get().map(String::as_str)
 }
 
 pub fn cross_pool_fence_fleet_proof_matches(proof: &CrossPoolFenceFleetProofToken) -> bool {
@@ -927,8 +1037,8 @@ pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct CrossPoolFenceFleetProofGuard {
+#[cfg(any(test, feature = "test-util"))]
+pub struct CrossPoolFenceFleetProofGuard {
     previous_proof: Option<FleetCapabilityProof>,
     previous_topology_conflict: bool,
     previous_journal_proof: Option<FleetCapabilityProof>,
@@ -937,7 +1047,7 @@ pub(crate) struct CrossPoolFenceFleetProofGuard {
     previous_decommission_topology_conflict: bool,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for CrossPoolFenceFleetProofGuard {
     fn drop(&mut self) {
         let mut state = cross_pool_fence_fleet_proof_slot()
@@ -977,8 +1087,19 @@ impl Drop for CrossPoolFenceFleetProofGuard {
 
 /// Temporarily revoke the test proof so activation paths can exercise their
 /// fail-closed behavior without changing the process-wide topology binding.
+#[cfg(any(test, feature = "test-util"))]
+pub fn without_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceFleetProofGuard {
+    revoke_cross_pool_fence_fleet_proof_for_test(true)
+}
+
+/// Simulate peer unavailability while retaining the configured topology identity.
 #[cfg(test)]
-pub(crate) fn without_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceFleetProofGuard {
+pub(crate) fn without_live_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceFleetProofGuard {
+    revoke_cross_pool_fence_fleet_proof_for_test(false)
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn revoke_cross_pool_fence_fleet_proof_for_test(topology_conflict: bool) -> CrossPoolFenceFleetProofGuard {
     let mut state = cross_pool_fence_fleet_proof_slot()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1002,21 +1123,21 @@ pub(crate) fn without_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceF
             state.draining_generation = Some(proof.generation);
         }
     }
-    state.topology_conflict = true;
+    state.topology_conflict |= topology_conflict;
     if let Some(proof) = journal_state.proof.take() {
         proof.generation.revoke();
         if !proof.generation.is_drained() {
             journal_state.draining_generation = Some(proof.generation);
         }
     }
-    journal_state.topology_conflict = true;
+    journal_state.topology_conflict |= topology_conflict;
     if let Some(proof) = decommission_state.proof.take() {
         proof.generation.revoke();
         if !proof.generation.is_drained() {
             decommission_state.draining_generation = Some(proof.generation);
         }
     }
-    decommission_state.topology_conflict = true;
+    decommission_state.topology_conflict |= topology_conflict;
     guard
 }
 
@@ -1209,18 +1330,165 @@ fn insert_remote_version_state_peer(peer_epochs: &mut BTreeMap<String, Uuid>, pe
     Ok(())
 }
 
+/// Authority for one MRF lifecycle format transition. The permit remains
+/// owned by the publisher until every admitted disk operation has finished.
+pub struct MrfLifecycleWriterFleetProofToken {
+    token: FleetCapabilityProofToken,
+    _permit: FleetCapabilityProofPermit,
+    local_reader_max_format: u8,
+    expires_at: Instant,
+}
+
+tokio::task_local! {
+    static MRF_LIFECYCLE_PUBLICATION: Arc<MrfLifecycleWriterFleetProofToken>;
+}
+
+/// Carry one publication's authority into local disk executors. Native CAS
+/// workers retain the same permit after an async timeout or cancellation.
+pub async fn with_mrf_lifecycle_writer_fleet_proof<F: std::future::Future>(
+    proof: Arc<MrfLifecycleWriterFleetProofToken>,
+    future: F,
+) -> F::Output {
+    MRF_LIFECYCLE_PUBLICATION.scope(proof, future).await
+}
+
+pub(crate) fn current_mrf_lifecycle_publication() -> Option<Arc<MrfLifecycleWriterFleetProofToken>> {
+    MRF_LIFECYCLE_PUBLICATION.try_with(Arc::clone).ok()
+}
+
+pub fn mrf_lifecycle_writer_fleet_proof_current(proof: &MrfLifecycleWriterFleetProofToken) -> bool {
+    let Some(topology) = configured_fleet_topology_fingerprint() else {
+        return false;
+    };
+    let state = mrf_lifecycle_writer_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    mrf_lifecycle_writer_fleet_proof_matches_at(&state, proof, topology, Instant::now())
+}
+
+fn mrf_lifecycle_writer_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    MRF_LIFECYCLE_WRITER_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+pub fn mrf_lifecycle_reader_local_process_epoch() -> Uuid {
+    *MRF_LIFECYCLE_READER_LOCAL_PROCESS_EPOCH
+}
+
+/// The caller supplies its decoder's actual maximum, not a deployment setting.
+/// Operator opt-in and rollback qualification remain the caller's responsibility.
+pub async fn acquire_mrf_lifecycle_writer_fleet_proof(local_reader_max_format: u8) -> Option<MrfLifecycleWriterFleetProofToken> {
+    let expected_topology = configured_fleet_topology_fingerprint()?;
+    let observed_at = Instant::now();
+    let observed = observe_mrf_lifecycle_reader_fleet(expected_topology, local_reader_max_format).await;
+    if publish_fleet_capability_probe_result(mrf_lifecycle_writer_fleet_proof_slot(), expected_topology, observed, observed_at)
+        .is_some()
+    {
+        return None;
+    }
+    let state = mrf_lifecycle_writer_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    acquire_mrf_lifecycle_writer_fleet_proof_from(&state, expected_topology, local_reader_max_format, Instant::now())
+}
+
+fn acquire_mrf_lifecycle_writer_fleet_proof_from(
+    state: &FleetCapabilityProofState,
+    expected_topology: &str,
+    local_reader_max_format: u8,
+    now: Instant,
+) -> Option<MrfLifecycleWriterFleetProofToken> {
+    if local_reader_max_format < MRF_LIFECYCLE_WRITER_FORMAT_VERSION {
+        return None;
+    }
+    let token = acquire_fleet_capability_proof_from(state, expected_topology, now)?;
+    let permit = state.proof.as_ref()?.generation.try_acquire()?;
+    Some(MrfLifecycleWriterFleetProofToken {
+        token,
+        _permit: permit,
+        local_reader_max_format,
+        expires_at: state.proof.as_ref()?.expires_at,
+    })
+}
+
+fn mrf_lifecycle_writer_fleet_proof_matches_at(
+    state: &FleetCapabilityProofState,
+    proof: &MrfLifecycleWriterFleetProofToken,
+    expected_topology: &str,
+    now: Instant,
+) -> bool {
+    now < proof.expires_at
+        && proof._permit.generation.is_accepting()
+        && fleet_capability_proof_matches_at(state, &proof.token, expected_topology, now)
+        && state
+            .proof
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &proof._permit.generation))
+}
+
+/// Reobserve every member before a manifest commit. No proof-slot lock is held
+/// during network I/O, and any failed or changed observation revokes admission.
+pub async fn mrf_lifecycle_writer_fleet_proof_matches(proof: &MrfLifecycleWriterFleetProofToken) -> bool {
+    let Some(expected_topology) = configured_fleet_topology_fingerprint() else {
+        return false;
+    };
+    {
+        let state = mrf_lifecycle_writer_fleet_proof_slot()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !mrf_lifecycle_writer_fleet_proof_matches_at(&state, proof, expected_topology, Instant::now()) {
+            return false;
+        }
+    }
+    let observed = observe_mrf_lifecycle_reader_fleet(expected_topology, proof.local_reader_max_format).await;
+    let mut state = mrf_lifecycle_writer_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !observed.is_ok_and(|observed| observed == *proof.token.peer_epochs) {
+        revoke_fleet_capability_proof_state(&mut state);
+        return false;
+    }
+    mrf_lifecycle_writer_fleet_proof_matches_at(&state, proof, expected_topology, Instant::now())
+}
+
+async fn observe_mrf_lifecycle_reader_fleet(
+    topology_fingerprint: &str,
+    local_reader_max_format: u8,
+) -> Result<BTreeMap<String, Uuid>> {
+    let notification_sys =
+        get_global_notification_sys().ok_or_else(|| Error::other("MRF lifecycle reader fleet is not initialized"))?;
+    timeout(
+        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+        notification_sys.probe_mrf_lifecycle_reader_fleet(topology_fingerprint, local_reader_max_format),
+    )
+    .await
+    .map_err(|_| Error::other("MRF lifecycle reader fleet probe timed out"))?
+}
+
+fn mrf_lifecycle_reader_epoch_map(
+    expected_remote_members: &[String],
+    local_member: String,
+    local_reader_max_format: u8,
+    remote_readers: Vec<(String, u8, Uuid)>,
+) -> Result<BTreeMap<String, Uuid>> {
+    if local_member.trim().is_empty() || local_reader_max_format < MRF_LIFECYCLE_WRITER_FORMAT_VERSION {
+        return Err(Error::other("MRF lifecycle local reader does not support the writer format"));
+    }
+    let mut peer_epochs = BTreeMap::new();
+    insert_remote_version_state_peer(&mut peer_epochs, local_member.clone(), mrf_lifecycle_reader_local_process_epoch())?;
+    for (member, maximum_format, epoch) in remote_readers {
+        if maximum_format < MRF_LIFECYCLE_WRITER_FORMAT_VERSION {
+            return Err(Error::other("MRF lifecycle peer reader does not support the writer format"));
+        }
+        insert_remote_version_state_peer(&mut peer_epochs, member, epoch)?;
+    }
+    validate_capability_fleet_members(expected_remote_members, &local_member, &peer_epochs)?;
+    Ok(peer_epochs)
+}
+
 pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
     if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.set(topology_fingerprint.clone()).is_err() {
         if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() != Some(&topology_fingerprint) {
-            for slot in [
-                remote_version_state_fleet_proof_slot(),
-                cross_pool_fence_fleet_proof_slot(),
-                tier_delete_journal_fleet_proof_slot(),
-                decommission_target_fence_fleet_proof_slot(),
-                legacy_transition_state_reconcile_fleet_proof_slot(),
-                ilm_recovery_export_fleet_proof_slot(),
-                transition_transaction_compaction_fleet_proof_slot(),
-            ] {
+            for slot in all_fleet_capability_proof_slots() {
                 mark_fleet_capability_topology_conflict(slot);
             }
         }
@@ -1228,53 +1496,59 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
     }
 
     tokio::spawn(async move {
+        let mut notification_sys_unavailable_logged = false;
         loop {
-            let notification_sys = get_global_notification_sys();
-            let remote_version_state_probe = async {
-                match notification_sys.as_ref() {
-                    Some(notification_sys) => timeout(
-                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
-                        notification_sys.probe_remote_version_state_fleet(&topology_fingerprint),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(Error::other("remote version state fleet capability probe timed out"))),
-                    None => Err(Error::other("remote version state fleet capability notification system is unavailable")),
+            let Some(notification_sys) = get_global_notification_sys() else {
+                // Startup publishes the notification system after this probe
+                // is started. Stay failed closed, but retry on the bootstrap
+                // cadence so a single node gains its capabilities as soon as
+                // the system appears instead of one full probe interval later.
+                revoke_all_fleet_capability_proofs();
+                if !notification_sys_unavailable_logged {
+                    notification_sys_unavailable_logged = true;
+                    debug!(
+                        event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        state = "waiting_for_notification_system",
+                        "notification capability probe"
+                    );
                 }
+                let _ = timeout(REMOTE_VERSION_STATE_PROBE_BOOTSTRAP_INTERVAL, NOTIFICATION_SYS_PUBLISHED.notified()).await;
+                continue;
+            };
+            notification_sys_unavailable_logged = false;
+            let remote_version_state_probe = async {
+                timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_remote_version_state_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("remote version state fleet capability probe timed out")))
             };
             let cross_pool_fence_probe = async {
-                match notification_sys.as_ref() {
-                    Some(notification_sys) => timeout(
-                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
-                        notification_sys.probe_cross_pool_fence_fleet(&topology_fingerprint),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out"))),
-                    None => Err(Error::other("cross-pool fence fleet capability notification system is unavailable")),
-                }
+                timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_cross_pool_fence_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out")))
             };
             let recovery_export_probe = async {
-                match notification_sys.as_ref() {
-                    Some(notification_sys) => timeout(
-                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
-                        notification_sys.probe_ilm_recovery_export_fleet(&topology_fingerprint),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(Error::other("ILM recovery export fleet capability probe timed out"))),
-                    None => Err(Error::other("ILM recovery export fleet capability notification system is unavailable")),
-                }
+                timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_ilm_recovery_export_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("ILM recovery export fleet capability probe timed out")))
             };
             let transition_transaction_compaction_probe = async {
-                match notification_sys.as_ref() {
-                    Some(notification_sys) => timeout(
-                        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
-                        notification_sys.probe_transition_transaction_compaction_fleet(&topology_fingerprint),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(Error::other("transition transaction compaction fleet capability probe timed out"))),
-                    None => Err(Error::other(
-                        "transition transaction compaction fleet capability notification system is unavailable",
-                    )),
-                }
+                timeout(
+                    REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+                    notification_sys.probe_transition_transaction_compaction_fleet(&topology_fingerprint),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::other("transition transaction compaction fleet capability probe timed out")))
             };
             let (result, fence_probe, recovery_export_result, transition_transaction_compaction_result) = tokio::join!(
                 remote_version_state_probe,
@@ -1299,13 +1573,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .topology_conflict;
             if topology_conflict {
-                revoke_fleet_capability_proof(remote_version_state_fleet_proof_slot());
-                revoke_fleet_capability_proof(cross_pool_fence_fleet_proof_slot());
-                revoke_fleet_capability_proof(tier_delete_journal_fleet_proof_slot());
-                revoke_fleet_capability_proof(decommission_target_fence_fleet_proof_slot());
-                revoke_fleet_capability_proof(legacy_transition_state_reconcile_fleet_proof_slot());
-                revoke_fleet_capability_proof(ilm_recovery_export_fleet_proof_slot());
-                revoke_fleet_capability_proof(transition_transaction_compaction_fleet_proof_slot());
+                revoke_all_fleet_capability_proofs();
             } else if let Some(err) = publish_fleet_capability_probe_result(
                 remote_version_state_fleet_proof_slot(),
                 &topology_fingerprint,
@@ -1428,9 +1696,11 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
 }
 
 pub async fn new_global_notification_sys(eps: EndpointServerPools) -> Result<()> {
-    let _ = GLOBAL_NOTIFICATION_SYS
-        .set(Arc::new(NotificationSys::new(eps).await))
-        .map_err(|_| Error::other("init notification_sys fail"));
+    if GLOBAL_NOTIFICATION_SYS.set(Arc::new(NotificationSys::new(eps).await)).is_ok() {
+        // `notify_one` stores a permit, so a probe that checks availability
+        // just before this publication still wakes without losing the signal.
+        NOTIFICATION_SYS_PUBLISHED.notify_one();
+    }
     Ok(())
 }
 
@@ -1535,6 +1805,25 @@ impl NotificationSys {
         Ok((peer_epochs, minimum_version))
     }
 
+    async fn probe_mrf_lifecycle_reader_fleet(
+        &self,
+        topology_fingerprint: &str,
+        local_reader_max_format: u8,
+    ) -> Result<BTreeMap<String, Uuid>> {
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            return Err(Error::other("MRF lifecycle reader fleet membership is incomplete"));
+        }
+        let local_member = runtime_sources::local_node_name().await;
+        let probes = self.peer_clients.iter().map(|client| async {
+            let client = client
+                .as_ref()
+                .ok_or_else(|| Error::other("MRF lifecycle reader peer is unreachable"))?;
+            client.probe_mrf_lifecycle_reader(topology_fingerprint.to_string()).await
+        });
+        let readers = join_all(probes).await.into_iter().collect::<Result<Vec<_>>>()?;
+        mrf_lifecycle_reader_epoch_map(&self.peer_topology_hosts, local_member, local_reader_max_format, readers)
+    }
+
     async fn probe_ilm_recovery_export_fleet(&self, topology_fingerprint: &str) -> Result<BTreeMap<String, Uuid>> {
         if self.peer_clients.len() != self.peer_topology_hosts.len() {
             return Err(Error::other("ILM recovery export capability fleet membership is incomplete"));
@@ -1555,12 +1844,12 @@ impl NotificationSys {
             let (peer, epoch) = result?;
             insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
         }
-        validate_ilm_recovery_export_members(&self.peer_topology_hosts, &local_member, &peer_epochs)?;
+        validate_capability_fleet_members(&self.peer_topology_hosts, &local_member, &peer_epochs)?;
         Ok(peer_epochs)
     }
 }
 
-fn validate_ilm_recovery_export_members(
+fn validate_capability_fleet_members(
     expected_remote_members: &[String],
     local_member: &str,
     observed: &BTreeMap<String, Uuid>,
@@ -1571,7 +1860,7 @@ fn validate_ilm_recovery_export_members(
         .chain(std::iter::once(local_member.to_string()))
         .collect::<BTreeSet<_>>();
     if expected.len() != expected_remote_members.len().saturating_add(1) || observed.keys().ne(expected.iter()) {
-        return Err(Error::other("ILM recovery export capability fleet membership does not match topology"));
+        return Err(Error::other("fleet capability membership does not match topology"));
     }
     Ok(())
 }
@@ -2417,30 +2706,11 @@ impl NotificationSys {
             None => store.current_rebalance_id().await,
         };
         match store.stop_rebalance_for_id(local_rebalance_id.as_deref()).await {
-            Ok(_) => {
-                let save_result = match local_rebalance_id.as_deref() {
-                    Some(expected_id) => {
-                        store
-                            .save_rebalance_stats_for_id(usize::MAX, RebalSaveOpt::StoppedAt, expected_id)
-                            .await
-                    }
-                    None => Ok(()),
-                };
-                if let Err(err) = save_result {
-                    error!(
-                        event = EVENT_NOTIFICATION_PEER_PROPAGATION,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
-                        action = "stop_rebalance",
-                        result = "local_save_failed",
-                        error = %err,
-                        "notification peer propagation"
-                    );
-                    return Err(Error::other(format!(
-                        "local stop_rebalance save_rebalance_stats(stopped_at) failed: {err}"
-                    )));
-                }
-            }
+            // `stop_rebalance_for_id` durably saves the terminal snapshot after
+            // activation readers drain. Do not acquire the same metadata lock
+            // again for an equivalent `StoppedAt` save while cleanup is still
+            // releasing its own metadata work.
+            Ok(_) => {}
             Err(err) => {
                 error!(
                     event = EVENT_NOTIFICATION_PEER_PROPAGATION,
@@ -2871,7 +3141,22 @@ impl NotificationSys {
     /// pin movement on one peer.
     pub async fn acquire_scanner_publication_leases(
         &self,
+        targets: Vec<(String, String, u64)>,
+    ) -> Result<Vec<ScannerPublicationLeaseGrant>> {
+        self.acquire_scanner_publication_leases_with_purpose(targets, false).await
+    }
+
+    pub async fn acquire_observational_scanner_publication_leases(
+        &self,
+        targets: Vec<(String, String, u64)>,
+    ) -> Result<Vec<ScannerPublicationLeaseGrant>> {
+        self.acquire_scanner_publication_leases_with_purpose(targets, true).await
+    }
+
+    async fn acquire_scanner_publication_leases_with_purpose(
+        &self,
         mut targets: Vec<(String, String, u64)>,
+        observational_only: bool,
     ) -> Result<Vec<ScannerPublicationLeaseGrant>> {
         targets.sort_by(|left, right| left.0.cmp(&right.0));
         for pair in targets.windows(2) {
@@ -2892,11 +3177,14 @@ impl NotificationSys {
                 let _ = self.release_scanner_publication_leases(grants).await;
                 return Err(Error::other(format!("scanner publication lease peer {host} is unavailable")));
             };
-            match client.acquire_scanner_publication_lease(&session_id, generation).await {
+            match client
+                .acquire_scanner_publication_lease(&session_id, generation, observational_only)
+                .await
+            {
                 Ok(lease) => grants.push(ScannerPublicationLeaseGrant { host, lease }),
                 Err(err) => {
                     let _ = self.release_scanner_publication_leases(grants).await;
-                    return Err(Error::other(format!("scanner publication lease acquisition failed: {err}")));
+                    return Err(scanner_publication_lease_acquisition_error(&host, observational_only, err));
                 }
             }
         }
@@ -3895,6 +4183,22 @@ mod tests {
     use crate::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
     use rustfs_data_usage::TierStats;
 
+    #[test]
+    fn scanner_lease_acquisition_error_identifies_peer_and_preserves_retry_suffix() {
+        for (observational_only, purpose) in [(false, "authoritative"), (true, "observational")] {
+            let reason = "scanner publication lease is blocked by pending namespace commit";
+            let error = scanner_publication_lease_acquisition_error(
+                "peer-a.example.invalid:9000",
+                observational_only,
+                Error::other(reason),
+            )
+            .to_string();
+            assert!(error.contains("peer-a.example.invalid:9000"), "missing peer: {error}");
+            assert!(error.contains(purpose), "missing purpose: {error}");
+            assert!(error.ends_with(reason), "retry classification must retain the original suffix");
+        }
+    }
+
     fn ring(total_size: u64) -> LastDayTierStats {
         let mut stats = LastDayTierStats::default();
         stats.add_stats(TierStats {
@@ -3903,6 +4207,49 @@ mod tests {
             num_objects: 1,
         });
         stats
+    }
+
+    /// rustfs/rustfs#8014: IAM finalization starts the fleet probe before the
+    /// notification system is published. The first probe therefore fails
+    /// closed, and a single node used to wait a full probe interval before the
+    /// durable quota capability appeared, even though `/health` was already
+    /// reporting ok. The probe must retry promptly while it waits for startup
+    /// to publish the notification system.
+    #[tokio::test]
+    async fn fleet_probe_publishes_promptly_once_the_notification_system_appears() {
+        if REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get().is_some() || GLOBAL_NOTIFICATION_SYS.get().is_some() {
+            // Process-wide state was bound by another test in this binary. The
+            // startup ordering under test needs a fresh process; nextest
+            // (the authoritative runner) always provides one.
+            eprintln!("skipping: fleet probe globals already bound in this process");
+            return;
+        }
+
+        // Share the fingerprint every other proof-installing test in this crate
+        // binds, so the plain `cargo test` fallback cannot see two topologies.
+        start_remote_version_state_fleet_probe("object-transaction-fencing-test".to_string());
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            acquire_cross_pool_fence_fleet_proof().is_none(),
+            "no capability proof may exist before the notification system is published"
+        );
+
+        let published_at = Instant::now();
+        new_global_notification_sys(EndpointServerPools::default())
+            .await
+            .expect("single-node notification system initializes");
+
+        let observed = timeout(Duration::from_secs(2), async {
+            while acquire_cross_pool_fence_fleet_proof().is_none() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            observed.is_ok(),
+            "single-node cross-pool fence proof should publish within 2s of the notification system, waited {:?}",
+            published_at.elapsed()
+        );
     }
 
     #[test]
@@ -3984,6 +4331,228 @@ mod tests {
     }
 
     #[test]
+    fn mrf_lifecycle_writer_requires_every_reader_and_the_local_decoder() {
+        let expected = vec!["peer-a".to_owned(), "peer-b".to_owned()];
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let readers = vec![("peer-a".to_owned(), 2, a), ("peer-b".to_owned(), 3, b)];
+        let observed = mrf_lifecycle_reader_epoch_map(&expected, "local".to_owned(), 2, readers.clone())
+            .expect("all members have compatible readers");
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed["local"], mrf_lifecycle_reader_local_process_epoch());
+        assert_eq!(observed["peer-a"], a);
+        for version in [0, 1] {
+            assert!(mrf_lifecycle_reader_epoch_map(&expected, "local".to_owned(), version, readers.clone()).is_err());
+            let mut old_peer = readers.clone();
+            old_peer[0].1 = version;
+            assert!(mrf_lifecycle_reader_epoch_map(&expected, "local".to_owned(), 2, old_peer).is_err());
+        }
+        for invalid in [
+            vec![readers[0].clone()],
+            vec![("unknown".to_owned(), 2, a), readers[1].clone()],
+            vec![readers[0].clone(), ("peer-a".to_owned(), 2, b)],
+            vec![readers[0].clone(), ("peer-b".to_owned(), 2, a)],
+            vec![readers[0].clone(), ("peer-b".to_owned(), 2, Uuid::nil())],
+            vec![
+                readers[0].clone(),
+                ("peer-b".to_owned(), 2, mrf_lifecycle_reader_local_process_epoch()),
+            ],
+        ] {
+            assert!(mrf_lifecycle_reader_epoch_map(&expected, "local".to_owned(), 2, invalid).is_err());
+        }
+        assert!(mrf_lifecycle_reader_epoch_map(&expected, "".to_owned(), 2, readers).is_err());
+        let single = mrf_lifecycle_reader_epoch_map(&[], "local".to_owned(), 2, Vec::new())
+            .expect("a single node must still prove its local decoder and epoch");
+        assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn mrf_lifecycle_writer_rejects_expired_failed_and_conflicting_proofs() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let peers = BTreeMap::from([("local".to_owned(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology", Ok(peers), now).is_none());
+        let token = {
+            let state = slot.read().expect("proof state");
+            assert!(acquire_mrf_lifecycle_writer_fleet_proof_from(&state, "topology", 1, now).is_none());
+            assert!(acquire_mrf_lifecycle_writer_fleet_proof_from(&state, "other-topology", 2, now).is_none());
+            let token = acquire_mrf_lifecycle_writer_fleet_proof_from(&state, "topology", 2, now)
+                .expect("compatible current observation");
+            assert!(mrf_lifecycle_writer_fleet_proof_matches_at(&state, &token, "topology", now));
+            assert!(!mrf_lifecycle_writer_fleet_proof_matches_at(
+                &state,
+                &token,
+                "topology",
+                now + REMOTE_VERSION_STATE_PROOF_TTL,
+            ));
+            token
+        };
+        assert!(publish_fleet_capability_probe_result(&slot, "topology", Err(Error::other("old reader")), now).is_some());
+        let state = slot.read().expect("revoked proof state");
+        assert!(!mrf_lifecycle_writer_fleet_proof_matches_at(&state, &token, "topology", now));
+        assert!(acquire_mrf_lifecycle_writer_fleet_proof_from(&state, "topology", 2, now).is_none());
+        assert!(state.draining_generation.is_some());
+        drop(state);
+        drop(token);
+        mark_fleet_capability_topology_conflict(&slot);
+        let state = slot.read().expect("conflicting topology state");
+        assert!(acquire_mrf_lifecycle_writer_fleet_proof_from(&state, "topology", 2, now).is_none());
+    }
+
+    #[test]
+    fn mrf_lifecycle_writer_refresh_cannot_extend_an_existing_publication() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let peers = BTreeMap::from([("local".to_owned(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology", Ok(peers.clone()), now).is_none());
+        let old = acquire_mrf_lifecycle_writer_fleet_proof_from(&slot.read().expect("proof state"), "topology", 2, now)
+            .expect("first publication");
+        let refreshed_at = now + REMOTE_VERSION_STATE_PROOF_TTL;
+        assert!(publish_fleet_capability_probe_result(&slot, "topology", Ok(peers), refreshed_at).is_none());
+        let state = slot.read().expect("refreshed proof state");
+        let current = acquire_mrf_lifecycle_writer_fleet_proof_from(&state, "topology", 2, refreshed_at)
+            .expect("a new publication can use the fresh observation");
+        assert!(mrf_lifecycle_writer_fleet_proof_matches_at(&state, &current, "topology", refreshed_at));
+        assert!(!mrf_lifecycle_writer_fleet_proof_matches_at(&state, &old, "topology", refreshed_at));
+    }
+
+    #[test]
+    fn mrf_lifecycle_writer_restart_waits_for_the_previous_publication() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let peers = BTreeMap::from([("local".to_owned(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology", Ok(peers), now).is_none());
+        let token = acquire_mrf_lifecycle_writer_fleet_proof_from(&slot.read().expect("proof state"), "topology", 2, now)
+            .expect("first publication permit");
+        let restarted = BTreeMap::from([("local".to_owned(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology", Ok(restarted.clone()), now).is_some());
+        {
+            let state = slot.read().expect("draining proof state");
+            assert!(!mrf_lifecycle_writer_fleet_proof_matches_at(&state, &token, "topology", now));
+            assert!(acquire_mrf_lifecycle_writer_fleet_proof_from(&state, "topology", 2, now).is_none());
+        }
+        drop(token);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology", Ok(restarted.clone()), now).is_none());
+        let state = slot.read().expect("successor proof state");
+        let successor = acquire_mrf_lifecycle_writer_fleet_proof_from(&state, "topology", 2, now)
+            .expect("successor may be admitted after the old disk operations finish");
+        assert_eq!(*successor.token.peer_epochs, restarted);
+        assert!(mrf_lifecycle_writer_fleet_proof_matches_at(&state, &successor, "topology", now));
+    }
+
+    #[tokio::test]
+    async fn mrf_lifecycle_writer_probe_rejects_missing_or_unreachable_members() {
+        for peer_clients in [Vec::new(), vec![None]] {
+            let notification_sys = NotificationSys {
+                peer_clients,
+                all_peer_clients: vec![None],
+                peer_topology_hosts: vec!["peer-a".to_owned()],
+                peer_admin_caches: Vec::new(),
+                tier_config_reload_workers: Default::default(),
+            };
+            assert!(
+                notification_sys
+                    .probe_mrf_lifecycle_reader_fleet("topology", 2)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mrf_lifecycle_writer_native_cas_retains_authority_after_timeout_or_cancellation() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use crate::disk::{RUSTFS_META_BUCKET, disk_store::LocalDiskWrapper, local::LocalDisk};
+        use crate::layout::endpoint::Endpoint;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
+            let topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get_or_init(|| "mrf-cas-test".to_owned());
+            let slot = mrf_lifecycle_writer_fleet_proof_slot();
+            for cancel_waiter in [true, false] {
+                let root = tempfile::tempdir().expect("isolated CAS fixture");
+                let endpoint = Endpoint::try_from(root.path().to_str().expect("fixture path")).expect("local endpoint");
+                let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+                let volume = disk.make_volume(RUSTFS_META_BUCKET).await;
+                assert!(
+                    matches!(volume, Ok(()) | Err(crate::disk::error::Error::VolumeExists)),
+                    "metadata volume: {volume:?}"
+                );
+                let relative = "mrf-authority";
+                let path = disk
+                    .get_object_path_for_io(RUSTFS_META_BUCKET, relative)
+                    .expect("native CAS publication path");
+                std::fs::write(&path, b"old").expect("old committed file");
+                let peers = BTreeMap::from([("local".to_owned(), Uuid::new_v4())]);
+                assert!(publish_fleet_capability_probe_result(slot, topology, Ok(peers), Instant::now()).is_none());
+                let proof = Arc::new(
+                    acquire_mrf_lifecycle_writer_fleet_proof_from(
+                        &slot.read().expect("proof state"),
+                        topology,
+                        2,
+                        Instant::now(),
+                    )
+                    .expect("publication permit"),
+                );
+                let weak = Arc::downgrade(&proof);
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let _hook = hooks::install_at(hooks::Stage::Rename, &path, move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                });
+                let wrapper = LocalDiskWrapper::new(disk, false);
+                let mut write = Box::pin(with_mrf_lifecycle_writer_fleet_proof(
+                    proof,
+                    wrapper.compare_and_update_file(
+                        RUSTFS_META_BUCKET,
+                        relative,
+                        Some(Bytes::from_static(b"old")),
+                        Some(Bytes::from_static(b"new")),
+                    ),
+                ));
+                timeout(Duration::from_secs(10), async {
+                    tokio::select! {
+                        result = entered_rx => result.expect("native CAS reached publication"),
+                        result = write.as_mut() => panic!("CAS returned before publication: {result:?}"),
+                    }
+                })
+                .await
+                .expect("native CAS boundary");
+                if cancel_waiter {
+                    drop(write);
+                } else {
+                    tokio::time::pause();
+                    tokio::time::advance(Duration::from_secs(61)).await;
+                    tokio::time::resume();
+                    let error = timeout(Duration::from_secs(5), write)
+                        .await
+                        .expect("disk deadline is bounded")
+                        .expect_err("blocked CAS must time out");
+                    assert_eq!(error, crate::disk::error::Error::Timeout);
+                }
+                assert!(weak.upgrade().is_some(), "the native worker still owns the permit");
+                let restarted = BTreeMap::from([("local".to_owned(), Uuid::new_v4())]);
+                assert!(publish_fleet_capability_probe_result(slot, topology, Ok(restarted.clone()), Instant::now()).is_some());
+                assert_eq!(std::fs::read(&path).expect("old file retained while blocked"), b"old");
+                drop(release_tx);
+                timeout(Duration::from_secs(5), async {
+                    while weak.upgrade().is_some() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("native worker drains");
+                assert_eq!(std::fs::read(&path).expect("revoked writer cannot publish"), b"old");
+                assert!(publish_fleet_capability_probe_result(slot, topology, Ok(restarted), Instant::now()).is_none());
+                revoke_fleet_capability_proof(slot);
+            }
+        })
+        .await;
+    }
+
+    #[test]
     fn remote_version_state_fleet_proof_rejects_stale_or_mismatched_membership() {
         let now = Instant::now();
         let mut peer_epochs = BTreeMap::new();
@@ -3994,6 +4563,134 @@ mod tests {
         assert!(!fleet_capability_proof_valid_at(Some(&proof), "topology-b", now));
         assert!(!fleet_capability_proof_valid_at(Some(&proof), "topology-a", proof.expires_at));
         assert!(!fleet_capability_proof_valid_at(None, "topology-a", now));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fleet_proof_wait_observes_publication_before_waiting() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(BTreeMap::new()), Instant::now()).is_none());
+        let published = Arc::clone(&slot.read().expect("proof state should be readable").published);
+        let started_at = tokio::time::Instant::now();
+        assert!(
+            wait_for_fleet_capability_proof(&CancellationToken::new(), &published, || {
+                acquire_fleet_capability_proof_from(
+                    &slot.read().expect("proof state should be readable"),
+                    "topology-a",
+                    Instant::now(),
+                )
+                .is_some()
+            })
+            .await
+        );
+        assert_eq!(tokio::time::Instant::now(), started_at);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fleet_proof_wait_cannot_lose_publication_between_registration_and_check() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let published = Arc::clone(&slot.read().expect("proof state should be readable").published);
+        let mut checks = 0;
+        let ready = timeout(
+            Duration::from_secs(1),
+            wait_for_fleet_capability_proof(&CancellationToken::new(), &published, || {
+                checks += 1;
+                if checks == 1 {
+                    // The authority check saw no proof immediately before the
+                    // publisher ran. There will be no second publication.
+                    assert!(
+                        publish_fleet_capability_probe_result(&slot, "topology-a", Ok(BTreeMap::new()), Instant::now()).is_none()
+                    );
+                    return false;
+                }
+                acquire_fleet_capability_proof_from(
+                    &slot.read().expect("proof state should be readable"),
+                    "topology-a",
+                    Instant::now(),
+                )
+                .is_some()
+            }),
+        )
+        .await
+        .expect("the single publication must wake the registered waiter");
+        assert!(ready);
+        assert_eq!(checks, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fleet_proof_wait_revalidates_authority_without_polling() {
+        let slot = Arc::new(std::sync::RwLock::new(FleetCapabilityProofState::default()));
+        let published = Arc::clone(&slot.read().expect("proof state should be readable").published);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let rx = CancellationToken::new();
+        let task = tokio::spawn({
+            let slot = slot.clone();
+            let published = published.clone();
+            let checks = checks.clone();
+            async move {
+                wait_for_fleet_capability_proof(&rx, &published, || {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    acquire_fleet_capability_proof_from(
+                        &slot.read().expect("proof state should be readable"),
+                        "topology-a",
+                        Instant::now(),
+                    )
+                    .is_some()
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(300)).await;
+        assert_eq!(checks.load(Ordering::SeqCst), 1, "missing proof must sleep until publication");
+
+        assert!(
+            publish_fleet_capability_probe_result(
+                &slot,
+                "topology-a",
+                Ok(BTreeMap::new()),
+                Instant::now() - REMOTE_VERSION_STATE_PROOF_TTL,
+            )
+            .is_none()
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert!(!task.is_finished(), "a published but expired proof must not authorize recovery");
+
+        slot.write().expect("proof state should be writable").topology_conflict = true;
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(BTreeMap::new()), Instant::now()).is_none());
+        tokio::task::yield_now().await;
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+        assert!(!task.is_finished(), "a publication must not bypass conflicting topology");
+
+        slot.write().expect("proof state should be writable").topology_conflict = false;
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(BTreeMap::new()), Instant::now()).is_none());
+        assert!(task.await.expect("a renewed valid proof should release the waiter"));
+        assert_eq!(checks.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fleet_proof_wait_cancels_without_publication() {
+        let rx = CancellationToken::new();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let rx = rx.clone();
+            let checks = checks.clone();
+            async move {
+                wait_for_fleet_capability_proof(&rx, &Notify::new(), || {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    false
+                })
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        let cancelled_at = tokio::time::Instant::now();
+        rx.cancel();
+        assert!(!task.await.expect("proof wait must observe cancellation"));
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert_eq!(tokio::time::Instant::now(), cancelled_at);
     }
 
     #[test]
@@ -4064,12 +4761,12 @@ mod tests {
             (local.to_string(), Uuid::new_v4()),
             (expected_remote[0].clone(), Uuid::new_v4()),
         ]);
-        assert!(validate_ilm_recovery_export_members(&expected_remote, local, &complete).is_ok());
+        assert!(validate_capability_fleet_members(&expected_remote, local, &complete).is_ok());
 
         let unexpected = BTreeMap::from([(local.to_string(), Uuid::new_v4()), ("node-c".to_string(), Uuid::new_v4())]);
-        assert!(validate_ilm_recovery_export_members(&expected_remote, local, &unexpected).is_err());
+        assert!(validate_capability_fleet_members(&expected_remote, local, &unexpected).is_err());
         assert!(
-            validate_ilm_recovery_export_members(&[local.to_string()], local, &complete).is_err(),
+            validate_capability_fleet_members(&[local.to_string()], local, &complete).is_err(),
             "the configured remote set cannot repeat the local member"
         );
     }
@@ -4549,6 +5246,7 @@ mod tests {
             )),
             draining_generation: None,
             topology_conflict: false,
+            ..Default::default()
         };
         assert!(acquire_fleet_capability_proof_from(&state, "topology-a", now).is_some());
 
@@ -4888,6 +5586,7 @@ mod tests {
                 lease: ScannerPublicationLease {
                     token: Uuid::new_v4(),
                     movement_generation: 3,
+                    observational_only: false,
                     owner_id: Uuid::new_v4().to_string(),
                     session_id: "session-a".to_string(),
                     expires_at: Instant::now() + Duration::from_secs(30),

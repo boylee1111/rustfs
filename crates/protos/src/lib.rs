@@ -25,8 +25,8 @@ use rustfs_common::{cache_connection, cached_connection, evict_connection_with_l
 use std::{
     collections::HashMap,
     error::Error,
-    sync::LazyLock,
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+    sync::{Arc, LazyLock, Mutex as StdMutex, Weak},
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -44,6 +44,37 @@ pub type NodeServiceClientType = NodeServiceClient<
 >;
 
 pub use generated::*;
+
+impl std::fmt::Debug for proto_gen::node_service::RenameDataResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RenameDataResponse")
+            .field("success", &self.success)
+            .field("payload", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for proto_gen::node_service::RecoverMultipartSourceRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoverMultipartSourceRequest")
+            .field("protocol_version", &self.protocol_version)
+            .field("operation", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for proto_gen::node_service::RecoverMultipartSourceResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoverMultipartSourceResponse")
+            .field("success", &self.success)
+            .field("protocol_version", &self.protocol_version)
+            .field("result", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
 pub use rustfs_common::ConnectionEvictionLogLevel;
 
 // Default 100 MB
@@ -59,6 +90,44 @@ const INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET: u8 = 0;
 const INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE: u8 = 1;
 const INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE: u8 = 2;
 static TLS_GENERATION_CACHE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+// Lock order: generation metadata, then the common connection cache. The dial
+// registry's standard mutex is released before waiting on any async lock.
+static DIAL_LOCK_REGISTRY: LazyLock<StdMutex<HashMap<String, Weak<Mutex<()>>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+struct DialLock {
+    key: String,
+    mutex: Arc<Mutex<()>>,
+}
+
+impl DialLock {
+    fn for_key(key: &str) -> Self {
+        let mut registry = DIAL_LOCK_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, lock| lock.strong_count() != 0);
+        let mutex = registry.get(key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let mutex = Arc::new(Mutex::new(()));
+            registry.insert(key.to_string(), Arc::downgrade(&mutex));
+            mutex
+        });
+        Self {
+            key: key.to_string(),
+            mutex,
+        }
+    }
+}
+
+impl Drop for DialLock {
+    fn drop(&mut self) {
+        let mut registry = DIAL_LOCK_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Arc::strong_count(&self.mutex) == 1
+            && registry
+                .get(&self.key)
+                .is_some_and(|slot| Weak::ptr_eq(slot, &Arc::downgrade(&self.mutex)))
+        {
+            registry.remove(&self.key);
+        }
+    }
+}
+
 static INTERNODE_RPC_MSGPACK_ONLY_CACHE: AtomicU8 = AtomicU8::new(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET);
 
 fn enforce_tls_generation_cache_bound(generation_cache: &mut HashMap<String, u64>, generation: u64, addr: &str) {
@@ -172,9 +241,14 @@ pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SI
 pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 3;
 pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
 pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
-pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v3\0";
+// v4 is an admission boundary, not a transport version bump. A peer that
+// cannot recognize this probe must fail the Admin Heal capability preflight;
+// accepting the older v3 probe would allow an upgraded node to silently lose
+// newly validated request semantics during a rolling upgrade.
+pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v4\0";
 pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
 pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
+pub const MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-mrf-lifecycle-reader-capability-v1\0";
 pub const ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-ilm-recovery-export-capability-v1\0";
 pub const TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX: &[u8] =
     b"rustfs-transition-transaction-compaction-capability-v1\0";
@@ -244,6 +318,30 @@ pub fn transition_transaction_compaction_capability_probe(nonce: &[u8; 16]) -> V
 pub fn is_transition_transaction_compaction_capability_probe(command: &[u8]) -> bool {
     command.len() == TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX.len() + 16
         && command.starts_with(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn mrf_lifecycle_reader_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_mrf_lifecycle_reader_capability_probe(command: &[u8]) -> bool {
+    command.len() == MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn encode_mrf_lifecycle_reader_capability(
+    maximum_format_version: u8,
+    topology_member: &str,
+    process_epoch: &[u8; 16],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let identity = encode_remote_version_state_capability(topology_member, process_epoch)?;
+    let mut result = Vec::with_capacity(1 + identity.len());
+    result.push(maximum_format_version);
+    result.extend_from_slice(&identity);
+    Ok(result)
 }
 
 pub fn encode_remote_version_state_capability(
@@ -318,7 +416,7 @@ pub fn canonical_heal_control_capability_ack(
     topology_fingerprint: &str,
     probe: &[u8],
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v3\0";
+    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v4\0";
 
     let fingerprint = topology_fingerprint.as_bytes();
     let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + probe.len());
@@ -606,11 +704,17 @@ pub fn canonical_scanner_dirty_usage_snapshot_response_body(
 pub fn canonical_scanner_publication_lease_request_body(
     request: &proto_gen::node_service::ScannerPublicationLeaseRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-request-v1\0";
+    const STRICT_DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-request-v1\0";
+    const OBSERVATIONAL_DOMAIN: &[u8] = b"rustfs-scanner-observed-usage-lease-request-v1\0";
+    let domain = if request.observational_only {
+        OBSERVATIONAL_DOMAIN
+    } else {
+        STRICT_DOMAIN
+    };
     let challenge = request.challenge.as_ref();
     let session_id = request.expected_session_id.as_bytes();
-    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + session_id.len() + 40);
-    body.extend_from_slice(DOMAIN);
+    let mut body = Vec::with_capacity(domain.len() + challenge.len() + session_id.len() + 40);
+    body.extend_from_slice(domain);
     body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
     body.extend_from_slice(challenge);
     body.extend_from_slice(&request.expected_movement_generation.to_be_bytes());
@@ -655,16 +759,22 @@ pub fn canonical_scanner_publication_lease_response_body(
     challenge: &[u8],
     response: &proto_gen::node_service::ScannerPublicationLeaseResponse,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
-    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-response-v1\0";
+    const STRICT_DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-response-v1\0";
+    const OBSERVATIONAL_DOMAIN: &[u8] = b"rustfs-scanner-observed-usage-lease-response-v1\0";
+    let domain = if response.observational_only {
+        OBSERVATIONAL_DOMAIN
+    } else {
+        STRICT_DOMAIN
+    };
     let token = response.token.as_ref();
     let owner_id = response.owner_id.as_bytes();
     let session_id = response.session_id.as_bytes();
     let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
     let error_code = response.error.as_ref().map_or(0, |error| error.code);
     let mut body = Vec::with_capacity(
-        DOMAIN.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 72,
+        domain.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 72,
     );
-    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(domain);
     body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
     body.extend_from_slice(challenge);
     body.push(u8::from(response.success));
@@ -817,6 +927,9 @@ impl_canonical_mutation_body!(
     |request, body| {
         body.push_str(&request.bucket)?;
         body.push_str(&request.options)?;
+        if !request.bucket_incarnation_id.is_empty() {
+            body.push_bytes(&request.bucket_incarnation_id)?;
+        }
     }
 );
 impl_canonical_mutation_body!(
@@ -995,6 +1108,225 @@ pub fn canonical_rename_data_request_body(
     if !request.scanner_publication_lease_token.is_empty() {
         body.push_bytes(&request.scanner_publication_lease_token)?;
     }
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
+    Ok(body.finish())
+}
+
+/// The fixed-MPU recovery method authenticates every wire field in its own domain.
+pub fn canonical_recover_multipart_source_request_body(
+    request: &proto_gen::node_service::RecoverMultipartSourceRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-recover-multipart-source-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.path)?;
+    body.push_u32(request.protocol_version);
+    body.push_bytes(&request.operation)?;
+    Ok(body.finish())
+}
+
+pub const MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES: usize = DEFAULT_GRPC_SERVER_MESSAGE_LEN;
+
+/// Recovery transports exactly one bounded, typed operation or response.
+pub fn decode_multipart_source_recovery_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    if payload.is_empty() || payload.len() > MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid multipart source recovery payload length",
+        ));
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = rmp_serde::from_read(&mut cursor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid multipart source recovery payload"))?;
+    if cursor.position() != u64::try_from(payload.len()).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trailing multipart source recovery payload",
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod multipart_source_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn multipart_source_recovery_canonical_body_binds_all_wire_fields_and_domain() {
+        let request = proto_gen::node_service::RecoverMultipartSourceRequest {
+            disk: "disk".into(),
+            path: "upload".into(),
+            protocol_version: 1,
+            operation: vec![0x80].into(),
+        };
+        let canonical = canonical_recover_multipart_source_request_body(&request).expect("canonical recovery body");
+        let mut bodies = std::collections::HashSet::from([canonical.clone()]);
+        for change in [
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.disk = "other".into(),
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.path = "other".into(),
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.protocol_version = 2,
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.operation = vec![0x81].into(),
+        ] {
+            let mut changed = request.clone();
+            change(&mut changed);
+            assert!(bodies.insert(canonical_recover_multipart_source_request_body(&changed).expect("changed recovery body")));
+        }
+        let delete = proto_gen::node_service::RecoverDeleteTransactionRequest {
+            disk: request.disk,
+            volume: request.path,
+            protocol_version: request.protocol_version,
+            operation: request.operation,
+        };
+        assert_ne!(
+            canonical,
+            canonical_recover_delete_transaction_request_body(&delete).expect("other recovery domain")
+        );
+    }
+
+    #[test]
+    fn multipart_source_recovery_payload_requires_one_bounded_value() {
+        let encoded = rmp_serde::to_vec_named(&vec![1_u32, 2]).expect("encoded operation");
+        assert_eq!(
+            decode_multipart_source_recovery_payload::<Vec<u32>>(&encoded).expect("one value"),
+            vec![1, 2]
+        );
+        let mut trailing = encoded;
+        trailing.push(0xc0);
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&trailing).is_err());
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&[]).is_err());
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&[0xc1]).is_err());
+        assert!(
+            decode_multipart_source_recovery_payload::<Vec<u32>>(&vec![0xc0; MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES + 1])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn multipart_source_wire_debug_redacts_capability_payloads() {
+        let secret = "private-undo-capability";
+        let rename = proto_gen::node_service::RenameDataResponse {
+            success: true,
+            rename_data_resp: secret.into(),
+            rename_data_resp_bin: secret.as_bytes().to_vec().into(),
+            error: None,
+        };
+        assert_eq!(
+            format!("{rename:?}"),
+            r#"RenameDataResponse { success: true, payload: "[REDACTED]", .. }"#
+        );
+        let request = proto_gen::node_service::RecoverMultipartSourceRequest {
+            disk: secret.into(),
+            path: secret.into(),
+            protocol_version: 1,
+            operation: secret.as_bytes().to_vec().into(),
+        };
+        assert_eq!(
+            format!("{request:?}"),
+            r#"RecoverMultipartSourceRequest { protocol_version: 1, operation: "[REDACTED]", .. }"#
+        );
+        let response = proto_gen::node_service::RecoverMultipartSourceResponse {
+            success: true,
+            protocol_version: 1,
+            result: secret.as_bytes().to_vec().into(),
+            error: None,
+        };
+        assert_eq!(
+            format!("{response:?}"),
+            r#"RecoverMultipartSourceResponse { success: true, protocol_version: 1, result: "[REDACTED]", .. }"#
+                .replace("\\\"", "\"")
+        );
+    }
+}
+
+pub fn canonical_pool_meta_native_recovery_request_body(
+    request: &proto_gen::node_service::PoolMetaNativeRecoveryRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-pool-meta-native-recovery-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_bytes(&request.payload)?;
+    Ok(body.finish())
+}
+
+/// The native recovery RPC accepts exactly one bounded MessagePack value.
+pub const POOL_META_NATIVE_RECOVERY_MAX_PAYLOAD_BYTES: usize = DEFAULT_GRPC_SERVER_MESSAGE_LEN;
+
+pub fn decode_pool_meta_native_recovery_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    if payload.is_empty() || payload.len() > POOL_META_NATIVE_RECOVERY_MAX_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid pool metadata recovery payload length",
+        ));
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = rmp_serde::from_read(&mut cursor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid pool metadata recovery payload"))?;
+    if cursor.position() != u64::try_from(payload.len()).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trailing pool metadata recovery payload",
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod pool_meta_native_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn pool_meta_native_recovery_body_binds_disk_and_payload_without_field_aliasing() {
+        use proto_gen::node_service::PoolMetaNativeRecoveryRequest;
+        let baseline = PoolMetaNativeRecoveryRequest {
+            disk: "disk-a".to_owned(),
+            payload: vec![1, 2].into(),
+        };
+        let body = canonical_pool_meta_native_recovery_request_body(&baseline).expect("body must encode");
+        for changed in [
+            PoolMetaNativeRecoveryRequest {
+                disk: "disk-b".to_owned(),
+                ..baseline.clone()
+            },
+            PoolMetaNativeRecoveryRequest {
+                payload: vec![1, 3].into(),
+                ..baseline
+            },
+            PoolMetaNativeRecoveryRequest {
+                disk: "disk-a\u{1}".to_owned(),
+                payload: vec![2].into(),
+            },
+        ] {
+            assert_ne!(
+                body,
+                canonical_pool_meta_native_recovery_request_body(&changed).expect("changed body must encode")
+            );
+        }
+    }
+
+    #[test]
+    fn pool_meta_native_recovery_codec_rejects_empty_malformed_and_trailing_values() {
+        for payload in [vec![], vec![0xc1], vec![0x90, 0xc0]] {
+            assert!(decode_pool_meta_native_recovery_payload::<Vec<u8>>(&payload).is_err());
+        }
+        assert_eq!(
+            decode_pool_meta_native_recovery_payload::<Vec<u8>>(&[0x90]).expect("one empty array is valid"),
+            Vec::<u8>::new()
+        );
+    }
+}
+
+pub const QUOTA_MUTATION_TOPOLOGY_HEADER: &str = "x-rustfs-quota-topology";
+
+/// Binds a quota mutation to the coordinator's complete, ordered storage layout.
+/// The inner canonical body retains its operation-specific domain and wire fields.
+pub fn canonical_quota_mutation_request_body(
+    topology_fingerprint: &str,
+    mutation_body: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-quota-mutation-topology-request-v1\0");
+    body.push_str(topology_fingerprint)?;
+    body.push_bytes(mutation_body)?;
     Ok(body.finish())
 }
 
@@ -1010,6 +1342,9 @@ pub fn canonical_delete_version_request_body(
     body.push_str(&request.opts)?;
     body.push_bytes(&request.file_info_bin)?;
     body.push_bytes(&request.opts_bin)?;
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -1032,6 +1367,17 @@ pub fn canonical_delete_versions_request_body(
     Ok(body.finish())
 }
 
+pub fn canonical_guarded_delete_versions_request_body(
+    request: &proto_gen::node_service::GuardedDeleteVersionsRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-guarded-delete-versions-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_bytes(&request.payload)?;
+    body.push_bool(request.probe_only);
+    Ok(body.finish())
+}
+
 pub fn canonical_write_metadata_request_body(
     request: &proto_gen::node_service::WriteMetadataRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -1041,6 +1387,10 @@ pub fn canonical_write_metadata_request_body(
     body.push_str(&request.path)?;
     body.push_str(&request.file_info)?;
     body.push_bytes(&request.file_info_bin)?;
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
     Ok(body.finish())
 }
 
@@ -1069,6 +1419,20 @@ pub fn canonical_write_all_request_body(
     Ok(body.finish())
 }
 
+pub fn canonical_compare_and_update_file_request_body(
+    request: &proto_gen::node_service::CompareAndUpdateFileRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-compare-and-update-file-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bool(request.expected.is_some());
+    body.push_bytes(request.expected.as_deref().unwrap_or_default())?;
+    body.push_bool(request.replacement.is_some());
+    body.push_bytes(request.replacement.as_deref().unwrap_or_default())?;
+    Ok(body.finish())
+}
+
 pub fn canonical_delete_request_body(
     request: &proto_gen::node_service::DeleteRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -1079,6 +1443,10 @@ pub fn canonical_delete_request_body(
     body.push_str(&request.options)?;
     if !request.scanner_publication_lease_token.is_empty() {
         body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
     }
     Ok(body.finish())
 }
@@ -1139,6 +1507,11 @@ pub fn canonical_rename_file_request_body(
     body.push_str(&request.src_path)?;
     body.push_str(&request.dst_volume)?;
     body.push_str(&request.dst_path)?;
+    // Preserve the release signature for ordinary renames. An older server
+    // computes a different digest for a durable request and rejects mutation.
+    if request.durable {
+        body.push_bool(true);
+    }
     Ok(body.finish())
 }
 
@@ -1165,6 +1538,37 @@ pub fn canonical_prepare_part_transaction_request_body(
     body.push_str(&request.dst_volume)?;
     body.push_str(&request.dst_path)?;
     body.push_bytes(&request.meta)?;
+    Ok(body.finish())
+}
+
+/// Recovery messages are bounded and must contain exactly one MessagePack value.
+pub const DELETE_RECOVERY_MAX_PAYLOAD_BYTES: usize = DEFAULT_GRPC_SERVER_MESSAGE_LEN;
+pub const DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+pub fn decode_delete_recovery_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    if payload.is_empty() || payload.len() > DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid delete recovery payload length",
+        ));
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = rmp_serde::from_read(&mut cursor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid delete recovery payload"))?;
+    if cursor.position() != u64::try_from(payload.len()).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "trailing delete recovery payload"));
+    }
+    Ok(value)
+}
+
+pub fn canonical_recover_delete_transaction_request_body(
+    request: &proto_gen::node_service::RecoverDeleteTransactionRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-recover-delete-transaction-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_u32(request.protocol_version);
+    body.push_bytes(&request.operation)?;
     Ok(body.finish())
 }
 
@@ -1215,12 +1619,98 @@ pub fn canonical_make_volumes_request_body(
 #[cfg(test)]
 mod disk_mutation_canonical_tests {
     use super::proto_gen::node_service::{
-        DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, MakeVolumeRequest,
-        MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
-        SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
+        CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
+        DeleteVolumeRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest,
+        RenameFileRequest, RenamePartRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest,
+        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
     };
     use super::*;
+
+    #[test]
+    fn quota_mutation_envelope_binds_topology_operation_and_field_boundaries() {
+        let acquire = canonical_snapshot_lease_request_body(&SnapshotLeaseRequest::default()).expect("acquire body");
+        let release =
+            canonical_snapshot_lease_release_request_body(&SnapshotLeaseReleaseRequest::default()).expect("release body");
+        let rename = canonical_rename_data_request_body(&RenameDataRequest::default()).expect("rename body");
+        let topology = "a".repeat(64);
+        let envelope = canonical_quota_mutation_request_body(&topology, &acquire).expect("quota envelope");
+        assert_ne!(envelope, acquire, "quota and ordinary mutation domains must differ");
+        assert_all_distinct(&[
+            envelope,
+            canonical_quota_mutation_request_body(&"b".repeat(64), &acquire).expect("changed topology"),
+            canonical_quota_mutation_request_body(&topology, &release).expect("release envelope"),
+            canonical_quota_mutation_request_body(&topology, &rename).expect("rename envelope"),
+        ]);
+        assert_ne!(
+            canonical_quota_mutation_request_body("ab", b"c").expect("first boundary"),
+            canonical_quota_mutation_request_body("a", b"bc").expect("second boundary"),
+            "topology and operation bytes must be independently length delimited"
+        );
+    }
+
+    #[test]
+    fn guarded_delete_digest_binds_probe_and_payload() {
+        let request = proto_gen::node_service::GuardedDeleteVersionsRequest {
+            disk: "disk-a".into(),
+            volume: "bucket-a".into(),
+            payload: vec![0x80].into(),
+            probe_only: false,
+        };
+        let original = canonical_guarded_delete_versions_request_body(&request).expect("encode guarded body");
+        let mut candidates = Vec::new();
+        let mut changed = request.clone();
+        changed.disk = "disk-b".into();
+        candidates.push(changed);
+        let mut changed = request.clone();
+        changed.volume = "bucket-b".into();
+        candidates.push(changed);
+        let mut changed = request.clone();
+        changed.payload = vec![0x81].into();
+        candidates.push(changed);
+        let mut changed = request;
+        changed.probe_only = true;
+        candidates.push(changed);
+        for changed in candidates {
+            assert_ne!(
+                canonical_guarded_delete_versions_request_body(&changed).expect("encode changed body"),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn delete_recovery_canonical_body_binds_all_wire_fields() {
+        let request = proto_gen::node_service::RecoverDeleteTransactionRequest {
+            disk: "disk".into(),
+            volume: "volume".into(),
+            protocol_version: 1,
+            operation: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_recover_delete_transaction_request_body(&request).expect("canonical body")];
+        for mutate in [
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.disk = "other".into(),
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.volume = "other".into(),
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.protocol_version = 2,
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.operation = vec![0x81].into(),
+        ] {
+            let mut changed = request.clone();
+            mutate(&mut changed);
+            bodies.push(canonical_recover_delete_transaction_request_body(&changed).expect("changed canonical body"));
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn delete_recovery_payload_rejects_trailing_malformed_and_oversized_values() {
+        let payload = rmp_serde::to_vec_named(&vec![1_u32, 2]).expect("encode test payload");
+        assert_eq!(decode_delete_recovery_payload::<Vec<u32>>(&payload).expect("one payload"), vec![1, 2]);
+        let mut trailing = payload;
+        trailing.push(0xc0);
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&trailing).is_err());
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&[]).is_err());
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&[0xc1]).is_err());
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&vec![0xc0; DELETE_RECOVERY_MAX_PAYLOAD_BYTES + 1]).is_err());
+    }
 
     fn assert_all_distinct(bodies: &[Vec<u8>]) {
         for (i, a) in bodies.iter().enumerate() {
@@ -1235,6 +1725,7 @@ mod disk_mutation_canonical_tests {
     #[test]
     fn rename_data_canonical_body_binds_every_field() {
         let baseline = RenameDataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "disk-a".into(),
             src_volume: "src-vol".into(),
             src_path: "src-path".into(),
@@ -1255,6 +1746,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut RenameDataRequest| r.file_info_bin = vec![0x81, 0x02].into(),
             |r: &mut RenameDataRequest| r.file_info_bin = Vec::new().into(),
             |r: &mut RenameDataRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
+            |r: &mut RenameDataRequest| r.bucket_incarnation_id = vec![0x01; 16].into(),
         ] {
             let mut request = baseline.clone();
             mutate(&mut request);
@@ -1285,6 +1777,7 @@ mod disk_mutation_canonical_tests {
     #[test]
     fn delete_version_canonical_body_binds_every_field() {
         let baseline = DeleteVersionRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "disk-a".into(),
             volume: "vol".into(),
             path: "path".into(),
@@ -1304,6 +1797,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut DeleteVersionRequest| r.opts = "{\"o\":1}".into(),
             |r: &mut DeleteVersionRequest| r.file_info_bin = vec![0x82].into(),
             |r: &mut DeleteVersionRequest| r.opts_bin = Vec::new().into(),
+            |r: &mut DeleteVersionRequest| r.bucket_incarnation_id = vec![1; 16].into(),
         ] {
             let mut request = baseline.clone();
             mutate(&mut request);
@@ -1346,6 +1840,7 @@ mod disk_mutation_canonical_tests {
         // Mutating each field in turn and asserting all bodies differ catches a dropped or
         // duplicated `push_*` in these hand-written builders — an unbound field is tamperable.
         let write_metadata = WriteMetadataRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "d".into(),
             volume: "v".into(),
             path: "p".into(),
@@ -1359,6 +1854,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut WriteMetadataRequest| r.path = "p2".into(),
             |r: &mut WriteMetadataRequest| r.file_info = "{\"a\":2}".into(),
             |r: &mut WriteMetadataRequest| r.file_info_bin = vec![0x82].into(),
+            |r: &mut WriteMetadataRequest| r.bucket_incarnation_id = vec![1; 16].into(),
         ] {
             let mut request = write_metadata.clone();
             mutate(&mut request);
@@ -1410,7 +1906,33 @@ mod disk_mutation_canonical_tests {
         }
         assert_all_distinct(&bodies);
 
+        let compare_and_update_file = CompareAndUpdateFileRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            expected: Some(vec![0xAA, 0xBB].into()),
+            replacement: Some(vec![0xCC, 0xDD].into()),
+        };
+        let mut bodies = vec![canonical_compare_and_update_file_request_body(&compare_and_update_file).unwrap()];
+        for mutate in [
+            |r: &mut CompareAndUpdateFileRequest| r.disk = "d2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.volume = "v2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.path = "p2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.expected = None,
+            |r: &mut CompareAndUpdateFileRequest| r.expected = Some(Vec::new().into()),
+            |r: &mut CompareAndUpdateFileRequest| r.expected = Some(vec![0xAA, 0xBC].into()),
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = None,
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = Some(Vec::new().into()),
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = Some(vec![0xCC, 0xDE].into()),
+        ] {
+            let mut request = compare_and_update_file.clone();
+            mutate(&mut request);
+            bodies.push(canonical_compare_and_update_file_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
         let delete = DeleteRequest {
+            bucket_incarnation_id: Default::default(),
             disk: "d".into(),
             volume: "v".into(),
             path: "p".into(),
@@ -1423,6 +1945,7 @@ mod disk_mutation_canonical_tests {
             |r: &mut DeleteRequest| r.volume = "v2".into(),
             |r: &mut DeleteRequest| r.path = "p2".into(),
             |r: &mut DeleteRequest| r.options = "{\"recursive\":true}".into(),
+            |r: &mut DeleteRequest| r.bucket_incarnation_id = vec![1; 16].into(),
             |r: &mut DeleteRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
         ] {
             let mut request = delete.clone();
@@ -1450,6 +1973,7 @@ mod disk_mutation_canonical_tests {
         assert_all_distinct(&bodies);
 
         let rename_file = RenameFileRequest {
+            durable: false,
             disk: "d".into(),
             src_volume: "sv".into(),
             src_path: "sp".into(),
@@ -1458,6 +1982,7 @@ mod disk_mutation_canonical_tests {
         };
         let mut bodies = vec![canonical_rename_file_request_body(&rename_file).unwrap()];
         for mutate in [
+            |r: &mut RenameFileRequest| r.durable = true,
             |r: &mut RenameFileRequest| r.disk = "d2".into(),
             |r: &mut RenameFileRequest| r.src_volume = "sv2".into(),
             |r: &mut RenameFileRequest| r.src_path = "sp2".into(),
@@ -1633,9 +2158,27 @@ mod disk_mutation_canonical_tests {
     }
 
     #[test]
+    fn durable_rename_extension_preserves_old_wire_defaults_and_signatures() {
+        use crate::proto_gen::node_service::RenameFileResponse;
+        use prost::Message;
+        // Release wire messages omitted request tag 6 and response tag 3.
+        let mut request =
+            RenameFileRequest::decode(b"\x0a\x01d\x12\x01s\x1a\x01p\x22\x01v\x2a\x01q".as_slice()).expect("release request");
+        assert!(!request.durable);
+        let old_body = b"rustfs-rename-file-request-v1\0\0\0\0\0\0\0\0\x01d\0\0\0\0\0\0\0\x01s\0\0\0\0\0\0\0\x01p\0\0\0\0\0\0\0\x01v\0\0\0\0\0\0\0\x01q";
+        assert_eq!(canonical_rename_file_request_body(&request).expect("body"), old_body);
+        request.durable = true;
+        assert_ne!(canonical_rename_file_request_body(&request).expect("durable body"), old_body);
+        let old_success = RenameFileResponse::decode(b"\x08\x01".as_slice()).expect("release response");
+        assert!(old_success.success);
+        assert!(!old_success.durability_applied, "old success cannot certify durable publication");
+    }
+
+    #[test]
     fn disk_mutation_canonical_domains_are_distinct_per_message() {
         // The same field values must never authenticate one RPC's request as another's.
         let rename_file = RenameFileRequest {
+            durable: false,
             disk: "d".into(),
             src_volume: "sv".into(),
             src_path: "sp".into(),
@@ -1741,7 +2284,7 @@ mod non_disk_mutation_canonical_tests {
 
     #[test]
     fn bucket_and_lock_canonical_bodies_bind_every_semantic_field() {
-        assert_fields_bound!(HealBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
+        assert_fields_bound!(HealBucketRequest, { bucket: "bucket".into(), options: "opts".into(), bucket_incarnation_id: vec![1; 16].into() });
         assert_fields_bound!(MakeBucketRequest, { name: "bucket".into(), options: "opts".into() });
         assert_fields_bound!(DeleteBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
         assert_fields_bound!(GenerallyLockRequest, { args: "lock".into() });
@@ -2102,6 +2645,7 @@ mod scanner_activity_tests {
             ttl_ms: 60_000,
             expected_session_id: "session-a".to_string(),
             token: Vec::new().into(),
+            observational_only: false,
         };
         let baseline = canonical_scanner_publication_lease_request_body(&request).unwrap();
         for variant in [
@@ -2119,6 +2663,10 @@ mod scanner_activity_tests {
             },
             ScannerPublicationLeaseRequest {
                 token: vec![3; 16].into(),
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                observational_only: true,
                 ..request
             },
         ] {
@@ -2149,6 +2697,7 @@ mod scanner_activity_tests {
             response_proof: Vec::new().into(),
             owner_id: "owner-a".to_string(),
             session_id: "session-a".to_string(),
+            observational_only: false,
         };
         let response_changed = ScannerPublicationLeaseResponse {
             owner_id: "owner-b".to_string(),
@@ -2157,6 +2706,14 @@ mod scanner_activity_tests {
         assert_ne!(
             canonical_scanner_publication_lease_response_body(&[1; 16], &response).unwrap(),
             canonical_scanner_publication_lease_response_body(&[1; 16], &response_changed).unwrap()
+        );
+        let observational_response = ScannerPublicationLeaseResponse {
+            observational_only: true,
+            ..response.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response).unwrap(),
+            canonical_scanner_publication_lease_response_body(&[1; 16], &observational_response).unwrap()
         );
     }
 }
@@ -2177,6 +2734,39 @@ mod heal_control_tests {
     };
     use crate::heal_control;
     use std::time::Duration;
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_probe_is_distinct_and_strict() {
+        let probe = super::mrf_lifecycle_reader_capability_probe(&[7; 16]);
+        let mut expected = b"rustfs-mrf-lifecycle-reader-capability-v1\0".to_vec();
+        expected.extend_from_slice(&[7; 16]);
+        assert_eq!(probe, expected);
+        assert!(super::is_mrf_lifecycle_reader_capability_probe(&probe));
+        assert!(!is_heal_control_capability_probe(&probe));
+        assert!(!is_cross_pool_fence_capability_probe(&probe));
+        assert!(!is_remote_version_state_capability_probe(&probe));
+        for length in 0..probe.len() {
+            assert!(!super::is_mrf_lifecycle_reader_capability_probe(&probe[..length]));
+        }
+        let mut trailing = probe.clone();
+        trailing.push(0);
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&trailing));
+        let mut unknown = probe;
+        unknown[0] ^= 1;
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&unknown));
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&heal_control_capability_probe(&[7; 16])));
+    }
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_carries_the_reported_format_and_identity() {
+        let epoch = [9; 16];
+        let result = super::encode_mrf_lifecycle_reader_capability(2, "node-a:9000", &epoch).expect("reader capability");
+        assert_eq!(result[0], 2);
+        assert_eq!(result.len(), 1 + 8 + "node-a:9000".len() + 16);
+        let (member, decoded_epoch) = decode_remote_version_state_capability(&result[1..]).expect("capability identity");
+        assert_eq!(member, "node-a:9000");
+        assert_eq!(decoded_epoch, &epoch);
+    }
 
     #[test]
     fn canonical_heal_control_body_binds_every_field_and_boundary() {
@@ -2210,10 +2800,10 @@ mod heal_control_tests {
     #[test]
     fn canonical_capability_ack_binds_version_and_topology() {
         assert_eq!(HEAL_CONTROL_PROTOCOL_VERSION, 3);
-        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v3"));
+        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v4"));
         let probe = heal_control_capability_probe(&[7; 16]);
         let ack = canonical_heal_control_capability_ack(1, "ab", &probe).expect("small acknowledgement should encode");
-        let mut golden = b"rustfs-heal-control-capability-ack-v3\0".to_vec();
+        let mut golden = b"rustfs-heal-control-capability-ack-v4\0".to_vec();
         golden.extend_from_slice(&1_u32.to_be_bytes());
         golden.extend_from_slice(&2_u64.to_be_bytes());
         golden.extend_from_slice(b"ab");
@@ -2228,6 +2818,8 @@ mod heal_control_tests {
         );
         assert!(is_heal_control_capability_probe(&probe));
         assert!(!is_heal_control_capability_probe(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX));
+        let legacy_probe = [b"rustfs-heal-control-capability-v3\0".as_slice(), &[7; 16]].concat();
+        assert!(!is_heal_control_capability_probe(&legacy_probe));
     }
 
     #[test]
@@ -2683,6 +3275,53 @@ fn bulk_cache_key(addr: &str, idx: usize) -> String {
     format!("{addr}\u{0}bulk\u{0}{idx}")
 }
 
+async fn cached_channel_for_tls_generation(dial_addr: &str, cache_key: &str) -> Option<Channel> {
+    if !dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        return cached_connection(cache_key).await;
+    }
+    let mut generations = TLS_GENERATION_CACHE.lock().await;
+    let Some(channel) = cached_connection(cache_key).await else {
+        generations.remove(cache_key);
+        return None;
+    };
+    if generations.get(cache_key).copied() == Some(runtime_sources::outbound_tls_generation()) {
+        return Some(channel);
+    }
+    evict_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await;
+    generations.remove(cache_key);
+    runtime_sources::record_stale_grpc_channel_tls_generation();
+    None
+}
+
+async fn cache_dialed_channel(dial_addr: &str, cache_key: &str, channel: &Channel, generation: Option<u64>) -> bool {
+    if !dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        cache_connection(cache_key.to_string(), channel.clone()).await;
+        return true;
+    }
+    let mut generations = TLS_GENERATION_CACHE.lock().await;
+    if generation != Some(runtime_sources::outbound_tls_generation()) {
+        runtime_sources::record_stale_grpc_channel_tls_generation();
+        return false;
+    }
+    cache_connection(cache_key.to_string(), channel.clone()).await;
+    // Publication can advance while the common cache's async lock is awaited.
+    if generation != Some(runtime_sources::outbound_tls_generation()) {
+        evict_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await;
+        generations.remove(cache_key);
+        runtime_sources::record_stale_grpc_channel_tls_generation();
+        return false;
+    }
+    if let Some(generation) = generation {
+        enforce_tls_generation_cache_bound(&mut generations, generation, cache_key);
+        generations.insert(cache_key.to_string(), generation);
+    }
+    true
+}
+
+fn channel_acquisition_timeout(_: tokio::time::error::Elapsed) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "internode channel acquisition deadline elapsed")
+}
+
 /// Acquire a cached-or-newly-dialed channel for the given peer and channel class.
 ///
 /// For [`ChannelClass::Control`] (or whenever isolation is disabled) this is exactly the legacy
@@ -2691,22 +3330,27 @@ fn bulk_cache_key(addr: &str, idx: usize) -> String {
 /// per-peer bulk pool and dialed on demand, physically isolating large transfers from
 /// control-plane RPCs.
 pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Channel, Box<dyn Error>> {
-    if class == ChannelClass::Control || !channel_isolation_enabled() {
-        if let Some(channel) = cached_connection(addr).await {
-            debug!("Using cached control gRPC channel for: {}", addr);
+    let deadline = tokio::time::Instant::now() + internode_connect_timeout();
+    tokio::time::timeout_at(deadline, async {
+        if class == ChannelClass::Control || !channel_isolation_enabled() {
+            if let Some(channel) = cached_channel_for_tls_generation(addr, addr).await {
+                debug!("Using cached control gRPC channel for: {}", addr);
+                return Ok(channel);
+            }
+            return build_channel_until(addr, addr, deadline, internode_rpc_timeout()).await;
+        }
+
+        let pool_size = bulk_channel_pool_size();
+        let idx = BULK_CHANNEL_CURSOR.fetch_add(1, Ordering::Relaxed) % pool_size;
+        let cache_key = bulk_cache_key(addr, idx);
+        if let Some(channel) = cached_channel_for_tls_generation(addr, &cache_key).await {
+            debug!("Using cached bulk gRPC channel {} for: {}", idx, addr);
             return Ok(channel);
         }
-        return create_new_channel(addr).await;
-    }
-
-    let pool_size = bulk_channel_pool_size();
-    let idx = BULK_CHANNEL_CURSOR.fetch_add(1, Ordering::Relaxed) % pool_size;
-    let cache_key = bulk_cache_key(addr, idx);
-    if let Some(channel) = cached_connection(&cache_key).await {
-        debug!("Using cached bulk gRPC channel {} for: {}", idx, addr);
-        return Ok(channel);
-    }
-    build_channel(addr, &cache_key).await
+        build_channel_until(addr, &cache_key, deadline, internode_rpc_timeout()).await
+    })
+    .await
+    .map_err(channel_acquisition_timeout)?
 }
 
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
@@ -2730,14 +3374,83 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 /// for isolated bulk channels (see [`bulk_cache_key`]), letting several physically distinct
 /// channels to the same peer be cached independently.
 async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<dyn Error>> {
+    let deadline = tokio::time::Instant::now() + internode_connect_timeout();
+    build_channel_until(dial_addr, cache_key, deadline, internode_rpc_timeout()).await
+}
+
+/// A separate channel deadline for slow authenticated recovery work. The cache
+/// key keeps this deadline from changing foreground lock, read, and write RPCs.
+#[derive(Debug)]
+pub enum DeleteRecoveryChannelError {
+    Connection(Box<dyn Error>),
+}
+
+impl std::fmt::Display for DeleteRecoveryChannelError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connection(error) => write!(formatter, "delete recovery channel connection failed: {error}"),
+        }
+    }
+}
+
+impl Error for DeleteRecoveryChannelError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Connection(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+pub async fn create_channel_with_timeout(addr: &str, rpc_timeout: Duration) -> Result<Channel, DeleteRecoveryChannelError> {
+    let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
+    let deadline = tokio::time::Instant::now() + internode_connect_timeout();
+    build_channel_until(addr, &cache_key, deadline, rpc_timeout)
+        .await
+        .map_err(DeleteRecoveryChannelError::Connection)
+}
+
+async fn build_channel_until(
+    dial_addr: &str,
+    cache_key: &str,
+    deadline: tokio::time::Instant,
+    rpc_timeout: Duration,
+) -> Result<Channel, Box<dyn Error>> {
+    tokio::time::timeout_at(deadline, async {
+        if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+            return Ok(channel);
+        }
+        let slot = DialLock::for_key(cache_key);
+        let _guard = slot.mutex.lock().await;
+        loop {
+            // A successful concurrent miss has already populated this exact key.
+            if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+                return Ok(channel);
+            }
+            let (channel, generation) = dial_channel(dial_addr, cache_key, rpc_timeout).await?;
+            if cache_dialed_channel(dial_addr, cache_key, &channel, generation).await
+                && let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await
+            {
+                debug!(
+                    "Successfully created and cached gRPC channel to: {} (cache key: {})",
+                    dial_addr, cache_key
+                );
+                return Ok(channel);
+            }
+            // A generation published during dial cannot be returned; rebuilding
+            // shares the original deadline with lock wait and all earlier dials.
+        }
+    })
+    .await
+    .map_err(channel_acquisition_timeout)?
+}
+
+async fn dial_channel(dial_addr: &str, cache_key: &str, rpc_timeout: Duration) -> Result<(Channel, Option<u64>), Box<dyn Error>> {
     debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
     let connect_timeout = internode_connect_timeout();
     let tcp_keepalive = internode_tcp_keepalive();
     let http2_keepalive_interval = internode_http2_keep_alive_interval();
     let http2_keepalive_timeout = internode_http2_keep_alive_timeout();
-    let rpc_timeout = internode_rpc_timeout();
-
     let mut connector = Endpoint::from_shared(dial_addr.to_string())?
         // Fast connection timeout for dead peer detection
         .connect_timeout(connect_timeout)
@@ -2765,18 +3478,10 @@ async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<
         connector = connector.initial_connection_window_size(conn_window);
     }
 
-    let outbound_tls = runtime_sources::outbound_tls_state().await;
-    let generation = outbound_tls.generation.0;
-    let mut stale_generation = false;
-    {
-        let generation_cache = TLS_GENERATION_CACHE.lock().await;
-        if let Some(cached_generation) = generation_cache.get(cache_key)
-            && *cached_generation != generation
-        {
-            stale_generation = true;
-        }
-    }
+    let mut generation = None;
     if dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        let outbound_tls = runtime_sources::outbound_tls_state().await;
+        generation = Some(outbound_tls.generation.0);
         if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
             let ca = Certificate::from_pem(cert_pem);
             // Derive the hostname from the HTTPS URL for TLS hostname verification.
@@ -2824,21 +3529,7 @@ async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<
         }
     };
 
-    cache_connection(cache_key.to_string(), channel.clone()).await;
-    {
-        let mut generation_cache = TLS_GENERATION_CACHE.lock().await;
-        enforce_tls_generation_cache_bound(&mut generation_cache, generation, cache_key);
-        generation_cache.insert(cache_key.to_string(), generation);
-    }
-    if stale_generation {
-        runtime_sources::record_stale_grpc_channel_tls_generation();
-    }
-
-    debug!(
-        "Successfully created and cached gRPC channel to: {} (cache key: {})",
-        dial_addr, cache_key
-    );
-    Ok(channel)
+    Ok((channel, generation))
 }
 
 /// Evict a connection from the cache after a failure.
@@ -2898,6 +3589,8 @@ mod tests {
     use super::*;
     use prost::Message as _;
     use std::sync::Mutex;
+
+    static TLS02_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     static INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -3020,6 +3713,268 @@ mod tests {
             "duplicate response send-site manifest entry"
         );
         assert_eq!(manifest_fields, proto_bin_json_fields("Response"));
+    }
+
+    #[tokio::test]
+    async fn tls02_stale_https_control_and_bulk_cache_entries_are_evicted() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-stale-cache.invalid:9000";
+        let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
+        let stale_generation = generation.checked_add(1).unwrap_or(0);
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE.lock().await.insert(key.clone(), stale_generation);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_none(),
+                "TLS02_INVARIANT stale HTTPS cache entry cannot be returned"
+            );
+            assert!(
+                !rustfs_common::has_cached_connection(&key).await,
+                "TLS02_INVARIANT stale entry is removed from the real connection cache"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_missing_https_generation_control_and_bulk_cache_entries_are_evicted() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-missing-generation.invalid:9000";
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE.lock().await.remove(&key);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_none(),
+                "TLS02_INVARIANT HTTPS channel without a generation cannot be returned"
+            );
+            assert!(
+                !rustfs_common::has_cached_connection(&key).await,
+                "TLS02_INVARIANT unbound entry is removed from the real connection cache"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_delete_recovery_channels_reject_unbound_and_stale_https_cache() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve recovery peer address");
+        let addr = format!("https://{}", listener.local_addr().expect("recovery peer address"));
+        drop(listener);
+        let rpc_timeout = Duration::from_secs(20);
+        let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
+        let generation = runtime_sources::outbound_tls_generation();
+        for cached_generation in [None, Some(generation.checked_add(1).unwrap_or(0))] {
+            cache_connection(cache_key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            if let Some(generation) = cached_generation {
+                TLS_GENERATION_CACHE.lock().await.insert(cache_key.clone(), generation);
+            } else {
+                TLS_GENERATION_CACHE.lock().await.remove(&cache_key);
+            }
+            assert!(
+                create_channel_with_timeout(&addr, rpc_timeout).await.is_err(),
+                "recovery must dial the unavailable HTTPS peer instead of returning an unbound or stale cached channel"
+            );
+            assert!(!rustfs_common::has_cached_connection(&cache_key).await);
+            assert!(!TLS_GENERATION_CACHE.lock().await.contains_key(&cache_key));
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_current_https_control_and_bulk_cache_entries_are_reused() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-current-generation.invalid:9000";
+        let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE.lock().await.insert(key.clone(), generation);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_some(),
+                "TLS02_INVARIANT HTTPS channel at the canonical generation is reused"
+            );
+            assert!(rustfs_common::has_cached_connection(&key).await);
+            evict_connection_with_log_level(&key, ConnectionEvictionLogLevel::Debug).await;
+            TLS_GENERATION_CACHE.lock().await.remove(&key);
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_http_control_and_bulk_cache_ignore_tls_generation() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://tls02-http-cache.invalid:9000";
+        let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE
+                .lock()
+                .await
+                .insert(key.clone(), generation.checked_add(1).unwrap_or(0));
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_some(),
+                "TLS02_INVARIANT HTTP cache is independent of TLS generations"
+            );
+            TLS_GENERATION_CACHE.lock().await.remove(&key);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_some(),
+                "TLS02_INVARIANT HTTP cache needs no TLS generation metadata"
+            );
+            evict_connection_with_log_level(&key, ConnectionEvictionLogLevel::Debug).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_captured_identity_is_immutable_and_late_dial_keeps_its_actual_generation() {
+        use rustfs_common::MtlsIdentityPem;
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let previous = runtime_sources::outbound_tls_state().await;
+        let first_generation = previous.generation.0.checked_add(1).expect("test generation capacity");
+        let first = OutboundTlsMaterial {
+            root_ca_pem: b"root-a".to_vec(),
+            mtls_identity: Some(MtlsIdentityPem {
+                cert_pem: b"certificate-a".to_vec(),
+                key_pem: b"test-key-a".to_vec(),
+            }),
+        };
+        publish_global_outbound_tls_state(TlsGeneration(first_generation), &first).await;
+        let captured = runtime_sources::outbound_tls_state().await;
+        let second = OutboundTlsMaterial {
+            root_ca_pem: b"root-b".to_vec(),
+            mtls_identity: Some(MtlsIdentityPem {
+                cert_pem: b"certificate-b".to_vec(),
+                key_pem: b"test-key-b".to_vec(),
+            }),
+        };
+        publish_global_outbound_tls_state(TlsGeneration(first_generation + 1), &second).await;
+        let current = runtime_sources::outbound_tls_state().await;
+        let addr = "https://tls02-late-dial.invalid:9000";
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let cached = cache_dialed_channel(addr, addr, &channel, Some(captured.generation.0)).await;
+        let original_key = captured.mtls_identity.as_ref().expect("captured identity").key_pem.clone();
+        let current_key = current.mtls_identity.as_ref().expect("current identity").key_pem.clone();
+        let restore = OutboundTlsMaterial {
+            root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+            mtls_identity: previous.mtls_identity,
+        };
+        publish_global_outbound_tls_state(TlsGeneration(first_generation + 2), &restore).await;
+        assert_eq!(
+            original_key, b"test-key-a",
+            "TLS02_INVARIANT captured identity cannot change with publication"
+        );
+        assert_eq!(captured.root_ca_pem.as_deref(), Some(b"root-a".as_slice()));
+        assert_eq!(current_key, b"test-key-b");
+        assert!(!cached, "TLS02_INVARIANT late dial cannot be relabeled with the current generation");
+        assert!(
+            !rustfs_common::has_cached_connection(addr).await,
+            "TLS02_INVARIANT late stale dial is never cached"
+        );
+        assert!(!TLS_GENERATION_CACHE.lock().await.contains_key(addr));
+    }
+
+    #[tokio::test]
+    async fn tls02_concurrent_control_and_bulk_misses_merge_successful_real_dials() {
+        use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP/2 test server");
+        let addr = format!("http://{}", listener.local_addr().expect("test server address"));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let incoming = TcpListenerStream::new(listener).map(move |stream| {
+            if stream.is_ok() {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            stream
+        });
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(incoming)
+                .await
+        });
+        for key in [addr.clone(), bulk_cache_key(&addr, 0)] {
+            let mut tasks = Vec::new();
+            for _ in 0..32 {
+                let dial_addr = addr.clone();
+                let cache_key = key.clone();
+                tasks.push(tokio::spawn(async move {
+                    build_channel(&dial_addr, &cache_key).await.map_err(|error| error.to_string())
+                }));
+            }
+            for task in tasks {
+                let channel = task.await.expect("channel acquisition task").expect("real HTTP/2 dial");
+                drop(channel);
+            }
+            assert!(rustfs_common::has_cached_connection(&key).await);
+            assert!(
+                !DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&key),
+                "TLS02_INVARIANT completed miss groups leave no lock entries"
+            );
+        }
+        // Tonic returns its channel before the server task necessarily polls the
+        // already-established sockets out of the listener's accept queue.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let connections = accepted.load(Ordering::SeqCst);
+        evict_connection_with_log_level(&addr, ConnectionEvictionLogLevel::Debug).await;
+        evict_connection_with_log_level(&bulk_cache_key(&addr, 0), ConnectionEvictionLogLevel::Debug).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(connections, 2, "TLS02_INVARIANT 32 misses per control/bulk key dial once each");
+    }
+
+    #[tokio::test]
+    async fn tls02_concurrent_waiters_share_bounded_total_deadlines_and_release_registry() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://tls02-contended-dial.invalid:9000";
+        let owner = DialLock::for_key(addr);
+        let guard = owner.mutex.lock().await;
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            tasks.push(tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+                let result = build_channel_until(addr, addr, deadline, internode_rpc_timeout()).await;
+                result.err().is_some_and(|error| {
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+                })
+            }));
+        }
+        let completed = tokio::time::timeout(Duration::from_millis(250), async {
+            for task in tasks {
+                assert!(
+                    task.await.expect("deadline waiter"),
+                    "TLS02_INVARIANT wait and rebuild share a typed timeout"
+                );
+            }
+        })
+        .await;
+        drop(guard);
+        drop(owner);
+        assert!(
+            completed.is_ok(),
+            "TLS02_INVARIANT eight waiters cannot accumulate eight connect timeouts"
+        );
+        assert!(
+            !DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(addr),
+            "TLS02_INVARIANT cancelled waiters release the lock registry"
+        );
+    }
+
+    #[test]
+    fn tls02_dial_registry_reclaims_unique_keys_and_preserves_live_lock_identity() {
+        for index in 0..1000 {
+            let key = format!("http://tls02-registry-{index}.invalid");
+            let first = DialLock::for_key(&key);
+            let second = DialLock::for_key(&key);
+            assert!(Arc::ptr_eq(&first.mutex, &second.mutex), "TLS02_INVARIANT one live lock per cache key");
+            drop(first);
+            assert!(DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&key));
+            drop(second);
+            assert!(
+                !DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&key),
+                "TLS02_INVARIANT last owner removes its own weak entry"
+            );
+        }
     }
 
     #[test]

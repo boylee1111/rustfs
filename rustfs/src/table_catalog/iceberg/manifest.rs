@@ -33,6 +33,87 @@ pub(crate) struct ManifestDataFileReference {
     pub file_size_bytes: Option<u64>,
     pub partition: Vec<(String, apache_avro::types::Value)>,
     pub sort_order_id: Option<i32>,
+    pub data_file_metadata: ManifestDataFileMetadata,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ManifestDataFileMetadata(BTreeMap<String, apache_avro::types::Value>);
+
+impl PartialEq for ManifestDataFileMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().zip(&other.0).all(|((name, value), (other_name, other_value))| {
+                name == other_name && manifest_metadata_value_eq(value, other_value)
+            })
+    }
+}
+
+fn manifest_metadata_value_eq(left: &apache_avro::types::Value, right: &apache_avro::types::Value) -> bool {
+    use apache_avro::types::Value;
+    match (avro_non_union_value(left), avro_non_union_value(right)) {
+        (Value::Record(left), Value::Record(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(name, value)| {
+                    right
+                        .iter()
+                        .find(|(other_name, _)| name == other_name)
+                        .is_some_and(|(_, other_value)| manifest_metadata_value_eq(value, other_value))
+                })
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| manifest_metadata_value_eq(left, right))
+        }
+        (Value::Map(left), Value::Map(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .all(|(key, value)| right.get(key).is_some_and(|other| manifest_metadata_value_eq(value, other)))
+        }
+        (Value::Float(left), Value::Float(right)) => left.to_bits() == right.to_bits() || (left.is_nan() && right.is_nan()),
+        (Value::Double(left), Value::Double(right)) => left.to_bits() == right.to_bits() || (left.is_nan() && right.is_nan()),
+        (Value::Int(left), Value::Long(right)) | (Value::Long(right), Value::Int(left)) => i64::from(*left) == *right,
+        (Value::Float(left), Value::Double(right)) | (Value::Double(right), Value::Float(left)) => {
+            f64::from(*left).to_bits() == right.to_bits() || (left.is_nan() && right.is_nan())
+        }
+        (left, right) => left == right,
+    }
+}
+
+fn manifest_data_file_metadata(value: &apache_avro::types::Value) -> TableCatalogStoreResult<ManifestDataFileMetadata> {
+    use apache_avro::types::Value;
+    let fields = avro_record_value_fields(value)
+        .ok_or_else(|| TableCatalogStoreError::Invalid("manifest data_file must be a record".to_string()))?;
+    let mut metadata = BTreeMap::new();
+    for (name, mut value) in fields {
+        // Content is compared separately with the v1 default. Deprecated fields are not carried into v2 manifests.
+        if matches!(
+            name.as_str(),
+            "content" | "block_size_in_bytes" | "file_ordinal" | "sort_columns" | "distinct_counts"
+        ) || value == Value::Null
+            || (name == "sort_order_id" && avro_i32_value(&value) == Some(0))
+        {
+            continue;
+        }
+        if name == "file_format"
+            && let Value::String(format) = &mut value
+        {
+            format.make_ascii_uppercase();
+        }
+        // Iceberg maps with integer keys are encoded as Avro arrays; their entry order has no meaning.
+        if matches!(
+            name.as_str(),
+            "column_sizes" | "value_counts" | "null_value_counts" | "nan_value_counts" | "lower_bounds" | "upper_bounds"
+        ) && let Value::Array(entries) = &mut value
+        {
+            entries.sort_by_key(|entry| avro_record_field(entry, "key").and_then(avro_i32_value));
+        }
+        metadata.insert(name, value);
+    }
+    Ok(ManifestDataFileMetadata(metadata))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +341,7 @@ pub(crate) fn decode_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Decod
                 .and_then(|value| u64::try_from(value).ok()),
             partition,
             sort_order_id: avro_record_field(data_file, "sort_order_id").and_then(avro_i32_value),
+            data_file_metadata: manifest_data_file_metadata(data_file)?,
         });
     }
     Ok(DecodedManifest {
@@ -581,6 +663,7 @@ fn avro_i64_value(value: &apache_avro::types::Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn rejects_v2_manifest_lists_without_required_count_fields() {
@@ -609,9 +692,9 @@ mod tests {
             Ok(_) => panic!("v2 count fields must be declared in the writer schema"),
             Err(error) => error,
         };
-        assert_eq!(
+        assert_matches!(
             error,
-            TableCatalogStoreError::Invalid("Iceberg v2 manifest list Avro schema is missing added_files_count".to_string())
+            TableCatalogStoreError::Invalid(message) if message == "Iceberg v2 manifest list Avro schema is missing added_files_count"
         );
     }
 
@@ -622,15 +705,15 @@ mod tests {
             ("added_rows_count".to_string(), apache_avro::types::Value::Long(-1)),
         ]);
 
-        assert_eq!(
-            avro_nullable_non_negative_i32(&value, "added_files_count", "manifest list")
-                .expect_err("negative file counts must be rejected"),
-            TableCatalogStoreError::Invalid("manifest list field added_files_count must be a non-negative int".to_string())
+        assert_matches!(
+        avro_nullable_non_negative_i32(&value, "added_files_count", "manifest list")
+                        .expect_err("negative file counts must be rejected"),
+        TableCatalogStoreError::Invalid(message) if message == "manifest list field added_files_count must be a non-negative int"
         );
-        assert_eq!(
-            avro_nullable_non_negative_i64(&value, "added_rows_count", "manifest list")
-                .expect_err("negative row counts must be rejected"),
-            TableCatalogStoreError::Invalid("manifest list field added_rows_count must be a non-negative long".to_string())
+        assert_matches!(
+        avro_nullable_non_negative_i64(&value, "added_rows_count", "manifest list")
+                        .expect_err("negative row counts must be rejected"),
+        TableCatalogStoreError::Invalid(message) if message == "manifest list field added_rows_count must be a non-negative long"
         );
     }
 
@@ -685,9 +768,9 @@ mod tests {
             Ok(_) => panic!("manifest partitions must preserve their record shape"),
             Err(error) => error,
         };
-        assert_eq!(
+        assert_matches!(
             error,
-            TableCatalogStoreError::Invalid("manifest data file partition must be a record".to_string())
+            TableCatalogStoreError::Invalid(message) if message == "manifest data file partition must be a record"
         );
     }
 

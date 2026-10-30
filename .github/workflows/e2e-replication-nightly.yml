@@ -38,8 +38,8 @@ name: e2e-nightly
 on:
   workflow_dispatch:
   schedule:
-    # 04:00 UTC nightly — staggered clear of fuzz/e2e-s3tests (02:00),
-    # stale (01:30) and performance-ab (06:00).
+    # 04:00 UTC nightly — staggered clear of fuzz/e2e-s3tests (02:00)
+    # and stale (01:30).
     - cron: "29 4 * * *"
 
 # Only alert-on-failure needs more than read access; it declares its own
@@ -53,6 +53,7 @@ concurrency:
 
 jobs:
   repl-nightly:
+    if: github.repository == 'rustfs/rustfs'
     name: Replication e2e (nightly)
     # dual-node tests spawn two full rustfs servers each; the extra headroom
     # over the per-PR sm-standard-2 e2e job keeps the parallel process fan-out
@@ -63,7 +64,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -77,7 +78,7 @@ jobs:
 
       # The STS dual-node test requires awscurl and fails if it is unavailable.
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -108,7 +109,7 @@ jobs:
 
       - name: Upload nextest junit report
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-replication-nightly-junit-${{ github.run_number }}
           path: |
@@ -119,6 +120,7 @@ jobs:
           if-no-files-found: ignore
 
   cluster-nightly:
+    if: github.repository == 'rustfs/rustfs'
     name: Cluster fault e2e (nightly)
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -126,7 +128,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -157,7 +159,7 @@ jobs:
 
       - name: Upload cluster fault diagnostics
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-cluster-nightly-${{ github.run_number }}
           path: |
@@ -168,6 +170,7 @@ jobs:
           if-no-files-found: warn
 
   protocols-nightly:
+    if: github.repository == 'rustfs/rustfs'
     name: Protocol e2e (nightly)
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -176,7 +179,7 @@ jobs:
       RUSTFS_BUILD_FEATURES: ftps,webdav,sftp
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
@@ -213,7 +216,7 @@ jobs:
 
       - name: Upload protocol diagnostics
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-protocol-nightly-${{ github.run_number }}
           path: |
@@ -229,14 +232,14 @@ jobs:
     # Only scheduled runs open/append the tracking issue (backlog#1149 ci-8);
     # manual workflow_dispatch runs stay quiet so a debugging run never files a
     # spurious alert.
-    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    if: github.repository == 'rustfs/rustfs' && (always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
       - name: Open or update failure-tracking issue

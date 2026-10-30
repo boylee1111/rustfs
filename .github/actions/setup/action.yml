@@ -36,6 +36,16 @@ inputs:
     description: "Install cross-compilation tools"
     required: false
     default: "false"
+  zig-version:
+    description: >-
+      Zig version for cargo-zigbuild builds. Pinned so the `<target>.<glibc>`
+      baseline semantics cannot drift with an untested zig release.
+    required: false
+    default: "0.17.0"
+  cargo-zigbuild-version:
+    description: "cargo-zigbuild version installed for cross builds."
+    required: false
+    default: "0.23.4"
   target:
     description: "Target architecture to add"
     required: false
@@ -99,17 +109,23 @@ runs:
     - name: Install Zig
       if: inputs.install-cross-tools == 'true'
       uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      with:
+        version: ${{ inputs.zig-version }}
 
     - name: Install cargo-zigbuild
       if: inputs.install-cross-tools == 'true'
       uses: taiki-e/install-action@a21ae4029b089b9ddc45704028756f51ab8abe48 # cargo-zigbuild
+      with:
+        tool: cargo-zigbuild@${{ inputs.cargo-zigbuild-version }}
 
     - name: Install cargo-nextest
       if: inputs.install-test-tools == 'true'
       uses: taiki-e/install-action@96c7780c1d8a2b8723e12031def873a434d39d8d # nextest
+      with:
+        tool: cargo-nextest@0.9.138
 
     - name: Setup Rust cache
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       with:
         # false is rust-cache's own default. With true, cleanup.ts returns
         # *before* pruning ~/.cargo/registry/src, and config.ts archives the
@@ -124,5 +140,5 @@ runs:
         # normalises, so cargo fingerprints stay valid.
         cache-all-crates: false
         cache-on-failure: true
-        shared-key: ${{ inputs.cache-shared-key }}
+        shared-key: ${{ inputs.cache-shared-key }}${{ inputs.install-cross-tools == 'true' && format('-zig-{0}-zigbuild-{1}', inputs.zig-version, inputs.cargo-zigbuild-version) || '' }}
         save-if: ${{ inputs.cache-save-if }}

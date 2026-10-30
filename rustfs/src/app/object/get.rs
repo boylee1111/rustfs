@@ -14,8 +14,32 @@
 
 //! GetObject / GetObjectAttributes read path: cold fill, resume, stream tuning.
 
+use super::veeam_sosapi;
 use super::*;
+use crate::app::storage_api::object_usecase::object_cache::{
+    GetObjectReadCondition, GetObjectReadMetadata, evaluate_read_preconditions, has_read_preconditions,
+    with_get_object_read_condition,
+};
 use crate::on_demand_migration::WriteBackBody;
+
+struct ConditionalRead {
+    bucket: String,
+    object: String,
+    headers: HeaderMap,
+    part_number: Option<usize>,
+}
+
+impl GetObjectReadCondition for ConditionalRead {
+    fn is_terminal(&self, metadata: GetObjectReadMetadata<'_>) -> bool {
+        if metadata.bucket != self.bucket || metadata.object != self.object || metadata.delete_marker {
+            return false;
+        }
+        evaluate_read_preconditions(&self.headers, metadata.etag, metadata.mod_time).is_err()
+            || self
+                .part_number
+                .is_some_and(|number| number > 1 && !metadata.parts.iter().any(|part| part.number == number))
+    }
+}
 use crate::on_demand_migration::{
     BucketOdmState, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, PullError, PullLeader, PullOutcome, PullReason, PullSlot,
     RangeGetPolicy, SourceBody, SourceClient, SourceError, SourceGet, SourceHead, commit_inline, idle_guarded_body,
@@ -48,6 +72,39 @@ type ColdFillReaderOpenProbeState = Option<(rustfs_object_data_cache::ObjectData
 
 #[cfg(test)]
 static COLD_FILL_READER_OPEN_PROBE: OnceLock<Mutex<ColdFillReaderOpenProbeState>> = OnceLock::new();
+
+#[cfg(test)]
+#[derive(Default)]
+struct BodyCacheFillCalls {
+    reservations: AtomicU64,
+    fills: AtomicU64,
+}
+
+#[cfg(test)]
+type BodyCacheFillProbeState = Option<(rustfs_object_data_cache::ObjectDataCacheKey, Arc<BodyCacheFillCalls>)>;
+
+#[cfg(test)]
+static BODY_CACHE_FILL_PROBE: OnceLock<Mutex<BodyCacheFillProbeState>> = OnceLock::new();
+
+#[cfg(test)]
+fn record_body_cache_fill_call_for_test(plan: &rustfs_object_data_cache::ObjectDataCacheGetPlan, reservation: bool) {
+    let Some(key) = plan.key() else { return };
+    let counters = BODY_CACHE_FILL_PROBE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(probe_key, _)| probe_key == key)
+        .map(|(_, counts)| Arc::clone(counts));
+    if let Some(counters) = counters {
+        let counter = if reservation {
+            &counters.reservations
+        } else {
+            &counters.fills
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 fn adjust_cold_fill_disk_permit_metric(owner: ColdFillDiskPermitOwner, acquired: bool) {
     macro_rules! adjust_gauge {
@@ -220,6 +277,16 @@ const GET_OBJECT_STAGE_CHECKSUM_HEADERS: &str = "checksum_headers";
 const GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION: &str = "lifecycle_expiration";
 
 const GET_OBJECT_STAGE_METADATA_FILTER: &str = "metadata_filter";
+
+const GET_OBJECT_STAGE_BODY_CACHE_HOOK_HIT: &str = "body_cache_hook_hit";
+const GET_OBJECT_STAGE_BODY_CACHE_LOOKUP: &str = "body_cache_lookup";
+const GET_OBJECT_STAGE_BODY_CACHE_FILL_HANDOFF: &str = "body_cache_fill_handoff";
+const GET_OBJECT_STAGE_BODY_BUFFERED_HANDOFF: &str = "body_buffered_handoff";
+const GET_OBJECT_STAGE_OUTPUT_STRUCT_BUILD: &str = "output_struct_build";
+const GET_OBJECT_STAGE_PREPARE_READ_EXECUTION: &str = "prepare_read_execution";
+const GET_OBJECT_STAGE_RESPONSE_CORS_WRAP: &str = "response_cors_wrap";
+const GET_OBJECT_STAGE_RESPONSE_HEADER_INJECT: &str = "response_header_inject";
+const GET_OBJECT_STAGE_RESPONSE_EVENT_COMPLETE: &str = "response_event_complete";
 
 const GET_OBJECT_STREAM_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 
@@ -497,6 +564,14 @@ fn get_object_stream_failure_reason(error_class: &'static str) -> &'static str {
     } else {
         GET_STREAMING_BODY_FAILURE_REASON_READER_ERROR
     }
+}
+
+/// A mid-stream reopen can only recover when another representation of the
+/// committed object may exist. Single-disk, no-parity objects have no alternate
+/// shard to discover after a bitrot/read-quorum failure, so arming the normal
+/// three-attempt resume loop only repeats the same failing read and adds delay.
+fn should_attach_get_object_resume(info: &ObjectInfo) -> bool {
+    info.parity_blocks > 0 || info.data_blocks > 1 || !info.transitioned_object.tier.is_empty()
 }
 
 fn record_get_object_reader_stream_failure(
@@ -1067,6 +1142,8 @@ async fn start_cold_fill_producer<AcquireIo, AcquireIoFuture, OpenReader, OpenRe
             let publish = async {
                 #[cfg(test)]
                 wait_cold_fill_publication_barrier(&engine_plan).await;
+                #[cfg(test)]
+                record_body_cache_fill_call_for_test(&engine_plan, false);
                 adapter.fill_reserved_body(&engine_plan, reserved).await
             };
             tokio::pin!(publish);
@@ -1473,6 +1550,14 @@ impl<R> GetObjectStreamingReader<R> {
                 state = "stall_timeout",
                 "GetObject streaming body stalled"
             );
+            if self.emitted < self.expected && self.resume.is_some() && !self.resume_in_flight() {
+                self.begin_resume(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "get object streaming body stall timeout",
+                ));
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             self.finish_err();
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -2090,6 +2175,42 @@ fn should_buffer_get_object_in_memory_with_threshold(
 }
 
 impl DefaultObjectUsecase {
+    fn with_get_object_conditions<F: std::future::Future>(
+        req: &S3Request<GetObjectInput>,
+        part_number: Option<usize>,
+        read: F,
+    ) -> impl std::future::Future<Output = F::Output> {
+        // The concrete reader future is large; keep it out of the request's stack frame.
+        let read = Box::pin(read);
+        let condition = if has_read_preconditions(&req.headers) {
+            let mut headers = HeaderMap::with_capacity(4);
+            for name in [
+                http::header::IF_MATCH,
+                http::header::IF_UNMODIFIED_SINCE,
+                http::header::IF_NONE_MATCH,
+                http::header::IF_MODIFIED_SINCE,
+            ] {
+                if let Some(value) = req.headers.get(&name) {
+                    headers.insert(name, value.clone());
+                }
+            }
+            Some(Arc::new(ConditionalRead {
+                bucket: req.input.bucket.clone(),
+                object: rustfs_utils::path::encode_dir_object_ref(&req.input.key).into_owned(),
+                headers,
+                part_number,
+            }))
+        } else {
+            None
+        };
+        async move {
+            if let Some(condition) = condition {
+                with_get_object_read_condition(condition, read).await
+            } else {
+                read.await
+            }
+        }
+    }
     fn build_memory_bytes_blob(
         bytes: Bytes,
         response_content_length: i64,
@@ -2148,7 +2269,7 @@ impl DefaultObjectUsecase {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_reader_blob<R>(
+    async fn build_reader_blob<R>(
         reader: R,
         response_content_length: i64,
         request_id: &str,
@@ -2159,10 +2280,12 @@ impl DefaultObjectUsecase {
         key: &str,
         lifecycle: GetObjectBodyLifecycle,
         resume: Option<GetObjectResumeControl<R>>,
-    ) -> StreamingBlob
+    ) -> S3Result<StreamingBlob>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
+        use tokio::io::AsyncReadExt as _;
+
         let streaming_blob_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
         let tuned_stream_buffer_size =
@@ -2178,7 +2301,7 @@ impl DefaultObjectUsecase {
             );
         }
         let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
-        let reader = GetObjectStreamingReader::new(
+        let mut reader = GetObjectStreamingReader::new(
             reader,
             bucket,
             key,
@@ -2189,6 +2312,17 @@ impl DefaultObjectUsecase {
             lifecycle,
             resume,
         );
+        let mut prefix = [0_u8; 1];
+        let prefix_len = if expected == 0 {
+            0
+        } else {
+            reader
+                .read_exact(&mut prefix)
+                .await
+                .map_err(|error| map_get_object_reader_error(StorageError::from(error)))?;
+            1
+        };
+        let reader = std::io::Cursor::new(prefix).take(prefix_len).chain(reader);
         let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source)
             .with_diagnostics(bucket, key, request_id);
         let blob = StreamingBlob::new(stream);
@@ -2202,7 +2336,7 @@ impl DefaultObjectUsecase {
             );
         }
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAMING_BLOB, streaming_blob_start);
-        blob
+        Ok(blob)
     }
 
     fn init_get_object_bootstrap(&self, bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
@@ -2250,9 +2384,40 @@ impl DefaultObjectUsecase {
         Ok(())
     }
 
-    fn validate_get_object_before_cold_fill(headers: &HeaderMap, part_number: Option<usize>, info: &ObjectInfo) -> S3Result<()> {
-        check_preconditions(headers, info)?;
-        Self::validate_get_object_part_number(part_number, info)
+    async fn validate_get_object_before_body(
+        req: &S3Request<GetObjectInput>,
+        bucket: &str,
+        key: &str,
+        part_number: Option<usize>,
+        info: &ObjectInfo,
+    ) -> S3Result<()> {
+        if info.delete_marker {
+            let code = if req.input.version_id.is_some() {
+                S3ErrorCode::MethodNotAllowed
+            } else {
+                S3ErrorCode::NoSuchKey
+            };
+            return Err(with_delete_marker_read_headers(S3Error::new(code), info, req.input.version_id.as_deref()));
+        }
+        let result =
+            check_preconditions(&req.headers, info).and_then(|()| Self::validate_get_object_part_number(part_number, info));
+        if result.is_err() {
+            let principal = SseKmsPrincipal::from_request(req);
+            crate::storage::sse::validate_conditional_read(bucket, key, &info.user_defined, &req.headers, principal.as_ref())
+                .await?;
+        }
+        result
+    }
+
+    /// The `x-amz-mp-parts-count` value for a response, if one is owed.
+    ///
+    /// s3 reports the part count only on a response to a request that named a
+    /// part, and only for an object created by a multipart upload.
+    fn get_object_parts_count(part_number: Option<usize>, info: &ObjectInfo) -> Option<i32> {
+        if part_number.is_none() || !info.is_multipart() {
+            return None;
+        }
+        i32::try_from(info.parts.len()).ok()
     }
 
     /// How long a GET waits for a disk read permit before degrading to a
@@ -2484,6 +2649,7 @@ impl DefaultObjectUsecase {
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
         let store_headers = project_ssec_transport_headers(&req.headers);
         let cache_adapter = self.object_data_cache();
+        let conditional = has_read_preconditions(&req.headers);
         if cache_adapter.is_disabled() || !cache_adapter.materialize_fill_enabled() {
             let io_planning = Self::acquire_get_object_io_planning(
                 manager,
@@ -2497,7 +2663,11 @@ impl DefaultObjectUsecase {
             .await?;
             let reader = track_object_read_setup(
                 object_traffic_health.as_deref(),
-                store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
+                Self::with_get_object_conditions(
+                    req,
+                    part_number,
+                    store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
+                ),
             )
             .await
             .map_err(map_get_object_reader_error)?;
@@ -2520,16 +2690,18 @@ impl DefaultObjectUsecase {
             )
             .await?,
         );
-        let mut prepared = Some(
-            track_object_read_setup(
-                object_traffic_health.as_deref(),
-                store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
-            )
-            .await
-            .map_err(map_get_object_reader_error)?,
-        );
+        let initial_metadata = track_object_read_setup(
+            object_traffic_health.as_deref(),
+            store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
+        )
+        .await
+        .map_err(map_get_object_reader_error)?;
         let mut cache_fill_allowed = true;
         let mut legacy_hook_missed = false;
+        if conditional {
+            Self::validate_get_object_before_body(req, bucket, key, part_number, initial_metadata.object_info()).await?;
+        }
+        let mut prepared = Some(initial_metadata);
         'snapshot: {
             let info = prepared
                 .as_ref()
@@ -2569,7 +2741,6 @@ impl DefaultObjectUsecase {
             if matches!(legacy_probe, GetObjectBodyCacheHookLookup::Ineligible) {
                 break 'snapshot;
             }
-            Self::validate_get_object_before_cold_fill(&req.headers, part_number, info)?;
             if let GetObjectBodyCacheHookLookup::Hit(body) = legacy_probe {
                 drop(metadata_admission.take());
                 let info = prepared
@@ -2730,6 +2901,8 @@ impl DefaultObjectUsecase {
                             return;
                         };
 
+                        #[cfg(test)]
+                        record_body_cache_fill_call_for_test(&engine_plan, true);
                         let reservation = adapter.reserve_body(&engine_plan);
                         #[cfg(test)]
                         let reader_open_plan = engine_plan.clone();
@@ -2786,10 +2959,12 @@ impl DefaultObjectUsecase {
             let io_planning = metadata_admission
                 .take()
                 .ok_or_else(|| s3_error!(InternalError, "prepared metadata admission is unavailable"))?;
-            let reader =
-                track_object_read_setup(object_traffic_health.as_deref(), prepared.with_headers(store_headers).into_reader())
-                    .await
-                    .map_err(map_get_object_reader_error)?;
+            let reader = track_object_read_setup(
+                object_traffic_health.as_deref(),
+                Self::with_get_object_conditions(req, part_number, prepared.with_headers(store_headers).into_reader()),
+            )
+            .await
+            .map_err(map_get_object_reader_error)?;
             (io_planning, reader)
         } else {
             let io_planning = Self::acquire_get_object_io_planning(
@@ -2809,13 +2984,20 @@ impl DefaultObjectUsecase {
                 )
                 .await
                 .map_err(map_get_object_reader_error)?;
-                track_object_read_setup(object_traffic_health.as_deref(), prepared.with_headers(store_headers).into_reader())
-                    .await
-                    .map_err(map_get_object_reader_error)?
+                track_object_read_setup(
+                    object_traffic_health.as_deref(),
+                    Self::with_get_object_conditions(req, part_number, prepared.with_headers(store_headers).into_reader()),
+                )
+                .await
+                .map_err(map_get_object_reader_error)?
             } else {
                 track_object_read_setup(
                     object_traffic_health.as_deref(),
-                    store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
+                    Self::with_get_object_conditions(
+                        req,
+                        part_number,
+                        store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
+                    ),
                 )
                 .await
                 .map_err(map_get_object_reader_error)?
@@ -2860,6 +3042,7 @@ impl DefaultObjectUsecase {
         let stream = reader.stream;
         let buffered_body = reader.buffered_body;
 
+        Self::validate_get_object_before_body(req, bucket, key, part_number, &info).await?;
         let read_duration = read_start.elapsed();
 
         // Conditional metrics recording to reduce overhead
@@ -2868,9 +3051,6 @@ impl DefaultObjectUsecase {
             record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
             manager.record_disk_operation(info.size as u64, read_duration, true).await;
         }
-
-        check_preconditions(&req.headers, &info)?;
-        Self::validate_get_object_part_number(part_number, &info)?;
 
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in info.parts.iter() {
@@ -2962,7 +3142,10 @@ impl DefaultObjectUsecase {
             // resolver; only the response headers, authorization and audit
             // summary are derived here, without a second KMS unwrap.
             Some(headers) => (
-                Some(headers.server_side_encryption),
+                headers
+                    .sse_customer_algorithm
+                    .is_none()
+                    .then_some(headers.server_side_encryption),
                 headers.sse_customer_algorithm,
                 headers.sse_customer_key_md5,
                 headers.ssekms_key_id,
@@ -3176,7 +3359,7 @@ impl DefaultObjectUsecase {
             let (stream_buffer_size, stream_strategy) =
                 Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
             record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAM_STRATEGY, stream_strategy_start);
-            return Ok(Self::build_reader_blob(
+            return Self::build_reader_blob(
                 final_stream,
                 response_content_length,
                 request_id,
@@ -3187,7 +3370,8 @@ impl DefaultObjectUsecase {
                 key,
                 lifecycle,
                 resume(info),
-            ));
+            )
+            .await;
         }
 
         if let Some(buffered_body) = buffered_body {
@@ -3254,7 +3438,7 @@ impl DefaultObjectUsecase {
         let (stream_buffer_size, stream_strategy) =
             Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAM_STRATEGY, stream_strategy_start);
-        Ok(Self::build_reader_blob(
+        Self::build_reader_blob(
             final_stream,
             response_content_length,
             request_id,
@@ -3265,7 +3449,8 @@ impl DefaultObjectUsecase {
             key,
             lifecycle,
             resume(info),
-        ))
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3299,12 +3484,15 @@ impl DefaultObjectUsecase {
         // already supplied this body, the request-level plan was built before
         // the authoritative lookup. Serve it without planning a second time.
         if cache_hook_served && let Some(bytes) = buffered_body.take() {
-            return Ok(Self::build_memory_bytes_blob(
+            let hook_hit_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+            let body = Self::build_memory_bytes_blob(
                 bytes,
                 response_content_length,
                 GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
                 lifecycle,
-            ));
+            );
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_HOOK_HIT, hook_hit_start);
+            return Ok(body);
         }
 
         if !cache_fill_allowed {
@@ -3345,20 +3533,27 @@ impl DefaultObjectUsecase {
         // authoritative because it ran after fresh metadata resolution, so the
         // app layer skips its own lookup and only uses the plan to fill.
         if !cache_hook_probed {
-            match lookup_get_object_body_cache_hit(cache_adapter, &cache_plan).await {
+            let cache_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+            let cache_lookup = lookup_get_object_body_cache_hit(cache_adapter, &cache_plan).await;
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_LOOKUP, cache_lookup_start);
+            match cache_lookup {
                 GetObjectBodyCacheLookup::Hit(bytes) => {
-                    return Ok(Self::build_memory_bytes_blob(
+                    let cache_hit_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+                    let body = Self::build_memory_bytes_blob(
                         bytes,
                         response_content_length,
                         GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
                         lifecycle,
-                    ));
+                    );
+                    record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_HOOK_HIT, cache_hit_start);
+                    return Ok(body);
                 }
                 GetObjectBodyCacheLookup::Disabled | GetObjectBodyCacheLookup::Skip | GetObjectBodyCacheLookup::Miss => {}
             }
         }
 
         if let Some(buffered_body) = buffered_body {
+            let cache_fill_handoff_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
             // ODC-15: the body is already fully in hand, so keep the fill off the
             // response's critical path. For a cacheable plan, run the fill in a
             // detached task (Bytes is a cheap clone) and return immediately. For
@@ -3369,18 +3564,30 @@ impl DefaultObjectUsecase {
                 let cache_plan = cache_plan.clone();
                 let fill_bytes = buffered_body.clone();
                 tokio::spawn(async move {
+                    #[cfg(test)]
+                    if let GetObjectBodyCachePlan::Cacheable(plan) = &cache_plan {
+                        record_body_cache_fill_call_for_test(plan, false);
+                    }
                     let _ = fill_get_object_body_cache_from_buffered_body(&cache_adapter, &cache_plan, &fill_bytes).await;
                 });
             } else if cache_fill_allowed {
+                #[cfg(test)]
+                if let GetObjectBodyCachePlan::Cacheable(plan) = &cache_plan {
+                    record_body_cache_fill_call_for_test(plan, false);
+                }
                 let _ = fill_get_object_body_cache_from_buffered_body(cache_adapter, &cache_plan, &buffered_body).await;
             }
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_FILL_HANDOFF, cache_fill_handoff_start);
 
-            return Ok(Self::build_memory_bytes_blob(
+            let buffered_handoff_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+            let body = Self::build_memory_bytes_blob(
                 buffered_body,
                 response_content_length,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
                 lifecycle,
-            ));
+            );
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_BUFFERED_HANDOFF, buffered_handoff_start);
+            return Ok(body);
         }
 
         let should_materialize_for_cache = cache_adapter.materialize_fill_enabled()
@@ -3434,14 +3641,23 @@ impl DefaultObjectUsecase {
             {
                 Ok(buf) => {
                     let bytes = Bytes::from(buf);
+                    let cache_fill_handoff_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
                     // ODC-15: fill off the response's critical path (see the
                     // buffered-body branch above).
                     let cache_adapter = cache_adapter.clone();
                     let cache_plan = cache_plan.clone();
                     let fill_bytes = bytes.clone();
                     tokio::spawn(async move {
+                        #[cfg(test)]
+                        if let GetObjectBodyCachePlan::Cacheable(plan) = &cache_plan {
+                            record_body_cache_fill_call_for_test(plan, false);
+                        }
                         let _ = fill_get_object_body_cache_from_materialized_body(&cache_adapter, &cache_plan, &fill_bytes).await;
                     });
+                    record_get_object_s3_handler_stage_duration(
+                        GET_OBJECT_STAGE_BODY_CACHE_FILL_HANDOFF,
+                        cache_fill_handoff_start,
+                    );
 
                     return Ok(Self::build_memory_bytes_blob(
                         bytes,
@@ -3580,13 +3796,19 @@ impl DefaultObjectUsecase {
             None => helper,
         };
         let helper = helper.version_id(version_id_for_event);
+        let cors_wrap_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let mut response = wrap_response_with_cors(bucket, method, headers, output).await;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_CORS_WRAP, cors_wrap_start);
+        let header_inject_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         inject_accept_ranges_header(&mut response.headers);
         // Emit XXHash3/64/128 and SHA-512 checksums that s3s GetObjectOutput cannot
         // carry (#1257). This is the download-side integrity path AWS SDKs verify.
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_HEADER_INJECT, header_inject_start);
         let result = Ok(response);
+        let event_complete_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let _ = helper.complete(&result);
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_EVENT_COMPLETE, event_complete_start);
         result
     }
 
@@ -3620,7 +3842,6 @@ impl DefaultObjectUsecase {
         queue_status: &concurrency::IoQueueStatus,
         concurrent_requests: usize,
         part_number: Option<usize>,
-        versioned: bool,
         lifecycle: GetObjectBodyLifecycle,
         resume: F,
     ) -> S3Result<GetObjectOutputContext>
@@ -3678,17 +3899,7 @@ impl DefaultObjectUsecase {
         let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_CHECKSUM_HEADERS, checksum_headers_start);
 
-        let output_version_id = if versioned {
-            info.version_id.map(|vid| {
-                if vid == Uuid::nil() {
-                    "null".to_string()
-                } else {
-                    vid.to_string()
-                }
-            })
-        } else {
-            None
-        };
+        let output_version_id = s3_response_version_id(info.version_id);
 
         // x-amz-restore: extract from object metadata
         let restore = info.user_defined.get(X_AMZ_RESTORE.as_str()).and_then(|v| {
@@ -3707,18 +3918,25 @@ impl DefaultObjectUsecase {
         let metadata_filter_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let metadata = filter_object_metadata(&info.user_defined);
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_METADATA_FILTER, metadata_filter_start);
-
+        let output_struct_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+        let parts_count = Self::get_object_parts_count(part_number, &info);
         let output = GetObjectOutput {
             body: Some(body),
             content_length: Some(response_content_length),
             last_modified,
             content_type,
             content_encoding: info.content_encoding.clone(),
+            content_language: info.user_defined.get("content-language").cloned(),
             cache_control,
             content_disposition,
             content_range,
+            parts_count,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata,
+            website_redirect_location: req
+                .extensions
+                .get::<crate::app::metadata_route::WebsiteRead>()
+                .and_then(|_| info.user_defined.get(AMZ_WEBSITE_REDIRECT_LOCATION).cloned()),
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
@@ -3735,6 +3953,7 @@ impl DefaultObjectUsecase {
             storage_class,
             ..Default::default()
         };
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_OUTPUT_STRUCT_BUILD, output_struct_start);
 
         Ok(GetObjectOutputContext {
             output,
@@ -3830,6 +4049,7 @@ impl DefaultObjectUsecase {
             storage_class: remote.storage_class.map(|sc| StorageClass::from(sc.as_str().to_string())),
             expiration: remote.expiration,
             restore: remote.restore,
+            website_redirect_location: remote.website_redirect_location,
             checksum_crc32: remote.checksum_crc32,
             checksum_crc32c: remote.checksum_crc32_c,
             checksum_crc64nvme: remote.checksum_crc64_nvme,
@@ -3911,6 +4131,7 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(name = "execute_get_object", level = "trace", skip(self, req))]
+    #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
     pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         self.execute_get_object_boxed(req).await
     }
@@ -3926,6 +4147,37 @@ impl DefaultObjectUsecase {
         let result = Err(err);
         let _ = helper.complete(&result);
         result
+    }
+
+    async fn serve_veeam_sosapi_get(
+        &self,
+        req: &S3Request<GetObjectInput>,
+        store: &Arc<ECStore>,
+        kind: veeam_sosapi::SosapiKind,
+        part_number: Option<usize>,
+        range: Option<&HTTPRangeSpec>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let representation =
+            veeam_sosapi::read_representation(store, &req.input.bucket, kind, &req.headers, part_number, range).await?;
+        let content_type = ContentType::from_str(veeam_sosapi::CONTENT_TYPE)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid SOSAPI content type"))?;
+        let ranged = representation.content_range.is_some();
+        let output = GetObjectOutput {
+            body: Some(StreamingBlob::from(s3s::Body::from(representation.body))),
+            content_length: Some(representation.content_length),
+            content_type: Some(content_type),
+            content_range: representation.content_range,
+            e_tag: Some(to_s3s_etag(&representation.etag_hex)),
+            last_modified: Some(Timestamp::from(representation.last_modified)),
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            ..Default::default()
+        };
+        let mut response = wrap_response_with_cors(&req.input.bucket, &req.method, &req.headers, output).await;
+        inject_accept_ranges_header(&mut response.headers);
+        if ranged {
+            response.status = Some(StatusCode::PARTIAL_CONTENT);
+        }
+        Ok(response)
     }
 
     async fn execute_get_object_inner(&self, mut req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
@@ -4006,6 +4258,26 @@ impl DefaultObjectUsecase {
         }
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BUCKET_VALIDATION, bucket_validation_start);
 
+        if validated.version_id.is_none()
+            && let Some(kind) = veeam_sosapi::handled_kind(&validated.key)
+        {
+            let served = self
+                .serve_veeam_sosapi_get(&req, &store, kind, validated.part_number, validated.rs.as_ref())
+                .await;
+            match served {
+                Ok(response) => {
+                    lifecycle.finish_ok();
+                    let result = Ok(response);
+                    let _ = helper.complete(&result);
+                    return result;
+                }
+                Err(err) => {
+                    lifecycle.finish_err();
+                    return Self::complete_get_object_error(helper, err);
+                }
+            }
+        }
+
         let request_context_start = stage_metrics_enabled.then(std::time::Instant::now);
         let request_context = match Self::prepare_get_object_request_context(validated, &req.headers).await {
             Ok(request_context) => request_context,
@@ -4035,6 +4307,7 @@ impl DefaultObjectUsecase {
 
         let manager = get_concurrency_manager();
 
+        let prepare_read_start = stage_metrics_enabled.then(std::time::Instant::now);
         let mut prepared_read = self
             .prepare_get_object_read_execution(
                 &req,
@@ -4050,6 +4323,7 @@ impl DefaultObjectUsecase {
                 object_traffic_health.clone(),
             )
             .await;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_PREPARE_READ_EXECUTION, prepare_read_start);
         // An object missing locally (and only missing — other errors keep
         // their semantics) may still be served by a remote copy.
         if let Err(err) = &prepared_read
@@ -4057,7 +4331,10 @@ impl DefaultObjectUsecase {
         {
             // Active-active replication lag window: proxy the GET to a
             // replication target (backlog#1675 P1-5).
-            if let Some(output) = Self::proxy_get_object_to_replication_targets(&req, &bucket, &key, &opts).await {
+            if let Some(mut output) = Self::proxy_get_object_to_replication_targets(&req, &bucket, &key, &opts).await {
+                if req.extensions.get::<crate::app::metadata_route::WebsiteRead>().is_none() {
+                    output.website_redirect_location = None;
+                }
                 lifecycle.finish_ok();
                 let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
                 inject_accept_ranges_header(&mut response.headers);
@@ -4073,7 +4350,10 @@ impl DefaultObjectUsecase {
                 .await
             {
                 None => {}
-                Some(OdmGetOutcome::Respond(Ok(output))) => {
+                Some(OdmGetOutcome::Respond(Ok(mut output))) => {
+                    if req.extensions.get::<crate::app::metadata_route::WebsiteRead>().is_none() {
+                        output.website_redirect_location = None;
+                    }
                     lifecycle.finish_ok();
                     let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, *output).await;
                     inject_accept_ranges_header(&mut response.headers);
@@ -4087,6 +4367,7 @@ impl DefaultObjectUsecase {
                     return Self::complete_get_object_error(helper.version_id(version_id_for_event), err);
                 }
                 Some(OdmGetOutcome::RetryLocal) => {
+                    let prepare_read_retry_start = stage_metrics_enabled.then(std::time::Instant::now);
                     prepared_read = self
                         .prepare_get_object_read_execution(
                             &req,
@@ -4102,6 +4383,10 @@ impl DefaultObjectUsecase {
                             object_traffic_health,
                         )
                         .await;
+                    record_get_object_s3_handler_stage_duration(
+                        GET_OBJECT_STAGE_PREPARE_READ_EXECUTION,
+                        prepare_read_retry_start,
+                    );
                 }
             }
         }
@@ -4181,19 +4466,20 @@ impl DefaultObjectUsecase {
                 &queue_status,
                 concurrent_requests,
                 part_number,
-                opts.versioned,
                 lifecycle,
                 |info| {
-                    Some(get_object_resume_control(GetObjectResumeContext::new(
-                        store,
-                        &bucket,
-                        &key,
-                        opts,
-                        &req.headers,
-                        info,
-                        resume_range_start,
-                        resume_range_end,
-                    )))
+                    should_attach_get_object_resume(info).then(|| {
+                        get_object_resume_control(GetObjectResumeContext::new(
+                            store,
+                            &bucket,
+                            &key,
+                            opts,
+                            &req.headers,
+                            info,
+                            resume_range_start,
+                            resume_range_end,
+                        ))
+                    })
                 },
             )
             .await;
@@ -4426,17 +4712,7 @@ impl DefaultObjectUsecase {
             None
         };
 
-        let version_id = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
-            info.version_id.map(|vid| {
-                if vid == Uuid::nil() {
-                    "null".to_string()
-                } else {
-                    vid.to_string()
-                }
-            })
-        } else {
-            None
-        };
+        let version_id = s3_response_version_id(info.version_id);
 
         let output = GetObjectAttributesOutput {
             checksum,
@@ -4624,6 +4900,7 @@ fn odm_get_output(head: &SourceHead, content_length: i64, content_range: Option<
         e_tag: head.etag.as_deref().map(to_s3s_etag),
         last_modified: head.last_modified.map(OffsetDateTime::from).map(Timestamp::from),
         metadata: (!head.user_metadata.is_empty()).then(|| head.user_metadata.clone()),
+        website_redirect_location: head.website_redirect_location.clone(),
         ..Default::default()
     }
 }
@@ -5326,7 +5603,11 @@ mod on_demand_migration_tests {
         let data = payload(512);
         let etag = source_head(&data).etag.expect("etag");
 
-        let source = ScriptedSource::for_object(&data);
+        let head = source_head(&data);
+        let source = ScriptedSource::new(
+            vec![Ok(head.clone()), Ok(head.clone()), Ok(head.clone())],
+            vec![Ok((head, data.clone(), None))],
+        );
         let mut headers = HeaderMap::new();
         headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_str(&format!("\"{etag}\"")).unwrap());
         let err = failed(odm_get_from_source(&state, &source, &headers, KEY, None, None).await);
@@ -5334,7 +5615,6 @@ mod on_demand_migration_tests {
         assert_eq!(source.head_calls(), 1);
         assert_eq!(source.get_calls(), 0, "a 304 never pulls");
 
-        let source = ScriptedSource::for_object(&data);
         let mut headers = HeaderMap::new();
         headers.insert(http::header::IF_MATCH, HeaderValue::from_static("\"another-etag\""));
         let err = failed(odm_get_from_source(&state, &source, &headers, KEY, None, None).await);
@@ -5343,6 +5623,15 @@ mod on_demand_migration_tests {
         assert_eq!(get_count(&state, OdmOutcome::SourceHit), 2);
         assert_eq!(state.inflight_keys(), 0);
         assert!(rt.write_back.puts().is_empty());
+
+        let (mut output, _) = served(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(
+            collect_body(&mut output).await,
+            data,
+            "positive control still fetches the source representation"
+        );
+        assert_eq!(source.get_calls(), 1, "the same SourceClient counter observes the positive-control GET");
+        assert_eq!(source.head_calls(), 3, "each conditional and ordinary request reads source metadata");
     }
 
     #[tokio::test]
@@ -5632,6 +5921,28 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, ReadBuf};
 
+    #[tokio::test]
+    async fn conditional_reader_scope_keeps_large_futures_off_the_request_stack() {
+        let mut req = build_request(GetObjectInput::default(), Method::GET);
+        for conditional in [false, true] {
+            if conditional {
+                req.headers
+                    .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"etag\""));
+            }
+            let payload = [0u8; 64 * 1024];
+            let read = async move {
+                std::hint::black_box(payload);
+                std::future::ready(()).await;
+            };
+            let read = DefaultObjectUsecase::with_get_object_conditions(&req, None, read);
+            assert!(
+                std::mem::size_of_val(&read) < 2048,
+                "reader scope must not embed the concrete reader future"
+            );
+            read.await;
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cold_fill_disk_admission_preserves_slow_down() {
         let manager = Box::leak(Box::new(ConcurrencyManager::with_disk_read_caps_for_test(1, 1)));
@@ -5649,6 +5960,194 @@ mod tests {
 
         drop(degraded);
         drop(primary);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn conditional_get_304_uses_metadata_without_decoding_damaged_data() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        let (store, ambient) = real_cold_fill_test_context().await;
+        let context = temp_env::with_vars([(rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE, Some("false"))], || {
+            Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()))
+        });
+        assert!(context.object_data_cache().is_disabled());
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let (disk_paths, _) = crate::app::gating_test_env::shared_gating_ecstore_and_disk_paths().await;
+        let bucket = format!("conditional-metadata-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create test bucket");
+        for (object, length) in [("inline.bin", 4096), ("shards.bin", 1_300_000)] {
+            let payload = vec![b'c'; length];
+            let info = put_real_cold_fill_object(&store, &bucket, object, &payload).await;
+            let etag = info.etag.as_deref().expect("committed ETag");
+            for disk in &disk_paths {
+                let object_path = disk.join(&bucket).join(object);
+                if length == 4096 {
+                    let meta_path = object_path.join("xl.meta");
+                    let mut metadata = tokio::fs::read(&meta_path).await.expect("read inline metadata");
+                    *metadata.last_mut().expect("inline data bytes") ^= 1;
+                    tokio::fs::write(&meta_path, metadata).await.expect("damage inline payload");
+                } else {
+                    // Discover version data dirs by listing the object directory
+                    // (matching delete_object_part_shards) instead of constructing
+                    // the path from info.data_dir, whose UUID string form may not
+                    // match the on-disk directory name.
+                    let mut entries = tokio::fs::read_dir(&object_path).await.expect("read object dir");
+                    while let Some(entry) = entries.next_entry().await.expect("read object dir entry") {
+                        if entry.file_type().await.expect("entry file type").is_dir() {
+                            tokio::fs::remove_dir_all(entry.path())
+                                .await
+                                .expect("remove object data shards");
+                        }
+                    }
+                }
+            }
+            let resolved = store
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("metadata remains readable");
+            assert_eq!(resolved.etag.as_deref(), Some(etag));
+            let mut req = build_request(
+                GetObjectInput::builder()
+                    .bucket(bucket.clone())
+                    .key(object.to_owned())
+                    .build()
+                    .expect("GET input"),
+                Method::GET,
+            );
+            req.headers.insert(
+                http::header::IF_NONE_MATCH,
+                HeaderValue::from_str(&format!("W/\"{etag}\"")).expect("ETag header"),
+            );
+            let error = usecase
+                .execute_get_object(req)
+                .await
+                .expect_err("matching condition returns 304");
+            assert_eq!(error.code(), &S3ErrorCode::NotModified);
+            assert_eq!(error.headers().expect("304 validators")["etag"], format!("\"{etag}\""));
+
+            let mut req = build_request(
+                HeadObjectInput::builder()
+                    .bucket(bucket.clone())
+                    .key(object.to_owned())
+                    .build()
+                    .expect("HEAD input"),
+                Method::HEAD,
+            );
+            req.headers.insert(
+                http::header::IF_NONE_MATCH,
+                HeaderValue::from_str(&format!("\"{etag}\"")).expect("ETag header"),
+            );
+            let error = usecase
+                .execute_head_object(req)
+                .await
+                .expect_err("conditional HEAD returns 304");
+            assert_eq!(error.code(), &S3ErrorCode::NotModified);
+            assert_eq!(error.headers().expect("HEAD validators")["etag"], format!("\"{etag}\""));
+
+            let req = build_request(
+                GetObjectInput::builder()
+                    .bucket(bucket.clone())
+                    .key(object.to_owned())
+                    .build()
+                    .expect("GET input"),
+                Method::GET,
+            );
+            if let Ok(mut response) = usecase.execute_get_object(req).await {
+                let mut body = response.output.body.take().expect("body for damaged GET");
+                let mut failed = false;
+                while let Some(chunk) = body.next().await {
+                    if chunk.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                assert!(failed, "ordinary GET must still reject damaged data");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_read_checks_encryption_before_not_modified() {
+        let mut info = ObjectInfo {
+            etag: Some("abc".to_owned()),
+            ..Default::default()
+        };
+        info.user_defined = std::collections::HashMap::from([(
+            "x-amz-server-side-encryption-customer-algorithm".to_owned(),
+            "AES256".to_owned(),
+        )])
+        .into();
+        let mut req = build_request(
+            GetObjectInput::builder()
+                .bucket("bucket".to_owned())
+                .key("key".to_owned())
+                .build()
+                .expect("GET input"),
+            Method::GET,
+        );
+        req.headers
+            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"abc\""));
+        let error = DefaultObjectUsecase::validate_get_object_before_body(&req, "bucket", "key", None, &info)
+            .await
+            .expect_err("SSE-C key is mandatory before 304");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn conditional_get_miss_preserves_full_and_range_bodies() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        let (store, ambient) = real_cold_fill_test_context().await;
+        let context = temp_env::with_vars([(rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE, Some("false"))], || {
+            Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()))
+        });
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let bucket = format!("conditional-miss-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let payload: Vec<u8> = (0..1_300_000)
+            .map(|index| u8::try_from(index % 251).expect("pattern byte"))
+            .collect();
+        put_real_cold_fill_object(&store, &bucket, "object", &payload).await;
+        for ranged in [false, true] {
+            let input = GetObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("object".to_owned())
+                .range(ranged.then_some(Range::Int {
+                    first: 10,
+                    last: Some(29),
+                }))
+                .build()
+                .expect("GET input");
+            let mut req = build_request(input, Method::GET);
+            req.headers
+                .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"other\""));
+            if ranged {
+                req.headers
+                    .insert(http::header::RANGE, HeaderValue::from_static("bytes=10-29"));
+            }
+            let mut response = usecase
+                .execute_get_object(req)
+                .await
+                .expect("unmatched condition serves body");
+            let expected = if ranged { &payload[10..30] } else { payload.as_slice() };
+            assert_eq!(
+                response.output.content_length,
+                Some(i64::try_from(expected.len()).expect("test body length"))
+            );
+            assert_eq!(response.output.content_range.as_deref(), ranged.then_some("bytes 10-29/1300000"));
+            let mut body = response.output.body.take().expect("GET body");
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await {
+                bytes.extend_from_slice(&chunk.expect("body chunk"));
+            }
+            assert_eq!(bytes, expected);
+        }
     }
 
     #[tokio::test]
@@ -5862,8 +6361,11 @@ mod tests {
     }
 
     impl AsyncRead for ReadProbeReader {
-        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
             self.reads.fetch_add(1, AtomicOrdering::Relaxed);
+            if buf.remaining() > 0 {
+                buf.put_slice(b"x");
+            }
             Poll::Ready(Ok(()))
         }
     }
@@ -6463,12 +6965,11 @@ mod tests {
         )
         .await
         .expect("reservation bypass must construct the normal streaming fallback");
-        let chunk = fallback_body
-            .next()
-            .await
-            .expect("fallback stream must yield a body chunk")
-            .expect("fallback stream must not fail");
-        assert_eq!(chunk, Bytes::from_static(b"body"));
+        let mut received = Vec::new();
+        while let Some(chunk) = fallback_body.next().await {
+            received.extend_from_slice(&chunk.expect("fallback stream must not fail"));
+        }
+        assert_eq!(received, b"body");
         assert!(fallback_reads.load(AtomicOrdering::Relaxed) > 0);
         assert_eq!(readers.load(AtomicOrdering::Relaxed), 0, "cold-fill materialization must remain unopened");
         assert_eq!(coordinator.active_session_count_for_test(), 0);
@@ -6626,6 +7127,100 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
+    async fn conditional_get_terminal_response_skips_cache_fill_calls_with_live_positive_control() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        struct ResetProbes;
+        impl Drop for ResetProbes {
+            fn drop(&mut self) {
+                *BODY_CACHE_FILL_PROBE
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .expect("cache-fill probe") = None;
+                *COLD_FILL_READER_OPEN_PROBE
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .expect("reader-open probe") = None;
+            }
+        }
+        let (store, context) = real_cold_fill_test_context().await;
+        let bucket = format!("conditional-fill-calls-{}", Uuid::new_v4());
+        let object = "object.bin";
+        let payload: Vec<_> = (0..1_300_000)
+            .map(|index| u8::try_from(index % 251).expect("pattern byte"))
+            .collect();
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let info = put_real_cold_fill_object(&store, &bucket, object, &payload).await;
+        let adapter = context.object_data_cache();
+        let plan = real_cold_fill_plan(&adapter, &bucket, object, &info);
+        let key = plan.key().expect("cacheable key").clone();
+        let fills = Arc::new(BodyCacheFillCalls::default());
+        let reader_opens = Arc::new(AtomicU64::new(0));
+        let _reset = ResetProbes;
+        *BODY_CACHE_FILL_PROBE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("cache-fill probe") = Some((key.clone(), Arc::clone(&fills)));
+        *COLD_FILL_READER_OPEN_PROBE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("reader-open probe") = Some((key, Arc::clone(&reader_opens)));
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let input = GetObjectInput::builder()
+            .bucket(bucket)
+            .key(object.to_owned())
+            .build()
+            .expect("GET input");
+        for (header, value, expected) in [
+            (
+                http::header::IF_NONE_MATCH,
+                format!("\"{}\"", info.etag.as_deref().expect("ETag")),
+                S3ErrorCode::NotModified,
+            ),
+            (http::header::IF_MATCH, "\"other-etag\"".to_owned(), S3ErrorCode::PreconditionFailed),
+        ] {
+            let mut req = build_request(input.clone(), Method::GET);
+            req.headers.insert(header, HeaderValue::from_str(&value).expect("condition"));
+            let error = usecase.execute_get_object(req).await.expect_err("terminal condition");
+            assert_eq!(error.code(), &expected);
+            assert_eq!(reader_opens.load(Ordering::Relaxed), 0, "no cold-fill body factory call");
+            assert_eq!(fills.reservations.load(Ordering::Relaxed), 0, "no cache-fill reservation call");
+            assert_eq!(fills.fills.load(Ordering::Relaxed), 0, "no cache-fill publish call");
+            assert_eq!(adapter.cold_fill_coordinator().active_session_count_for_test(), 0);
+        }
+
+        let mut response = usecase
+            .execute_get_object(build_request(input, Method::GET))
+            .await
+            .expect("positive-control GET");
+        let mut body = response.output.body.take().expect("body");
+        let mut actual = Vec::new();
+        while let Some(chunk) = body.next().await {
+            actual.extend_from_slice(&chunk.expect("positive-control chunk"));
+        }
+        assert_eq!(actual, payload);
+        assert!(
+            reader_opens.load(Ordering::Relaxed) > 0,
+            "the same factory probe observes the positive control"
+        );
+        assert!(
+            fills.reservations.load(Ordering::Relaxed) > 0,
+            "the same reservation probe observes the positive control"
+        );
+        assert!(
+            fills.fills.load(Ordering::Relaxed) > 0,
+            "the same fill probe observes the positive control"
+        );
+        assert!(
+            matches!(adapter.lookup_body(&plan).await, rustfs_object_data_cache::ObjectDataCacheLookup::Hit(_)),
+            "the positive control really populated the cache"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
     async fn execute_get_object_maps_cold_fill_session_rejection_to_slow_down_without_opening_reader() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 
@@ -6691,6 +7286,16 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
     async fn execute_get_object_generation_change_bypasses_old_cold_fill_plan() {
+        run_conditional_generation_change(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn conditional_get_rechecks_generation_before_fallback_body() {
+        run_conditional_generation_change(true).await;
+    }
+
+    async fn run_conditional_generation_change(conditional: bool) {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 
         let (store, context) = real_cold_fill_test_context().await;
@@ -6702,6 +7307,16 @@ mod tests {
             .expect("real cold-fill generation bucket must be created");
         let initial_body = vec![b'a'; 1_300_000];
         let changed_body = vec![b'b'; initial_body.len()];
+        let condition_etag = if conditional {
+            Some(
+                put_real_cold_fill_object(&store, &bucket, object, &changed_body)
+                    .await
+                    .etag
+                    .expect("replacement ETag"),
+            )
+        } else {
+            None
+        };
         let initial_info = put_real_cold_fill_object(&store, &bucket, object, &initial_body).await;
         let adapter = context.object_data_cache();
         let initial_plan = real_cold_fill_plan(&adapter, &bucket, object, &initial_info);
@@ -6728,7 +7343,14 @@ mod tests {
                 ..GetObjectTimeoutPolicy::default()
             },
         );
-        let request = tokio::spawn(async move { usecase.execute_get_object(build_request(input, Method::GET)).await });
+        let mut req = build_request(input, Method::GET);
+        if let Some(etag) = &condition_etag {
+            req.headers.insert(
+                http::header::IF_NONE_MATCH,
+                HeaderValue::from_str(&format!("\"{etag}\"")).expect("replacement condition"),
+            );
+        }
+        let request = tokio::spawn(async move { usecase.execute_get_object(req).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while coordinator.global_waiter_count_for_test() != 1 {
                 tokio::task::yield_now().await;
@@ -6739,13 +7361,32 @@ mod tests {
 
         let changed_info = put_real_cold_fill_object(&store, &bucket, object, &changed_body).await;
         assert_ne!(initial_info.etag, changed_info.etag);
+        if conditional {
+            let (paths, _) = crate::app::gating_test_env::shared_gating_ecstore_and_disk_paths().await;
+            for path in paths {
+                tokio::fs::remove_dir_all(
+                    path.join(&bucket)
+                        .join(object)
+                        .join(changed_info.data_dir.expect("replacement data directory").to_string()),
+                )
+                .await
+                .expect("remove replacement shards before fallback");
+            }
+        }
         producer.relinquish_or_finish(ColdFillError::Storage(StorageError::Timeout));
 
-        let mut response = tokio::time::timeout(Duration::from_secs(10), request)
+        let result = tokio::time::timeout(Duration::from_secs(10), request)
             .await
             .expect("generation-changing GET must complete")
-            .expect("generation-changing GET task must join")
-            .expect("generation-changing GET must fall back successfully");
+            .expect("generation-changing GET task must join");
+        if conditional {
+            let error = result.expect_err("fallback must recheck the replacement ETag before body access");
+            assert_eq!(error.code(), &S3ErrorCode::NotModified);
+            assert_eq!(coordinator.global_waiter_count_for_test(), 0);
+            assert_eq!(coordinator.active_session_count_for_test(), 0);
+            return;
+        }
+        let mut response = result.expect("generation-changing GET must fall back successfully");
         let mut response_body = response.output.body.take().expect("GET response must include a body");
         let mut actual = Vec::with_capacity(changed_body.len());
         while let Some(chunk) = response_body.next().await {
@@ -7763,6 +8404,40 @@ mod tests {
         }
     }
 
+    struct PendingAfterReader {
+        data: std::io::Cursor<Vec<u8>>,
+        pending_after_data: bool,
+    }
+
+    impl PendingAfterReader {
+        fn new(data: &[u8], pending_after_data: bool) -> Self {
+            Self {
+                data: std::io::Cursor::new(data.to_vec()),
+                pending_after_data,
+            }
+        }
+    }
+
+    impl AsyncRead for PendingAfterReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let position = usize::try_from(self.data.position()).unwrap_or(usize::MAX);
+            let source_len = self.data.get_ref().len();
+            if position >= source_len {
+                if self.pending_after_data {
+                    return Poll::Pending;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            let want = buf.remaining().min(source_len - position);
+            if want == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            buf.put_slice(&self.data.get_ref()[position..position + want]);
+            self.data.set_position(u64::try_from(position + want).unwrap_or(u64::MAX));
+            Poll::Ready(Ok(()))
+        }
+    }
+
     fn relocation_read_error() -> std::io::Error {
         std::io::Error::other(StorageError::FileNotFound)
     }
@@ -7786,6 +8461,151 @@ mod tests {
                 0,
             ),
         )
+    }
+
+    #[tokio::test]
+    async fn build_reader_blob_rejects_quorum_failure_before_handoff() {
+        let result = DefaultObjectUsecase::build_reader_blob(
+            FailAtEndReader::new(
+                b"",
+                Some(std::io::Error::other(StorageError::InsufficientReadQuorum(
+                    "test-bucket".to_string(),
+                    "unavailable-object".to_string(),
+                ))),
+            ),
+            5,
+            "req-preheader-quorum",
+            None,
+            64,
+            GetObjectStreamStrategy::Standard,
+            "test-bucket",
+            "unavailable-object",
+            GetObjectBodyLifecycle::disabled(),
+            None,
+        )
+        .await;
+
+        let error = result.expect_err("a read quorum failure before the first byte must reject response construction");
+        assert_eq!(error.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
+        assert_eq!(error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(error.message(), Some("Resource requested is unreadable, please reduce your request rate"));
+    }
+
+    #[tokio::test]
+    async fn build_reader_blob_preserves_primed_byte_for_full_and_range() {
+        for (request_id, content_range) in [("req-preheader-full", None), ("req-preheader-range", Some("bytes 10-14/100"))] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let mut body = DefaultObjectUsecase::build_reader_blob(
+                DataProbeReader {
+                    reads: Arc::clone(&reads),
+                    data: std::io::Cursor::new(b"hello".to_vec()),
+                },
+                5,
+                request_id,
+                content_range,
+                64,
+                GetObjectStreamStrategy::Standard,
+                "test-bucket",
+                "test-object",
+                GetObjectBodyLifecycle::disabled(),
+                None,
+            )
+            .await
+            .expect("the first byte should be available before response handoff");
+
+            assert_eq!(reads.load(AtomicOrdering::Relaxed), 1, "response construction must prime one byte");
+            let mut received = Vec::new();
+            while let Some(chunk) = body.next().await {
+                received.extend_from_slice(&chunk.expect("the primed body should remain readable"));
+            }
+            assert_eq!(received, b"hello", "the primed byte must be delivered exactly once");
+        }
+    }
+
+    #[tokio::test]
+    async fn build_reader_blob_does_not_poll_empty_object() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut body = DefaultObjectUsecase::build_reader_blob(
+            ReadProbeReader {
+                reads: Arc::clone(&reads),
+            },
+            0,
+            "req-empty-object",
+            None,
+            64,
+            GetObjectStreamStrategy::Standard,
+            "test-bucket",
+            "empty-object",
+            GetObjectBodyLifecycle::disabled(),
+            None,
+        )
+        .await
+        .expect("an empty response should not require a storage read");
+
+        assert_eq!(reads.load(AtomicOrdering::Relaxed), 0);
+        assert!(body.next().await.is_none());
+        assert_eq!(reads.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn build_reader_blob_leaves_later_failure_in_body_stream() {
+        let mut body = DefaultObjectUsecase::build_reader_blob(
+            FailAtEndReader::new(b"h", Some(std::io::Error::other("failure after handoff"))),
+            5,
+            "req-postheader-failure",
+            None,
+            64,
+            GetObjectStreamStrategy::Standard,
+            "test-bucket",
+            "later-failure-object",
+            GetObjectBodyLifecycle::disabled(),
+            None,
+        )
+        .await
+        .expect("the available first byte should allow response handoff");
+
+        let first = body
+            .next()
+            .await
+            .expect("the primed byte must be present")
+            .expect("the primed byte must be successful");
+        assert_eq!(first, Bytes::from_static(b"h"));
+        let error = body
+            .next()
+            .await
+            .expect("the later read must produce a body result")
+            .expect_err("a failure after the first byte must stay in the body stream");
+        assert!(error.to_string().contains("failure after handoff"));
+    }
+
+    #[tokio::test]
+    async fn build_reader_blob_resume_offset_includes_primed_byte() {
+        let reopen_count = Arc::new(AtomicUsize::new(0));
+        let control = counting_resume_control(Arc::clone(&reopen_count), |emitted| {
+            assert_eq!(emitted, 1, "resume must start after the byte consumed before response handoff");
+            Ok(FailAtEndReader::new(b"ello", None))
+        });
+        let mut body = DefaultObjectUsecase::build_reader_blob(
+            FailAtEndReader::new(b"h", Some(relocation_read_error())),
+            5,
+            "req-preheader-resume-offset",
+            None,
+            64,
+            GetObjectStreamStrategy::Standard,
+            "test-bucket",
+            "relocated-object",
+            GetObjectBodyLifecycle::disabled(),
+            Some(control),
+        )
+        .await
+        .expect("the first byte should permit response handoff before relocation");
+
+        let mut received = Vec::new();
+        while let Some(chunk) = body.next().await {
+            received.extend_from_slice(&chunk.expect("resume should complete the body"));
+        }
+        assert_eq!(received, b"hello");
+        assert_eq!(reopen_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -7826,6 +8646,63 @@ mod tests {
             assert_eq!(out, b"hello world");
             assert_eq!(reopen_count.load(Ordering::Relaxed), 1);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_object_streaming_reader_resumes_after_body_stall() {
+        use tokio::io::AsyncReadExt;
+
+        let reopen_count = Arc::new(AtomicUsize::new(0));
+        let reopen: GetObjectReopen<PendingAfterReader> = Box::new({
+            let reopen_count = Arc::clone(&reopen_count);
+            move |emitted| {
+                assert_eq!(emitted, 6, "resume must continue at the delivered byte offset");
+                reopen_count.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { Ok(PendingAfterReader::new(b"world", false)) })
+            }
+        });
+        let control = GetObjectResumeControl::new(
+            reopen,
+            RetryTimer::new(
+                GET_OBJECT_RESUME_MAX_ATTEMPTS,
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                rustfs_utils::retry::NO_JITTER,
+                0,
+            ),
+        );
+        let mut reader = GetObjectStreamingReader::new(
+            PendingAfterReader::new(b"hello ", true),
+            "test-bucket",
+            "stalled-object",
+            "req-resume-stall",
+            None,
+            11,
+            Duration::from_secs(1),
+            GetObjectBodyLifecycle::disabled(),
+            Some(control),
+        );
+
+        let mut first = [0; 6];
+        assert_eq!(reader.read(&mut first).await.expect("initial bytes must be readable"), 6);
+        assert_eq!(&first, b"hello ");
+
+        let mut tail = Vec::new();
+        let read_to_end = reader.read_to_end(&mut tail);
+        tokio::pin!(read_to_end);
+        assert!(
+            futures::poll!(&mut read_to_end).is_pending(),
+            "the body should stall before the watchdog fires"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(3)).await;
+
+        read_to_end
+            .await
+            .expect("a timed-out source read must resume from the same object version");
+        assert_eq!(tail, b"world");
+        assert_eq!(reopen_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -8222,6 +9099,34 @@ mod tests {
         );
         assert_eq!(out, b"hello world");
         assert_eq!(reopen_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn get_object_resume_only_attaches_for_recoverable_layouts() {
+        let single_disk = ObjectInfo {
+            data_blocks: 1,
+            parity_blocks: 0,
+            ..Default::default()
+        };
+        assert!(!should_attach_get_object_resume(&single_disk));
+
+        let erasure = ObjectInfo {
+            data_blocks: 2,
+            parity_blocks: 1,
+            ..Default::default()
+        };
+        assert!(should_attach_get_object_resume(&erasure));
+
+        let transitioned = ObjectInfo {
+            data_blocks: 1,
+            parity_blocks: 0,
+            transitioned_object: crate::storage_api::server::event::contract::lifecycle::TransitionedObject {
+                tier: "remote-tier".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(should_attach_get_object_resume(&transitioned));
     }
 
     #[test]
@@ -9108,7 +10013,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_get_object_body_keeps_large_objects_on_streaming_path_without_preread() {
+    async fn build_get_object_body_primes_large_stream_before_handoff() {
         let reads = Arc::new(AtomicUsize::new(0));
         let reader = ReadProbeReader {
             reads: Arc::clone(&reads),
@@ -9141,13 +10046,13 @@ mod tests {
 
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "large-object response construction should not pre-read object data"
+            1,
+            "large-object response construction should prime exactly one byte"
         );
     }
 
     #[tokio::test]
-    async fn build_get_object_body_keeps_large_encrypted_objects_on_streaming_path_without_preread() {
+    async fn build_get_object_body_primes_large_encrypted_stream_before_handoff() {
         let reads = Arc::new(AtomicUsize::new(0));
         let reader = ReadProbeReader {
             reads: Arc::clone(&reads),
@@ -9180,8 +10085,8 @@ mod tests {
 
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "large encrypted object response construction should not pre-read object data"
+            1,
+            "large encrypted object response construction should prime exactly one byte"
         );
     }
 
@@ -9351,8 +10256,8 @@ mod tests {
         assert_eq!(fill, rustfs_object_data_cache::ObjectDataCacheFillResult::SkippedSizeMismatch);
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "size-mismatched rejected fill should construct the fallback stream without pre-reading"
+            1,
+            "size-mismatched rejected fill should prime the fallback stream before handoff"
         );
         assert!(
             matches!(lookup_after_mismatch, rustfs_object_data_cache::ObjectDataCacheLookup::Miss),
@@ -10060,8 +10965,8 @@ mod tests {
 
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "too-large materialize-fill candidate must not pre-read the fallback reader"
+            1,
+            "too-large materialize-fill candidate must prime the streaming fallback"
         );
     }
 
@@ -10099,8 +11004,8 @@ mod tests {
 
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
-            0,
-            "default GetObject response construction should not pre-read small plain object data"
+            1,
+            "default GetObject response construction should prime exactly one byte"
         );
     }
 
@@ -10495,78 +11400,101 @@ mod tests {
 
     #[tokio::test]
     async fn build_get_object_output_context_returns_standard_headers() {
-        let mut metadata = HashMap::new();
-        metadata.insert("cache-control".to_string(), "public, max-age=259200".to_string());
-        metadata.insert("content-disposition".to_string(), "attachment; filename=\"demo.png\"".to_string());
+        for (content_language, user_language) in [
+            (Some("zh-CN"), None),
+            (None, None),
+            (Some(""), None),
+            (Some("zh-CN"), Some("fr-FR")),
+            (None, Some("fr-FR")),
+        ] {
+            let mut metadata = HashMap::new();
+            metadata.insert("cache-control".to_string(), "public, max-age=259200".to_string());
+            metadata.insert("content-disposition".to_string(), "attachment; filename=\"demo.png\"".to_string());
+            if let Some(language) = content_language {
+                metadata.insert("content-language".to_string(), language.to_string());
+            }
+            if let Some(language) = user_language {
+                metadata.insert("x-amz-meta-content-language".to_string(), language.to_string());
+            }
 
-        let info = ObjectInfo {
-            bucket: "test-bucket".to_string(),
-            name: "path/raw".to_string(),
-            user_defined: Arc::new(metadata),
-            ..Default::default()
-        };
+            let info = ObjectInfo {
+                bucket: "test-bucket".to_string(),
+                name: "path/raw".to_string(),
+                user_defined: Arc::new(metadata),
+                ..Default::default()
+            };
 
-        let input = GetObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("path/raw".to_string())
-            .build()
-            .unwrap();
-        let req = build_request(input, Method::GET);
-        let usecase = DefaultObjectUsecase::without_context();
-        let queue_status = concurrency::IoQueueStatus::default();
+            let input = GetObjectInput::builder()
+                .bucket("test-bucket".to_string())
+                .key("path/raw".to_string())
+                .build()
+                .unwrap();
+            let req = build_request(input, Method::GET);
+            let usecase = DefaultObjectUsecase::without_context();
+            let queue_status = concurrency::IoQueueStatus::default();
 
-        let context = usecase
-            .build_get_object_output_context(
-                &req,
-                get_concurrency_manager(),
-                "test-bucket",
-                "path/raw",
-                info.clone(),
-                Some(info),
-                wrap_reader(tokio::io::empty()),
-                Some(Bytes::new()),
-                false,
-                false,
-                true,
-                None,
-                None,
-                None,
-                0,
-                None,
-                "req-output-content-disposition",
-                None,
-                None,
-                None,
-                None,
-                false,
-                Duration::ZERO,
-                0.0,
-                &queue_status,
-                1,
-                None,
-                false,
-                GetObjectBodyLifecycle::disabled(),
-                |_| panic!("a buffered output must not initialize streaming resume state"),
-            )
-            .await
-            .expect("get object output context");
+            let context = usecase
+                .build_get_object_output_context(
+                    &req,
+                    get_concurrency_manager(),
+                    "test-bucket",
+                    "path/raw",
+                    info.clone(),
+                    Some(info),
+                    wrap_reader(tokio::io::empty()),
+                    Some(Bytes::new()),
+                    false,
+                    false,
+                    true,
+                    None,
+                    None,
+                    None,
+                    0,
+                    None,
+                    "req-output-content-disposition",
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Duration::ZERO,
+                    0.0,
+                    &queue_status,
+                    1,
+                    None,
+                    GetObjectBodyLifecycle::disabled(),
+                    |_| panic!("a buffered output must not initialize streaming resume state"),
+                )
+                .await
+                .expect("get object output context");
 
-        assert_eq!(context.output.cache_control.as_deref(), Some("public, max-age=259200"));
-        assert_eq!(context.output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
-        assert!(
-            !context
-                .output
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.contains_key("cache-control"))
-        );
-        assert!(
-            !context
-                .output
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.contains_key("content-disposition"))
-        );
+            assert_eq!(context.output.cache_control.as_deref(), Some("public, max-age=259200"));
+            assert_eq!(context.output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
+            assert_eq!(context.output.content_language.as_deref(), content_language);
+            assert_eq!(
+                context
+                    .output
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("content-language"))
+                    .map(String::as_str),
+                user_language,
+            );
+            assert!(
+                !context
+                    .output
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.contains_key("cache-control"))
+            );
+            assert!(
+                !context
+                    .output
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.contains_key("content-disposition"))
+            );
+        }
     }
 
     #[tokio::test]
@@ -10611,50 +11539,42 @@ mod tests {
     }
 
     #[test]
-    fn cold_fill_conditions_fail_before_phase_probe_advances() {
-        fn run_phase_probe(headers: &HeaderMap, info: &ObjectInfo) -> (S3Result<()>, [usize; 3]) {
-            let coordination = AtomicUsize::new(0);
-            let permit = AtomicUsize::new(0);
-            let reader = AtomicUsize::new(0);
-            let result = DefaultObjectUsecase::validate_get_object_before_cold_fill(headers, None, info);
-            if result.is_ok() {
-                coordination.fetch_add(1, AtomicOrdering::Relaxed);
-                permit.fetch_add(1, AtomicOrdering::Relaxed);
-                reader.fetch_add(1, AtomicOrdering::Relaxed);
+    fn get_object_reports_parts_count_for_multipart_objects() {
+        fn info_with_parts(count: usize, etag: &str) -> ObjectInfo {
+            ObjectInfo {
+                parts: Arc::new(
+                    (1..=count)
+                        .map(|number| rustfs_filemeta::ObjectPartInfo {
+                            number,
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                etag: Some(etag.to_string()),
+                ..Default::default()
             }
-            (
-                result,
-                [
-                    coordination.load(AtomicOrdering::Relaxed),
-                    permit.load(AtomicOrdering::Relaxed),
-                    reader.load(AtomicOrdering::Relaxed),
-                ],
-            )
         }
 
-        let info = ObjectInfo {
-            etag: Some("phase-etag".to_string()),
-            parts: Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
-                number: 1,
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
+        // A multipart object, asked for by part: the count is what lets the
+        // client know three more parts follow.
+        let multipart = info_with_parts(4, "d41d8cd98f00b204e9800998ecf8427e-4");
+        assert!(multipart.is_multipart());
+        assert_eq!(DefaultObjectUsecase::get_object_parts_count(Some(1), &multipart), Some(4));
 
-        let mut not_modified = HeaderMap::new();
-        not_modified.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"phase-etag\""));
-        let (result, phases) = run_phase_probe(&not_modified, &info);
-        assert_eq!(result.expect_err("matching If-None-Match must reject").code(), &S3ErrorCode::NotModified);
-        assert_eq!(phases, [0, 0, 0]);
+        // Not asked for by part: s3 omits the header entirely.
+        assert_eq!(DefaultObjectUsecase::get_object_parts_count(None, &multipart), None);
 
-        let mut precondition_failed = HeaderMap::new();
-        precondition_failed.insert(http::header::IF_MATCH, HeaderValue::from_static("\"other-etag\""));
-        let (result, phases) = run_phase_probe(&precondition_failed, &info);
-        assert_eq!(
-            result.expect_err("mismatched If-Match must reject").code(),
-            &S3ErrorCode::PreconditionFailed
-        );
-        assert_eq!(phases, [0, 0, 0]);
+        // A plain PutObject is stored as one part and carries a bare 32-char
+        // etag, so it is not multipart and is owed no count.
+        let single = info_with_parts(1, "d41d8cd98f00b204e9800998ecf8427e");
+        assert!(!single.is_multipart());
+        assert_eq!(DefaultObjectUsecase::get_object_parts_count(Some(1), &single), None);
+
+        // A multipart upload that happened to have one part still carries the
+        // `-1` etag suffix, so it is multipart and reports a count of 1.
+        let single_part_multipart = info_with_parts(1, "d41d8cd98f00b204e9800998ecf8427e-1");
+        assert!(single_part_multipart.is_multipart());
+        assert_eq!(DefaultObjectUsecase::get_object_parts_count(Some(1), &single_part_multipart), Some(1));
     }
 
     #[tokio::test]

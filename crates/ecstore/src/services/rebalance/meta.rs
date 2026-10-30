@@ -1,3 +1,4 @@
+use super::worker::{rebalance_max_attempts, retry_rebalance_metadata_access};
 use super::{
     EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_STATE, Error, GetObjectReader, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
     ObjectInfo, ObjectOptions, PutObjReader, REBAL_META_FMT, REBAL_META_NAME, REBAL_META_VER,
@@ -70,6 +71,31 @@ impl From<u8> for RebalStatus {
 }
 
 impl RebalanceMeta {
+    /// A historical run has no authority over the current deployment's pool
+    /// indices. Stop timestamps alone do not prove that its workers stopped.
+    pub(crate) fn has_terminal_topology(&self) -> bool {
+        !self.id.is_empty()
+            && !self.pool_stats.is_empty()
+            && self.pool_stats.iter().all(|pool| {
+                if pool.info.stopping
+                    || !matches!(pool.info.status, RebalStatus::Completed | RebalStatus::Stopped | RebalStatus::Failed)
+                        && (pool.participating || pool.info.status != RebalStatus::None)
+                {
+                    return false;
+                }
+                let Some(message) = pool.info.last_error.as_deref() else {
+                    return true;
+                };
+                if !is_rebalance_stop_propagation_error(Some(message)) {
+                    return true;
+                }
+                decode_rebalance_stop_propagation_record(message).is_some_and(|record| {
+                    !record.has_failures()
+                        && (record.stop_attempt_at.or(self.stopped_at).is_none() || record.terminal_reload_attempt_at.is_some())
+                })
+            })
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -100,7 +126,10 @@ impl RebalanceMeta {
                 PutObjectReader = PutObjReader,
             >,
     {
-        let (data, _) = read_config_with_metadata(store, REBAL_META_NAME, &opts).await?;
+        let (data, _) = retry_rebalance_metadata_access(None, rebalance_max_attempts(), || {
+            read_config_with_metadata(Arc::clone(&store), REBAL_META_NAME, &opts)
+        })
+        .await?;
         if data.is_empty() {
             debug!(
                 event = EVENT_REBALANCE_STATE,
@@ -125,7 +154,8 @@ impl RebalanceMeta {
             ver => return Err(rebalance_meta_load_unknown_version_error(ver)),
         }
 
-        let meta: Self = rmp_serde::from_read(Cursor::new(&data[4..]))?;
+        let meta: Self = rmp_serde::from_read(Cursor::new(&data[4..]))
+            .map_err(|source| Error::other(RebalanceMetadataLoadError::Decode(source)))?;
         *self = meta;
 
         self.last_refreshed_at = Some(OffsetDateTime::now_utc());
@@ -230,16 +260,28 @@ pub(super) fn first_rebalance_bucket(pool_stat: &RebalanceStats) -> Option<Strin
     pool_stat.buckets.first().cloned()
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RebalanceMetadataLoadError {
+    #[error("rebalance metadata load failed: metadata payload is too short")]
+    PayloadTooShort,
+    #[error("rebalance metadata load failed: unknown format {0}")]
+    UnknownFormat(u16),
+    #[error("rebalance metadata load failed: unknown version {0}")]
+    UnknownVersion(u16),
+    #[error("rebalance metadata load failed: payload decode failed: {0}")]
+    Decode(#[source] rmp_serde::decode::Error),
+}
+
 pub(super) fn rebalance_meta_load_no_data_error() -> Error {
-    Error::other("rebalance metadata load failed: metadata payload is too short")
+    Error::other(RebalanceMetadataLoadError::PayloadTooShort)
 }
 
 pub(super) fn rebalance_meta_load_unknown_format_error(fmt: u16) -> Error {
-    Error::other(format!("rebalance metadata load failed: unknown format {fmt}"))
+    Error::other(RebalanceMetadataLoadError::UnknownFormat(fmt))
 }
 
 pub(super) fn rebalance_meta_load_unknown_version_error(ver: u16) -> Error {
-    Error::other(format!("rebalance metadata load failed: unknown version {ver}"))
+    Error::other(RebalanceMetadataLoadError::UnknownVersion(ver))
 }
 
 pub fn encode_rebalance_stop_propagation_record(record: &RebalanceStopPropagationRecord) -> String {

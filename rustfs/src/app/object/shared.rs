@@ -32,6 +32,19 @@ pub(super) const LOG_COMPONENT_APP: &str = "app";
 
 pub(super) const LOG_SUBSYSTEM_OBJECT: &str = "object";
 
+/// Encode a resolved object version identity for an S3 response. Storage
+/// distinguishes a null version from an unversioned object by returning a nil
+/// UUID instead of None.
+pub(crate) fn s3_response_version_id(version_id: Option<Uuid>) -> Option<String> {
+    version_id.map(|id| {
+        if id.is_nil() {
+            NULL_VERSION_ID.to_owned()
+        } else {
+            id.to_string()
+        }
+    })
+}
+
 fn is_delete_marker_read_error(err: &S3Error, version_id: Option<&str>) -> bool {
     let code = if version_id.is_some() {
         S3ErrorCode::MethodNotAllowed
@@ -185,7 +198,7 @@ pub(super) fn request_body_is_aws_chunked_framed(headers: &HeaderMap) -> bool {
 
 /// Map a bucket-quota checker outcome onto the S3 admission result.
 ///
-/// Hard is the only supported quota type, so a checker fault (bucket-config read, config parse, or usage lookup) must fail closed rather than admit the write: allowing it would silently bypass a configured hard quota. The no-quota happy path never reaches the error arm — `QuotaChecker::check_quota` returns `Ok(allowed)` via the zero-extra-I/O fast path when no quota is configured, so failing closed here cannot penalise buckets without a quota. A fault surfaces as a retryable `ServiceUnavailable` and is counted; the client-facing message stays generic so internal config/usage details are not leaked.
+/// Hard is the only supported quota type, so a checker fault (bucket-config read, config parse, or usage lookup) must fail closed rather than admit the write: allowing it would silently bypass a configured hard quota. The no-quota happy path never reaches the error arm — `QuotaChecker::check_quota` returns `Ok(allowed)` via the zero-extra-I/O fast path when no quota is configured, so failing closed here cannot penalise buckets without a quota. A bucket admitted by the durable reservation ledger never reaches it for an unavailable usage lookup either: the checker reports that usage as absent (`current_usage = None`) and the ledger settles admission at commit (rustfs/backlog#2904); only the snapshot protocol still fails closed on it. A fault surfaces as a retryable `ServiceUnavailable` and is counted; the client-facing message stays generic so internal config/usage details are not leaked.
 pub(crate) fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, QuotaError>) -> S3Result<QuotaCheckResult> {
     match outcome {
         Ok(result) if !result.allowed => Err(S3Error::with_message(
@@ -466,7 +479,7 @@ mod bucket_default_sse_lookup_tests {
         let err = classify_bucket_default_sse_lookup("bucket", Err(StorageError::ErasureReadQuorum))
             .expect_err("an unreadable metadata subsystem must never degrade to plaintext");
 
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
     }
 
     #[test]
@@ -547,6 +560,29 @@ pub(crate) fn inject_additional_checksum_headers(headers: &mut HeaderMap, pairs:
 
 pub(super) fn inject_accept_ranges_header(headers: &mut HeaderMap) {
     headers.insert(http::header::ACCEPT_RANGES, HeaderValue::from_static(ACCEPT_RANGES_BYTES));
+}
+
+/// Reject a mutation of a Veeam SOSAPI key while the feature is enabled.
+///
+/// The store closure runs only after the key matches, so ordinary object
+/// writes pay two string compares. Bucket existence is checked first so a
+/// missing bucket stays `NoSuchBucket`.
+pub(crate) async fn reject_veeam_sosapi_mutation(
+    store: impl FnOnce() -> Option<Arc<ECStore>>,
+    bucket: &str,
+    key: &str,
+) -> S3Result<()> {
+    if !super::veeam_sosapi::mutation_blocked(key) {
+        return Ok(());
+    }
+    let Some(store) = store() else {
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+    };
+    validate_bucket_exists(&store, bucket).await?;
+    Err(S3Error::with_message(
+        S3ErrorCode::MethodNotAllowed,
+        "Veeam SOSAPI system objects are read-only",
+    ))
 }
 
 /// Derive the response-header echo pairs for an additional-checksum algorithm
@@ -660,7 +696,10 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
         return None;
     }
 
-    let expiry_date = expire_time.format(&Rfc3339).ok()?;
+    // `x-amz-expiration` is a date-valued S3 response header and therefore uses
+    // HTTP-date, not ISO-8601: the AWS SDKs hand this value to an RFC 822
+    // parser, which rejects `2026-10-02T00:00:00Z` and drops the metadata.
+    let expiry_date = format_http_date(&Timestamp::from(expire_time)).ok()?;
     Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
 }
 
@@ -696,10 +735,21 @@ pub(super) fn parse_expires_header(expires: Option<&str>) -> S3Result<Option<Tim
 }
 
 pub(super) fn format_expires_header(expires: &Timestamp) -> S3Result<String> {
+    format_http_date(expires)
+}
+
+/// Render a date-valued S3 response header (`Expires`, `x-amz-expiration`) as
+/// HTTP-date: RFC 1123 with a literal `GMT` zone, e.g.
+/// `Fri, 23 Dec 2012 00:00:00 GMT`.
+///
+/// Interoperability depends on this shape. `x-amz-expiration` in particular is
+/// parsed with an RFC 822 parser by the AWS SDKs, which rejects an RFC 3339
+/// value such as `2026-10-02T00:00:00Z` and then discards the whole header.
+pub(super) fn format_http_date(timestamp: &Timestamp) -> S3Result<String> {
     let mut formatted = Vec::new();
-    expires
+    timestamp
         .format(TimestampFormat::HttpDate, &mut formatted)
-        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid expires timestamp: {e}"))))?;
+        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid HTTP-date timestamp: {e}"))))?;
     Ok(String::from_utf8_lossy(&formatted).into_owned())
 }
 
@@ -824,7 +874,7 @@ pub(crate) fn build_put_like_object_lock_metadata(
     Ok(Some(eval_metadata))
 }
 
-fn put_like_write_creates_new_version(opts: &ObjectOptions) -> bool {
+pub(super) fn put_like_write_creates_new_version(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
@@ -1065,31 +1115,41 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
     if (needs_etag && head.etag.is_none()) || (needs_mtime && head.last_modified.is_none()) {
         return Err(odm_source_unavailable_error("missing_source_validator"));
     }
+    let mut metadata = HashMap::new();
+    for (name, value) in [("cache-control", &head.cache_control), ("expires", &head.expires)] {
+        if let Some(value) = value {
+            metadata.insert(name.to_owned(), value.clone());
+        }
+    }
     let info = ObjectInfo {
         etag: head.etag.clone(),
         mod_time: head.last_modified.map(OffsetDateTime::from),
+        user_defined: metadata.into(),
         ..Default::default()
     };
-    // A successful source read establishes wildcard existence, but the
-    // remaining conditions must still run in their ordinary precedence.
-    if head.etag.is_none() && (if_match == Some("*") || if_none_match == Some("*")) {
-        let mut remaining = headers.clone();
-        if if_match == Some("*") {
-            remaining.remove(http::header::IF_MATCH);
-            remaining.remove(http::header::IF_UNMODIFIED_SINCE);
-        }
-        if if_none_match == Some("*") {
-            remaining.remove(http::header::IF_NONE_MATCH);
-            remaining.remove(http::header::IF_MODIFIED_SINCE);
-        }
-        check_preconditions(&remaining, &info)?;
-        return if if_none_match == Some("*") {
-            Err(S3Error::new(S3ErrorCode::NotModified))
-        } else {
-            Ok(())
-        };
-    }
     check_preconditions(headers, &info)
+}
+
+/// S3 documents write-side `If-None-Match` only as `*` (create-only).
+/// Reject unsupported ETag comparisons with 501 NotImplemented.
+/// Treating it as an ETag comparison would let a write overwrite an existing key
+/// while still satisfying a policy that requires `s3:if-none-match`.
+pub(crate) fn reject_non_wildcard_write_if_none_match(
+    if_none_match: Option<&s3s::dto::ETagCondition>,
+    headers: &HeaderMap,
+) -> S3Result<()> {
+    // POST parses conditional DTO fields from the form, so HTTP headers also need validation.
+    if matches!(if_none_match, Some(s3s::dto::ETagCondition::ETag(_)))
+        || headers.get_all(http::header::IF_NONE_MATCH).iter().any(|value| {
+            value.to_str().map_or(true, |value| {
+                let value = value.trim();
+                !value.is_empty() && value != "*"
+            })
+        })
+    {
+        return Err(S3Error::new(S3ErrorCode::NotImplemented));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1101,6 +1161,63 @@ mod tests {
         ServerSideEncryptionRule,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_allows_only_wildcard() {
+        let headers = HeaderMap::new();
+        assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok());
+        assert!(reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers).is_ok());
+
+        let etag = s3s::dto::ETagCondition::ETag(ETag::Strong("9b2cf535f27731c974343645a3985328".to_owned()));
+        let err =
+            reject_non_wildcard_write_if_none_match(Some(&etag), &headers).expect_err("an ETag If-None-Match must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(err.status_code(), Some(http::StatusCode::NOT_IMPLEMENTED));
+        assert_eq!(
+            err.message(),
+            Some("A header you provided implies functionality that is not implemented.")
+        );
+    }
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_checks_header_without_dto() {
+        for value in ["*", " * ", "", " "] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
+            assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok(), "{value:?}");
+        }
+        for value in ["\"different-etag\"", "W/\"weak-etag\"", "unquoted-etag"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
+            let err = reject_non_wildcard_write_if_none_match(None, &headers)
+                .expect_err("header-only ETag precondition must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        }
+    }
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_rejects_conflicting_sources() {
+        for value in [
+            http::HeaderValue::from_static("\"different-etag\""),
+            http::HeaderValue::from_bytes(b"\xff").expect("obs-text is a valid HTTP header"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.append(http::header::IF_NONE_MATCH, http::HeaderValue::from_static("*"));
+            headers.append(http::header::IF_NONE_MATCH, value);
+            let err = reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers)
+                .expect_err("a form wildcard must not hide an unsupported raw HTTP precondition");
+            assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        }
+    }
+
+    #[test]
+    fn s3_response_version_id_distinguishes_absent_null_and_uuid_versions() {
+        let version = Uuid::parse_str("9341ae04-d4ce-468c-a4e1-6501d58cd6b7").unwrap();
+
+        assert_eq!(s3_response_version_id(None), None);
+        assert_eq!(s3_response_version_id(Some(Uuid::nil())).as_deref(), Some(NULL_VERSION_ID));
+        assert_eq!(s3_response_version_id(Some(version)), Some(version.to_string()));
+    }
 
     #[test]
     fn delete_marker_read_headers_round_trip_uuid_and_null_errors() {
@@ -1477,7 +1594,7 @@ mod tests {
 
     #[test]
     fn build_put_like_object_lock_metadata_rejects_retain_until_date_without_mode() {
-        let retain_until = Timestamp::from(OffsetDateTime::now_utc().add(time::Duration::days(1)));
+        let retain_until = Timestamp::from(OffsetDateTime::now_utc() + time::Duration::days(1));
         let err = build_put_like_object_lock_metadata(
             "test-bucket",
             &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
@@ -1689,13 +1806,11 @@ mod tests {
 
     #[test]
     fn s3s_body_error_to_io_preserves_upload_stream_error_source() {
-        let error = s3s_body_error_to_io(Box::new(MockUploadStreamSha256Mismatch));
+        let error = s3s_body_error_to_io(Box::new(UploadStreamError::Sha256Mismatch));
 
         assert!(matches!(
-            error
-                .get_ref()
-                .and_then(|source| source.downcast_ref::<MockUploadStreamSha256Mismatch>()),
-            Some(MockUploadStreamSha256Mismatch)
+            error.get_ref().and_then(|source| source.downcast_ref::<UploadStreamError>()),
+            Some(UploadStreamError::Sha256Mismatch)
         ));
     }
 
@@ -1834,6 +1949,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
@@ -1849,11 +1965,13 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
-        let expiry_date = expire_time.format(&Rfc3339).unwrap();
-        let expected = format!("expiry-date=\"{}\", rule-id=\"rule-1\"", expiry_date);
-        assert_eq!(build_put_object_expiration_header(&event), Some(expected));
+        // HTTP-date, not RFC 3339: the AWS SDKs parse this field with an
+        // RFC 822 parser, so `2026-10-02T00:00:00Z` loses the metadata.
+        let expected = "expiry-date=\"Tue, 14 Nov 2023 22:13:20 GMT\", rule-id=\"rule-1\"";
+        assert_eq!(build_put_object_expiration_header(&event), Some(expected.to_string()));
     }
 
     #[test]
@@ -1865,6 +1983,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
@@ -1876,6 +1995,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
@@ -2085,14 +2205,38 @@ mod tests {
 
     #[test]
     fn quota_admission_fails_closed_on_unknown_authoritative_usage() {
+        // Only the snapshot protocol still surfaces this: the checker never
+        // returns it for a bucket the durable reservation ledger admits.
         let err = map_quota_check_outcome(
             "bucket",
             Err(QuotaError::UsageUnavailable {
                 bucket: "bucket".to_string(),
             }),
         )
-        .expect_err("unknown authoritative usage must not admit a quota-controlled write");
+        .expect_err("unknown authoritative usage must not admit a snapshot-protocol write");
         assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+    }
+
+    /// rustfs/backlog#2904: a durable-quota check whose scanner usage is
+    /// unknown admits the write at the handler and leaves the decision to the
+    /// ledger; nothing on the handler path treats the absent usage as zero.
+    #[test]
+    fn durable_quota_without_scanner_usage_admits_the_write() {
+        let unknown_usage = QuotaCheckResult {
+            allowed: true,
+            current_usage: None,
+            quota_limit: Some(2048),
+            operation_size: 512,
+            remaining: None,
+            uses_durable_reservations: true,
+        };
+        let result = map_quota_check_outcome("bucket", Ok(unknown_usage)).expect("the ledger settles admission at commit");
+        assert_eq!(result.current_usage, None);
+
+        let mut opts = ObjectOptions::default();
+        apply_quota_admission(&mut opts, &result).expect("durable admission carries no snapshot into the write");
+        assert!(opts.quota_admission.is_none());
+        ensure_object_size_within_quota(&result, 4096).expect("unknown usage cannot pre-reject an object");
     }
 }
 

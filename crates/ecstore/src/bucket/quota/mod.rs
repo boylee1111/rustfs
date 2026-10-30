@@ -32,7 +32,10 @@ pub enum QuotaType {
     Hard,
 }
 
-pub(crate) const QUOTA_RESERVATION_PROTOCOL_V1: u32 = 1;
+pub const QUOTA_RESERVATION_PROTOCOL_V1: u32 = 1;
+/// Sharded durable reservations. Older nodes reject this protocol instead of
+/// silently falling back to the single-ledger protocol.
+pub const QUOTA_RESERVATION_PROTOCOL_V2: u32 = 2;
 
 /// Bucket quota configuration. quota_type defaults to Hard when omitted.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -89,7 +92,10 @@ impl<'de> Deserialize<'de> for BucketQuota {
         D: Deserializer<'de>,
     {
         let wire = BucketQuotaWire::deserialize(deserializer)?;
-        let quota = if wire.reservation_protocol == Some(QUOTA_RESERVATION_PROTOCOL_V1) {
+        let quota = if matches!(
+            wire.reservation_protocol,
+            Some(QUOTA_RESERVATION_PROTOCOL_V1) | Some(QUOTA_RESERVATION_PROTOCOL_V2)
+        ) {
             Some(
                 wire.reservation_quota
                     .ok_or_else(|| D::Error::custom("reservation_quota is required for reservation protocol v1"))?,
@@ -129,17 +135,53 @@ impl BucketQuota {
         }
     }
 
+    /// Creates a quota using the sharded durable reservation protocol.
+    /// Deployment must complete the mixed-version rollout before enabling it;
+    /// older nodes fail closed when they see protocol v2.
+    pub fn new_sharded(quota: u64) -> Self {
+        let mut config = Self::new(Some(quota));
+        config.reservation_protocol = Some(QUOTA_RESERVATION_PROTOCOL_V2);
+        config
+    }
+
     pub fn get_quota_limit(&self) -> Option<u64> {
         self.quota
     }
 
     pub fn uses_durable_reservations(&self) -> bool {
-        self.reservation_protocol == Some(QUOTA_RESERVATION_PROTOCOL_V1)
+        matches!(
+            self.reservation_protocol,
+            Some(QUOTA_RESERVATION_PROTOCOL_V1) | Some(QUOTA_RESERVATION_PROTOCOL_V2)
+        )
+    }
+
+    pub fn uses_sharded_reservations(&self) -> bool {
+        self.reservation_protocol == Some(QUOTA_RESERVATION_PROTOCOL_V2)
     }
 
     pub fn has_unsupported_reservation_protocol(&self) -> bool {
         self.reservation_protocol
-            .is_some_and(|version| version != QUOTA_RESERVATION_PROTOCOL_V1)
+            .is_some_and(|version| !matches!(version, QUOTA_RESERVATION_PROTOCOL_V1 | QUOTA_RESERVATION_PROTOCOL_V2))
+    }
+
+    /// A limit saved before the reservation protocols existed: its writes
+    /// are still admitted from scanner usage snapshots. Durable and unknown
+    /// future protocols are never rewritten.
+    pub fn needs_reservation_protocol_migration(&self) -> bool {
+        self.quota.is_some() && self.reservation_protocol.is_none()
+    }
+
+    /// The same limit and type re-expressed under the sharded durable
+    /// reservation protocol; `created_at` is kept for audit continuity.
+    /// `None` when the quota is not a migration candidate.
+    pub fn migrated_to_sharded_reservations(&self) -> Option<Self> {
+        self.needs_reservation_protocol_migration().then(|| Self {
+            quota: self.quota,
+            quota_type: self.quota_type.clone(),
+            reservation_protocol: Some(QUOTA_RESERVATION_PROTOCOL_V2),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
     }
 
     pub fn check_operation_allowed(&self, current_usage: u64, operation_size: u64) -> bool {
@@ -176,6 +218,45 @@ pub enum QuotaOperation {
     PostObject,
     CopyObject,
     DeleteObject,
+}
+
+/// Outcome of re-saving one bucket's quota under the sharded durable
+/// reservation protocol (rustfs/backlog#2904).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuotaProtocolMigration {
+    /// No quota limit is configured; nothing to migrate.
+    NoQuota,
+    /// The quota already uses a durable reservation protocol.
+    AlreadyDurable { reservation_protocol: u32 },
+    /// The quota was re-saved under the sharded protocol at this revision.
+    Migrated {
+        reservation_protocol: u32,
+        updated_at: OffsetDateTime,
+    },
+    /// The quota was left untouched for the stated reason.
+    Skipped { reason: QuotaMigrationSkipReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaMigrationSkipReason {
+    /// A reservation protocol this node does not understand; rewriting it
+    /// would downgrade a newer fleet's quota.
+    UnsupportedReservationProtocol,
+    /// The quota configuration changed between the cached read and the
+    /// guarded write; the newer configuration wins.
+    QuotaRevisionChanged,
+    /// The bucket was replaced or removed since the cached read.
+    BucketIncarnationChanged,
+}
+
+impl QuotaMigrationSkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedReservationProtocol => "unsupported_reservation_protocol",
+            Self::QuotaRevisionChanged => "quota_revision_changed",
+            Self::BucketIncarnationChanged => "bucket_incarnation_changed",
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -322,9 +403,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_reservation_protocol_does_not_activate_v1() {
+    fn sharded_quota_roundtrips_with_authoritative_reservation_quota() {
+        let quota = BucketQuota::new_sharded(4096);
+        let json = serde_json::to_value(&quota).expect("sharded quota should serialize");
+        assert_eq!(json["quota"], 0);
+        assert_eq!(json["reservation_protocol"], QUOTA_RESERVATION_PROTOCOL_V2);
+        assert_eq!(json["reservation_quota"], 4096);
+        let restored: BucketQuota = serde_json::from_value(json).expect("sharded quota should parse");
+        assert_eq!(restored.quota, Some(4096));
+        assert!(restored.uses_sharded_reservations());
+    }
+
+    #[test]
+    fn unknown_reservation_protocol_does_not_activate_any_known_protocol() {
         let quota: BucketQuota =
-            serde_json::from_str(r#"{"quota":0,"quota_type":"Hard","reservation_protocol":2,"reservation_quota":2048}"#)
+            serde_json::from_str(r#"{"quota":0,"quota_type":"Hard","reservation_protocol":3,"reservation_quota":2048}"#)
                 .expect("future protocol should remain parseable");
 
         assert!(!quota.uses_durable_reservations());

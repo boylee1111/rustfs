@@ -45,10 +45,12 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionStat
 use crate::bucket::metadata_sys::BucketMetadataSys;
 use crate::bucket::replication::{DynReplicationPool, ReplicationStats};
 use crate::disk::DiskStore;
+use crate::disk::multipart_source::ProofVerificationContext;
 use crate::layout::endpoints::{EndpointServerPools, SetupType};
 use crate::object_api::ObjectEncryptionResolver;
 use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
+use crate::store::delete_recovery_runtime::DeleteRecoveryHints;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
 use std::collections::{HashMap, HashSet};
@@ -59,6 +61,8 @@ use std::sync::{
 use tokio::sync::{Mutex, Notify, OnceCell, OwnedRwLockReadGuard, RwLock};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 const SCANNER_PUBLICATION_STATE_UNKNOWN: u8 = 0;
@@ -72,11 +76,24 @@ pub(crate) const SCANNER_PUBLICATION_LEASE_MAX_ENTRIES: usize = 256;
 /// have started movement after the lease was abandoned.
 pub(crate) const SCANNER_PUBLICATION_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Observational leases hold data-movement fencing but may coexist with
+/// ordinary namespace commits; authoritative leases require a stable namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScannerPublicationLeasePurpose {
+    Authoritative,
+    Observational,
+}
+
+/// Movement read admission granted with a publication lease. Lease-scoped
+/// target operations share it rather than queueing a second read on the gate.
+pub(crate) type ScannerPublicationLeasePermit = Arc<OwnedRwLockReadGuard<()>>;
+
 pub(crate) struct ScannerPublicationLeaseEntry {
     pub(crate) expires_at: Instant,
     pub(crate) movement_generation: u64,
-    pub(crate) namespace_generation: u64,
-    pub(crate) _operation_guard: OwnedRwLockReadGuard<()>,
+    pub(crate) namespace_generation: Option<u64>,
+    pub(crate) purpose: ScannerPublicationLeasePurpose,
+    pub(crate) operation_guard: ScannerPublicationLeasePermit,
 }
 
 pub(crate) struct NamespaceCommitGuard {
@@ -91,6 +108,82 @@ impl Drop for NamespaceCommitGuard {
             self.ctx.advance_namespace_commit_generation();
             self.ctx.namespace_commits.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+}
+
+/// A durable decommission pause as seen by this instance's worker watchdog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecommissionPauseRecord {
+    pub(crate) reason: String,
+    /// The pool's settled progress when it paused; see
+    /// [`DecommissionCountLedger::progress`].
+    pub(crate) progress: u64,
+    /// Consecutive pauses on `reason` without progress in between.
+    pub(crate) repeats: u32,
+    /// The watchdog does not relaunch the pool before this instant.
+    pub(crate) relaunch_after: Instant,
+}
+
+/// What this instance counted for one decommission generation of a pool.
+///
+/// Progress counters persist only at checkpoints and a resumed pass relists
+/// the bucket, so a retained entry (one whose source stays) is seen again on
+/// every pass. The ledger keeps its counted versions so a relist in the same
+/// process does not count them twice.
+#[derive(Debug, Default)]
+pub(crate) struct DecommissionCountLedger {
+    generation: Option<time::OffsetDateTime>,
+    /// (bucket, object, version id, delete marker) of retained versions.
+    retained: HashSet<(String, String, Option<uuid::Uuid>, bool)>,
+    retained_key_bytes: usize,
+    /// Entries whose source was cleaned up. Only moving an entry off the pool
+    /// advances it; a relisted retained entry cannot.
+    cleaned_entries: u64,
+}
+
+impl DecommissionCountLedger {
+    const MAX_RETAINED_VERSIONS: usize = 1024;
+    const MAX_RETAINED_KEY_BYTES: usize = 1024 * 1024;
+
+    /// Whether this version is counted now: a retained version once, and a
+    /// cleaned-up version unless it was already counted while retained.
+    /// When the retained ledger is full, omit that progress count until source
+    /// cleanup. This bounds diagnostic memory without evicting deduplication
+    /// evidence or blocking data movement.
+    pub(crate) fn admit(&mut self, bucket: &str, object: &str, version: (Option<uuid::Uuid>, bool), cleaned: bool) -> bool {
+        let key_bytes = bucket.len().saturating_add(object.len());
+        if cleaned {
+            // Most successful entries never needed retained-version tracking.
+            if self.retained.is_empty() || key_bytes > Self::MAX_RETAINED_KEY_BYTES {
+                return true;
+            }
+            let key = (bucket.to_owned(), object.to_owned(), version.0, version.1);
+            if self.retained.remove(&key) {
+                self.retained_key_bytes -= key_bytes;
+                return false;
+            }
+            return true;
+        }
+        if self.retained.len() >= Self::MAX_RETAINED_VERSIONS
+            || key_bytes > Self::MAX_RETAINED_KEY_BYTES.saturating_sub(self.retained_key_bytes)
+        {
+            return false;
+        }
+        let key = (bucket.to_owned(), object.to_owned(), version.0, version.1);
+        if self.retained.insert(key) {
+            self.retained_key_bytes += key_bytes;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn record_cleaned_entry(&mut self) {
+        self.cleaned_entries = self.cleaned_entries.saturating_add(1);
+    }
+
+    pub(crate) fn progress(&self) -> u64 {
+        self.cleaned_entries
     }
 }
 
@@ -130,6 +223,8 @@ pub struct InstanceContext {
     /// Write-once: storage startup publishes the server pools exactly once.
     /// Replaces the process-global endpoints static.
     endpoints: OnceLock<EndpointServerPools>,
+    /// Only a complete validated topology may enable native local proof origin.
+    multipart_proof_topology: OnceLock<([u8; 32], ProofVerificationContext)>,
     /// This instance's tier configuration manager (Phase 5 Slice 7, backlog#939).
     ///
     /// Lazily materialized on first access so `InstanceContext::new()` stays
@@ -201,6 +296,16 @@ pub struct InstanceContext {
     /// Readers are held across one publication commit; movement transitions
     /// take the writer at their durable state commit boundary.
     data_movement_operation_gate: Arc<RwLock<()>>,
+    /// Set while an operator decommission start runs on this instance. A
+    /// start runs detached from its caller, so this keeps abandoned requests
+    /// and their retries from stacking concurrent starts and preflight heals.
+    decommission_start_in_flight: AtomicBool,
+    /// The last durable pause of each local decommission, keyed by pool
+    /// index. The worker watchdog backs off relaunching a pool that keeps
+    /// pausing on the same cause without progress.
+    decommission_pauses: std::sync::Mutex<HashMap<usize, DecommissionPauseRecord>>,
+    /// Per-pool counting ledger of the current decommission generation.
+    decommission_count_ledgers: std::sync::Mutex<HashMap<usize, DecommissionCountLedger>>,
     /// Remote scanner publication leases own a read guard until explicit
     /// release or bounded expiry.  Keeping the guard in storage-owned state
     /// makes a remote movement transition wait on the same fence as a local
@@ -229,11 +334,16 @@ pub struct InstanceContext {
     namespace_commit_generation: AtomicU64,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
+    delete_recovery_hints: DeleteRecoveryHints,
     tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
     #[cfg(test)]
     suppress_tier_delete_journal_recovery: bool,
     transition_transaction_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
     tier_delete_journal_recovery_wakeup: tokio::sync::Notify,
+    /// Object mutations that run on their own task so that dropping the
+    /// caller (for example, an S3 client disconnect) cannot stop them between
+    /// their on-disk steps. Shutdown waits for them after the HTTP drain.
+    detached_mutations: TaskTracker,
 }
 
 impl InstanceContext {
@@ -256,6 +366,7 @@ impl InstanceContext {
             region: OnceLock::new(),
             deployment_id: OnceLock::new(),
             endpoints: OnceLock::new(),
+            multipart_proof_topology: OnceLock::new(),
             tier_config_mgr: OnceLock::new(),
             event_notifier: OnceLock::new(),
             expiry_state: OnceLock::new(),
@@ -269,6 +380,9 @@ impl InstanceContext {
             bucket_metadata_sys: std::sync::Mutex::new(None),
             background_cancel_token: OnceLock::new(),
             data_movement_operation_gate: Arc::new(RwLock::new(())),
+            decommission_start_in_flight: AtomicBool::new(false),
+            decommission_pauses: std::sync::Mutex::new(HashMap::new()),
+            decommission_count_ledgers: std::sync::Mutex::new(HashMap::new()),
             scanner_publication_leases: Arc::new(Mutex::new(HashMap::new())),
             data_movement_operation_epoch: AtomicU64::new(0),
             data_movement_operation_epoch_exhausted: AtomicBool::new(false),
@@ -279,11 +393,13 @@ impl InstanceContext {
             namespace_commits: AtomicU64::new(0),
             namespace_commit_generation: AtomicU64::new(0),
             object_encryption_resolver: OnceLock::new(),
+            delete_recovery_hints: DeleteRecoveryHints::default(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             #[cfg(test)]
             suppress_tier_delete_journal_recovery: false,
             transition_transaction_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             tier_delete_journal_recovery_wakeup: tokio::sync::Notify::new(),
+            detached_mutations: TaskTracker::new(),
         }
     }
 
@@ -297,8 +413,105 @@ impl InstanceContext {
         self.lock_manager.clone()
     }
 
+    /// Run a multi-step mutation on its own task and wait for its output.
+    ///
+    /// Dropping the returned future leaves the task running to completion, so
+    /// the mutation, together with the locks and guards it owns, never stops
+    /// between two of its on-disk steps because its caller went away.
+    pub(crate) async fn run_detached_mutation<F>(&self, mutation: F) -> Result<F::Output, tokio::task::JoinError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        // Capture before spawning: Tokio tasks do not inherit request task-locals.
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let mutation = crate::cluster::rpc::runtime_sources::with_captured_read_version_context(
+            rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::DetachedMutation,
+            mutation,
+        );
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+        let context = rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context();
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+        let mutation = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(context, mutation);
+        self.detached_mutations.spawn(mutation.in_current_span()).await
+    }
+
+    /// Wait up to `timeout` for every detached mutation to finish. Returns
+    /// `false` when some are still running at the deadline.
+    pub async fn wait_for_detached_mutations(&self, timeout: std::time::Duration) -> bool {
+        self.detached_mutations.close();
+        tokio::time::timeout(timeout, self.detached_mutations.wait()).await.is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detached_mutation_count(&self) -> usize {
+        self.detached_mutations.len()
+    }
+
     pub(crate) fn data_movement_operation_gate(&self) -> Arc<RwLock<()>> {
         Arc::clone(&self.data_movement_operation_gate)
+    }
+
+    /// Claim the single decommission start slot; `false` when a start is
+    /// already running. Release it with [`Self::end_decommission_start`].
+    pub(crate) fn try_begin_decommission_start(&self) -> bool {
+        self.decommission_start_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn end_decommission_start(&self) {
+        self.decommission_start_in_flight.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn decommission_start_running(&self) -> bool {
+        self.decommission_start_in_flight.load(Ordering::Acquire)
+    }
+
+    /// Record a durable pause of `pool_index`; `update` derives the new record
+    /// from the previous one.
+    pub(crate) fn record_decommission_pause(
+        &self,
+        pool_index: usize,
+        update: impl FnOnce(Option<&DecommissionPauseRecord>) -> DecommissionPauseRecord,
+    ) -> DecommissionPauseRecord {
+        let mut pauses = self
+            .decommission_pauses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = update(pauses.get(&pool_index));
+        pauses.insert(pool_index, record.clone());
+        record
+    }
+
+    /// Run `update` on `pool_index`'s counting ledger for `generation`,
+    /// starting a fresh ledger when the generation changed.
+    pub(crate) fn with_decommission_count_ledger<T>(
+        &self,
+        pool_index: usize,
+        generation: time::OffsetDateTime,
+        update: impl FnOnce(&mut DecommissionCountLedger) -> T,
+    ) -> T {
+        let mut ledgers = self
+            .decommission_count_ledgers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ledger = ledgers.entry(pool_index).or_default();
+        if ledger.generation != Some(generation) {
+            *ledger = DecommissionCountLedger {
+                generation: Some(generation),
+                ..Default::default()
+            };
+        }
+        update(ledger)
+    }
+
+    pub(crate) fn decommission_pause(&self, pool_index: usize) -> Option<DecommissionPauseRecord> {
+        self.decommission_pauses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&pool_index)
+            .cloned()
     }
 
     pub(crate) async fn install_scanner_publication_lease(
@@ -306,7 +519,8 @@ impl InstanceContext {
         token: Uuid,
         expires_at: Instant,
         movement_generation: u64,
-        namespace_generation: u64,
+        namespace_generation: Option<u64>,
+        purpose: ScannerPublicationLeasePurpose,
         operation_guard: OwnedRwLockReadGuard<()>,
     ) -> bool {
         let mut leases = self.scanner_publication_leases.lock().await;
@@ -319,7 +533,8 @@ impl InstanceContext {
                 expires_at,
                 movement_generation,
                 namespace_generation,
-                _operation_guard: operation_guard,
+                purpose,
+                operation_guard: Arc::new(operation_guard),
             },
         );
         true
@@ -329,21 +544,43 @@ impl InstanceContext {
         self.scanner_publication_leases.lock().await.remove(&token).is_some()
     }
 
-    /// Return both generations from the same live lease while the caller holds
-    /// the movement read guard. Namespace commits do not take that guard, so
-    /// the caller must compare the saved namespace generation after this await.
+    /// Return the generations and purpose from the same live lease while the
+    /// caller holds the movement read guard. Namespace commits do not take that
+    /// guard, so strict leases compare their saved generation after this await.
     /// The process-owned table rejects tokens from a prior instance or expiry.
-    pub(crate) async fn scanner_publication_lease_generations(&self, token: Uuid) -> Option<(u64, u64)> {
+    pub(crate) async fn scanner_publication_lease_generations(
+        &self,
+        token: Uuid,
+    ) -> Option<(u64, Option<u64>, ScannerPublicationLeasePurpose)> {
+        self.scanner_publication_lease_admission(token)
+            .await
+            .map(|(movement_generation, namespace_generation, purpose, _)| (movement_generation, namespace_generation, purpose))
+    }
+
+    /// Return the live lease's generations and purpose together with a share
+    /// of its movement read admission. The share keeps movement writers out
+    /// for as long as the caller holds it, even if the lease is released or
+    /// expires meanwhile, without queueing a new read behind a waiting writer.
+    pub(crate) async fn scanner_publication_lease_admission(
+        &self,
+        token: Uuid,
+    ) -> Option<(u64, Option<u64>, ScannerPublicationLeasePurpose, ScannerPublicationLeasePermit)> {
         let mut leases = self.scanner_publication_leases.lock().await;
         let now = Instant::now();
-        let (expires_at, movement_generation, namespace_generation) = leases
-            .get(&token)
-            .map(|entry| (entry.expires_at, entry.movement_generation, entry.namespace_generation))?;
+        let (expires_at, movement_generation, namespace_generation, purpose, permit) = leases.get(&token).map(|entry| {
+            (
+                entry.expires_at,
+                entry.movement_generation,
+                entry.namespace_generation,
+                entry.purpose,
+                Arc::clone(&entry.operation_guard),
+            )
+        })?;
         if expires_at <= now {
             leases.remove(&token);
             return None;
         }
-        Some((movement_generation, namespace_generation))
+        Some((movement_generation, namespace_generation, purpose, permit))
     }
 
     pub(crate) async fn expire_scanner_publication_lease(&self, token: Uuid, expires_at: Instant) {
@@ -396,7 +633,7 @@ impl InstanceContext {
     pub(crate) fn begin_namespace_commit(self: &Arc<Self>) -> Arc<NamespaceCommitGuard> {
         let counted = self
             .namespace_commits
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_add(1))
             .is_ok();
         if counted {
             self.advance_namespace_commit_generation();
@@ -412,13 +649,17 @@ impl InstanceContext {
     fn advance_namespace_commit_generation(&self) {
         let _ = self
             .namespace_commit_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| Some(generation.saturating_add(1)));
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| Some(generation.saturating_add(1)));
     }
 
     pub(crate) fn namespace_commit_generation(&self) -> u64 {
         self.namespace_commit_generation.load(Ordering::Acquire)
     }
 
+    /// Whether a namespace commit is still pending. The scanner publication
+    /// barrier no longer consults it (an ordinary PUT shades its bucket
+    /// instead); fixtures use it to drain rename tails deterministically.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn namespace_commits_pending(&self) -> bool {
         self.namespace_commits.load(Ordering::Acquire) != 0 || self.namespace_commit_generation() == u64::MAX
     }
@@ -571,6 +812,38 @@ impl InstanceContext {
         self.endpoints.get().cloned()
     }
 
+    /// Keep one authority identity across complete local registry reinitializations.
+    /// Changing the instance or crossing the local/RPC mode boundary is forbidden.
+    pub(crate) fn bind_multipart_proof_topology(
+        &self,
+        endpoints: &EndpointServerPools,
+    ) -> crate::disk::error::Result<ProofVerificationContext> {
+        // Registry vectors are indexed by pool_idx. Validate every index before
+        // adding endpoint permissions or allowing a caller to clear the registry.
+        if endpoints.as_ref().iter().enumerate().any(|(pool, entry)| {
+            entry
+                .endpoints
+                .as_ref()
+                .iter()
+                .any(|endpoint| usize::try_from(endpoint.pool_idx).ok() != Some(pool))
+        }) {
+            return Err(crate::disk::error::DiskError::InconsistentDisk);
+        }
+        let (identity, authority) = ProofVerificationContext::for_topology(endpoints)?;
+        let stored = self.multipart_proof_topology.get_or_init(|| (identity, authority.clone()));
+        if stored.0 != identity {
+            stored.1.register_topology(&authority)?;
+        }
+        Ok(stored.1.clone())
+    }
+
+    pub(crate) fn multipart_proof_verification_context(&self) -> ProofVerificationContext {
+        self.multipart_proof_topology
+            .get()
+            .map(|(_, authority)| authority.clone())
+            .unwrap_or_default()
+    }
+
     /// This instance's tier configuration manager, materializing it on first
     /// access. Shared for the lifetime of the instance.
     pub fn tier_config_mgr(&self) -> Arc<RwLock<TierConfigMgr>> {
@@ -680,6 +953,10 @@ impl InstanceContext {
 
     pub(crate) fn bind_background_cancel_token(&self, token: CancellationToken) -> CancellationToken {
         self.background_cancel_token.get_or_init(|| token).clone()
+    }
+
+    pub(crate) fn delete_recovery_hints(&self) -> &DeleteRecoveryHints {
+        &self.delete_recovery_hints
     }
 
     pub(crate) fn mark_tier_delete_journal_recovery_started(&self, store_id: Uuid) -> bool {
@@ -809,6 +1086,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decommission_count_ledger_bounds_retained_entries() {
+        let mut ledger = super::DecommissionCountLedger::default();
+        for index in 0..1024 {
+            assert!(ledger.admit("bucket", &format!("key-{index}"), (None, false), false));
+        }
+        assert!(!ledger.admit("bucket", "overflow", (None, false), false));
+        assert_eq!(ledger.retained.len(), 1024);
+        // An uncounted retained version can still be counted after cleanup.
+        assert!(ledger.admit("bucket", "overflow", (None, false), true));
+        assert!(!ledger.admit("bucket", "key-0", (None, false), true));
+        assert!(ledger.admit("bucket", "next", (None, false), false));
+        assert!(!ledger.admit("bucket", "next", (None, false), false));
+        assert_eq!(ledger.retained.len(), 1024);
+    }
+
+    #[test]
+    fn decommission_count_ledger_bounds_retained_key_bytes() {
+        let mut ledger = super::DecommissionCountLedger::default();
+        let bucket = "b".repeat(63);
+        let object_prefix = "x".repeat(1020);
+        let mut admitted = 0;
+        for index in 0..1024 {
+            admitted += usize::from(ledger.admit(&bucket, &format!("{object_prefix}{index:04}"), (None, false), false));
+        }
+        assert!(admitted > 0 && admitted < 1024);
+        assert!(ledger.retained.iter().map(|(b, o, _, _)| b.len() + o.len()).sum::<usize>() <= 1024 * 1024);
+        // Removal releases the byte reservation as well as the entry slot.
+        assert!(!ledger.admit(&bucket, &format!("{object_prefix}0000"), (None, false), true));
+        assert!(ledger.admit(&bucket, &format!("{object_prefix}1024"), (None, false), false));
+    }
+
+    #[test]
     fn namespace_commit_guards_are_instance_local_and_count_until_last_owner() {
         let first = Arc::new(InstanceContext::new());
         let other = Arc::new(InstanceContext::new());
@@ -859,12 +1168,22 @@ mod tests {
         let gate = ctx.data_movement_operation_gate();
         let permit = gate.clone().read_owned().await;
         assert!(
-            ctx.install_scanner_publication_lease(token, Instant::now() + SCANNER_PUBLICATION_LEASE_TTL, 7, 11, permit)
-                .await
+            ctx.install_scanner_publication_lease(
+                token,
+                Instant::now() + SCANNER_PUBLICATION_LEASE_TTL,
+                7,
+                Some(11),
+                ScannerPublicationLeasePurpose::Authoritative,
+                permit,
+            )
+            .await
         );
         drop(ctx.begin_namespace_commit());
         assert_eq!(ctx.namespace_commit_generation(), 2);
-        assert_eq!(ctx.scanner_publication_lease_generations(token).await, Some((7, 11)));
+        assert_eq!(
+            ctx.scanner_publication_lease_generations(token).await,
+            Some((7, Some(11), ScannerPublicationLeasePurpose::Authoritative))
+        );
         assert!(gate.clone().try_write_owned().is_err(), "lookup must retain the stored permit");
         tokio::time::advance(SCANNER_PUBLICATION_LEASE_TTL).await;
         assert_eq!(ctx.scanner_publication_lease_generations(token).await, None);
@@ -894,6 +1213,159 @@ mod tests {
             assert_eq!(ctx.is_dist_erasure().await, want_dist, "is_dist_erasure for {input:?}");
             assert_eq!(ctx.is_erasure_sd().await, want_sd, "is_erasure_sd for {input:?}");
         }
+    }
+
+    // A detached mutation keeps running after its caller is dropped, and
+    // shutdown waits for it instead of tearing it down mid-way.
+    #[tokio::test]
+    async fn detached_mutation_outlives_dropped_caller_and_is_awaited() {
+        let ctx = InstanceContext::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut caller = Box::pin(ctx.run_detached_mutation({
+            let finished = Arc::clone(&finished);
+            async move {
+                let _ = release_rx.await;
+                finished.store(true, Ordering::Release);
+            }
+        }));
+        assert!(futures::poll!(caller.as_mut()).is_pending());
+        drop(caller);
+        assert_eq!(ctx.detached_mutation_count(), 1, "dropping the caller must not cancel the mutation");
+
+        assert!(
+            !ctx.wait_for_detached_mutations(std::time::Duration::from_millis(50)).await,
+            "the wait must report a mutation that is still running"
+        );
+        release_tx.send(()).expect("the detached mutation should still be waiting");
+        assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
+        assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn detached_mutations_keep_operation_and_guards_after_caller_drops() {
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("DELETE");
+        let operation = request.in_scope(|| {
+            rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(rustfs_s3_ops::S3Operation::DeleteObject);
+            current_s3_http_operation_context().expect("delete operation was captured")
+        });
+        for parent in [Some(operation), None] {
+            let ctx = InstanceContext::new();
+            let gate = Arc::new(RwLock::new(()));
+            let guard = gate.clone().read_owned().await;
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let expected = parent.map(|_| "s3:DeleteObject");
+            let mut caller = Box::pin(with_s3_http_operation_context(
+                parent,
+                ctx.run_detached_mutation(async move {
+                    release_rx.await.expect("release detached mutation");
+                    result_tx
+                        .send(current_s3_http_operation_name())
+                        .expect("report detached operation");
+                    drop(guard);
+                }),
+            ));
+            assert!(futures::poll!(caller.as_mut()).is_pending());
+            drop(caller);
+            assert_eq!(current_s3_http_operation_name(), None, "parent scope was restored");
+            assert_eq!(ctx.detached_mutation_count(), 1);
+            assert!(gate.try_write().is_err(), "mutation retains the owned guard after caller cancellation");
+            release_tx.send(()).expect("detached mutation is still alive");
+            assert_eq!(result_rx.await.expect("detached operation result"), expected);
+            assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
+            assert!(gate.try_write().is_ok(), "completion releases the mutation guard");
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_mutation_captures_operation_when_polled_and_keeps_results() {
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(rustfs_s3_ops::S3Operation::PutObject);
+            current_s3_http_operation_context().expect("PUT operation context")
+        });
+        let ctx = InstanceContext::new();
+        let mutation = ctx.run_detached_mutation(async { (current_s3_http_operation_name(), Err::<(), _>("mutation failure")) });
+        let result = with_s3_http_operation_context(Some(operation), mutation)
+            .await
+            .expect("mutation task completes");
+        assert_eq!(result, (Some("s3:PutObject"), Err("mutation failure")));
+        assert_eq!(current_s3_http_operation_name(), None);
+
+        let mutation = request.in_scope(|| ctx.run_detached_mutation(async { current_s3_http_operation_name() }));
+        assert_eq!(mutation.await.expect("unscoped poll completes"), None);
+
+        let failure =
+            with_s3_http_operation_context(Some(operation), ctx.run_detached_mutation(async { panic!("mutation panic") }))
+                .await
+                .expect_err("child panic remains a join failure");
+        assert!(failure.is_panic());
+        assert_eq!(current_s3_http_operation_name(), None);
+        assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn detached_mutations_keep_existing_context_after_waiter_drop_and_nested_spawn() {
+        use crate::cluster::rpc::runtime_sources::{
+            current_read_version_entry_source, current_read_version_request_caller, with_read_version_entry,
+            with_read_version_request_caller,
+        };
+        use rustfs_io_metrics::internode_metrics::{ReadVersionEntrySource, ReadVersionRequestCaller};
+
+        let ctx = Arc::new(InstanceContext::new());
+        let child_ctx = Arc::clone(&ctx);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let mut caller = Box::pin(with_read_version_request_caller(ReadVersionRequestCaller::Object, async {
+            with_read_version_entry(ReadVersionEntrySource::LifecycleRecovery, async {
+                ctx.run_detached_mutation(async move {
+                    entered_tx.send(()).expect("mutation caller is present");
+                    release_rx.await.expect("mutation may finish");
+                    let observed = with_read_version_entry(ReadVersionEntrySource::ConfigRead, async {
+                        child_ctx
+                            .run_detached_mutation(async {
+                                (current_read_version_request_caller(), current_read_version_entry_source())
+                            })
+                            .await
+                            .expect("nested mutation joins")
+                    })
+                    .await;
+                    finished_tx.send(observed).expect("completion observer remains live");
+                })
+                .await
+            })
+            .await
+        }));
+        assert!(futures::poll!(caller.as_mut()).is_pending());
+        entered_rx.await.expect("mutation entered");
+        drop(caller);
+        assert_eq!(current_read_version_request_caller(), None);
+        assert_eq!(current_read_version_entry_source(), None);
+        assert_eq!(ctx.detached_mutation_count(), 1);
+        release_tx.send(()).expect("mutation remains alive after waiter drop");
+        assert_eq!(
+            finished_rx.await.expect("nested mutation completes"),
+            (Some(ReadVersionRequestCaller::Object), Some(ReadVersionEntrySource::LifecycleRecovery))
+        );
+        assert_eq!(
+            ctx.run_detached_mutation(async { (current_read_version_request_caller(), current_read_version_entry_source()) })
+                .await
+                .expect("unscoped mutation joins"),
+            (None, None)
+        );
+        assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
     }
 
     // A fresh context (before any update) reflects the initial all-false state.
@@ -1266,5 +1738,134 @@ mod tests {
         token_a.cancel();
         assert!(a.background_cancel_token().expect("a token").is_cancelled());
         assert!(b.background_cancel_token().is_none());
+    }
+}
+
+#[cfg(test)]
+mod multipart_instance_authority_tests {
+    use super::*;
+    use crate::layout::endpoint::Endpoint;
+    use crate::layout::endpoints::PoolEndpoints;
+
+    fn local_topology(root: &str) -> EndpointServerPools {
+        let mut endpoint = Endpoint::try_from(root).expect("local endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: vec![endpoint].into(),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }])
+    }
+
+    #[test]
+    fn multipart_instance_authority_is_explicit_stable_across_local_topologies() {
+        let ctx = InstanceContext::new();
+        assert!(matches!(ctx.multipart_proof_verification_context(), ProofVerificationContext::RpcOnly));
+        let topology = local_topology("/tmp/multipart-instance-a");
+        let first = ctx
+            .bind_multipart_proof_topology(&topology)
+            .expect("complete local topology should bind");
+        let again = ctx
+            .bind_multipart_proof_topology(&topology)
+            .expect("reopening the same topology should retain authority");
+        assert!(first.same_authority(&again));
+        assert!(first.same_authority(&ctx.multipart_proof_verification_context()));
+        let replacement = local_topology("/tmp/multipart-instance-b");
+        let extended = ctx
+            .bind_multipart_proof_topology(&replacement)
+            .expect("a complete local reinitialization should retain the native owner");
+        assert!(first.same_authority(&extended));
+        first.validate_endpoint(&topology.0[0].endpoints.as_ref()[0]).unwrap();
+        first.validate_endpoint(&replacement.0[0].endpoints.as_ref()[0]).unwrap();
+        assert!(first.same_authority(&ctx.multipart_proof_verification_context()));
+        let independent = InstanceContext::new().bind_multipart_proof_topology(&topology).unwrap();
+        assert!(!first.same_authority(&independent));
+    }
+
+    #[test]
+    fn multipart_distributed_instance_never_becomes_local_after_reinitialization() {
+        let ctx = InstanceContext::new();
+        let mut topology = local_topology("/tmp/multipart-remote-instance");
+        topology.0[0].endpoints.as_mut()[0].is_local = false;
+        assert!(matches!(
+            ctx.bind_multipart_proof_topology(&topology).unwrap(),
+            ProofVerificationContext::RpcOnly
+        ));
+        topology.0[0].endpoints.as_mut()[0].is_local = true;
+        assert!(ctx.bind_multipart_proof_topology(&topology).is_err());
+        assert!(matches!(ctx.multipart_proof_verification_context(), ProofVerificationContext::RpcOnly));
+    }
+
+    #[test]
+    fn multipart_parallel_topology_bind_retains_one_instance_authority() {
+        let ctx = Arc::new(InstanceContext::new());
+        let topologies = (0..4)
+            .map(|slot| local_topology(&format!("/tmp/multipart-parallel-instance-{slot}")))
+            .collect::<Vec<_>>();
+        let authorities = std::thread::scope(|scope| {
+            let mut tasks = Vec::with_capacity(topologies.len());
+            for topology in &topologies {
+                let ctx = ctx.clone();
+                tasks.push(scope.spawn(move || ctx.bind_multipart_proof_topology(topology).unwrap()));
+            }
+            tasks.into_iter().map(|task| task.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert!(authorities.iter().all(|authority| authority.same_authority(&authorities[0])));
+        for topology in topologies {
+            authorities[0]
+                .validate_endpoint(&topology.0[0].endpoints.as_ref()[0])
+                .unwrap();
+        }
+    }
+    #[test]
+    fn multipart_topology_registration_rejects_invalid_indices_and_mode_switch_without_granting_endpoints() {
+        let ctx = InstanceContext::new();
+        let original = local_topology("/tmp/multipart-original-registry");
+        let first = ctx.bind_multipart_proof_topology(&original).unwrap();
+        let candidate = local_topology("/tmp/multipart-unregistered-candidate");
+        let mut outside = candidate.clone();
+        outside.0[0].endpoints.as_mut()[0].set_pool_index(1);
+        assert!(
+            ctx.bind_multipart_proof_topology(&outside).is_err(),
+            "one pool cannot address registry slot one"
+        );
+        assert!(first.validate_endpoint(&outside.0[0].endpoints.as_ref()[0]).is_err());
+        let fresh = InstanceContext::new();
+        assert!(fresh.bind_multipart_proof_topology(&outside).is_err());
+        assert!(
+            fresh.multipart_proof_topology.get().is_none(),
+            "invalid initial registration must have no authority effect"
+        );
+
+        let mut sparse = candidate.clone();
+        let mut second = local_topology("/tmp/multipart-unregistered-second").0.remove(0);
+        second.endpoints.as_mut()[0].set_pool_index(2);
+        sparse.0.push(second);
+        assert!(ctx.bind_multipart_proof_topology(&sparse).is_err());
+        assert!(
+            first.validate_endpoint(&candidate.0[0].endpoints.as_ref()[0]).is_err(),
+            "a valid early pool cannot be partially granted"
+        );
+        let mut mixed = candidate.clone();
+        let mut second = local_topology("/tmp/multipart-remote-later-pool").0.remove(0);
+        second.endpoints.as_mut()[0].set_pool_index(1);
+        second.endpoints.as_mut()[0].is_local = false;
+        mixed.0.push(second);
+        assert!(
+            ctx.bind_multipart_proof_topology(&mixed).is_err(),
+            "local authority cannot switch mode for a remote later pool"
+        );
+        assert!(first.validate_endpoint(&candidate.0[0].endpoints.as_ref()[0]).is_err());
+        let mut incomplete = candidate.clone();
+        incomplete.0[0].drives_per_set = 2;
+        assert!(ctx.bind_multipart_proof_topology(&incomplete).is_err());
+        assert!(first.validate_endpoint(&candidate.0[0].endpoints.as_ref()[0]).is_err());
+        assert!(first.same_authority(&ctx.multipart_proof_verification_context()));
+        first.validate_endpoint(&original.0[0].endpoints.as_ref()[0]).unwrap();
     }
 }

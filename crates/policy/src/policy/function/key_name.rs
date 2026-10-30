@@ -57,6 +57,7 @@ impl KeyName {
         KeyName::S3(S3KeyName::S3XAmzContentSha256),
         KeyName::S3(S3KeyName::S3LocationConstraint),
         KeyName::S3(S3KeyName::S3VersionId),
+        KeyName::S3(S3KeyName::S3ObjectCreationOperation),
         //aws
         KeyName::Aws(AwsKeyName::AWSReferer),
         KeyName::Aws(AwsKeyName::AWSSourceIP),
@@ -121,12 +122,13 @@ impl KeyName {
     /// values for these keys. Without that check a caller could satisfy conditions such
     /// as `aws:userid` or `jwt:groups` simply by sending a header of the same name.
     ///
-    /// The `s3:` namespace is mixed: `s3:x-amz-*` keys mirror request headers by
-    /// design, while the rest (`s3:authType`, `s3:LocationConstraint`, ...) are
-    /// computed by the server.
+    /// The `s3:` namespace is mixed: `s3:x-amz-*`, `s3:if-match` and `s3:if-none-match`
+    /// mirror request headers by design, while the rest (`s3:authType`,
+    /// `s3:LocationConstraint`, ...) are computed by the server.
     pub fn is_server_derived(&self) -> bool {
         match self {
             KeyName::Aws(_) | KeyName::Jwt(_) | KeyName::Ldap(_) | KeyName::Sts(_) | KeyName::Svc(_) => true,
+            KeyName::S3(S3KeyName::S3IfMatch | S3KeyName::S3IfNoneMatch) => false,
             KeyName::S3(_) => !self.name().starts_with("x-amz-"),
         }
     }
@@ -137,15 +139,9 @@ impl KeyName {
         Self::COMMON_KEYS.iter().filter(|k| k.is_server_derived()).map(|k| k.name())
     }
 
+    /// Returns the policy variable form of the key, e.g. `${jwt:sub}`.
     pub fn var_name(&self) -> String {
-        match self {
-            KeyName::Aws(s) => format!("${{aws:{}}}", Into::<&str>::into(s)),
-            KeyName::Jwt(s) => format!("${{jwt:{}}}", Into::<&str>::into(s)),
-            KeyName::Ldap(s) => format!("${{ldap:{}}}", Into::<&str>::into(s)),
-            KeyName::Sts(s) => format!("${{sts:{}}}", Into::<&str>::into(s)),
-            KeyName::Svc(s) => format!("${{svc:{}}}", Into::<&str>::into(s)),
-            KeyName::S3(s) => format!("${{s3:{}}}", Into::<&str>::into(s)),
-        }
+        format!("${{{}}}", Into::<&str>::into(self))
     }
 }
 
@@ -165,6 +161,9 @@ impl From<&KeyName> for &'static str {
 #[derive(Clone, EnumString, Debug, IntoStaticStr, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum S3KeyName {
+    #[strum(serialize = "s3:ObjectCreationOperation")]
+    S3ObjectCreationOperation,
+
     #[strum(serialize = "s3:x-amz-copy-source")]
     S3XAmzCopySource,
 
@@ -197,6 +196,9 @@ pub enum S3KeyName {
 
     #[strum(serialize = "s3:object-lock-retain-until-date")]
     S3ObjectLockRetainUntilDate,
+
+    #[strum(serialize = "s3:object-lock-remaining-retention-days")]
+    S3ObjectLockRemainingRetentionDays,
 
     #[strum(serialize = "s3:object-lock-legal-hold")]
     S3ObjectLockLegalHold,
@@ -233,6 +235,12 @@ pub enum S3KeyName {
 
     #[strum(serialize = "s3:x-amz-grant-write-acp")]
     S3XAmzGrantWriteAcp,
+
+    #[strum(serialize = "s3:if-match")]
+    S3IfMatch,
+
+    #[strum(serialize = "s3:if-none-match")]
+    S3IfNoneMatch,
 
     #[strum(serialize = "s3:ExistingObjectTag")]
     S3ExistingObjectTag,
@@ -388,11 +396,37 @@ mod tests {
     use serde::Deserialize;
     use test_case::test_case;
 
+    #[test]
+    fn object_creation_operation_is_registered_as_server_derived() {
+        let key = KeyName::try_from("s3:ObjectCreationOperation").expect("AWS object creation condition key should parse");
+        assert_eq!(key.name(), "ObjectCreationOperation");
+        assert!(key.is_server_derived());
+        assert!(KeyName::server_derived_key_names().any(|name| name == "ObjectCreationOperation"));
+        assert_eq!(
+            serde_json::to_string(&key).expect("condition key should serialize"),
+            "\"s3:ObjectCreationOperation\""
+        );
+    }
+
+    #[test_case(KeyName::Aws(AwsKeyName::AWSSourceIP), "${aws:SourceIp}")]
+    #[test_case(KeyName::Jwt(JwtKeyName::JWTPrefUsername), "${jwt:preferred_username}")]
+    #[test_case(KeyName::Ldap(LdapKeyName::Username), "${ldap:username}")]
+    #[test_case(KeyName::S3(S3KeyName::S3LocationConstraint), "${s3:LocationConstraint}")]
+    fn var_name_matches_policy_variable_syntax(key: KeyName, expected: &str) {
+        assert_eq!(key.var_name(), expected);
+    }
+
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
     #[test_case("s3:VersionId", KeyName::S3(S3KeyName::S3VersionId) ; "aws_version_id")]
     #[test_case("s3:versionid", KeyName::S3(S3KeyName::S3VersionId) ; "minio_version_id")]
     #[test_case("s3:object-lock-mode", KeyName::S3(S3KeyName::S3ObjectLockMode))]
     #[test_case("s3:object-lock-legal-hold", KeyName::S3(S3KeyName::S3ObjectLockLegalHold))]
+    #[test_case(
+        "s3:object-lock-remaining-retention-days",
+        KeyName::S3(S3KeyName::S3ObjectLockRemainingRetentionDays)
+    )]
+    #[test_case("s3:if-match", KeyName::S3(S3KeyName::S3IfMatch))]
+    #[test_case("s3:if-none-match", KeyName::S3(S3KeyName::S3IfNoneMatch))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
@@ -417,6 +451,12 @@ mod tests {
     #[test_case("s3:versionid", KeyName::S3(S3KeyName::S3VersionId) ; "minio_version_id")]
     #[test_case("s3:object-lock-mode", KeyName::S3(S3KeyName::S3ObjectLockMode))]
     #[test_case("s3:object-lock-legal-hold", KeyName::S3(S3KeyName::S3ObjectLockLegalHold))]
+    #[test_case(
+        "s3:object-lock-remaining-retention-days",
+        KeyName::S3(S3KeyName::S3ObjectLockRemainingRetentionDays)
+    )]
+    #[test_case("s3:if-match", KeyName::S3(S3KeyName::S3IfMatch))]
+    #[test_case("s3:if-none-match", KeyName::S3(S3KeyName::S3IfNoneMatch))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
@@ -437,6 +477,12 @@ mod tests {
     #[test_case("s3:versionid", KeyName::S3(S3KeyName::S3VersionId))]
     #[test_case("s3:object-lock-mode", KeyName::S3(S3KeyName::S3ObjectLockMode))]
     #[test_case("s3:object-lock-legal-hold", KeyName::S3(S3KeyName::S3ObjectLockLegalHold))]
+    #[test_case(
+        "s3:object-lock-remaining-retention-days",
+        KeyName::S3(S3KeyName::S3ObjectLockRemainingRetentionDays)
+    )]
+    #[test_case("s3:if-match", KeyName::S3(S3KeyName::S3IfMatch))]
+    #[test_case("s3:if-none-match", KeyName::S3(S3KeyName::S3IfNoneMatch))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
@@ -451,6 +497,14 @@ mod tests {
         let except = format!("{{\"data\":\"{except}\"}}");
         let data = serde_json::to_string(&TestCase { data: value }).expect("marshal failed");
         assert_eq!(data, except);
+    }
+
+    #[test_case("s3:if-match", "if-match")]
+    #[test_case("s3:if-none-match", "if-none-match")]
+    fn conditional_write_key_names_match_request_header_names(key: &str, header: &str) {
+        let key_name = KeyName::try_from(key).expect("conditional write key must parse");
+        assert_eq!(key_name.name(), header);
+        assert!(!key_name.is_server_derived(), "{key} is filled from a request header");
     }
 
     #[test]

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::module_switches::{is_audit_module_enabled, is_notify_module_enabled};
-use crate::shared_types::convert_ecstore_object_info;
+use crate::shared_types::{RemoteAddr, convert_ecstore_object_info};
 use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::RequestContext;
 use crate::storage::sse::KmsRequestAuditScope;
@@ -22,24 +22,31 @@ use hashbrown::HashMap;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_audit::{
-    ObjectVersion,
+    ApiDetails, AuditEntry, ObjectVersion,
     entity::{ApiDetailsBuilder, AuditEntryBuilder},
     global::AuditLogger,
 };
 use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::EventArgsBuilder;
+use rustfs_policy::policy::action::Action;
 use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
 use rustfs_s3_types::EventName;
 use rustfs_targets::{
     extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
+use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use s3s::{S3Request, S3Response, S3Result};
 use serde_json::Value;
 use std::future::Future;
 use tokio::runtime::{Builder, Handle};
+
+/// Request type seen by the denial auditor, so `denial_audit` stays off the direct s3s surface.
+pub(crate) type DenialRequest<T> = S3Request<T>;
 use tracing::{Instrument, info_span, warn};
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+use super::storage_api::ecstore_diagnostic;
 use crate::storage::storage_api::helper_consumer::StorageObjectInfo as ObjectInfo;
 
 /// Schedules an asynchronous task on the current runtime;
@@ -48,6 +55,17 @@ pub(crate) fn spawn_background<F>(fut: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    // Capture before handing work to either runtime; request task-locals are not inherited.
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let fut = ecstore_diagnostic::with_captured_read_version_context(
+        ecstore_diagnostic::ReadVersionContextBoundary::BackgroundTask,
+        fut,
+    );
+    #[cfg(not(feature = "diagnostic-read-version-caller"))]
+    let fut = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(
+        rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
+        fut,
+    );
     if let Ok(handle) = Handle::try_current() {
         drop(handle.spawn(fut));
     } else {
@@ -83,6 +101,42 @@ pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id:
     resp_elements
 }
 
+/// Builds the audit entry shared by every request-scoped audit source: caller identity,
+/// client address and the request line, without any outcome.
+fn request_audit_builder<T>(
+    req: &S3Request<T>,
+    req_info: Option<&ReqInfo>,
+    event: EventName,
+    trigger: &str,
+    api: ApiDetails,
+    request_id: &str,
+) -> AuditEntryBuilder {
+    let remote_host = req
+        .extensions
+        .get::<ClientInfo>()
+        .map(|info| info.real_ip.to_string())
+        .or_else(|| {
+            req.extensions
+                .get::<Option<RemoteAddr>>()
+                .and_then(|addr| addr.map(|addr| addr.0.ip().to_string()))
+        })
+        .unwrap_or_default();
+    let mut builder = AuditEntryBuilder::new("1.0", event, trigger, api)
+        .remote_host(remote_host)
+        .user_agent(get_request_user_agent(&req.headers))
+        .req_host(get_request_host(&req.headers))
+        .req_path(req.uri.path().to_string())
+        .req_query(extract_req_params(req))
+        .request_id(request_id);
+    if let Some(cred) = req_info
+        .and_then(|info| info.cred.as_ref())
+        .filter(|cred| !cred.access_key.is_empty())
+    {
+        builder = builder.access_key(&cred.access_key);
+    }
+    builder
+}
+
 /// A unified helper structure for building and distributing audit logs and event notifications via RAII mode at the end of an S3 operation scope.
 pub enum OperationHelper {
     Disabled,
@@ -105,7 +159,23 @@ pub struct EnabledOperationHelper {
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
-        let op_event_matches = operation_matches_event_name(op, event);
+        Self::build(req, event, op, false)
+    }
+
+    /// Create an OperationHelper that only emits an audit entry, never a bucket notification.
+    ///
+    /// For operations that have no notification event of their own (`UploadPart`, the
+    /// bucket configuration writes) or whose event is internal (`AbortMultipartUpload`).
+    /// Unlike `new` it does not call `record_s3_op`, so per-operation metrics stay as the
+    /// handlers already report them.
+    pub fn audit_only(req: &S3Request<impl Send + Sync>, op: S3Operation) -> Self {
+        let event = op.to_event_name().unwrap_or(EventName::AuditS3Operation);
+        Self::build(req, event, op, true)
+    }
+
+    fn build(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation, audit_only: bool) -> Self {
+        // `audit_only` derives the event from the operation, so there is nothing to cross-check.
+        let op_event_matches = audit_only || operation_matches_event_name(op, event);
         debug_assert!(op_event_matches, "operation/event mismatch: op={} event={}", op.as_str(), event.as_str());
         if !op_event_matches {
             counter!(
@@ -122,7 +192,11 @@ impl OperationHelper {
         }
 
         let audit_enabled = is_audit_module_enabled();
-        let notify_enabled = should_build_notification_event(is_notify_module_enabled());
+        let notify_enabled = !audit_only && should_build_notification_event(is_notify_module_enabled());
+        if audit_only && !audit_enabled {
+            // Nothing to record and no metric to bump: skip the path parsing below.
+            return Self::Disabled;
+        }
 
         let path = req.uri.path().trim_start_matches('/');
         let mut segs = path.splitn(2, '/');
@@ -134,7 +208,9 @@ impl OperationHelper {
             .filter(|value| !value.is_empty())
             .unwrap_or(path_bucket);
 
-        record_s3_op(op);
+        if !audit_only {
+            record_s3_op(op);
+        }
 
         // Fast path: when both chains are disabled, avoid audit/notify builder work.
         if !audit_enabled && !notify_enabled {
@@ -149,15 +225,6 @@ impl OperationHelper {
             .and_then(|info| info.object.clone())
             .filter(|value| !value.is_empty())
             .unwrap_or(path_object_key);
-
-        // Infer remote address
-        let remote_host = req
-            .headers
-            .get(rustfs_utils::http::X_FORWARDED_FOR)
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| req.headers.get(rustfs_utils::http::X_REAL_IP).and_then(|v| v.to_str().ok()))
-            .unwrap_or("")
-            .to_string();
 
         let trigger = op.as_str();
 
@@ -178,19 +245,8 @@ impl OperationHelper {
         let request_context = request_context.unwrap_or_else(|| RequestContext::from_external_headers(&req.headers));
         let request_id = request_context.request_id.clone();
 
-        let audit_builder = if audit_enabled {
-            Some(
-                AuditEntryBuilder::new("1.0", event, trigger, api_builder.clone().build())
-                    .remote_host(remote_host)
-                    .user_agent(get_request_user_agent(&req.headers))
-                    .req_host(get_request_host(&req.headers))
-                    .req_path(req.uri.path().to_string())
-                    .req_query(extract_req_params(req))
-                    .request_id(&request_id),
-            )
-        } else {
-            None
-        };
+        let audit_builder =
+            audit_enabled.then(|| request_audit_builder(req, req_info, event, trigger, api_builder.clone().build(), &request_id));
 
         let event_object = ObjectInfo {
             bucket: bucket.clone(),
@@ -346,10 +402,6 @@ impl OperationHelper {
                 final_builder = final_builder.error(err);
             }
 
-            if let Some(cred) = runtime_sources::current_action_credentials() {
-                final_builder = final_builder.access_key(&cred.access_key);
-            }
-
             // Inject OpenTelemetry trace context into audit tags for distributed tracing correlation
             let mut tags = HashMap::new();
             if let Some(ref tid) = state.request_context.trace_id {
@@ -400,6 +452,89 @@ impl OperationHelper {
             }
         }
     }
+}
+
+/// What an authorization denial entry describes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DenialScope {
+    /// One refused request for the request's own bucket and object.
+    Request,
+    /// A bulk request (DeleteObjects) in which this many keys were refused; no single object applies.
+    Keys(u64),
+}
+
+/// Builds the audit entry for a request the authorization layer refused.
+///
+/// The entry carries the action that was denied and the internal denial reason, so an
+/// audit consumer can tell a refused request from a handler that never ran.
+pub(crate) fn authorization_denial_entry<T>(
+    req: &S3Request<T>,
+    action: &Action,
+    reason: &'static str,
+    scope: DenialScope,
+) -> AuditEntry {
+    let req_info = req.extensions.get::<ReqInfo>();
+    let path = req.uri.path().trim_start_matches('/');
+    let mut segs = path.splitn(2, '/');
+    let path_bucket = segs.next().unwrap_or("");
+    let path_object = segs.next().unwrap_or("");
+    let bucket = req_info
+        .and_then(|info| info.bucket.as_deref())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(path_bucket);
+    let object = match scope {
+        DenialScope::Request => req_info
+            .and_then(|info| info.object.as_deref())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(path_object),
+        DenialScope::Keys(_) => "",
+    };
+
+    let action_name: &str = action.into();
+    let mut api = ApiDetailsBuilder::new()
+        .name(action_name)
+        .status("failure")
+        .status_code(StatusCode::FORBIDDEN.as_u16() as i32);
+    if !bucket.is_empty() {
+        api = api.bucket(bucket);
+    }
+    if !object.is_empty() {
+        api = api.object(object);
+    }
+
+    let request_context = request_context_from_req(req).unwrap_or_else(|| RequestContext::from_external_headers(&req.headers));
+    let mut tags = HashMap::new();
+    tags.insert("denialReason".to_string(), Value::String(reason.to_string()));
+    if let DenialScope::Keys(denied) = scope {
+        tags.insert("deniedKeys".to_string(), Value::from(denied));
+    }
+    request_audit_builder(
+        req,
+        req_info,
+        EventName::AuditS3Operation,
+        action_name,
+        api.build(),
+        &request_context.request_id,
+    )
+    .error("Access Denied")
+    .tags(tags)
+    .build()
+}
+
+/// Runs `handler` on `req` and records the outcome as an audit-only entry for `op`.
+///
+/// The helper is built before the request is handed over so it sees the original headers
+/// and extensions, and it completes with the handler's result, so failed requests are audited too.
+pub(crate) async fn audit_only_operation<I, O, F, Fut>(req: S3Request<I>, op: S3Operation, handler: F) -> S3Result<S3Response<O>>
+where
+    I: Send + Sync,
+    F: FnOnce(S3Request<I>) -> Fut,
+    Fut: Future<Output = S3Result<S3Response<O>>>,
+{
+    let helper = OperationHelper::audit_only(&req, op);
+    let result = handler(req).await;
+    let _helper = helper.complete(&result);
+    result
 }
 
 fn should_build_notification_event(notify_module_enabled: bool) -> bool {
@@ -454,9 +589,161 @@ mod tests {
     use rustfs_s3_types::EventName;
     use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
     use s3s::dto::{DeleteObjectTaggingInput, DeleteObjectTaggingOutput, GetObjectInput, GetObjectOutput};
-    use s3s::{S3Error, S3ErrorCode, S3Request, S3Response};
+    use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
     use std::sync::{Arc, Mutex};
     use temp_env::{async_with_vars, with_vars};
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_background_tasks_keep_existing_entry_across_nested_spawns() {
+        use super::ecstore_diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("GET");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(S3Operation::GetObject);
+            current_s3_http_operation_context().expect("captured GET operation")
+        });
+        for has_request_context in [false, true] {
+            let context = has_request_context.then(|| RequestContext::from_headers(&HeaderMap::new()));
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            with_s3_http_operation_context(Some(operation), async {
+                with_read_version_entry(ReadVersionEntrySource::TierConfigReload, async {
+                    super::spawn_background_with_context(context, async move {
+                        release_rx.await.expect("parent releases background work");
+                        with_read_version_entry(ReadVersionEntrySource::ConfigRead, async move {
+                            super::spawn_background_with_context(None, async move {
+                                tx.send((current_s3_http_operation_name(), current_read_version_entry_source()))
+                                    .expect("context observer remains live");
+                            });
+                        })
+                        .await;
+                    });
+                })
+                .await;
+            })
+            .await;
+            assert_eq!(current_read_version_entry_source(), None);
+            release_tx.send(()).expect("detached background work remains alive");
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                    .await
+                    .expect("background completion deadline")
+                    .expect("context result"),
+                (Some("s3:GetObject"), Some(ReadVersionEntrySource::TierConfigReload))
+            );
+        }
+        drop(request);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        super::spawn_background(async move {
+            tx.send((current_s3_http_operation_name(), current_read_version_entry_source()))
+                .expect("unscoped observer remains live");
+        });
+        assert_eq!(rx.await.expect("unscoped task completes"), (None, None));
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[test]
+    fn diagnostic_background_tasks_keep_existing_entry_on_fallback_thread() {
+        use super::ecstore_diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let mut request = S3HttpRequestGuard::new("DELETE");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(S3Operation::DeleteObject);
+            current_s3_http_operation_context().expect("captured DELETE operation")
+        });
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        futures::executor::block_on(with_s3_http_operation_context(Some(operation), async {
+            with_read_version_entry(ReadVersionEntrySource::TierConfigReload, async {
+                super::spawn_background(async move {
+                    release_rx.await.expect("parent releases fallback work");
+                    tx.send((current_s3_http_operation_name(), current_read_version_entry_source()))
+                        .expect("fallback observer remains live");
+                });
+            })
+            .await;
+        }));
+        drop(request);
+        assert_eq!(current_read_version_entry_source(), None);
+        release_tx.send(()).expect("fallback work remains alive");
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("fallback thread completes"),
+            (Some("s3:DeleteObject"), Some(ReadVersionEntrySource::TierConfigReload))
+        );
+        assert_eq!(current_s3_http_operation_name(), None);
+    }
+
+    #[tokio::test]
+    async fn background_tasks_keep_operation_after_parent_scope_ends() {
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_name, observe_s3_http_operation};
+
+        for context in [None, Some(RequestContext::from_headers(&HeaderMap::new()))] {
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+            let mut request = S3HttpRequestGuard::new("GET");
+            request.in_scope(|| {
+                observe_s3_http_operation(S3Operation::GetObject);
+                super::spawn_background_with_context(context, async move {
+                    release_rx.await.expect("parent releases detached task");
+                    completed_tx
+                        .send(current_s3_http_operation_name())
+                        .expect("receiver remains live");
+                });
+            });
+            drop(request);
+            assert_eq!(current_s3_http_operation_name(), None);
+            release_tx.send(()).expect("detached task remains live");
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(5), completed_rx)
+                .await
+                .expect("detached completion deadline")
+                .expect("detached task sends operation");
+            assert_eq!(observed, Some("s3:GetObject"));
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        super::spawn_background_with_context(None, async move {
+            tx.send(current_s3_http_operation_name())
+                .expect("internal receiver remains live");
+        });
+        assert_eq!(rx.await.expect("internal task completes"), None);
+    }
+
+    #[test]
+    fn background_tasks_keep_operation_on_fallback_thread() {
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_name, observe_s3_http_operation};
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut request = S3HttpRequestGuard::new("DELETE");
+        request.in_scope(|| {
+            observe_s3_http_operation(S3Operation::DeleteObject);
+            super::spawn_background_with_context(Some(RequestContext::from_headers(&HeaderMap::new())), async move {
+                release_rx.await.expect("parent releases fallback thread");
+                tx.send(current_s3_http_operation_name())
+                    .expect("fallback receiver remains live");
+            });
+        });
+        drop(request);
+        release_tx.send(()).expect("fallback task remains live");
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("fallback thread completes"),
+            Some("s3:DeleteObject")
+        );
+        assert_eq!(current_s3_http_operation_name(), None);
+    }
 
     fn build_request<T>(input: T, method: Method, uri: Uri) -> S3Request<T> {
         S3Request {
@@ -568,6 +855,278 @@ mod tests {
                 assert_eq!(event_args.object.name, "prefix/issue-2292.txt");
                 assert_eq!(event_args.version_id, "version-123");
                 assert_eq!(event_args.req_params.get("principalId").map(String::as_str), Some("notifyTag"));
+            },
+        );
+    }
+
+    /// Operations without a notification event still produce an audit entry, and the
+    /// audit-only constructor never builds a notification event, even with notify on.
+    #[test]
+    fn audit_only_helper_audits_operations_without_a_notification_event() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("true")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                for (op, uri, expected_event) in [
+                    (S3Operation::UploadPart, "/audit-bucket/object.txt", EventName::AuditS3Operation),
+                    (S3Operation::UploadPartCopy, "/audit-bucket/object.txt", EventName::AuditS3Operation),
+                    (S3Operation::PutBucketPolicy, "/audit-bucket", EventName::AuditS3Operation),
+                    (S3Operation::PutBucketVersioning, "/audit-bucket", EventName::AuditS3Operation),
+                    (
+                        S3Operation::AbortMultipartUpload,
+                        "/audit-bucket/object.txt",
+                        EventName::ObjectRemovedAbortMultipartUpload,
+                    ),
+                ] {
+                    let input = DeleteObjectTaggingInput::builder()
+                        .bucket("audit-bucket".to_string())
+                        .key("object.txt".to_string())
+                        .build()
+                        .unwrap();
+                    let mut req = build_request(input, Method::PUT, Uri::from_static(uri));
+                    req.extensions.insert(ReqInfo {
+                        cred: Some(Credentials {
+                            access_key: "auditor".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+
+                    let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
+                    let mut helper = OperationHelper::audit_only(&req, op).complete(&result);
+                    assert!(!helper.wants_object_info(), "{} must not build a notification event", op.as_str());
+                    assert!(helper.event_args().is_none(), "{} must not build a notification event", op.as_str());
+                    let OperationHelper::Enabled(state) = &mut helper else {
+                        panic!("helper should be enabled when the audit switch is on");
+                    };
+                    let entry = state.audit_builder.take().expect("audit builder should exist").build();
+                    assert_eq!(entry.event, expected_event, "{}", op.as_str());
+                    assert_eq!(entry.api.name.as_deref(), Some(op.as_str()));
+                    assert_eq!(entry.api.bucket.as_deref(), Some("audit-bucket"));
+                    assert_eq!(entry.api.status.as_deref(), Some("success"));
+                    assert_eq!(entry.access_key.as_deref(), Some("auditor"));
+                }
+            },
+        );
+    }
+
+    /// With audit off, the audit-only helper does no work: it is the disabled helper.
+    #[test]
+    fn audit_only_helper_is_disabled_when_audit_is_off() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("true")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("false")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+                let input = DeleteObjectTaggingInput::builder()
+                    .bucket("audit-bucket".to_string())
+                    .key("object.txt".to_string())
+                    .build()
+                    .unwrap();
+                let req = build_request(input, Method::PUT, Uri::from_static("/audit-bucket/object.txt"));
+                assert!(matches!(
+                    OperationHelper::audit_only(&req, S3Operation::UploadPart),
+                    OperationHelper::Disabled
+                ));
+            },
+        );
+    }
+
+    /// A failed audit-only operation is audited with a failure status, the error message and
+    /// the error's status code.
+    #[test]
+    fn audit_only_helper_records_failure_status_and_error() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let input = DeleteObjectTaggingInput::builder()
+                    .bucket("audit-bucket".to_string())
+                    .key("object.txt".to_string())
+                    .build()
+                    .unwrap();
+                let req = build_request(input, Method::PUT, Uri::from_static("/audit-bucket"));
+                let result: S3Result<S3Response<DeleteObjectTaggingOutput>> =
+                    Err(S3Error::with_message(S3ErrorCode::AccessDenied, "policy refused".to_string()));
+                let mut helper = OperationHelper::audit_only(&req, S3Operation::PutBucketPolicy).complete(&result);
+                let OperationHelper::Enabled(state) = &mut helper else {
+                    panic!("helper should be enabled when the audit switch is on");
+                };
+                let entry = state.audit_builder.take().expect("audit builder should exist").build();
+                assert_eq!(entry.api.status.as_deref(), Some("failure"));
+                assert_eq!(entry.api.status_code, Some(403));
+                assert_eq!(entry.error.as_deref(), Some("policy refused"));
+            },
+        );
+    }
+
+    /// A failed request is audited with its failure status, and the wrapper hands the
+    /// handler's result back unchanged.
+    #[tokio::test]
+    async fn audit_only_operation_returns_the_handler_result_unchanged() {
+        async_with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("true")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            async {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let input = DeleteObjectTaggingInput::builder()
+                    .bucket("audit-bucket".to_string())
+                    .key("object.txt".to_string())
+                    .build()
+                    .unwrap();
+                let req = build_request(input, Method::PUT, Uri::from_static("/audit-bucket"));
+                let err = super::audit_only_operation(req, S3Operation::PutBucketPolicy, |req| async move {
+                    assert_eq!(req.input.bucket, "audit-bucket");
+                    Err::<S3Response<DeleteObjectTaggingOutput>, _>(S3Error::new(S3ErrorCode::AccessDenied))
+                })
+                .await
+                .unwrap_err();
+                assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn operation_helper_audits_the_authenticated_request_identity() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                for (access_key, parent_user) in [
+                    (Some("testuser"), ""),
+                    (Some("rustfsadmin"), ""),
+                    (Some("service-account"), "testuser"),
+                    (Some("sts-session"), "testuser"),
+                    (None, ""),
+                    (Some(""), ""),
+                ] {
+                    let expected_access_key = access_key.filter(|key| !key.is_empty());
+                    for outcome in [None, Some(true), Some(false)] {
+                        let input = GetObjectInput::builder()
+                            .bucket("audit-bucket".to_string())
+                            .key("object.txt".to_string())
+                            .build()
+                            .expect("get object input should build");
+                        let mut req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/object.txt"));
+                        req.extensions.insert(ReqInfo {
+                            cred: access_key.map(|key| Credentials {
+                                access_key: key.to_string(),
+                                secret_key: "audit-secret-must-not-leak".to_string(),
+                                session_token: "audit-token-must-not-leak".to_string(),
+                                parent_user: parent_user.to_string(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        });
+                        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+                        if let Some(success) = outcome {
+                            let result = if success {
+                                Ok(S3Response::new(GetObjectOutput::default()))
+                            } else {
+                                Err(S3Error::new(S3ErrorCode::NoSuchKey))
+                            };
+                            helper = helper.complete(&result);
+                        }
+                        let OperationHelper::Enabled(state) = &mut helper else {
+                            panic!("helper should be enabled when the audit switch is on");
+                        };
+                        let entry = state.audit_builder.take().expect("audit builder should exist").build();
+                        assert_eq!(entry.access_key.as_deref(), expected_access_key);
+                        let json = serde_json::to_value(&entry).expect("audit entry should serialize");
+                        assert_eq!(json.get("accessKey").and_then(|key| key.as_str()), expected_access_key);
+                        let rendered = serde_json::to_string(&entry).expect("audit entry should serialize");
+                        assert!(!rendered.contains("audit-secret-must-not-leak"));
+                        assert!(!rendered.contains("audit-token-must-not-leak"));
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn operation_helper_audits_verified_client_addresses() {
+        use crate::shared_types::RemoteAddr;
+        use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
+        use std::net::SocketAddr;
+
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let peer: SocketAddr = "192.0.2.10:54321".parse().unwrap();
+                let ipv6_peer: SocketAddr = "[2001:db8::10]:54321".parse().unwrap();
+                let proxied = ClientInfo::from_trusted_proxy(
+                    "198.51.100.20".parse().unwrap(),
+                    None,
+                    None,
+                    peer.ip(),
+                    1,
+                    ValidationMode::Strict,
+                    Vec::new(),
+                );
+                for (remote_addr, client_info, expected) in [
+                    (Some(RemoteAddr(peer)), None, "192.0.2.10"),
+                    (Some(RemoteAddr(ipv6_peer)), None, "2001:db8::10"),
+                    (Some(RemoteAddr(peer)), Some(proxied), "198.51.100.20"),
+                    (Some(RemoteAddr(peer)), Some(ClientInfo::direct(peer)), "192.0.2.10"),
+                    (None, None, ""),
+                ] {
+                    for spoofed in [false, true] {
+                        let input = GetObjectInput::builder()
+                            .bucket("audit-bucket".to_string())
+                            .key("object.txt".to_string())
+                            .build()
+                            .expect("get object input should build");
+                        let mut req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/object.txt"));
+                        req.extensions.insert(remote_addr);
+                        if let Some(client_info) = client_info.as_ref() {
+                            req.extensions.insert(client_info.clone());
+                        }
+                        if spoofed {
+                            req.headers
+                                .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.99"));
+                            req.headers.insert("x-real-ip", HeaderValue::from_static("203.0.113.98"));
+                        }
+                        let result = Ok(S3Response::new(GetObjectOutput::default()));
+                        let mut helper =
+                            OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).complete(&result);
+                        let OperationHelper::Enabled(state) = &mut helper else {
+                            panic!("helper should be enabled when the audit switch is on");
+                        };
+                        let entry = state.audit_builder.take().expect("audit builder should exist").build();
+                        assert_eq!(entry.remote_host.as_deref(), Some(expected));
+                        let rendered = serde_json::to_value(&entry).expect("audit entry should serialize");
+                        assert_eq!(rendered["remotehost"], expected);
+                    }
+                }
             },
         );
     }
