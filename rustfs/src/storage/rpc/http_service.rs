@@ -44,11 +44,11 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_CAPABILITY, INTERNODE_OPERATION_PUT_FILE_STREAM,
     INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
 };
+use rustfs_utils::crypto::Sha256;
 use s3s::Body;
 use s3s::dto::StreamingBlob;
 use serde::de::DeserializeOwned;
 use serde_urlencoded::from_bytes;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -1911,7 +1911,7 @@ mod tests {
         NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY,
         NS_SCANNER_SESSION_SEQUENCE_QUERY, NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY, NsScannerCapabilityResponse,
         NsScannerQuery, PUT_FILE_AUTH_STREAM_PATH, PUT_FILE_CAPABILITY_PATH, PUT_FILE_STREAM_PATH, PutFileQuery,
-        READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery, append_walk_dir_completion,
+        READ_FILE_STREAM_PATH, Sha256, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery, append_walk_dir_completion,
         internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path, legacy_meta_bucket_alias,
         ns_scanner_response_body, ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce,
         put_file_capability_response, put_file_server_epoch_accepted, put_file_server_epoch_matches,
@@ -1935,7 +1935,6 @@ mod tests {
         INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
         global_internode_metrics,
     };
-    use sha2::Digest as _;
     use std::collections::HashMap;
     use std::convert::Infallible;
     use std::future::Future as _;
@@ -2488,7 +2487,7 @@ mod tests {
     #[test]
     fn namespace_scanner_requires_matching_signed_body_digest() {
         let body = br#"{"scan_plan_digest":[1],"checkpoint_plan_digest":[2]}"#;
-        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(body), hex_simd::AsciiCase::Lower);
+        let digest = hex_simd::encode_to_string(Sha256::digest(body), hex_simd::AsciiCase::Lower);
         let request_id = uuid::Uuid::new_v4();
         let server_epoch = uuid::Uuid::new_v4();
         let session_id = uuid::Uuid::new_v4();
@@ -2752,7 +2751,7 @@ mod tests {
             "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
             "&append=false&size=11&put_file_auth=digest-trailer-v1&put_file_nonce=11111111-2222-4333-8444-555555555555"
         );
-        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"hello world"), hex_simd::AsciiCase::Lower);
+        let digest = hex_simd::encode_to_string(Sha256::digest(b"hello world"), hex_simd::AsciiCase::Lower);
         let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &digest).expect("trailer should build");
         let query = PutFileQuery {
             disk: "disk-a".to_string(),
@@ -2789,7 +2788,7 @@ mod tests {
             "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
             "&append=false&size=11&put_file_auth=digest-trailer-v1&put_file_nonce=22222222-3333-4444-8555-666666666666"
         );
-        let signed_digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"hello world"), hex_simd::AsciiCase::Lower);
+        let signed_digest = hex_simd::encode_to_string(Sha256::digest(b"hello world"), hex_simd::AsciiCase::Lower);
         let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &signed_digest).expect("trailer should build");
         let query = PutFileQuery {
             disk: "disk-a".to_string(),
@@ -2822,7 +2821,7 @@ mod tests {
             "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
             "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=33333333-4444-4555-8666-777777777777"
         );
-        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"append-data"), hex_simd::AsciiCase::Lower);
+        let digest = hex_simd::encode_to_string(Sha256::digest(b"append-data"), hex_simd::AsciiCase::Lower);
         let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &digest).expect("trailer should build");
         let query = PutFileQuery {
             disk: "disk-a".to_string(),
@@ -2855,7 +2854,7 @@ mod tests {
             "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
             "&append=false&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=43434343-4444-4555-8666-777777777777"
         );
-        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"unknown-size-data"), hex_simd::AsciiCase::Lower);
+        let digest = hex_simd::encode_to_string(Sha256::digest(b"unknown-size-data"), hex_simd::AsciiCase::Lower);
         let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &digest).expect("trailer should build");
         let query = PutFileQuery {
             disk: "disk-a".to_string(),
@@ -2920,7 +2919,7 @@ mod tests {
             "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
             "&append=false&size=11&put_file_auth=digest-trailer-v1&put_file_nonce=55555555-6666-4777-8888-999999999999"
         );
-        let signed_digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"hello world"), hex_simd::AsciiCase::Lower);
+        let signed_digest = hex_simd::encode_to_string(Sha256::digest(b"hello world"), hex_simd::AsciiCase::Lower);
         let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &signed_digest).expect("trailer should build");
         let query = PutFileQuery {
             disk: "disk-a".to_string(),
@@ -3044,7 +3043,7 @@ mod tests {
             "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
             "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=88888888-9999-4aaa-8bbb-cccccccccccc"
         );
-        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"append-data"), hex_simd::AsciiCase::Lower);
+        let digest = hex_simd::encode_to_string(Sha256::digest(b"append-data"), hex_simd::AsciiCase::Lower);
         let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &digest).expect("trailer should build");
         let query = PutFileQuery {
             disk: "disk-a".to_string(),
@@ -3086,7 +3085,7 @@ mod tests {
             "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
             "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=99999999-aaaa-4bbb-8ccc-dddddddddddd"
         );
-        let first_digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"first"), hex_simd::AsciiCase::Lower);
+        let first_digest = hex_simd::encode_to_string(Sha256::digest(b"first"), hex_simd::AsciiCase::Lower);
         let first_trailer =
             build_put_file_auth_trailer(first_url, &Method::PUT, first_nonce, &first_digest).expect("first trailer should build");
         let mut first_payload = b"first".to_vec();
@@ -3097,7 +3096,7 @@ mod tests {
             "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
             "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
         );
-        let second_digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"second"), hex_simd::AsciiCase::Lower);
+        let second_digest = hex_simd::encode_to_string(Sha256::digest(b"second"), hex_simd::AsciiCase::Lower);
         let second_trailer = build_put_file_auth_trailer(second_url, &Method::PUT, second_nonce, &second_digest)
             .expect("second trailer should build");
         let mut second_payload = b"second".to_vec();
@@ -3195,7 +3194,7 @@ mod tests {
             "/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
             "&append=true&size=0&put_file_auth=digest-trailer-v1&put_file_nonce=bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
         );
-        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(b"authenticated"), hex_simd::AsciiCase::Lower);
+        let digest = hex_simd::encode_to_string(Sha256::digest(b"authenticated"), hex_simd::AsciiCase::Lower);
         let trailer = build_put_file_auth_trailer(url, &Method::PUT, nonce, &digest).expect("trailer should build");
         let mut payload = b"authenticated".to_vec();
         payload.extend_from_slice(&trailer);
@@ -3596,7 +3595,7 @@ mod tests {
     #[test]
     fn walk_dir_completion_requires_matching_signed_body_digest() {
         let body = br#"{"bucket":"bucket-a"}"#;
-        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(body), hex_simd::AsciiCase::Lower);
+        let digest = hex_simd::encode_to_string(Sha256::digest(body), hex_simd::AsciiCase::Lower);
         let capable: WalkDirQuery = serde_urlencoded::from_str(&format!(
             "disk=disk-a&walk_dir_stream_completion=error-v1&{WALK_DIR_BODY_SHA256_QUERY}={digest}"
         ))

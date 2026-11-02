@@ -16,8 +16,146 @@ use hex_simd::{AsOut, AsciiCase};
 use hmac::{Hmac, KeyInit, Mac};
 use hyper::body::Bytes;
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use std::mem::MaybeUninit;
+
+/// Error returned when an HMAC key is rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidKeyLength;
+
+impl std::fmt::Display for InvalidKeyLength {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid HMAC key length")
+    }
+}
+
+impl std::error::Error for InvalidKeyLength {}
+
+/// Error returned when MAC verification fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacError;
+
+impl std::fmt::Display for MacError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MAC verification failed")
+    }
+}
+
+impl std::error::Error for MacError {}
+
+/// 32-byte HMAC-SHA256 output tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HmacOutput([u8; 32]);
+
+impl HmacOutput {
+    /// Returns the raw 32-byte HMAC tag.
+    #[must_use]
+    pub fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl AsRef<[u8]> for HmacOutput {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<HmacOutput> for [u8; 32] {
+    fn from(output: HmacOutput) -> Self {
+        output.0
+    }
+}
+
+/// Incremental SHA-256 hasher and one-shot digest helper.
+#[derive(Clone, Default)]
+pub struct Sha256(sha2::Sha256);
+
+impl std::fmt::Debug for Sha256 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sha256").finish_non_exhaustive()
+    }
+}
+
+impl Sha256 {
+    /// Size of a SHA-256 digest in bytes.
+    pub const OUTPUT_SIZE: usize = 32;
+
+    /// Creates a new incremental SHA-256 hasher.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(<sha2::Sha256 as Digest>::new())
+    }
+
+    /// Feeds `data` into the hasher.
+    pub fn update(&mut self, data: impl AsRef<[u8]>) {
+        self.0.update(data.as_ref());
+    }
+
+    /// Finalizes the hasher and returns the 32-byte SHA-256 digest.
+    #[must_use]
+    pub fn finalize(self) -> [u8; 32] {
+        self.0.finalize().into()
+    }
+
+    /// Resets the hasher to its initial state.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Computes the SHA-256 digest of `data` in one shot.
+    #[must_use]
+    pub fn digest(data: impl AsRef<[u8]>) -> [u8; 32] {
+        <sha2::Sha256 as Digest>::digest(data.as_ref()).into()
+    }
+
+    /// Returns the SHA-256 output size in bytes (32).
+    #[must_use]
+    pub const fn output_size() -> usize {
+        Self::OUTPUT_SIZE
+    }
+}
+
+/// Incremental HMAC-SHA256 signer and verifier.
+#[derive(Clone)]
+pub struct HmacSha256(Hmac<sha2::Sha256>);
+
+impl std::fmt::Debug for HmacSha256 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HmacSha256").finish_non_exhaustive()
+    }
+}
+
+impl HmacSha256 {
+    /// Creates a new HMAC-SHA256 instance from `key`.
+    #[must_use]
+    pub fn new(key: impl AsRef<[u8]>) -> Self {
+        Self(<Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key.as_ref()).expect("HMAC accepts keys of any length"))
+    }
+
+    /// Creates a new HMAC-SHA256 instance from `key`.
+    pub fn new_from_slice(key: &[u8]) -> Result<Self, InvalidKeyLength> {
+        <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key)
+            .map(Self)
+            .map_err(|_| InvalidKeyLength)
+    }
+
+    /// Feeds `data` into the MAC state.
+    pub fn update(&mut self, data: impl AsRef<[u8]>) {
+        self.0.update(data.as_ref());
+    }
+
+    /// Finalizes the MAC and returns the 32-byte output tag.
+    #[must_use]
+    pub fn finalize(self) -> HmacOutput {
+        HmacOutput(self.0.finalize().into_bytes().into())
+    }
+
+    /// Verifies that the computed MAC equals `tag` in constant time.
+    pub fn verify_slice(self, tag: &[u8]) -> Result<(), MacError> {
+        self.0.verify_slice(tag).map_err(|_| MacError)
+    }
+}
 
 /// Base64 URL safe encoding without padding
 /// `base64_encode_url_safe_no_pad(input)`
@@ -100,9 +238,9 @@ pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
 /// A 32-byte array containing the HMAC-SHA256 hash of the input data using the provided key
 ///
 pub fn hmac_sha256(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 32] {
-    let mut m = Hmac::<Sha256>::new_from_slice(key.as_ref()).expect("operation should succeed");
+    let mut m = HmacSha256::new_from_slice(key.as_ref()).expect("operation should succeed");
     m.update(data.as_ref());
-    m.finalize().into_bytes().into()
+    m.finalize().into_bytes()
 }
 
 /// `f(hex(src))`
@@ -112,12 +250,14 @@ fn hex_bytes32<R>(src: impl AsRef<[u8]>, f: impl FnOnce(&str) -> R) -> R {
     f(ans)
 }
 
-fn sha256(data: &[u8]) -> impl AsRef<[u8; 32]> + use<> {
-    <Sha256 as Digest>::digest(data)
+/// Computes the one-shot SHA-256 digest of `data`.
+#[must_use]
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data)
 }
 
-fn sha256_chunk(chunk: &[Bytes]) -> impl AsRef<[u8; 32]> + use<> {
-    let mut h = <Sha256 as Digest>::new();
+fn sha256_chunk(chunk: &[Bytes]) -> [u8; 32] {
+    let mut h = Sha256::new();
     chunk.iter().for_each(|data| h.update(data));
     h.finalize()
 }
@@ -133,12 +273,34 @@ fn sha256_chunk(chunk: &[Bytes]) -> impl AsRef<[u8; 32]> + use<> {
 /// representation of the SHA-256 hash of the input data
 ///
 pub fn hex_sha256<R>(data: &[u8], f: impl FnOnce(&str) -> R) -> R {
-    hex_bytes32(sha256(data).as_ref(), f)
+    hex_bytes32(sha256(data), f)
 }
 
 /// `f(hex(sha256(chunk)))`
 pub fn hex_sha256_chunk<R>(chunk: &[Bytes], f: impl FnOnce(&str) -> R) -> R {
-    hex_bytes32(sha256_chunk(chunk).as_ref(), f)
+    hex_bytes32(sha256_chunk(chunk), f)
+}
+
+#[test]
+fn test_sha256_and_hmac_sha256_rfc4231() {
+    let digest = hex_sha256(b"abc", str::to_owned);
+    assert_eq!(digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+    let key = [0x0b_u8; 20];
+    let data = b"Hi There";
+    let expected_hex = "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7";
+    let mac = hmac_sha256(key, data);
+    assert_eq!(hex(mac), expected_hex);
+
+    let mut verifier = HmacSha256::new_from_slice(&key).expect("valid key");
+    verifier.update(data);
+    assert!(verifier.verify_slice(&mac).is_ok());
+
+    let mut bad_mac = mac;
+    bad_mac[0] ^= 0x01;
+    let mut verifier_bad = HmacSha256::new_from_slice(&key).expect("valid key");
+    verifier_bad.update(data);
+    assert!(verifier_bad.verify_slice(&bad_mac).is_err());
 }
 
 #[test]
