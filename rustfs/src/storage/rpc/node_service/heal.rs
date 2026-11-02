@@ -19,8 +19,8 @@ use rmp_serde::Deserializer;
 use rustfs_heal::HealOperationsSnapshot;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_scanner::scanner::BackgroundHealInfo;
+use rustfs_utils::crypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::io::Cursor;
 
 use super::super::encode_msgpack_map;

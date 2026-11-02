@@ -14,6 +14,7 @@ This document records where RustFS stands on cryptographic module validation and
 | Layer | Where | Implementation | Primitives | Validated module |
 | --- | --- | --- | --- | --- |
 | TLS using the process-wide rustls provider | Provider installed or checked by `install_default_crypto_provider` in `rustfs/src/startup_runtime_hooks.rs` | `rustls` with the process-wide provider (AWS-LC is installed when none exists) | TLS 1.2/1.3 suites, `prefer-post-quantum` hybrid key exchange (restricted to FIPS-approved suites and groups when `--features fips` is enabled) | No in the default build (`aws-lc-sys`); opt-in `--features fips` enables `aws-lc-fips-sys` and checks the installed provider at startup; module validation depends on the deployment |
+| Internode HTTP RPC authentication and frame/payload hashing | `crates/ecstore/src/cluster/rpc/http_auth.rs`, `crates/ecstore/src/cluster/rpc/internode_data_transport.rs`, `rustfs/src/storage/rpc/http_service.rs`, `rustfs/src/storage/rpc/node_service.rs` via `rustfs_utils::crypto` | RustCrypto `hmac`, `sha2` in the default build (`crates/utils/src/crypto/standard.rs`); `aws-lc-rs` when `fips` is enabled (`crates/utils/src/crypto/fips.rs`) | HMAC-SHA256 (`x-rustfs-signature-256`), SHA-256 (`x-rustfs-content-sha256` and streaming frame digests) | No in the default build; opt-in `--features fips` enables `rustfs-utils/fips` (`aws-lc-fips-sys`) |
 | Object data path AEAD (SSE) | `crates/kms/src/encryption/ciphers.rs`, `crates/rio/src/encrypt_reader.rs`, `crates/rio-v2/src/encrypt_reader.rs` | RustCrypto `aes-gcm`, `chacha20poly1305` | AES-256-GCM, ChaCha20-Poly1305 | No |
 | DEK wrapping | `crates/kms/src/encryption/dek.rs` | RustCrypto `aes-gcm` | AES-256-GCM | No |
 | Local KMS backend master key | `crates/kms/src/backends/local.rs` | RustCrypto `argon2`, `aes-gcm` | Argon2id KDF, AES-256-GCM | No |
@@ -52,7 +53,7 @@ Boilerplate when the topic cannot be avoided:
 
 ## The `rustfs` and `rustfs-tls-runtime` `fips` feature
 
-`rustfs/Cargo.toml` and the TLS runtime, protocols, targets, S3 client, and ECStore library manifests define opt-in `fips` features (disabled by default) for the `aws-lc-fips-sys` / `rustls` path. The RustFS feature propagates the policy to these libraries; when enabling a protocol library independently, also enable the required protocol feature.
+`rustfs/Cargo.toml` and the TLS runtime, utils, protocols, targets, S3 client, and ECStore library manifests define opt-in `fips` features (disabled by default) for the `aws-lc-fips-sys` / `rustls` path. The RustFS feature propagates the policy to these libraries; when enabling a protocol library independently, also enable the required protocol feature.
 
 Cargo's `--all-features` also enables `fips`, including for these individual libraries. Such builds inherit the FIPS backend's target and native-tool requirements; select supported feature combinations deliberately rather than assuming every all-features build is supported.
 

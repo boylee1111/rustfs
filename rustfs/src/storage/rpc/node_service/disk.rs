@@ -55,7 +55,7 @@ fn startup_cas_rename_observation(
     request: &RenameDataRequest,
     file_info: &FileInfo,
 ) -> Option<serde_json::Value> {
-    use sha2::{Digest, Sha256};
+    use rustfs_utils::crypto::Sha256;
     if request.dst_volume != ".rustfs.sys" || !matches!(request.dst_path.as_str(), "pool.bin" | "pool.bin.identity") {
         return None;
     }
@@ -66,7 +66,7 @@ fn startup_cas_rename_observation(
         "target": match target { LocalMutationTarget::Ready(_) => "ready", LocalMutationTarget::Bootstrap(_) => "bootstrap", LocalMutationTarget::Unbound => "unbound" },
         "disk": request.disk, "src_volume": request.src_volume, "src_path": request.src_path,
         "dst_volume": request.dst_volume, "dst_path": request.dst_path,
-        "body_sha256": rustfs_utils::crypto::hex(Sha256::digest(body)),
+        "body_sha256": rustfs_utils::crypto::hex(Sha256::digest(&body)),
         "etag": file_info.metadata.get("etag"),
         "mod_time": file_info.mod_time.map(|time| time.unix_timestamp_nanos().to_string()),
     }))

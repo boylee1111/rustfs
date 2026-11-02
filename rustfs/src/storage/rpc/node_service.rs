@@ -49,8 +49,8 @@ use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
+use rustfs_utils::crypto::Sha256;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     future::Future,
@@ -864,7 +864,7 @@ async fn execute_heal_control_envelope_with_manager(
         .map_err(Status::failed_precondition)?;
     let expires_at_unix_ms = envelope.expires_at_unix_ms();
     let canonical_envelope = rustfs_protos::heal_control::encode_envelope(&envelope).map_err(Status::invalid_argument)?;
-    let command_digest = Sha256::digest(&canonical_envelope).into();
+    let command_digest = Sha256::digest(&canonical_envelope);
     let (request_id, coordinator_epoch, command) = envelope.into_execution().map_err(Status::invalid_argument)?;
 
     // Reject invalid targets before replay admission or forceStart can mutate
@@ -8227,7 +8227,7 @@ mod tests {
             LocalPublicationPause, LocalPublicationStage,
             ecstore_disk::{DiskAPI, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, ReadOptions},
         };
-        use sha2::{Digest, Sha256};
+        use rustfs_utils::crypto::Sha256;
 
         let fixture = target_rpc_fixture().await;
         // Mirror server startup: the disk fixture builds the store but leaves
@@ -8923,7 +8923,7 @@ mod tests {
             init_local_disks_with_instance_ctx, new_instance_ctx, read_config_no_lock,
         };
         use rustfs_filemeta::{FileInfo, ObjectPartInfo};
-        use sha2::{Digest, Sha256};
+        use rustfs_utils::crypto::Sha256;
         use tokio_util::sync::CancellationToken;
 
         let _ = rustfs_credentials::set_global_rpc_secret(Uuid::new_v4().to_string());

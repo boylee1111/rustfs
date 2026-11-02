@@ -36,7 +36,7 @@ use rustfs_config::{
 use rustfs_rio::{
     ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter, HttpWriterMemoryReservation, HttpWriterMemoryReserver,
 };
-use sha2::{Digest, Sha256};
+use rustfs_utils::crypto::Sha256;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
