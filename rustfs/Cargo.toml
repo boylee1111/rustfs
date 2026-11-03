@@ -58,6 +58,16 @@ required-features = ["swift"]
 
 [features]
 default = ["ftps", "webdav", "gcs"]
+# Opt-in build feature that switches AWS-LC, rustls TLS, s3s SigV4/streaming SHA-256,
+# and rustfs-utils SHA-256/HMAC-SHA256 to the FIPS-validated aws-lc-fips-sys module.
+aws-lc-fips = [
+    "dep:aws-lc-rs",
+    "aws-lc-rs/fips",
+    "rustls/fips",
+    "rustfs-tls-runtime/fips",
+    "rustfs-utils/aws-lc-rs",
+    "s3s/aws-lc-rs",
+]
 gcs = ["rustfs-ecstore/gcs", "dep:google-cloud-auth"]
 metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
@@ -330,6 +340,7 @@ snap.workspace = true
 zstd.workspace = true
 
 # Cryptography and Security
+aws-lc-rs = { workspace = true, optional = true }
 ed25519-dalek.workspace = true
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = { workspace = true }

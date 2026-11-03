@@ -13,17 +13,18 @@ This document records where RustFS stands on cryptographic module validation and
 
 | Layer | Where | Implementation | Primitives | Validated module |
 | --- | --- | --- | --- | --- |
-| TLS (S3 server, internode, outbound clients) | Process-wide default provider installed by `install_default_crypto_provider` in `rustfs/src/startup_runtime_hooks.rs` | `rustls` with the `aws-lc-rs` provider | TLS 1.2/1.3 suites, `prefer-post-quantum` hybrid key exchange | No — the ordinary `aws-lc-rs` build, not the `aws-lc-fips-sys`-backed FIPS variant |
+| TLS (S3 server, internode, outbound clients) | Process-wide default provider installed by `install_default_crypto_provider` in `rustfs/src/startup_runtime_hooks.rs` | `rustls` with the `aws-lc-rs` provider | TLS 1.2/1.3 suites, `prefer-post-quantum` hybrid key exchange | Default build: No (`aws-lc-sys`). Opt-in `--features aws-lc-fips` build: Yes (`aws-lc-fips-sys`, verified at startup via `aws_lc_rs::try_fips_mode()` and `CryptoProvider::fips()`) |
+| S3 SigV4, `aws-chunked` streaming, `x-amz-content-sha256`, and internode RPC HMAC-SHA256 | `s3s`, `s3s-sigv4`, `crates/utils/src/crypto.rs`, `crates/ecstore/src/cluster/rpc/http_auth.rs` | Default: RustCrypto `sha2` / `hmac`. With `--features aws-lc-fips`: `aws-lc-rs` (`digest` / `hmac`) | SHA-256, HMAC-SHA256 | Default build: No. Opt-in `--features aws-lc-fips` build: Yes (`aws-lc-fips-sys`) |
 | Object data path AEAD (SSE) | `crates/kms/src/encryption/ciphers.rs`, `crates/rio/src/encrypt_reader.rs`, `crates/rio-v2/src/encrypt_reader.rs` | RustCrypto `aes-gcm`, `chacha20poly1305` | AES-256-GCM, ChaCha20-Poly1305 | No |
 | DEK wrapping | `crates/kms/src/encryption/dek.rs` | RustCrypto `aes-gcm` | AES-256-GCM | No |
 | Local KMS backend master key | `crates/kms/src/backends/local.rs` | RustCrypto `argon2`, `aes-gcm` | Argon2id KDF, AES-256-GCM | No |
 | Config and IAM blobs at rest | `crates/crypto/src/encdec/` (`rustfs-crypto`) | RustCrypto `pbkdf2`/`argon2`, `aes-gcm`, `chacha20poly1305`, `sha2` | see [the `fips` feature](#the-rustfs-crypto-fips-feature-what-it-actually-does) | No |
-| JWT signing and verification | `jsonwebtoken` with the `aws_lc_rs` feature (`crates/crypto`, `crates/iam`, `crates/policy`) | AWS-LC through `aws-lc-rs` | Non-FIPS build | No |
+| JWT signing and verification | `jsonwebtoken` with the `aws_lc_rs` feature (`crates/crypto`, `crates/iam`, `crates/policy`) | AWS-LC through `aws-lc-rs` | Default: non-FIPS build; `--features aws-lc-fips`: unified with `aws-lc-rs/fips` | Default build: No. Opt-in `--features aws-lc-fips` build: Yes (`aws-lc-fips-sys`) |
 
 Two consequences are commonly assumed the other way:
 
-- **AWS-LC being present does not imply FIPS.** `aws-lc-rs` has a FIPS variant; the workspace does not enable it anywhere.
-- **The data path never touches AWS-LC.** Every byte of object plaintext is encrypted by RustCrypto software implementations. Swapping the TLS provider would not change that; see route 1 below.
+- **AWS-LC being present in the default build does not imply FIPS.** `aws-lc-rs` has a FIPS variant (`aws-lc-fips-sys`); the default workspace build does not enable it unless compiled with `--features aws-lc-fips`.
+- **The SSE object data path never touches AWS-LC.** Every byte of SSE object plaintext is encrypted by RustCrypto software implementations. Enabling `--features aws-lc-fips` switches TLS, JWT, S3 SigV4/streaming SHA-256, and internode RPC HMAC-SHA256 to `aws-lc-fips-sys`, but does not validate the RustCrypto SSE/KMS data path; see route 1 below.
 
 ## Terminology red lines for external material
 

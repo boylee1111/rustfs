@@ -13,9 +13,12 @@
 // limitations under the License.
 
 use hex_simd::{AsOut, AsciiCase};
+#[cfg(not(feature = "aws-lc-rs"))]
 use hmac::{Hmac, KeyInit, Mac};
 use hyper::body::Bytes;
+#[cfg(not(feature = "aws-lc-rs"))]
 use sha1::Sha1;
+#[cfg(not(feature = "aws-lc-rs"))]
 use sha2::Digest;
 use std::mem::MaybeUninit;
 
@@ -68,6 +71,19 @@ impl From<HmacOutput> for [u8; 32] {
 }
 
 /// Incremental SHA-256 hasher and one-shot digest helper.
+#[cfg(feature = "aws-lc-rs")]
+#[derive(Clone)]
+pub struct Sha256(aws_lc_rs::digest::Context);
+
+#[cfg(feature = "aws-lc-rs")]
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Incremental SHA-256 hasher and one-shot digest helper.
+#[cfg(not(feature = "aws-lc-rs"))]
 #[derive(Clone, Default)]
 pub struct Sha256(sha2::Sha256);
 
@@ -84,7 +100,14 @@ impl Sha256 {
     /// Creates a new incremental SHA-256 hasher.
     #[must_use]
     pub fn new() -> Self {
-        Self(<sha2::Sha256 as Digest>::new())
+        #[cfg(feature = "aws-lc-rs")]
+        {
+            Self(aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256))
+        }
+        #[cfg(not(feature = "aws-lc-rs"))]
+        {
+            Self(<sha2::Sha256 as Digest>::new())
+        }
     }
 
     /// Feeds `data` into the hasher.
@@ -95,7 +118,18 @@ impl Sha256 {
     /// Finalizes the hasher and returns the 32-byte SHA-256 digest.
     #[must_use]
     pub fn finalize(self) -> [u8; 32] {
-        self.0.finalize().into()
+        #[cfg(feature = "aws-lc-rs")]
+        {
+            self.0
+                .finish()
+                .as_ref()
+                .try_into()
+                .expect("SHA-256 digest is always 32 bytes")
+        }
+        #[cfg(not(feature = "aws-lc-rs"))]
+        {
+            self.0.finalize().into()
+        }
     }
 
     /// Resets the hasher to its initial state.
@@ -106,7 +140,17 @@ impl Sha256 {
     /// Computes the SHA-256 digest of `data` in one shot.
     #[must_use]
     pub fn digest(data: impl AsRef<[u8]>) -> [u8; 32] {
-        <sha2::Sha256 as Digest>::digest(data.as_ref()).into()
+        #[cfg(feature = "aws-lc-rs")]
+        {
+            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data.as_ref())
+                .as_ref()
+                .try_into()
+                .expect("SHA-256 digest is always 32 bytes")
+        }
+        #[cfg(not(feature = "aws-lc-rs"))]
+        {
+            <sha2::Sha256 as Digest>::digest(data.as_ref()).into()
+        }
     }
 
     /// Returns the SHA-256 output size in bytes (32).
@@ -117,6 +161,12 @@ impl Sha256 {
 }
 
 /// Incremental HMAC-SHA256 signer and verifier.
+#[cfg(feature = "aws-lc-rs")]
+#[derive(Clone)]
+pub struct HmacSha256(aws_lc_rs::hmac::Context);
+
+/// Incremental HMAC-SHA256 signer and verifier.
+#[cfg(not(feature = "aws-lc-rs"))]
 #[derive(Clone)]
 pub struct HmacSha256(Hmac<sha2::Sha256>);
 
@@ -130,14 +180,22 @@ impl HmacSha256 {
     /// Creates a new HMAC-SHA256 instance from `key`.
     #[must_use]
     pub fn new(key: impl AsRef<[u8]>) -> Self {
-        Self(<Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key.as_ref()).expect("HMAC accepts keys of any length"))
+        Self::new_from_slice(key.as_ref()).expect("HMAC accepts keys of any length")
     }
 
     /// Creates a new HMAC-SHA256 instance from `key`.
     pub fn new_from_slice(key: &[u8]) -> Result<Self, InvalidKeyLength> {
-        <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key)
-            .map(Self)
-            .map_err(|_| InvalidKeyLength)
+        #[cfg(feature = "aws-lc-rs")]
+        {
+            let signing_key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key);
+            Ok(Self(aws_lc_rs::hmac::Context::with_key(&signing_key)))
+        }
+        #[cfg(not(feature = "aws-lc-rs"))]
+        {
+            <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key)
+                .map(Self)
+                .map_err(|_| InvalidKeyLength)
+        }
     }
 
     /// Feeds `data` into the MAC state.
@@ -148,12 +206,28 @@ impl HmacSha256 {
     /// Finalizes the MAC and returns the 32-byte output tag.
     #[must_use]
     pub fn finalize(self) -> HmacOutput {
-        HmacOutput(self.0.finalize().into_bytes().into())
+        #[cfg(feature = "aws-lc-rs")]
+        {
+            let tag = self.0.sign();
+            HmacOutput(tag.as_ref().try_into().expect("HMAC-SHA256 tag is always 32 bytes"))
+        }
+        #[cfg(not(feature = "aws-lc-rs"))]
+        {
+            HmacOutput(self.0.finalize().into_bytes().into())
+        }
     }
 
     /// Verifies that the computed MAC equals `tag` in constant time.
     pub fn verify_slice(self, tag: &[u8]) -> Result<(), MacError> {
-        self.0.verify_slice(tag).map_err(|_| MacError)
+        #[cfg(feature = "aws-lc-rs")]
+        {
+            let computed = self.0.sign();
+            aws_lc_rs::constant_time::verify_slices_are_equal(computed.as_ref(), tag).map_err(|_| MacError)
+        }
+        #[cfg(not(feature = "aws-lc-rs"))]
+        {
+            self.0.verify_slice(tag).map_err(|_| MacError)
+        }
     }
 }
 
@@ -222,9 +296,18 @@ pub fn is_sha256_checksum(s: &str) -> bool {
 /// A 20-byte array containing the HMAC-SHA1 hash of the input data using the provided key
 ///
 pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
-    let mut m = <Hmac<Sha1>>::new_from_slice(key.as_ref()).expect("operation should succeed");
-    m.update(data.as_ref());
-    m.finalize().into_bytes().into()
+    #[cfg(feature = "aws-lc-rs")]
+    {
+        let signing_key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, key.as_ref());
+        let tag = aws_lc_rs::hmac::sign(&signing_key, data.as_ref());
+        tag.as_ref().try_into().expect("HMAC-SHA1 tag is always 20 bytes")
+    }
+    #[cfg(not(feature = "aws-lc-rs"))]
+    {
+        let mut m = <Hmac<Sha1>>::new_from_slice(key.as_ref()).expect("operation should succeed");
+        m.update(data.as_ref());
+        m.finalize().into_bytes().into()
+    }
 }
 
 /// HMAC-SHA256 hashing

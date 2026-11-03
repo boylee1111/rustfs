@@ -117,7 +117,30 @@ pub(crate) fn install_default_crypto_provider() {
             "Rustls crypto provider state checked"
         );
     }
+    assert_fips_crypto_operational();
 }
+
+#[cfg(feature = "aws-lc-fips")]
+fn assert_fips_crypto_operational() {
+    aws_lc_rs::try_fips_mode().expect("rustfs built with `aws-lc-fips`, but aws_lc_rs::try_fips_mode() failed");
+    let fips_provider = rustls::crypto::CryptoProvider::get_default().is_some_and(|provider| provider.fips());
+    assert!(
+        fips_provider,
+        "rustfs built with `aws-lc-fips`, but installed rustls CryptoProvider::fips() is false"
+    );
+    info!(
+        target: "rustfs::main",
+        event = EVENT_CRYPTO_PROVIDER_STATE,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        provider = "aws_lc_rs",
+        fips = true,
+        "Verified aws-lc-rs FIPS module and rustls FIPS CryptoProvider at startup"
+    );
+}
+
+#[cfg(not(feature = "aws-lc-fips"))]
+fn assert_fips_crypto_operational() {}
 
 pub(crate) async fn init_embedded_runtime_hooks(obs_endpoint: String) -> Result<()> {
     // Observability is a process-global tracing subscriber and can only be
@@ -165,15 +188,29 @@ fn install_embedded_default_crypto_provider() {
             "Embedded crypto provider state changed"
         );
     }
+    assert_fips_crypto_operational();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{init_profiling_runtime_with, shutdown_profiling_runtime_with};
+    use super::{init_profiling_runtime_with, install_default_crypto_provider, shutdown_profiling_runtime_with};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    #[test]
+    fn install_default_crypto_provider_verifies_fips_when_enabled() {
+        install_default_crypto_provider();
+        let provider = rustls::crypto::CryptoProvider::get_default().expect("default provider should be installed");
+        #[cfg(feature = "aws-lc-fips")]
+        {
+            aws_lc_rs::try_fips_mode().expect("aws-lc-rs FIPS mode should be active");
+            assert!(provider.fips(), "rustls CryptoProvider::fips() should be true");
+        }
+        #[cfg(not(feature = "aws-lc-fips"))]
+        let _ = provider;
+    }
 
     #[tokio::test]
     async fn init_profiling_runtime_invokes_registered_hook() {

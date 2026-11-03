@@ -51,11 +51,36 @@ pub use state::OutboundOnlySnapshotArgs;
 pub use state::{TlsGeneration, TlsPublishedState, TlsReloadRuntimeState, TlsRuntimeStatusSnapshot};
 pub use state::{TlsRuntimeConsumerSection, TlsRuntimeOutboundSection, TlsRuntimeRuntimeSection, TlsRuntimeServerSection};
 
+/// Installs the process-wide `rustls` crypto provider (`aws-lc-rs`) if not already installed,
+/// and when compiled with the `fips` feature, verifies that the installed provider reports
+/// `fips() == true`.
+pub fn ensure_process_crypto_provider_installed() -> std::io::Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    #[cfg(feature = "fips")]
+    {
+        let fips_active = rustls::crypto::CryptoProvider::get_default().is_some_and(|p| p.fips());
+        if !fips_active {
+            return Err(std::io::Error::other(
+                "rustfs-tls-runtime compiled with `fips` feature, but installed rustls CryptoProvider::fips() is false",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rcgen::generate_simple_self_signed;
     use std::collections::HashMap;
+
+    #[test]
+    fn process_crypto_provider_installs_and_matches_fips_feature() {
+        ensure_process_crypto_provider_installed().expect("crypto provider installation should succeed");
+        let provider = rustls::crypto::CryptoProvider::get_default().expect("default provider should be installed");
+        #[cfg(feature = "fips")]
+        assert!(provider.fips(), "CryptoProvider::fips() must be true when `fips` feature is enabled");
+    }
 
     #[test]
     fn tls_source_requires_existing_directory() {

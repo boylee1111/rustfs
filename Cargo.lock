@@ -255,7 +255,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -266,7 +266,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -909,11 +909,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-lc-fips-sys"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b744eed18cd75d814effdf2aba2880f912abe0fe1c327b361341d31aba9a7005"
+dependencies = [
+ "bindgen",
+ "cc",
+ "cmake",
+ "dunce",
+ "fs_extra",
+ "pkg-config",
+ "regex",
+]
+
+[[package]]
 name = "aws-lc-rs"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "048006790404103c488e6c5616b3e7e702a71292aadda08e8f7698a9e0d2eb53"
 dependencies = [
+ "aws-lc-fips-sys",
  "aws-lc-sys",
  "untrusted 0.7.1",
  "zeroize",
@@ -1524,6 +1540,8 @@ dependencies = [
  "bitflags 2.13.2",
  "cexpr",
  "clang-sys",
+ "log",
+ "prettyplease 0.3.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -1881,7 +1899,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -3977,7 +3995,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4291,7 +4309,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6887,7 +6905,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8587,7 +8605,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9333,6 +9351,7 @@ dependencies = [
  "atoi 3.1.1",
  "atomic_enum",
  "aws-config",
+ "aws-lc-rs",
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
@@ -9640,7 +9659,6 @@ dependencies = [
  "google-cloud-storage",
  "h2",
  "hex-simd",
- "hmac 0.13.0",
  "hostname",
  "hotpath",
  "http 1.5.0",
@@ -10860,6 +10878,7 @@ dependencies = [
 name = "rustfs-utils"
 version = "1.0.2"
 dependencies = [
+ "aws-lc-rs",
  "base64-simd",
  "blake2",
  "brotli 9.1.1",
@@ -10970,7 +10989,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11053,7 +11072,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11110,12 +11129,13 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
+source = "git+https://github.com/boylee1111/s3s?rev=2cec1c64f5bd789f915d9853f1ed231a76ddb787#2cec1c64f5bd789f915d9853f1ed231a76ddb787"
 dependencies = [
  "arc-swap",
  "arrayvec",
  "async-trait",
  "atoi 3.1.1",
+ "aws-lc-rs",
  "base64-simd",
  "bytes",
  "bytestring",
@@ -11167,7 +11187,7 @@ dependencies = [
 [[package]]
 name = "s3s-multipart"
 version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
+source = "git+https://github.com/boylee1111/s3s?rev=2cec1c64f5bd789f915d9853f1ed231a76ddb787#2cec1c64f5bd789f915d9853f1ed231a76ddb787"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -11180,7 +11200,7 @@ dependencies = [
 [[package]]
 name = "s3s-rfc2047"
 version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
+source = "git+https://github.com/boylee1111/s3s?rev=2cec1c64f5bd789f915d9853f1ed231a76ddb787#2cec1c64f5bd789f915d9853f1ed231a76ddb787"
 dependencies = [
  "base64-simd",
  "thiserror 2.0.21",
@@ -11189,7 +11209,7 @@ dependencies = [
 [[package]]
 name = "s3s-sigv2"
 version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
+source = "git+https://github.com/boylee1111/s3s?rev=2cec1c64f5bd789f915d9853f1ed231a76ddb787#2cec1c64f5bd789f915d9853f1ed231a76ddb787"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
@@ -11202,9 +11222,10 @@ dependencies = [
 [[package]]
 name = "s3s-sigv4"
 version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s?rev=5761ddfe4c509fcac87e3b99fd5bd9e176b442c0#5761ddfe4c509fcac87e3b99fd5bd9e176b442c0"
+source = "git+https://github.com/boylee1111/s3s?rev=2cec1c64f5bd789f915d9853f1ed231a76ddb787#2cec1c64f5bd789f915d9853f1ed231a76ddb787"
 dependencies = [
  "arrayvec",
+ "aws-lc-rs",
  "base64-simd",
  "hex-simd",
  "hmac 0.13.0",
@@ -11864,7 +11885,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -12015,7 +12036,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -12321,10 +12342,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13431,7 +13452,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
