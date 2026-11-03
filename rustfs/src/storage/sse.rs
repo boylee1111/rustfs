@@ -536,6 +536,22 @@ fn sse_invalid_argument(message: &str) -> ApiError {
     }
 }
 
+#[cfg(feature = "aws-lc-fips")]
+#[inline]
+fn reject_sse_in_fips_build() -> Result<(), ApiError> {
+    Err(ApiError {
+        code: S3ErrorCode::NotImplemented,
+        message: "Server-Side Encryption (SSE-S3, SSE-KMS, SSE-C) is disabled in aws-lc-fips builds because object data-path encryption uses unvalidated software cryptography.".to_string(),
+        source: None,
+    })
+}
+
+#[cfg(not(feature = "aws-lc-fips"))]
+#[inline]
+fn reject_sse_in_fips_build() -> Result<(), ApiError> {
+    Ok(())
+}
+
 /// SSE-C parameters extracted from headers (algorithm, key, key MD5).
 pub(crate) type SsecParamsFromHeaders = (Option<SSECustomerAlgorithm>, Option<SSECustomerKey>, Option<SSECustomerKeyMD5>);
 
@@ -625,6 +641,10 @@ pub(crate) fn validate_sse_headers_for_write(
 
     let has_ssec_headers = sse_customer_algorithm.is_some() || sse_customer_key.is_some() || sse_customer_key_md5.is_some();
     let has_managed_headers = server_side_encryption.is_some() || ssekms_key_id.is_some() || ssekms_context.is_some();
+
+    if has_ssec_headers || has_managed_headers {
+        reject_sse_in_fips_build()?;
+    }
 
     if has_ssec_headers {
         if has_managed_headers {
@@ -2119,6 +2139,7 @@ pub async fn sse_encryption(request: EncryptionRequest<'_>) -> Result<Option<Enc
     if let Some(sse_config) = sse_config
         && is_managed_sse(&sse_config.effective_sse)
     {
+        reject_sse_in_fips_build()?;
         return apply_managed_encryption_material(
             request.bucket,
             request.key,
@@ -2184,6 +2205,10 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
         request.ssekms_key_id,
     )
     .await?;
+
+    if sse_type.is_some() {
+        reject_sse_in_fips_build()?;
+    }
 
     // apply encryption material
     let material = match sse_type {
@@ -2251,6 +2276,9 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
 /// }
 /// ```
 pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<DecryptionMaterial>, ApiError> {
+    if stored_ssec_metadata(request.metadata) || contains_managed_encryption_metadata(request.metadata) {
+        reject_sse_in_fips_build()?;
+    }
     // Check for SSE-C encryption
     if stored_ssec_metadata(request.metadata) {
         let (key, key_md5) = match (request.sse_customer_key, request.sse_customer_key_md5) {
@@ -2465,6 +2493,9 @@ pub(crate) fn project_sse_read_response_headers(
 ///   be established in this build — classify as `None`, exactly where
 ///   [`sse_decryption`] returned `None`.
 pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Result<Option<SseReadResponseHeaders>, ApiError> {
+    if stored_ssec_metadata(request.metadata) || contains_managed_encryption_metadata(request.metadata) {
+        reject_sse_in_fips_build()?;
+    }
     if stored_ssec_metadata(request.metadata) {
         let (key, key_md5) = match (request.sse_customer_key, request.sse_customer_key_md5) {
             (Some(k), Some(md5)) => (k, md5),
@@ -8992,5 +9023,27 @@ mod tests {
         let tags = scope.audit_tags();
         assert_eq!(audit_tag(&tags, "kmsKeyVersion").as_deref(), Some("3"));
         assert_eq!(audit_tag(&tags, "kmsOutcome").as_deref(), Some("success"));
+    }
+
+    #[cfg(feature = "aws-lc-fips")]
+    #[tokio::test]
+    async fn sse_requests_are_rejected_with_not_implemented_in_aws_lc_fips_mode() {
+        let sse_s3 = ServerSideEncryption::from_static(ServerSideEncryption::AES256);
+        let err = super::validate_sse_headers_for_write(Some(&sse_s3), None, None, None, None, None, true)
+            .expect_err("SSE-S3 write must be rejected in aws-lc-fips mode");
+        assert_eq!(err.code, S3ErrorCode::NotImplemented);
+
+        let metadata = HashMap::from([("x-amz-server-side-encryption".to_string(), "AES256".to_string())]);
+        let err = super::sse_decryption(super::DecryptionRequest {
+            bucket: "bucket",
+            key: "key",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        })
+        .await
+        .expect_err("SSE read must be rejected in aws-lc-fips mode");
+        assert_eq!(err.code, S3ErrorCode::NotImplemented);
     }
 }

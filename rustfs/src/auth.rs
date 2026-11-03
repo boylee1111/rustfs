@@ -1108,6 +1108,14 @@ const SIGV4_UNSIGNED_ENVELOPE_HEADERS: &[&str] = &[
 /// that claims the SigV4 algorithm still fails closed here. SigV2 signs every
 /// `x-amz-*` header itself; JWT and anonymous requests carry no SigV4 list.
 pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, query: Option<&str>) -> S3Result<()> {
+    #[cfg(feature = "aws-lc-fips")]
+    if is_request_signature_v2(header) || is_request_presigned_signature_v2(header, query) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "AWS Signature Version 2 is disabled in aws-lc-fips builds; use Signature Version 4".to_owned(),
+        ));
+    }
+
     reject_unsigned_amz_headers_on_presigned_request(header, query)?;
 
     for value in header.get_all(http::header::AUTHORIZATION) {
@@ -1561,6 +1569,27 @@ mod tests {
         // We can't easily test internal state without exposing it,
         // but we can test it doesn't panic on creation
         assert_eq!(size_of_val(&iam_auth), size_of::<IAMAuth>());
+    }
+
+    #[cfg(feature = "aws-lc-fips")]
+    #[test]
+    fn sigv2_requests_are_rejected_in_aws_lc_fips_mode() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("AWS AKIAIOSFODNN7EXAMPLE:frJIUN8DYpKDtOLCwo//yllqDzg="),
+        );
+        let err = reject_unsigned_amz_headers_on_sigv4_request(&headers, None)
+            .expect_err("SigV2 header auth must be rejected in aws-lc-fips mode");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        let empty_headers = HeaderMap::new();
+        let err = reject_unsigned_amz_headers_on_sigv4_request(
+            &empty_headers,
+            Some("AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE&Expires=1141889120&Signature=vjbyPxybdZaNmGa%2ByT272YEAiv4%3D"),
+        )
+        .expect_err("SigV2 presigned URL must be rejected in aws-lc-fips mode");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
     #[tokio::test]

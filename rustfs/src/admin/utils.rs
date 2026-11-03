@@ -14,6 +14,7 @@
 
 use crate::server::{MINIO_ADMIN_PREFIX, has_path_prefix};
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
+#[cfg(not(feature = "aws-lc-fips"))]
 use rustfs_crypto::{decrypt_data, decrypt_stream_io, encrypt_stream_io};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
@@ -45,9 +46,20 @@ pub(crate) async fn read_compatible_admin_body(
         .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
     if is_compat_admin_request(path) {
-        decrypt_stream_io(secret_key.as_bytes(), body.as_ref())
-            .or_else(|_| decrypt_data(secret_key.as_bytes(), body.as_ref()))
-            .map_err(|e| s3_error!(InvalidRequest, "failed to decrypt MinIO admin payload: {}", e))
+        #[cfg(feature = "aws-lc-fips")]
+        {
+            let _ = secret_key;
+            return Err(s3_error!(
+                InvalidRequest,
+                "Password-encrypted /minio/admin/v3 payloads are disabled in aws-lc-fips builds; use /rustfs/admin/v3 over TLS"
+            ));
+        }
+        #[cfg(not(feature = "aws-lc-fips"))]
+        {
+            decrypt_stream_io(secret_key.as_bytes(), body.as_ref())
+                .or_else(|_| decrypt_data(secret_key.as_bytes(), body.as_ref()))
+                .map_err(|e| s3_error!(InvalidRequest, "failed to decrypt MinIO admin payload: {}", e))
+        }
     } else {
         Ok(body.to_vec())
     }
@@ -55,9 +67,20 @@ pub(crate) async fn read_compatible_admin_body(
 
 pub(crate) fn encode_compatible_admin_payload(path: &str, secret_key: &str, data: Vec<u8>) -> S3Result<(Vec<u8>, &'static str)> {
     if is_compat_admin_request(path) {
-        let encrypted = encrypt_stream_io(secret_key.as_bytes(), &data)
-            .map_err(|e| s3_error!(InternalError, "failed to encrypt MinIO admin payload: {}", e))?;
-        Ok((encrypted, "application/octet-stream"))
+        #[cfg(feature = "aws-lc-fips")]
+        {
+            let _ = (secret_key, data);
+            return Err(s3_error!(
+                InvalidRequest,
+                "Password-encrypted /minio/admin/v3 payloads are disabled in aws-lc-fips builds; use /rustfs/admin/v3 over TLS"
+            ));
+        }
+        #[cfg(not(feature = "aws-lc-fips"))]
+        {
+            let encrypted = encrypt_stream_io(secret_key.as_bytes(), &data)
+                .map_err(|e| s3_error!(InternalError, "failed to encrypt MinIO admin payload: {}", e))?;
+            Ok((encrypted, "application/octet-stream"))
+        }
     } else {
         Ok((data, "application/json"))
     }
@@ -108,6 +131,7 @@ pub(crate) fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "aws-lc-fips"))]
     use rustfs_crypto::encrypt_data;
     use s3s::Body;
 
@@ -143,6 +167,7 @@ mod tests {
         assert_eq!(content_type, "application/json");
     }
 
+    #[cfg(not(feature = "aws-lc-fips"))]
     #[test]
     fn encodes_compat_payload_with_compatible_encryption() {
         let payload = b"{\"ok\":true}".to_vec();
@@ -154,6 +179,7 @@ mod tests {
         assert_eq!(decrypt_stream_io(b"secret", &encoded).expect("decrypt payload"), payload);
     }
 
+    #[cfg(not(feature = "aws-lc-fips"))]
     #[tokio::test]
     async fn reads_legacy_compat_payload_as_fallback() {
         let payload = b"{\"ok\":true}".to_vec();
@@ -164,6 +190,20 @@ mod tests {
             .expect("decode payload");
 
         assert_eq!(decoded, payload);
+    }
+
+    #[cfg(feature = "aws-lc-fips")]
+    #[tokio::test]
+    async fn compat_admin_encrypted_payloads_are_rejected_in_aws_lc_fips_mode() {
+        let payload = b"{\"ok\":true}".to_vec();
+        let err = encode_compatible_admin_payload("/minio/admin/v3/list-users", "secret", payload.clone())
+            .expect_err("compat admin encryption must be rejected in aws-lc-fips mode");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        let err = read_compatible_admin_body(Body::from(payload), 1024, "/minio/admin/v3/list-users", "secret")
+            .await
+            .expect_err("compat admin decryption must be rejected in aws-lc-fips mode");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
     async fn body_bytes(mut body: Body) -> Vec<u8> {
