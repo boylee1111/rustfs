@@ -29,8 +29,9 @@ use super::storage_api::object_usecase::access::{
 #[cfg(test)]
 use super::storage_api::object_usecase::bucket::quota::BucketQuota;
 use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
+use super::storage_api::object_usecase::bucket::replication::ReplicationState;
 #[cfg(test)]
-use super::storage_api::object_usecase::bucket::replication::{ReplicationState, replication_statuses_map};
+use super::storage_api::object_usecase::bucket::replication::replication_statuses_map;
 use super::storage_api::object_usecase::bucket::{
     VersioningConfigExt as _,
     lifecycle::{
@@ -49,10 +50,11 @@ use super::storage_api::object_usecase::bucket::{
     replication::{
         DeleteReplicationConfigSnapshot, REPLICATE_INCOMING_DELETE, ReplicationStatusType, commit_force_delete_intent,
         delete_replication_state_from_config, delete_replication_version_id, deleted_object_has_pending_replication_delete,
-        force_delete_target_set, get_read_proxy_targets, has_active_delete_rule, load_delete_config_snapshot,
-        must_replicate_object, persist_force_delete_intent, record_replication_proxy, schedule_object_replication,
-        schedule_replication_delete, schedule_replication_deletes, set_deleted_object_replication_state,
-        should_schedule_delete_replication, should_use_existing_delete_replication_info,
+        force_delete_target_set, get_read_proxy_targets, has_active_delete_rule, has_site_replication_shaped_rule,
+        load_delete_config_snapshot, must_replicate_object, persist_force_delete_intent, record_replication_proxy,
+        replica_delete_fanout_state_from_config, schedule_object_replication, schedule_replication_delete,
+        schedule_replication_deletes, set_deleted_object_replication_state, should_schedule_delete_replication,
+        should_use_existing_delete_replication_info,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -230,7 +232,10 @@ pub(crate) use self::on_demand_migration_put::*;
 #[cfg(test)]
 pub(crate) use self::put::PollCountingBody;
 use self::put::*;
-pub(crate) use self::put::{guard_put_object_body_read_timeout, put_object_body_read_timeout, reject_oversize_single_upload};
+pub(crate) use self::put::{
+    guard_put_object_body_read_timeout, previous_current_size_from_backfill, put_object_body_read_timeout,
+    reject_oversize_single_upload,
+};
 #[cfg(test)]
 pub(crate) use self::restore::RestoreStatusCommitBarrier;
 pub(crate) use self::shared::*;

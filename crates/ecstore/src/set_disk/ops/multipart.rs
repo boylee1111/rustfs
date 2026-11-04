@@ -41,8 +41,8 @@ use super::super::{
     SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks, SmallWritePath, StorageError,
     Uuid, WriteLayout, check_object_lock_for_deletion_with_state, classify_multipart_part_write_path, coding,
     complete_multipart_part_error, complete_multipart_part_error_result, complete_part_checksum, contains_key_str,
-    create_bitrot_writer, debug, disk, error, file_info_is_valid_for_metadata, get_complete_multipart_md5, get_header_map,
-    get_str, insert_str, is_err_object_not_found, is_err_version_not_found, is_min_allowed_part_size,
+    create_bitrot_writer_with_orig_volume, debug, disk, error, file_info_is_valid_for_metadata, get_complete_multipart_md5,
+    get_header_map, get_str, insert_str, is_err_object_not_found, is_err_version_not_found, is_min_allowed_part_size,
     log_multipart_write_quorum_failure, multipart_part_logical_size, parts_after_marker, path_join_buf,
     prepare_complete_multipart_parts, record_compression_total_memory, record_multipart_write_quorum_failure,
     reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map, resolve_write_layout,
@@ -57,7 +57,6 @@ use super::object::{
     object_transaction_fencing_requested, read_object_transaction_epoch_fence, verify_object_transaction_epoch_fence,
 };
 use crate::api::config::storageclass;
-#[cfg(test)]
 use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::bucket::quota::reservation;
 use crate::bucket::replication::ReplicationStatusType;
@@ -124,9 +123,10 @@ async fn create_part_writers(
         let Some(disk) = disk else {
             return (None, Some(DiskError::DiskNotFound));
         };
-        match create_bitrot_writer(
+        match create_bitrot_writer_with_orig_volume(
             false,
             Some(disk),
+            RUSTFS_META_MULTIPART_BUCKET,
             RUSTFS_META_TMP_BUCKET,
             path,
             length,
@@ -977,7 +977,7 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_pref
         return Err(DiskError::DiskNotFound);
     }
 
-    if !root_prefix.is_empty() {
+    if !root_prefix.is_empty() && root_prefix != DATA_MOVEMENT_MULTIPART_PREFIX {
         let upload_dirs = match disk.list_dir(bucket, RUSTFS_META_MULTIPART_BUCKET, root_prefix, -1).await {
             Ok(entries) => entries,
             Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => return Ok(Vec::new()),
@@ -1002,6 +1002,13 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_pref
         .into_iter()
         .map(|sha_dir| sha_dir.trim_end_matches('/').to_owned())
         .filter(|sha_dir| sha_dir.len() == 64 && sha_dir.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(|sha_dir| {
+            if root_prefix.is_empty() {
+                sha_dir
+            } else {
+                format!("{root_prefix}/{sha_dir}")
+            }
+        })
         .collect::<Vec<_>>();
     let listed_upload_dirs = stream::iter(sha_dirs)
         .map(|sha_dir| {
@@ -1124,6 +1131,7 @@ impl SetDisks {
         orig_bucket: &str,
         error_path: &str,
         root_prefix: &str,
+        require_all_disks: bool,
     ) -> Result<(Vec<Option<DiskStore>>, Vec<String>, usize, bool)> {
         let disks = self.disks.read().await.clone();
         if disks.is_empty() {
@@ -1165,7 +1173,8 @@ impl SetDisks {
             }
         }
 
-        if let Some(err) = reduce_read_quorum_errs(&discovery_errors, OBJECT_OP_IGNORED_ERRS, discovery_quorum) {
+        let required_discoveries = if require_all_disks { disks.len() } else { discovery_quorum };
+        if let Some(err) = reduce_read_quorum_errs(&discovery_errors, OBJECT_OP_IGNORED_ERRS, required_discoveries) {
             return Err(to_object_err(err.into(), vec![orig_bucket, error_path]));
         }
 
@@ -1187,7 +1196,7 @@ impl SetDisks {
 
     pub(crate) async fn first_multipart_upload_path_for_decommission(&self, bucket: &str) -> Result<Option<String>> {
         let (_, paths, _, _) = self
-            .discover_multipart_upload_paths(bucket, RUSTFS_META_MULTIPART_BUCKET, "")
+            .discover_multipart_upload_paths(bucket, RUSTFS_META_MULTIPART_BUCKET, "", false)
             .await?;
         Ok(paths.into_iter().next())
     }
@@ -1200,8 +1209,9 @@ impl SetDisks {
         upload_identity: &str,
     ) -> Result<Vec<String>> {
         let expected_parent = format!("{DATA_MOVEMENT_MULTIPART_PREFIX}/{}", Self::get_multipart_sha_dir(bucket, object));
-        let (_, candidate_paths, _, has_minority_candidate) =
-            self.discover_multipart_upload_paths(bucket, object, &expected_parent).await?;
+        let (_, candidate_paths, _, has_minority_candidate) = self
+            .discover_multipart_upload_paths(bucket, object, &expected_parent, false)
+            .await?;
         if has_minority_candidate {
             return Err(Error::DecommissionCapacityBlocked {
                 message: "data movement multipart cleanup found an upload path on fewer than the discovery quorum of disks"
@@ -1750,6 +1760,54 @@ impl SetDisks {
         })
     }
 
+    pub(crate) async fn ensure_no_multipart_uploads(&self, bucket: &str) -> Result<()> {
+        // Every disk must confirm absence in both namespaces before cleanup can
+        // remove catalog protection from the bucket.
+        for root_prefix in ["", DATA_MOVEMENT_MULTIPART_PREFIX] {
+            let (disks, paths, _, has_minority_candidate) =
+                self.discover_multipart_upload_paths(bucket, "", root_prefix, true).await?;
+            if has_minority_candidate {
+                return Err(Error::ErasureReadQuorum);
+            }
+            for upload_path in paths {
+                let (sha_dir, _) = upload_path
+                    .rsplit_once('/')
+                    .filter(|(directory, upload_id)| !directory.is_empty() && !upload_id.is_empty())
+                    .ok_or(DiskError::CorruptedFormat)?;
+                let (metadata, errors) =
+                    Self::read_all_fileinfo(&disks, bucket, RUSTFS_META_MULTIPART_BUCKET, &upload_path, "", false, false, false)
+                        .await?;
+                let (read_quorum, _) = Self::object_quorum_from_meta(&metadata, &errors, self.default_parity_count)?;
+                let read_quorum = usize::try_from(read_quorum).map_err(|_| DiskError::ErasureReadQuorum)?;
+                if let Some(error) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+                    return Err(to_object_err(error.into(), vec![bucket, &upload_path]));
+                }
+                let (_, modified, etag) = Self::list_online_disks(&disks, &metadata, &errors, read_quorum);
+                let file = Self::pick_valid_fileinfo(&metadata, modified, etag, read_quorum)?;
+                let (Some(owner_bucket), Some(owner_object)) = (
+                    file.metadata.get(RUSTFS_MULTIPART_BUCKET_KEY),
+                    file.metadata.get(RUSTFS_MULTIPART_OBJECT_KEY),
+                ) else {
+                    return Err(to_object_err(DiskError::CorruptedFormat.into(), vec![bucket, &upload_path]));
+                };
+                if owner_bucket.is_empty()
+                    || owner_object.is_empty()
+                    || Self::get_multipart_sha_dir(owner_bucket, owner_object)
+                        != sha_dir
+                            .strip_prefix(DATA_MOVEMENT_MULTIPART_PREFIX)
+                            .and_then(|suffix| suffix.strip_prefix('/'))
+                            .unwrap_or(sha_dir)
+                {
+                    return Err(to_object_err(DiskError::CorruptedFormat.into(), vec![bucket, &upload_path]));
+                }
+                if owner_bucket == bucket {
+                    return Err(Error::BucketNotEmpty(bucket.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_multipart_uploads_for_incarnation(
         &self,
@@ -1761,7 +1819,8 @@ impl SetDisks {
         max_uploads: usize,
         expected_incarnation_id: Option<Uuid>,
     ) -> Result<ListMultipartsInfo> {
-        let (disks, candidate_paths, discovery_quorum, _) = self.discover_multipart_upload_paths(bucket, prefix, "").await?;
+        let (disks, candidate_paths, discovery_quorum, _) =
+            self.discover_multipart_upload_paths(bucket, prefix, "", false).await?;
         let listed_uploads = stream::iter(candidate_paths)
             .map(|upload_path| {
                 let disks = &disks;
@@ -2372,7 +2431,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let multipart_part_size = data.size();
             let stream = mem::replace(
                 &mut data.stream,
-                HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
+                HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, true)?,
             );
 
             let write_path = classify_multipart_part_write_path(multipart_part_size, fi.erasure.block_size);
@@ -2436,7 +2495,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
 
             let part_integrity = if let Some(integrity) = integrity {
-                Some(integrity.write(&mut shuffle_disks, bucket, RUSTFS_META_TMP_BUCKET, &tmp_part).await?)
+                Some(
+                    integrity
+                        .write(
+                            &mut shuffle_disks,
+                            RUSTFS_META_MULTIPART_BUCKET,
+                            RUSTFS_META_TMP_BUCKET,
+                            &tmp_part,
+                        )
+                        .await?,
+                )
             } else { None };
             if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
                 return Err(Error::ErasureWriteQuorum);
@@ -3471,16 +3539,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         bind_multipart_proof_snapshot(&disks, &self.multipart_proof_verification_context())?;
 
         let part_path = format!("{}/{}/", upload_id_path, fi.data_dir.unwrap_or(Uuid::nil()));
-        self.recover_part_transactions(&part_path, read_quorum, write_quorum)
-            .await
-            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
-
         let part_meta_paths = uploaded_parts
             .iter()
             .map(|v| format!("{part_path}part.{0}.meta", v.part_num))
             .collect::<Vec<String>>();
 
         let part_numbers = uploaded_parts.iter().map(|v| v.part_num).collect::<Vec<usize>>();
+
+        self.recover_part_transactions(&part_path, read_quorum, write_quorum)
+            .await
+            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
 
         let object_parts = Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum)
             .await
@@ -4045,6 +4113,40 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         )
         .await?;
 
+        if !opts.versioned
+            && !crate::bucket::utils::is_meta_bucketname(bucket)
+            && let Some(snapshot) = opts.object_lock_config_snapshot.as_deref()
+            && !matches!(snapshot.state(), ObjectLockConfigState::ConfirmedAbsent)
+        {
+            // Completion replaces the null version, not necessarily the latest
+            // version inspected by the request-level Object Lock check.
+            let current = self
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: Some(Uuid::nil().to_string()),
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: opts.versioned,
+                        version_suspended: opts.version_suspended,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match current {
+                Ok(existing) => {
+                    if check_object_lock_for_deletion_with_state(snapshot.state(), &existing, false)?.is_some() {
+                        return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                    }
+                }
+                // A null delete marker has no protected payload to replace.
+                Err(StorageError::MethodNotAllowed) => {}
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
         if opts.data_movement
             && opts.http_preconditions.is_some()
             && let Some(err) = self.check_write_precondition(bucket, object, opts).await
@@ -4389,6 +4491,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let needs_immediate_heal = rename_commit.needs_immediate_heal();
             let op_old_dir = rename_commit.data_dir;
             let cleanup_disks = rename_commit.cleanup_disks;
+            let old_current_size = rename_commit.old_current_size;
             let committed_file_info = rename_commit.committed_file_info;
 
             if needs_immediate_heal {
@@ -4457,7 +4560,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // parts; deleting them before the commit would strand the upload
             // permanently. This mirrors the "clean up only after commit" pattern
             // already used for the old data-dir GC and the upload-dir delete_all below.
-            commit_set.cleanup_multipart_path(&parts).await;
+            let can_skip_part_cleanup = !needs_upgrade
+                && commit_disks
+                    .iter()
+                    .all(|disk| disk.as_ref().is_some_and(|disk| disk.is_local()));
+            if !can_skip_part_cleanup {
+                commit_set.cleanup_multipart_path(&parts).await;
+            }
 
             if let Some(old_dir) = op_old_dir {
                 // backlog#898: best-effort reclaim of the dereferenced old data dir.
@@ -4503,7 +4612,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             drop(_upload_guard.take());
 
-            Ok(ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned))
+            let mut obj_info = ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned);
+            obj_info.backfilled_old_current_size = old_current_size;
+            Ok(obj_info)
         };
 
         let result = if detach_commit_owner {
@@ -9982,7 +10093,7 @@ mod tests {
 
         // Real disk callbacks and health probes must share wall-clock deadlines.
         // Advancing Tokio time can expire unrelated healthy-drive probes.
-        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("2"))], async {
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, None::<&str>)], async {
             let (dirs, store) = crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks().await;
             crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
             let bucket = "mpu-quorum-success-physical";
@@ -10009,6 +10120,8 @@ mod tests {
                 local.observe_multipart_cleanup_for_test(&upload_path)
             }).collect::<Vec<_>>();
             let disk::Disk::Local(paused_local) = disks[3].as_ref() else { panic!("actual local physical tail") };
+            // Fault only the held leg; healthy disks keep their normal I/O budgets.
+            let _paused_timeout = paused_local.override_operation_timeout_for_test(Duration::from_secs(2));
             let io_target = paused_local.get_disk().get_object_path_for_io(bucket, object).expect("real IO target");
             let mutation_key = paused_local.get_disk().get_object_path(bucket, object).expect("logical native mutation key");
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -10165,7 +10278,15 @@ mod tests {
                 let size = copy_info.get_actual_size().expect("actual source size");
                 copy_info.put_object_reader = Some(PutObjReader::new(HashReader::from_stream(reader.stream, size, size, None, None, false).expect("actual Copy body stream")));
                 tokio::time::timeout(Duration::from_secs(5), store.copy_object(bucket, object, bucket, copy_object, &mut copy_info, &ObjectOptions::default(), &ObjectOptions::default()))
-                    .await.expect("cross-key Copy cannot wait on the old successful logical owner").expect("actual CopyObject");
+                    .await.expect("cross-key Copy cannot wait on the old successful logical owner")
+                    .unwrap_or_else(|error| {
+                        let health = disks.iter().enumerate().map(|(slot, disk)| {
+                            let disk::Disk::Local(local) = disk.as_ref() else { panic!("actual local Copy backend") };
+                            let metrics = local.metrics_snapshot();
+                            (slot, disk.runtime_state(), metrics.total_errors_timeout, metrics.total_errors_availability, metrics.total_waiting, metrics.api_calls)
+                        }).collect::<Vec<_>>();
+                        panic!("actual CopyObject: {error:?}; drive health (slot, state, timeouts, unavailable, waiting, calls): {health:?}");
+                    });
                 drop(copy_info);
                 let mut copied = store.get_object_reader(bucket, copy_object, None, HeaderMap::new(), &ObjectOptions::default()).await.expect("actual copied body");
                 let mut actual = Vec::new();
@@ -11192,6 +11313,163 @@ mod tests {
             .expect("recovered quorum should make the staged upload verifiable");
         assert_eq!(recovered.len(), 1);
         assert_eq!(upload_uuid_suffix(&recovered[0]), upload_uuid_suffix(&upload.upload_id));
+    }
+
+    #[tokio::test]
+    async fn multipart_absence_inspection_distinguishes_bucket_ownership() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-cleanup-target";
+        let other = "multipart-cleanup-other";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create target bucket");
+            disk.make_volume(other).await.expect("create other bucket");
+        }
+        set_disks
+            .ensure_no_multipart_uploads(bucket)
+            .await
+            .expect("an empty upload namespace permits cleanup");
+        set_disks
+            .new_multipart_upload(other, "object.bin", &ObjectOptions::default())
+            .await
+            .expect("create upload in other bucket");
+        set_disks
+            .ensure_no_multipart_uploads(bucket)
+            .await
+            .expect("an upload owned by another bucket permits cleanup");
+        set_disks
+            .new_multipart_upload(bucket, "object.bin", &ObjectOptions::default())
+            .await
+            .expect("create upload in target bucket");
+        assert!(
+            matches!(set_disks.ensure_no_multipart_uploads(bucket).await, Err(Error::BucketNotEmpty(name)) if name == bucket)
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_absence_inspection_requires_every_disk_online() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-cleanup-offline";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        set_disks.disks.write().await[3] = None;
+        let listed = set_disks
+            .list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
+            .await
+            .expect("ordinary listing preserves its discovery quorum");
+        assert!(listed.uploads.is_empty());
+        let error = set_disks
+            .ensure_no_multipart_uploads(bucket)
+            .await
+            .expect_err("an offline disk must prevent confirmation of an empty multipart namespace");
+        assert!(
+            matches!(&error, Error::InsufficientReadQuorum(error_bucket, error_path) if error_bucket == bucket && error_path.is_empty()),
+            "the offline disk must produce a bucket-scoped read quorum error: {error:?}"
+        );
+
+        set_disks.disks.write().await[3] = Some(disk_stores[3].clone());
+        set_disks
+            .ensure_no_multipart_uploads(bucket)
+            .await
+            .expect("all disks can confirm the empty namespace after recovery");
+    }
+
+    #[tokio::test]
+    async fn multipart_absence_inspection_rejects_a_failed_disk_enumeration() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-cleanup-list-error";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        let sha_dir = SetDisks::get_multipart_sha_dir(bucket, "object.bin");
+        let multipart_dir = temp_dirs[0].path().join(RUSTFS_META_MULTIPART_BUCKET);
+        tokio::fs::create_dir_all(&multipart_dir)
+            .await
+            .expect("create multipart staging directory");
+        tokio::fs::write(multipart_dir.join(&sha_dir), b"not a directory")
+            .await
+            .expect("replace one upload parent directory with a file");
+        multipart_upload_paths_on_disk(disk_stores[0].clone(), bucket, "")
+            .await
+            .expect_err("the affected disk must fail directory enumeration");
+        let listed = set_disks
+            .list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
+            .await
+            .expect("ordinary listing still accepts the remaining discovery quorum");
+        assert!(listed.uploads.is_empty());
+        let error = set_disks
+            .ensure_no_multipart_uploads(bucket)
+            .await
+            .expect_err("a failed disk enumeration must prevent confirmation of an empty multipart namespace");
+        assert!(
+            matches!(&error, Error::InsufficientReadQuorum(error_bucket, error_path) if error_bucket == bucket && error_path.is_empty()),
+            "the failed enumeration must produce a bucket-scoped read quorum error: {error:?}"
+        );
+
+        tokio::fs::remove_file(temp_dirs[0].path().join(RUSTFS_META_MULTIPART_BUCKET).join(sha_dir))
+            .await
+            .expect("remove the invalid directory entry");
+        set_disks
+            .ensure_no_multipart_uploads(bucket)
+            .await
+            .expect("all disks can confirm the empty namespace after repair");
+    }
+
+    #[tokio::test]
+    async fn multipart_absence_inspection_rejects_data_movement_uploads() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-cleanup-data-movement";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            format!("v1:{}:{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp_nanos()),
+        );
+        set_disks
+            .new_multipart_upload(
+                bucket,
+                "object.bin",
+                &ObjectOptions {
+                    data_movement: true,
+                    user_defined: metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create data movement upload");
+        assert!(
+            matches!(set_disks.ensure_no_multipart_uploads(bucket).await, Err(Error::BucketNotEmpty(name)) if name == bucket)
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_absence_inspection_rejects_unreadable_ownership() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-cleanup-corrupt";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        set_disks
+            .new_multipart_upload(bucket, "object.bin", &ObjectOptions::default())
+            .await
+            .expect("create multipart upload");
+        let mut corrupted = 0;
+        for temp_dir in &temp_dirs {
+            for path in multipart_meta_files_on_disk(temp_dir, "xl.meta").await {
+                tokio::fs::write(path, b"invalid upload metadata")
+                    .await
+                    .expect("corrupt upload metadata");
+                corrupted += 1;
+            }
+        }
+        assert!(corrupted > 0, "upload metadata must exist before corruption");
+        set_disks
+            .ensure_no_multipart_uploads(bucket)
+            .await
+            .expect_err("unreadable upload ownership must block cleanup");
     }
 
     /// Regression (issue #5716): a single upload directory whose `xl.meta` was

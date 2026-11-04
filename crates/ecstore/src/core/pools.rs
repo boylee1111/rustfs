@@ -94,7 +94,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
-#[cfg(test)]
 use std::io::Cursor;
 use std::io::Write;
 use std::path::PathBuf;
@@ -3720,33 +3719,45 @@ fn is_decommission_copy_quorum_deferral(err: &Error) -> bool {
     data_movement::data_movement_stage_source_as::<DecommissionCopyQuorumFailure>(err).is_some()
 }
 
-/// The storage error of a version copy that kept timing out on a namespace
-/// lock through its in-place retries, kept typed so the entry failure policy
-/// defers it.
+/// A copy whose object namespace lock remained unavailable through its
+/// in-place retries, retained as a typed deferral.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-struct DecommissionCopyLockTimeout(#[source] Error);
+struct DecommissionCopyLockUnavailable(#[source] Error);
 
-fn is_decommission_copy_lock_timeout_error(err: &Error) -> bool {
-    let err = data_movement::data_movement_stage_source(err).unwrap_or(err);
-    matches!(err, Error::Lock(rustfs_lock::LockError::Timeout { .. }))
+fn is_decommission_copy_lock_unavailable_error(err: &Error, bucket: &str, object: &str) -> bool {
+    let source = data_movement::data_movement_stage_source(err).unwrap_or(err);
+    match source {
+        Error::Lock(rustfs_lock::LockError::Timeout { .. }) => true,
+        Error::NamespaceLockQuorumUnavailable {
+            mode: "read",
+            bucket: lock_bucket,
+            object: lock_object,
+            ..
+        } => {
+            data_movement::data_movement_error_is_stage(err, "prepare_put_object")
+                && lock_bucket == bucket
+                && lock_object == object
+        }
+        _ => false,
+    }
 }
 
-/// A version copy that timed out acquiring a namespace lock leaves the source
+/// A version copy that could not acquire its namespace lock leaves the source
 /// in place; the next attempt copies the version again or finds an equivalent
 /// committed target. The lock is held by another mutation of the key or, when
 /// this node restarted mid-copy, by its previous incarnation until that lock's
 /// lease expires on the peers. Either clears by waiting, so the entry is
 /// deferred instead of being counted as a permanent per-object failure.
-fn decommission_copy_lock_timeout_deferral(stage: &str, bucket: &str, object: &str, err: Error) -> Error {
+fn decommission_copy_lock_unavailable_deferral(stage: &str, bucket: &str, object: &str, err: Error) -> Error {
     data_movement::data_movement_context_error(
-        format!("decommission {stage} timed out on a namespace lock for {bucket}/{object}: {err}"),
-        DecommissionCopyLockTimeout(err),
+        format!("decommission {stage} could not acquire a namespace lock for {bucket}/{object}: {err}"),
+        DecommissionCopyLockUnavailable(err),
     )
 }
 
-fn is_decommission_copy_lock_timeout_deferral(err: &Error) -> bool {
-    data_movement::data_movement_stage_source_as::<DecommissionCopyLockTimeout>(err).is_some()
+fn is_decommission_copy_lock_unavailable_deferral(err: &Error) -> bool {
+    data_movement::data_movement_stage_source_as::<DecommissionCopyLockUnavailable>(err).is_some()
 }
 
 /// The deferral of a version copy whose in-place retries ended on `error`, if
@@ -3756,8 +3767,8 @@ fn take_decommission_copy_deferral(stage: &str, bucket: &str, object: &str, erro
         return Some(decommission_copy_quorum_deferral(stage, bucket, object, err));
     }
     error
-        .take_if(|err| is_decommission_copy_lock_timeout_error(err))
-        .map(|err| decommission_copy_lock_timeout_deferral(stage, bucket, object, err))
+        .take_if(|err| is_decommission_copy_lock_unavailable_error(err, bucket, object))
+        .map(|err| decommission_copy_lock_unavailable_deferral(stage, bucket, object, err))
 }
 
 fn resolve_decommission_entry_reload_result(result: Result<()>, bucket: &str, object_name: &str) -> Result<()> {
@@ -5822,13 +5833,13 @@ enum DecommissionEntryOutcome {
 /// entry is done and must not be counted as a failure or escalated. A quorum
 /// failure of the source cleanup is deferred too: the copied source is still
 /// in place and the next attempt cleans it up again. So is a version copy that
-/// lost drive quorum or timed out on a namespace lock through its in-place
+/// lost drive quorum or could not acquire an object namespace lock through its in-place
 /// retries: the source still holds the version and the next attempt copies it
 /// again. Every other failure stays terminal.
 fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOutcome> {
     if is_decommission_source_cleanup_retryable_error(&err)
         || is_decommission_copy_quorum_deferral(&err)
-        || is_decommission_copy_lock_timeout_deferral(&err)
+        || is_decommission_copy_lock_unavailable_deferral(&err)
     {
         return Ok(DecommissionEntryOutcome::Deferred(err));
     }
@@ -6827,11 +6838,47 @@ impl Drop for PoolMetaTransactionArm {
     }
 }
 
+fn ensure_legacy_pool_meta_republish_safe(data: &[u8]) -> Result<()> {
+    if data.len() >= 4
+        && LittleEndian::read_u16(&data[2..4]) == POOL_META_V1_VERSION
+        // The selection already validates the payload. The runtime-only
+        // flag can only appear in the legacy three-field sequence or map.
+        && rmp::decode::read_array_len(&mut &data[4..])
+            .or_else(|_| rmp::decode::read_map_len(&mut &data[4..]))
+            .ok()
+            == Some(3)
+        && let Ok(legacy) = rmp_serde::from_slice::<LegacyPoolMeta>(&data[4..])
+        && legacy.dont_save
+    {
+        return Err(Error::other("pool metadata legacy source contains dont_save=true"));
+    }
+    Ok(())
+}
+
+// Ordinary legacy reads retain their compatibility behavior, but bytes that
+// will be copied to another pool must not contain an unparsed extension.
+fn ensure_legacy_pool_meta_payload_complete(data: &[u8]) -> Result<()> {
+    let payload = data
+        .get(4..)
+        .ok_or_else(|| Error::other("pool metadata legacy source is too short"))?;
+    let mut decoder = rmp_serde::Deserializer::new(Cursor::new(payload));
+    serde::de::IgnoredAny::deserialize(&mut decoder).map_err(|_| Error::other("pool metadata legacy source is invalid"))?;
+    let payload_len = u64::try_from(payload.len()).map_err(|_| Error::other("pool metadata legacy source is too large"))?;
+    if decoder.get_ref().position() != payload_len {
+        return Err(Error::other("pool metadata legacy source has trailing bytes"));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct PoolMetaSelection {
     meta: PoolMeta,
     revision: PoolMetaRevision,
     canonical: Option<Vec<u8>>,
+    // Legacy semantic comparison canonicalizes to V2; a heal must instead
+    // preserve verified raw bytes at the highest observed format floor.
+    legacy_raw: Option<Vec<u8>>,
+    legacy_has_unsafe_flag: bool,
     replica_state: PoolMetaReplicaState,
     cas_tokens: Vec<PoolMetaCasToken>,
     absent: bool,
@@ -7222,6 +7269,8 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
             meta: PoolMeta::default(),
             revision: PoolMetaRevision::legacy(0),
             canonical: None,
+            legacy_raw: None,
+            legacy_has_unsafe_flag: false,
             replica_state: PoolMetaReplicaState {
                 needs_repair: false,
                 repair_write_safe: true,
@@ -7276,6 +7325,8 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
             meta: selected.meta.clone(),
             revision: selected.revision,
             canonical: Some(selected.canonical.clone()),
+            legacy_raw: None,
+            legacy_has_unsafe_flag: false,
             replica_state: PoolMetaReplicaState {
                 needs_repair,
                 repair_write_safe,
@@ -7289,6 +7340,10 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
 
     // Legacy V1/V2 has no durable generation. Pool zero remains the commit
     // record; divergent backups without it are ambiguous and fail closed.
+    let legacy_has_unsafe_flag = committed
+        .iter()
+        .any(|(_, raw, _)| ensure_legacy_pool_meta_republish_safe(raw).is_err());
+    let mut floor_raw = None;
     let mut selected: Option<(usize, Vec<u8>, PoolMetaCommittedCandidate)> = None;
     for (idx, raw, candidate) in committed {
         if let Some((selected_idx, selected_raw, selected_candidate)) = selected.as_ref() {
@@ -7302,19 +7357,36 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
                 }
             } else {
                 needs_repair |= selected_raw != &raw;
+                if floor_raw.is_none()
+                    && candidate.revision.version == observed_version
+                    && raw
+                        .get(2..4)
+                        .is_some_and(|version| LittleEndian::read_u16(version) == observed_version)
+                {
+                    floor_raw = Some(raw);
+                }
             }
         } else {
             selected = Some((idx, raw, candidate));
         }
     }
-    let (_, _, mut selected) =
+    let (_, selected_raw, mut selected) =
         selected.ok_or_else(|| Error::other("pool metadata recovery required: no valid legacy replica is available"))?;
+    if selected.revision.version == observed_version
+        && selected_raw
+            .get(2..4)
+            .is_some_and(|version| LittleEndian::read_u16(version) == observed_version)
+    {
+        floor_raw = Some(selected_raw);
+    }
     selected.meta.version = observed_version;
     selected.revision.version = observed_version;
     Ok(PoolMetaSelection {
         meta: selected.meta,
         revision: selected.revision,
         canonical: Some(selected.canonical),
+        legacy_raw: floor_raw,
+        legacy_has_unsafe_flag,
         replica_state: PoolMetaReplicaState {
             needs_repair,
             repair_write_safe,
@@ -14534,6 +14606,23 @@ impl ECStore {
             .canonical
             .as_ref()
             .ok_or_else(|| Error::other("pool metadata heal has no committed source"))?;
+        if selection.generation_protocol_observed && !selection.revision.is_generation_protocol() {
+            return Err(Error::other("pool metadata heal requires recovery of the observed generation protocol"));
+        }
+        if selection.legacy_has_unsafe_flag {
+            return Err(Error::other("pool metadata legacy replica contains dont_save=true"));
+        }
+        let repair_data = if selection.revision.is_generation_protocol() {
+            canonical.clone()
+        } else {
+            let raw = selection
+                .legacy_raw
+                .clone()
+                .ok_or_else(|| Error::other("pool metadata heal cannot prove the legacy format floor"))?;
+            ensure_legacy_pool_meta_payload_complete(&raw)?;
+            raw
+        };
+        ensure_legacy_pool_meta_republish_safe(&repair_data)?;
         let pool = self
             .pools
             .get(pool_index)
@@ -14544,10 +14633,10 @@ impl ECStore {
             .get(pool_index)
             .ok_or_else(|| Error::other("pool metadata heal has no target revision"))?;
         let mut arm = state.arm_transaction();
-        save_pool_meta_object_cas(pool.clone(), POOL_META_NAME, canonical.clone(), token, &fence, "native_heal", &mut arm)
+        save_pool_meta_object_cas(pool.clone(), POOL_META_NAME, repair_data.clone(), token, &fence, "native_heal", &mut arm)
             .await?;
         let (confirmed, _) = read_config_no_lock_preserve_empty_with_metadata(pool, POOL_META_NAME).await?;
-        if confirmed != *canonical {
+        if confirmed != repair_data {
             return Err(Error::other("pool metadata native heal readback diverged"));
         }
         fence.ensure_held()?;
@@ -28353,7 +28442,7 @@ mod tests {
             "one version must commit before the next version times out"
         );
         assert!(
-            matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_timeout_deferral(err)),
+            matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_unavailable_deferral(err)),
             "{outcome:?}"
         );
         assert_eq!(
@@ -28365,6 +28454,88 @@ mod tests {
             0,
             "a deferred entry must not be counted as a permanent failure"
         );
+        drop(fault);
+        let (outcome, _) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        fixture.assert_moved().await;
+        let mut reader = fixture.store.pools[1]
+            .get_object_reader(
+                fixture.bucket,
+                fixture.object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(fixture.seeded.versions[0].version_id.expect("newer version").to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the newer version must remain readable");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read the newer version");
+        assert_eq!(actual, b"written after versioning was enabled");
+    }
+
+    /// A target lookup that loses its read-lock quorum must retain the source
+    /// and resume an entry after an earlier version has already committed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_defers_target_lookup_read_lock_quorum_and_resumes() {
+        use tokio::io::AsyncReadExt as _;
+
+        let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+        let object = fixture.object;
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new({
+                let attempted = Arc::clone(&attempted);
+                move |stage, _, faulted, _, success| {
+                    stage == "before_target_commit"
+                        && faulted == object
+                        && success
+                        && attempted.fetch_add(1, Ordering::SeqCst) > 0
+                }
+            }),
+            Some(Arc::new(|_, bucket, object| {
+                data_movement::data_movement_stage_error_for_test(
+                    "decommission_object",
+                    "prepare_put_object",
+                    bucket,
+                    object,
+                    Error::NamespaceLockQuorumUnavailable {
+                        mode: "read",
+                        bucket: bucket.to_owned(),
+                        object: object.to_owned(),
+                        required: 1,
+                        achieved: 0,
+                    },
+                )
+            })),
+        );
+        let (outcome, _) = fixture.run_entry().await;
+        assert!(
+            matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_unavailable_deferral(err)),
+            "{outcome:?}"
+        );
+        fixture.assert_source_retained().await;
+        assert_eq!(
+            fixture
+                .target_versions()
+                .await
+                .expect("first version committed")
+                .versions
+                .len(),
+            1
+        );
+        assert_eq!(
+            fixture.store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("active decommission")
+                .items_decommission_failed,
+            0
+        );
+
         drop(fault);
         let (outcome, _) = fixture.run_entry().await;
         assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
@@ -28429,7 +28600,7 @@ mod tests {
 
             let (outcome, _) = fixture.run_entry().await;
             assert!(
-                matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_timeout_deferral(err)),
+                matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_unavailable_deferral(err)),
                 "{outcome:?}"
             );
             assert_eq!(
@@ -28838,17 +29009,17 @@ mod tests {
             timeout(),
         );
         for err in [timeout(), prepare] {
-            assert!(is_decommission_copy_lock_timeout_error(&err), "{err}");
+            assert!(is_decommission_copy_lock_unavailable_error(&err, "bucket-a", "object-a"), "{err}");
             assert!(!is_decommission_copy_quorum_error(&err), "{err}");
             let mut error = Some(err);
             let deferred = take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut error)
                 .expect("a lock timeout copy must be deferred");
             assert!(error.is_none());
-            assert!(is_decommission_copy_lock_timeout_deferral(&deferred));
+            assert!(is_decommission_copy_lock_unavailable_deferral(&deferred));
             assert!(!is_decommission_copy_quorum_deferral(&deferred));
-            let failure = data_movement::data_movement_stage_source_as::<DecommissionCopyLockTimeout>(&deferred)
+            let failure = data_movement::data_movement_stage_source_as::<DecommissionCopyLockUnavailable>(&deferred)
                 .expect("the deferred error must keep its lock-timeout origin");
-            assert!(is_decommission_copy_lock_timeout_error(&failure.0));
+            assert!(is_decommission_copy_lock_unavailable_error(&failure.0, "bucket-a", "object-a"));
             assert!(matches!(
                 resolve_decommission_entry_failure(deferred),
                 Ok(DecommissionEntryOutcome::Deferred(_))
@@ -28870,6 +29041,43 @@ mod tests {
                 "{error:?}"
             );
             assert!(error.is_some(), "a per-object failure keeps its error");
+        }
+    }
+
+    #[test]
+    fn decommission_copy_defers_only_the_matching_object_read_lock_quorum() {
+        let quorum = |mode, bucket: &str, object: &str| Error::NamespaceLockQuorumUnavailable {
+            mode,
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            required: 1,
+            achieved: 0,
+        };
+        let wrap = |stage, err| {
+            data_movement::data_movement_stage_error_for_test("decommission_object", stage, "bucket-a", "object-a", err)
+        };
+        let mut error = Some(wrap("prepare_put_object", quorum("read", "bucket-a", "object-a")));
+        let deferred = take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut error)
+            .expect("matching read-lock quorum must defer");
+        assert!(error.is_none());
+        assert!(matches!(
+            resolve_decommission_entry_failure(deferred),
+            Ok(DecommissionEntryOutcome::Deferred(_))
+        ));
+        for err in [
+            quorum("read", "bucket-a", "object-a"),
+            wrap("source_recheck", quorum("read", "bucket-a", "object-a")),
+            wrap("prepare_put_object", quorum("write", "bucket-a", "object-a")),
+            wrap(
+                "prepare_put_object",
+                quorum("exact_delete_capacity_reconciliation", "bucket-a", "object-a"),
+            ),
+            wrap("prepare_put_object", quorum("read", "other-bucket", "object-a")),
+            wrap("prepare_put_object", quorum("read", "bucket-a", "other-object")),
+        ] {
+            let mut error = Some(err);
+            assert!(take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut error).is_none());
+            assert!(error.is_some(), "unrelated lock failures must stay terminal");
         }
     }
 
@@ -29349,6 +29557,53 @@ mod tests {
             decommission.terminal_reload_failures,
             vec!["complete_decommission: peer node-a failed".to_string()]
         );
+    }
+
+    #[test]
+    fn legacy_republish_guard_checks_only_three_field_sequence_or_map() {
+        let frame = |payload: Vec<u8>| {
+            let mut data = Vec::new();
+            data.extend_from_slice(&POOL_META_FORMAT.to_le_bytes());
+            data.extend_from_slice(&POOL_META_V1_VERSION.to_le_bytes());
+            data.extend_from_slice(&payload);
+            data
+        };
+        let two_fields = PersistedPoolMetaV1 {
+            version: POOL_META_V1_VERSION,
+            pools: Vec::new(),
+        };
+        for payload in [rmp_serde::to_vec(&two_fields), rmp_serde::to_vec_named(&two_fields)] {
+            let data = frame(payload.expect("two-field V1 payload must serialize"));
+            assert!(matches!(decode_pool_meta_replica(data.clone()), PoolMetaReplica::Valid { .. }));
+            assert!(ensure_legacy_pool_meta_republish_safe(&data).is_ok());
+            assert!(ensure_legacy_pool_meta_payload_complete(&data).is_ok());
+            let mut trailing = data;
+            trailing.push(0xc0);
+            assert!(ensure_legacy_pool_meta_payload_complete(&trailing).is_err());
+        }
+        for dont_save in [false, true] {
+            let legacy = LegacyPoolMeta {
+                version: POOL_META_V1_VERSION,
+                pools: Vec::new(),
+                dont_save,
+            };
+            for payload in [rmp_serde::to_vec(&legacy), rmp_serde::to_vec_named(&legacy)] {
+                let data = frame(payload.expect("three-field V1 payload must serialize"));
+                assert!(matches!(decode_pool_meta_replica(data.clone()), PoolMetaReplica::Valid { .. }));
+                assert_eq!(ensure_legacy_pool_meta_republish_safe(&data).is_err(), dont_save);
+                assert!(ensure_legacy_pool_meta_payload_complete(&data).is_ok());
+                let mut trailing = data;
+                trailing.push(0xc0);
+                assert!(ensure_legacy_pool_meta_payload_complete(&trailing).is_err());
+            }
+        }
+        // This guard is only called for already-decoded replicas; malformed
+        // containers must fail selection rather than becoming repair sources.
+        let truncated = frame(vec![0x93, 0x01]);
+        assert!(matches!(
+            decode_pool_meta_replica(truncated),
+            PoolMetaReplica::Corrupt(_) | PoolMetaReplica::Incompatible(_)
+        ));
     }
 
     #[test]

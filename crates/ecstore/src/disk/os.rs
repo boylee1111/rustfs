@@ -1668,7 +1668,7 @@ fn clear_file_fdatasync_group_commit_for_test() {
 
 // Small object directories are cheaper to flush in one blocking task. Multipart
 // directories fan out only once enough files can amortize per-task scheduling.
-const PARALLEL_FILE_SYNC_THRESHOLD: usize = 16;
+pub(crate) const PARALLEL_FILE_SYNC_THRESHOLD: usize = 16;
 pub(crate) const MAX_PARALLEL_FILE_SYNCS: usize = 16;
 // Scale aggregate fan-out for wider nodes while reserving at least half of the
 // configured Tokio blocking pool for unrelated filesystem work.
@@ -1677,8 +1677,396 @@ const MAX_GLOBAL_FILE_SYNCS: usize = 512;
 #[cfg(test)]
 const TEST_GLOBAL_FILE_SYNCS: usize = 64;
 
+const PATH_LOCK_SHARDS: usize = 64;
+const PATH_LOCK_INITIAL_GC_THRESHOLD: usize = 64;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Default)]
+struct Xxh3SliceHasher(u64);
+
+#[cfg(unix)]
+impl std::hash::Hasher for Xxh3SliceHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = xxhash_rust::xxh3::xxh3_64(bytes);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, _i: usize) {}
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[cfg(unix)]
+type Xxh3SliceBuildHasher = std::hash::BuildHasherDefault<Xxh3SliceHasher>;
+
+#[cfg(unix)]
+#[inline]
+fn is_canonical_unix_key_bytes(bytes: &[u8]) -> bool {
+    if bytes.starts_with(b"./") {
+        return !bytes[1..].windows(2).any(|w| w == b"//") && !bytes[1..].windows(3).any(|w| w == b"/./");
+    }
+    const SLASH_MASK: u64 = 0x2f2f_2f2f_2f2f_2f2f;
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    let mut i = 0usize;
+    let len = bytes.len();
+    let mut prev_s = 0u64;
+    while i + 8 <= len {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[i..i + 8]);
+        let w = u64::from_le_bytes(buf);
+        let x = w ^ SLASH_MASK;
+        let s = (x.wrapping_sub(LOW_BITS)) & !x & HIGH_BITS;
+        let s_prev1 = (s << 8) | (prev_s >> 56);
+        let s_prev2 = (s << 16) | (prev_s >> 48);
+        if (s & (s_prev1 | s_prev2)) != 0 {
+            let start = i.saturating_sub(2);
+            let window = &bytes[start..i + 8];
+            if window.windows(2).any(|pair| pair == b"//") || window.windows(3).any(|triple| triple == b"/./") {
+                return false;
+            }
+        }
+        prev_s = s;
+        i += 8;
+    }
+    let tail_start = i.saturating_sub(2);
+    let tail = &bytes[tail_start..];
+    !tail.windows(2).any(|pair| pair == b"//") && !tail.windows(3).any(|triple| triple == b"/./")
+}
+
+#[cfg(unix)]
+#[cold]
+fn canonical_unix_path_key_slow(path: &Path) -> std::borrow::Cow<'static, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = Vec::with_capacity(path.as_os_str().len());
+    for comp in path.components() {
+        match comp {
+            Component::RootDir => {
+                out.clear();
+                out.push(b'/');
+            }
+            Component::CurDir => {
+                if out.is_empty() {
+                    out.push(b'.');
+                }
+            }
+            Component::ParentDir => {
+                if out.len() > 1 || (out.len() == 1 && out[0] != b'/') {
+                    out.push(b'/');
+                }
+                out.extend_from_slice(b"..");
+            }
+            Component::Normal(part) => {
+                if out.len() > 1 || (out.len() == 1 && out[0] != b'/') {
+                    out.push(b'/');
+                }
+                out.extend_from_slice(part.as_bytes());
+            }
+            Component::Prefix(_) => {}
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+#[cfg(unix)]
+#[inline]
+fn canonical_unix_path_key(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut bytes = path.as_os_str().as_bytes();
+    while bytes.len() > 1 {
+        if bytes[bytes.len() - 1] == b'/' {
+            bytes = &bytes[..bytes.len() - 1];
+        } else if bytes.len() >= 2 && bytes[bytes.len() - 2] == b'/' && bytes[bytes.len() - 1] == b'.' {
+            bytes = if bytes.len() == 2 { b"/" } else { &bytes[..bytes.len() - 2] };
+        } else {
+            break;
+        }
+    }
+    if is_canonical_unix_key_bytes(bytes) {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    canonical_unix_path_key_slow(path)
+}
+
+#[cfg(unix)]
+#[inline]
+fn unix_canonical_key_starts_with(path_key: &[u8], root_key: &[u8]) -> bool {
+    if root_key.is_empty() {
+        return true;
+    }
+    if root_key == b"/" {
+        return path_key.starts_with(b"/");
+    }
+    path_key.starts_with(root_key) && (path_key.len() == root_key.len() || path_key.get(root_key.len()) == Some(&b'/'))
+}
+
+struct PathLockShard<L> {
+    #[cfg(unix)]
+    entries: HashMap<Box<[u8]>, Weak<L>, Xxh3SliceBuildHasher>,
+    #[cfg(not(unix))]
+    entries: HashMap<PathBuf, Weak<L>>,
+    next_gc_threshold: usize,
+}
+
+impl<L> Default for PathLockShard<L> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::default(),
+            next_gc_threshold: PATH_LOCK_INITIAL_GC_THRESHOLD,
+        }
+    }
+}
+
+struct ShardedPathLockRegistry<L> {
+    shards: [Mutex<PathLockShard<L>>; PATH_LOCK_SHARDS],
+}
+
+impl<L> ShardedPathLockRegistry<L> {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(PathLockShard::default())),
+        }
+    }
+
+    #[cfg(unix)]
+    #[inline]
+    fn get_or_create_by_key(&self, key: &[u8], init: impl FnOnce() -> L) -> Arc<L> {
+        let hash = xxhash_rust::xxh3::xxh3_64(key);
+        let shard_idx = ((hash >> 32) as usize) & (PATH_LOCK_SHARDS - 1);
+        let mut shard = self.shards[shard_idx].lock();
+        if let Some(existing) = shard.entries.get(key).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let created = Arc::new(init());
+        let weak = Arc::downgrade(&created);
+        if let Some(slot) = shard.entries.get_mut(key) {
+            *slot = weak;
+            return created;
+        }
+        if shard.entries.len() >= shard.next_gc_threshold {
+            shard.entries.retain(|_, entry| entry.strong_count() > 0);
+            shard.next_gc_threshold = shard
+                .entries
+                .len()
+                .saturating_add(1)
+                .saturating_mul(2)
+                .max(PATH_LOCK_INITIAL_GC_THRESHOLD);
+        }
+        shard.entries.insert(key.into(), weak);
+        created
+    }
+
+    #[inline]
+    fn get_or_create(&self, path: &Path, init: impl FnOnce() -> L) -> Arc<L> {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            self.get_or_create_by_key(key.as_ref(), init)
+        }
+        #[cfg(not(unix))]
+        {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut hasher);
+            let shard_idx = ((hasher.finish() >> 32) as usize) & (PATH_LOCK_SHARDS - 1);
+            let mut shard = self.shards[shard_idx].lock();
+            if let Some(existing) = shard.entries.get(path).and_then(Weak::upgrade) {
+                return existing;
+            }
+            let created = Arc::new(init());
+            let weak = Arc::downgrade(&created);
+            if let Some(slot) = shard.entries.get_mut(path) {
+                *slot = weak;
+                return created;
+            }
+            if shard.entries.len() >= shard.next_gc_threshold {
+                shard.entries.retain(|_, entry| entry.strong_count() > 0);
+                shard.next_gc_threshold = shard
+                    .entries
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(2)
+                    .max(PATH_LOCK_INITIAL_GC_THRESHOLD);
+            }
+            shard.entries.insert(path.to_path_buf(), weak);
+            created
+        }
+    }
+}
+
+#[cfg(unix)]
+type PathCacheShardMap<V> = HashMap<Box<[u8]>, V, Xxh3SliceBuildHasher>;
+#[cfg(not(unix))]
+type PathCacheShardMap<V> = HashMap<PathBuf, V>;
+
+pub(crate) struct ShardedPathCache<V> {
+    shards: [Mutex<PathCacheShardMap<V>>; PATH_LOCK_SHARDS],
+    max_entries_per_shard: usize,
+}
+
+impl<V> ShardedPathCache<V> {
+    pub(crate) fn new(max_entries_per_shard: usize) -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::default())),
+            max_entries_per_shard: max_entries_per_shard.max(1),
+        }
+    }
+
+    #[cfg(unix)]
+    #[inline]
+    fn shard_index(key: &[u8]) -> usize {
+        let hash = xxhash_rust::xxh3::xxh3_64(key);
+        ((hash >> 32) as usize) & (PATH_LOCK_SHARDS - 1)
+    }
+
+    #[cfg(not(unix))]
+    #[inline]
+    fn shard_index(path: &Path) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        ((hasher.finish() >> 32) as usize) & (PATH_LOCK_SHARDS - 1)
+    }
+
+    #[inline]
+    pub(crate) fn insert(&self, path: &Path, value: V) {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            let shard_idx = Self::shard_index(key.as_ref());
+            let mut shard = self.shards[shard_idx].lock();
+            if let Some(slot) = shard.get_mut(key.as_ref()) {
+                *slot = value;
+                return;
+            }
+            if shard.len() >= self.max_entries_per_shard
+                && let Some(evict_key) = shard.keys().next().cloned()
+            {
+                shard.remove(&evict_key);
+            }
+            shard.insert(key.into_owned().into_boxed_slice(), value);
+        }
+        #[cfg(not(unix))]
+        {
+            let shard_idx = Self::shard_index(path);
+            let mut shard = self.shards[shard_idx].lock();
+            if let Some(slot) = shard.get_mut(path) {
+                *slot = value;
+                return;
+            }
+            if shard.len() >= self.max_entries_per_shard
+                && let Some(evict_key) = shard.keys().next().cloned()
+            {
+                shard.remove(&evict_key);
+            }
+            shard.insert(path.to_path_buf(), value);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn remove(&self, path: &Path) -> Option<V> {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            let shard_idx = Self::shard_index(key.as_ref());
+            self.shards[shard_idx].lock().remove(key.as_ref())
+        }
+        #[cfg(not(unix))]
+        {
+            let shard_idx = Self::shard_index(path);
+            self.shards[shard_idx].lock().remove(path)
+        }
+    }
+
+    /// Runs `f` while holding the target shard mutex. `f` must not block, perform I/O, or re-enter `self`.
+    #[inline]
+    pub(crate) fn with_get<R>(&self, path: &Path, f: impl FnOnce(&V) -> R) -> Option<R> {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            let shard_idx = Self::shard_index(key.as_ref());
+            let shard = self.shards[shard_idx].lock();
+            shard.get(key.as_ref()).map(f)
+        }
+        #[cfg(not(unix))]
+        {
+            let shard_idx = Self::shard_index(path);
+            let shard = self.shards[shard_idx].lock();
+            shard.get(path).map(f)
+        }
+    }
+
+    /// Runs `f` while holding the target shard mutex. `f` must not block, perform I/O, or re-enter `self`.
+    #[inline]
+    pub(crate) fn with_get_mut<R>(&self, path: &Path, f: impl FnOnce(&mut V) -> R) -> Option<R> {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            let shard_idx = Self::shard_index(key.as_ref());
+            let mut shard = self.shards[shard_idx].lock();
+            shard.get_mut(key.as_ref()).map(f)
+        }
+        #[cfg(not(unix))]
+        {
+            let shard_idx = Self::shard_index(path);
+            let mut shard = self.shards[shard_idx].lock();
+            shard.get_mut(path).map(f)
+        }
+    }
+
+    /// Runs `should_remove` while holding the target shard mutex. `should_remove` must not block, perform I/O, or re-enter `self`.
+    #[inline]
+    pub(crate) fn remove_if_mut(&self, path: &Path, should_remove: impl FnOnce(&mut V) -> bool) {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            let shard_idx = Self::shard_index(key.as_ref());
+            let mut shard = self.shards[shard_idx].lock();
+            if let Some(entry) = shard.get_mut(key.as_ref())
+                && should_remove(entry)
+            {
+                shard.remove(key.as_ref());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let shard_idx = Self::shard_index(path);
+            let mut shard = self.shards[shard_idx].lock();
+            if let Some(entry) = shard.get_mut(path)
+                && should_remove(entry)
+            {
+                shard.remove(path);
+            }
+        }
+    }
+
+    pub(crate) fn retain_outside_prefix(&self, prefix: &Path) {
+        #[cfg(unix)]
+        {
+            let prefix_key = canonical_unix_path_key(prefix);
+            let prefix_bytes = prefix_key.as_ref();
+            for shard in &self.shards {
+                shard
+                    .lock()
+                    .retain(|key, _| !unix_canonical_key_starts_with(key, prefix_bytes));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            for shard in &self.shards {
+                shard.lock().retain(|key, _| !key.starts_with(prefix));
+            }
+        }
+    }
+}
+
 static FILE_SYNC_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(global_file_sync_limit()));
-static DISK_FILE_SYNC_LIMITERS: LazyLock<Mutex<HashMap<PathBuf, Weak<Semaphore>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static DISK_FILE_SYNC_LIMITERS: LazyLock<ShardedPathLockRegistry<Semaphore>> = LazyLock::new(ShardedPathLockRegistry::new);
 
 /// Dedicated tokio runtime for fsync/fdatasync blocking operations. When
 /// configured with >1 threads, isolates device-bound fsync from the main
@@ -1742,12 +2130,10 @@ fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
         f()
     })
 }
-static DISK_VOLUME_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static DISK_VOLUME_MUTATION_LOCKS: LazyLock<ShardedPathLockRegistry<RwLock<()>>> = LazyLock::new(ShardedPathLockRegistry::new);
 type NamespaceMutationLock = AsyncMutex<()>;
-type NamespaceMutationLockRegistry = HashMap<PathBuf, Weak<NamespaceMutationLock>>;
-static DISK_NAMESPACE_MUTATION_LOCKS: LazyLock<Mutex<NamespaceMutationLockRegistry>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static DISK_NAMESPACE_MUTATION_LOCKS: LazyLock<ShardedPathLockRegistry<NamespaceMutationLock>> =
+    LazyLock::new(ShardedPathLockRegistry::new);
 
 fn default_global_file_sync_limit(cpu_count: usize, max_blocking_threads: usize) -> usize {
     let cpu_scaled = cpu_count
@@ -1771,21 +2157,16 @@ fn global_file_sync_limit() -> usize {
 
 /// Reuse a disk's limiter across reconnects while detached sync calls still hold it.
 pub(crate) fn disk_file_sync_limiter(root: &Path) -> Arc<Semaphore> {
-    let mut limiters = DISK_FILE_SYNC_LIMITERS.lock();
-    limiters.retain(|_, limiter| limiter.strong_count() > 0);
-    if let Some(limiter) = limiters.get(root).and_then(Weak::upgrade) {
-        return limiter;
-    }
-
-    let limiter = Arc::new(Semaphore::new(MAX_PARALLEL_FILE_SYNCS));
-    limiters.insert(root.to_path_buf(), Arc::downgrade(&limiter));
-    limiter
+    DISK_FILE_SYNC_LIMITERS.get_or_create(root, || Semaphore::new(MAX_PARALLEL_FILE_SYNCS))
 }
 
-// Keep one warm draining worker per disk/lane and spin briefly in user space
+// Keep warm draining workers per disk/lane and spin briefly in user space
 // before exiting `spawn_blocking` so back-to-back stages of `PUT` and `DELETE`
-// on the same drive do not thrash Tokio's `BlockingPool` (`futex_wake`/`futex_wait`).
+// on the same drive do not thrash Tokio's `BlockingPool` (`futex_wake`/`futex_wait`),
+// while allowing concurrent fsync callers to enter the kernel simultaneously and
+// coalesce in the filesystem journal (`jbd2`/`xfs` group commit).
 const MAX_NAMESPACE_WORKERS_PER_DISK: usize = 1;
+pub(crate) const MAX_FSYNC_WORKERS_PER_DISK: usize = 8;
 // Return busy workers to the shared pool so other disks can acquire a slot.
 const MAX_BLOCKING_JOBS_PER_WORKER: usize = 64;
 const WORKER_IDLE_SPIN_ITERS: usize = 256;
@@ -1813,6 +2194,7 @@ impl DiskBlockingLane {
 struct DiskBlockingQueueState {
     jobs: VecDeque<Box<dyn FnOnce() + Send>>,
     active_workers: usize,
+    idle_workers: usize,
     #[cfg(any(test, feature = "test-util"))]
     paused_workers: usize,
 }
@@ -1856,6 +2238,7 @@ impl Drop for DiskBlockingWorkerGuard {
             let cancelled = {
                 let mut state = self.queue.lane(self.lane).state.lock();
                 state.active_workers = state.active_workers.saturating_sub(1);
+                state.idle_workers = state.idle_workers.saturating_sub(1);
                 if state.active_workers == 0 {
                     self.queue
                         .lane(self.lane)
@@ -1874,9 +2257,10 @@ impl Drop for DiskBlockingWorkerGuard {
         let should_respawn = {
             let mut state = self.queue.lane(self.lane).state.lock();
             state.active_workers = state.active_workers.saturating_sub(1);
-            let max_workers = self.queue.effective_max_workers(&state);
-            if !state.jobs.is_empty() && state.active_workers < max_workers {
+            let max_workers = self.queue.effective_max_workers(self.lane, &state);
+            if state.jobs.len() > state.idle_workers && state.active_workers < max_workers {
                 state.active_workers += 1;
+                state.idle_workers += 1;
                 true
             } else {
                 false
@@ -1901,15 +2285,23 @@ impl DiskBlockingQueue {
     }
 
     #[inline]
-    fn effective_max_workers(&self, state: &DiskBlockingQueueState) -> usize {
+    fn lane_max_workers(&self, lane: DiskBlockingLane) -> usize {
+        match lane {
+            DiskBlockingLane::Foreground | DiskBlockingLane::Isolated => MAX_NAMESPACE_WORKERS_PER_DISK,
+            DiskBlockingLane::Fsync => MAX_FSYNC_WORKERS_PER_DISK,
+        }
+    }
+
+    #[inline]
+    fn effective_max_workers(&self, lane: DiskBlockingLane, state: &DiskBlockingQueueState) -> usize {
         #[cfg(any(test, feature = "test-util"))]
         {
-            MAX_NAMESPACE_WORKERS_PER_DISK.saturating_add(state.paused_workers)
+            self.lane_max_workers(lane).saturating_add(state.paused_workers)
         }
         #[cfg(not(any(test, feature = "test-util")))]
         {
             let _ = state;
-            MAX_NAMESPACE_WORKERS_PER_DISK
+            self.lane_max_workers(lane)
         }
     }
 
@@ -1918,8 +2310,9 @@ impl DiskBlockingQueue {
             let mut state = self.lane(lane).state.lock();
             state.jobs.push_back(job);
             self.lane(lane).ready.store(true, std::sync::atomic::Ordering::Relaxed);
-            if state.active_workers < self.effective_max_workers(&state) {
+            if state.jobs.len() > state.idle_workers && state.active_workers < self.effective_max_workers(lane, &state) {
                 state.active_workers += 1;
+                state.idle_workers += 1;
                 true
             } else {
                 false
@@ -1962,13 +2355,19 @@ impl DiskBlockingQueue {
             CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
                 *slot.borrow_mut() = Some((Arc::clone(&queue), lane));
             });
-            guard.state = DiskBlockingWorkerState::Running;
             let mut remaining_jobs = MAX_BLOCKING_JOBS_PER_WORKER;
             let mut idle_polled = false;
+            let mut counted_idle = true;
             loop {
                 let job = {
                     let mut state = queue.lane(lane).state.lock();
-                    if state.active_workers > queue.effective_max_workers(&state) || (idle_polled && state.jobs.is_empty()) {
+                    if counted_idle {
+                        state.idle_workers = state.idle_workers.saturating_sub(1);
+                        counted_idle = false;
+                    }
+                    guard.state = DiskBlockingWorkerState::Running;
+                    if state.active_workers > queue.effective_max_workers(lane, &state) || (idle_polled && state.jobs.is_empty())
+                    {
                         state.active_workers = state.active_workers.saturating_sub(1);
                         guard.state = DiskBlockingWorkerState::Retired;
                         return;
@@ -1978,6 +2377,15 @@ impl DiskBlockingQueue {
                         .lane(lane)
                         .ready
                         .store(!state.jobs.is_empty(), std::sync::atomic::Ordering::Relaxed);
+                    if job.is_none() {
+                        if state.idle_workers > 0 {
+                            state.active_workers = state.active_workers.saturating_sub(1);
+                            guard.state = DiskBlockingWorkerState::Retired;
+                            return;
+                        }
+                        state.idle_workers += 1;
+                        counted_idle = true;
+                    }
                     job
                 };
                 if let Some(job) = job {
@@ -1988,15 +2396,11 @@ impl DiskBlockingQueue {
                     }
                     idle_polled = false;
                 } else {
-                    for i in 0..WORKER_IDLE_SPIN_ITERS {
+                    for _ in 0..WORKER_IDLE_SPIN_ITERS {
                         if queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
-                        if i & 15 == 15 {
-                            std::thread::yield_now();
-                        } else {
-                            std::hint::spin_loop();
-                        }
+                        std::hint::spin_loop();
                     }
                     // Recheck and retire under the same mutex used by enqueue.
                     idle_polled = true;
@@ -2106,8 +2510,9 @@ pub(crate) fn enter_blocking_test_hook() -> BlockingTestHookGuard {
         let should_spawn = {
             let mut state = queue.lane(lane).state.lock();
             state.paused_workers = state.paused_workers.saturating_add(1);
-            if !state.jobs.is_empty() && state.active_workers < queue.effective_max_workers(&state) {
+            if state.jobs.len() > state.idle_workers && state.active_workers < queue.effective_max_workers(lane, &state) {
                 state.active_workers += 1;
+                state.idle_workers += 1;
                 true
             } else {
                 false
@@ -2120,45 +2525,131 @@ pub(crate) fn enter_blocking_test_hook() -> BlockingTestHookGuard {
     BlockingTestHookGuard { queue }
 }
 
-static DISK_BLOCKING_QUEUES: LazyLock<Mutex<HashMap<PathBuf, Weak<DiskBlockingQueue>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+struct RegisteredDiskBlockingQueue {
+    #[cfg(not(unix))]
+    root: PathBuf,
+    #[cfg(unix)]
+    canonical_root: Box<[u8]>,
+    queue: Weak<DiskBlockingQueue>,
+}
+
+static DISK_BLOCKING_QUEUES: LazyLock<parking_lot::RwLock<Vec<RegisteredDiskBlockingQueue>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(Vec::new()));
 static FALLBACK_BLOCKING_QUEUES: LazyLock<[Arc<DiskBlockingQueue>; FALLBACK_NAMESPACE_QUEUE_SHARDS]> =
     LazyLock::new(|| std::array::from_fn(|_| DiskBlockingQueue::new()));
 
 pub(crate) fn register_disk_blocking_queue(root: &Path, io_root: &Path) -> Arc<DiskBlockingQueue> {
-    let mut queues = DISK_BLOCKING_QUEUES.lock();
-    queues.retain(|_, q| q.strong_count() > 0);
-    let queue = queues.get(root).and_then(Weak::upgrade).unwrap_or_else(|| {
-        let queue = DiskBlockingQueue::new();
-        queues.insert(root.to_path_buf(), Arc::downgrade(&queue));
-        queue
-    });
-    if io_root != root {
-        queues.insert(io_root.to_path_buf(), Arc::downgrade(&queue));
+    #[cfg(unix)]
+    let root_key = canonical_unix_path_key(root);
+    #[cfg(unix)]
+    let io_root_key = canonical_unix_path_key(io_root);
+
+    let mut queues = DISK_BLOCKING_QUEUES.write();
+    queues.retain(|entry| entry.queue.strong_count() > 0);
+    let queue = queues
+        .iter()
+        .find_map(|entry| {
+            #[cfg(unix)]
+            let matches = entry.canonical_root.as_ref() == root_key.as_ref();
+            #[cfg(not(unix))]
+            let matches = entry.root == root;
+            matches.then(|| entry.queue.upgrade()).flatten()
+        })
+        .unwrap_or_else(|| {
+            let queue = DiskBlockingQueue::new();
+            queues.push(RegisteredDiskBlockingQueue {
+                #[cfg(not(unix))]
+                root: root.to_path_buf(),
+                #[cfg(unix)]
+                canonical_root: root_key.as_ref().into(),
+                queue: Arc::downgrade(&queue),
+            });
+            queue
+        });
+    #[cfg(unix)]
+    let io_matches_root = io_root_key.as_ref() == root_key.as_ref();
+    #[cfg(not(unix))]
+    let io_matches_root = io_root == root;
+    if !io_matches_root {
+        let weak = Arc::downgrade(&queue);
+        if let Some(existing) = queues.iter_mut().find(|entry| {
+            #[cfg(unix)]
+            {
+                entry.canonical_root.as_ref() == io_root_key.as_ref()
+            }
+            #[cfg(not(unix))]
+            {
+                entry.root == io_root
+            }
+        }) {
+            existing.queue = weak;
+        } else {
+            queues.push(RegisteredDiskBlockingQueue {
+                #[cfg(not(unix))]
+                root: io_root.to_path_buf(),
+                #[cfg(unix)]
+                canonical_root: io_root_key.as_ref().into(),
+                queue: weak,
+            });
+        }
     }
     queue
 }
 
 fn disk_blocking_queue_for_root(root: &Path) -> Arc<DiskBlockingQueue> {
-    register_disk_blocking_queue(root, root)
-}
-
-fn disk_blocking_queue_for_path(path: &Path) -> Arc<DiskBlockingQueue> {
+    #[cfg(unix)]
+    let root_key = canonical_unix_path_key(root);
     {
-        let queues = DISK_BLOCKING_QUEUES.lock();
-        for (root, weak) in queues.iter() {
-            if path.starts_with(root)
-                && let Some(queue) = weak.upgrade()
-            {
+        let queues = DISK_BLOCKING_QUEUES.read();
+        for entry in queues.iter() {
+            #[cfg(unix)]
+            let matches = entry.canonical_root.as_ref() == root_key.as_ref();
+            #[cfg(not(unix))]
+            let matches = entry.root == root;
+            if matches && let Some(queue) = entry.queue.upgrade() {
                 return queue;
             }
         }
     }
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    let idx = usize::try_from(hasher.finish() % (FALLBACK_NAMESPACE_QUEUE_SHARDS as u64)).unwrap_or(0);
-    Arc::clone(&FALLBACK_BLOCKING_QUEUES[idx])
+    register_disk_blocking_queue(root, root)
+}
+
+fn disk_blocking_queue_for_path(path: &Path) -> Arc<DiskBlockingQueue> {
+    #[cfg(unix)]
+    {
+        let path_key = canonical_unix_path_key(path);
+        {
+            let queues = DISK_BLOCKING_QUEUES.read();
+            for entry in queues.iter() {
+                if unix_canonical_key_starts_with(path_key.as_ref(), entry.canonical_root.as_ref())
+                    && let Some(queue) = entry.queue.upgrade()
+                {
+                    return queue;
+                }
+            }
+        }
+        let hash = xxhash_rust::xxh3::xxh3_64(path_key.as_ref());
+        let idx = usize::try_from(hash % (FALLBACK_NAMESPACE_QUEUE_SHARDS as u64)).unwrap_or(0);
+        Arc::clone(&FALLBACK_BLOCKING_QUEUES[idx])
+    }
+    #[cfg(not(unix))]
+    {
+        {
+            let queues = DISK_BLOCKING_QUEUES.read();
+            for entry in queues.iter() {
+                if path.starts_with(&entry.root)
+                    && let Some(queue) = entry.queue.upgrade()
+                {
+                    return queue;
+                }
+            }
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        let idx = usize::try_from(hasher.finish() % (FALLBACK_NAMESPACE_QUEUE_SHARDS as u64)).unwrap_or(0);
+        Arc::clone(&FALLBACK_BLOCKING_QUEUES[idx])
+    }
 }
 
 /// Serialize a bucket's local metadata commits with physical bucket removal.
@@ -2167,32 +2658,46 @@ fn disk_blocking_queue_for_path(path: &Path) -> Arc<DiskBlockingQueue> {
 /// [`LocalDisk`](super::local::LocalDisk) instances share the same lock while
 /// disconnected disks do not keep the registry alive.
 pub(crate) fn disk_volume_mutation_lock(root: &Path, volume: &str) -> Arc<RwLock<()>> {
-    let key = root.join(volume);
-    let mut locks = DISK_VOLUME_MUTATION_LOCKS.lock();
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
-        return lock;
+    #[cfg(unix)]
+    {
+        let vol_bytes = volume.as_bytes();
+        if !vol_bytes.is_empty()
+            && vol_bytes[0] != b'/'
+            && vol_bytes != b"."
+            && !vol_bytes.starts_with(b"./")
+            && !vol_bytes.ends_with(b"/")
+            && !vol_bytes.ends_with(b"/.")
+            && is_canonical_unix_key_bytes(vol_bytes)
+            && let std::borrow::Cow::Borrowed(root_bytes) = canonical_unix_path_key(root)
+            && !root_bytes.is_empty()
+            && root_bytes != b"/"
+        {
+            let total_len = root_bytes.len() + 1 + vol_bytes.len();
+            if total_len <= 512 {
+                let mut stack_key = [0u8; 512];
+                stack_key[..root_bytes.len()].copy_from_slice(root_bytes);
+                stack_key[root_bytes.len()] = b'/';
+                stack_key[root_bytes.len() + 1..total_len].copy_from_slice(vol_bytes);
+                return DISK_VOLUME_MUTATION_LOCKS.get_or_create_by_key(&stack_key[..total_len], || RwLock::new(()));
+            }
+        }
     }
-
-    let lock = Arc::new(RwLock::new(()));
-    locks.insert(key, Arc::downgrade(&lock));
-    lock
+    let key = root.join(volume);
+    DISK_VOLUME_MUTATION_LOCKS.get_or_create(&key, || RwLock::new(()))
 }
 
 fn disk_namespace_mutation_lock(path: &Path) -> Arc<NamespaceMutationLock> {
-    let mut locks = DISK_NAMESPACE_MUTATION_LOCKS.lock();
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
-        return lock;
-    }
-
-    let lock = Arc::new(AsyncMutex::new(()));
-    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
-    lock
+    DISK_NAMESPACE_MUTATION_LOCKS.get_or_create(path, || AsyncMutex::new(()))
 }
 
-static DISK_METADATA_MUTATION_LOCKS: LazyLock<Mutex<NamespaceMutationLockRegistry>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(unix)]
+#[inline]
+fn disk_namespace_mutation_lock_by_key(key: &[u8]) -> Arc<NamespaceMutationLock> {
+    DISK_NAMESPACE_MUTATION_LOCKS.get_or_create_by_key(key, || AsyncMutex::new(()))
+}
+
+static DISK_METADATA_MUTATION_LOCKS: LazyLock<ShardedPathLockRegistry<NamespaceMutationLock>> =
+    LazyLock::new(ShardedPathLockRegistry::new);
 
 /// Serializes the complete xl.meta read/modify/commit transaction. This domain
 /// precedes namespace/volume publication locks, whose narrower syscall leases
@@ -2206,17 +2711,7 @@ pub(crate) async fn acquire_metadata_mutation_lease(
     object: &Path,
     owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<MetadataMutationLease> {
-    let lock = {
-        let mut locks = DISK_METADATA_MUTATION_LOCKS.lock();
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = locks.get(object).and_then(Weak::upgrade) {
-            lock
-        } else {
-            let lock = Arc::new(AsyncMutex::new(()));
-            locks.insert(object.to_path_buf(), Arc::downgrade(&lock));
-            lock
-        }
-    };
+    let lock = DISK_METADATA_MUTATION_LOCKS.get_or_create(object, || AsyncMutex::new(()));
     Arc::new(MetadataMutationLease {
         _guard: lock.lock_owned().await,
         _owner: owner,
@@ -2279,17 +2774,45 @@ pub(crate) async fn acquire_rename_data_mutation_lease_with_owner(
 ) -> Arc<NamespaceMutationLease> {
     // Metadata ownership precedes namespace paths in lexical order, then volume
     // ownership. Deduplicate identical keys so TMP-to-TMP publication cannot self-lock.
-    let destination_lock = disk_namespace_mutation_lock(destination_object);
-    let (namespace_guard, staging_guard) = match staging_prefix {
-        Some(source) if source < destination_object => {
-            let staging = disk_namespace_mutation_lock(source).lock_owned().await;
-            (destination_lock.lock_owned().await, Some(staging))
+    #[cfg(unix)]
+    let (namespace_guard, staging_guard) = {
+        let dst_key = canonical_unix_path_key(destination_object);
+        let destination_lock = disk_namespace_mutation_lock_by_key(dst_key.as_ref());
+        match staging_prefix {
+            Some(source) => {
+                let src_key = canonical_unix_path_key(source);
+                match src_key.as_ref().cmp(dst_key.as_ref()) {
+                    std::cmp::Ordering::Less => {
+                        let staging = disk_namespace_mutation_lock_by_key(src_key.as_ref()).lock_owned().await;
+                        (destination_lock.lock_owned().await, Some(staging))
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let destination = destination_lock.lock_owned().await;
+                        (
+                            destination,
+                            Some(disk_namespace_mutation_lock_by_key(src_key.as_ref()).lock_owned().await),
+                        )
+                    }
+                    std::cmp::Ordering::Equal => (destination_lock.lock_owned().await, None),
+                }
+            }
+            None => (destination_lock.lock_owned().await, None),
         }
-        Some(source) if source > destination_object => {
-            let destination = destination_lock.lock_owned().await;
-            (destination, Some(disk_namespace_mutation_lock(source).lock_owned().await))
+    };
+    #[cfg(not(unix))]
+    let (namespace_guard, staging_guard) = {
+        let destination_lock = disk_namespace_mutation_lock(destination_object);
+        match staging_prefix {
+            Some(source) if source < destination_object => {
+                let staging = disk_namespace_mutation_lock(source).lock_owned().await;
+                (destination_lock.lock_owned().await, Some(staging))
+            }
+            Some(source) if source > destination_object => {
+                let destination = destination_lock.lock_owned().await;
+                (destination, Some(disk_namespace_mutation_lock(source).lock_owned().await))
+            }
+            _ => (destination_lock.lock_owned().await, None),
         }
-        _ => (destination_lock.lock_owned().await, None),
     };
     let volume_guard = disk_volume_mutation_lock(root, volume).read_owned().await;
     let blocking_queue = disk_blocking_queue_for_root(root);
@@ -2569,7 +3092,7 @@ fn sync_files(paths: &[PathBuf]) -> io::Result<()> {
     Ok(())
 }
 
-fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::with_capacity(PARALLEL_FILE_SYNC_THRESHOLD);
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -2752,22 +3275,114 @@ pub(crate) fn read_dir_probe(path: impl AsRef<Path>, entry_limit: usize) -> io::
     })
 }
 
+#[cfg(test)]
 pub(crate) fn has_non_data_dir_entry(path: impl AsRef<Path>, data_dirs: &[uuid::Uuid]) -> io::Result<bool> {
-    match has_non_data_dir_entry_inner(path.as_ref(), data_dirs) {
-        Ok(res) => Ok(res),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
-    }
+    has_non_data_dir_entry_lazy(path, || data_dirs.to_vec()).map(|(_, res)| res)
 }
 
-fn has_non_data_dir_entry_inner(path: &Path, data_dirs: &[uuid::Uuid]) -> io::Result<bool> {
-    let mut dir = std::fs::read_dir(path)?;
-    let entry_limit = data_dirs.len().saturating_add(2);
+#[cfg(target_os = "linux")]
+pub(crate) fn has_non_data_dir_entry_lazy_from_fd(
+    dir_fd: &std::fs::File,
+    load_data_dirs: impl FnOnce() -> Vec<uuid::Uuid>,
+) -> io::Result<(Vec<uuid::Uuid>, bool)> {
+    use rustix::fs::{AtFlags, FileType, RawDir, statat};
+
+    let mut raw_buf = [std::mem::MaybeUninit::<u8>::uninit(); 1024];
+    let mut dir = RawDir::new(dir_fd, &mut raw_buf);
+    let mut data_dirs: Option<Vec<uuid::Uuid>> = None;
+    let mut load = Some(load_data_dirs);
     let mut valid_entries = 0usize;
 
     for _ in 0..READ_DIR_PROBE_RAW_LIMIT {
         let Some(entry) = dir.next() else {
-            return Ok(false);
+            return Ok((data_dirs.unwrap_or_default(), false));
+        };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(rustix::io::Errno::NOENT) => return Ok((data_dirs.unwrap_or_default(), false)),
+            Err(err) => return Err(io::Error::from(err)),
+        };
+        let c_name = entry.file_name();
+        let name_bytes = c_name.to_bytes();
+        if name_bytes.is_empty() || name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        let file_type = match entry.file_type() {
+            FileType::Unknown => match statat(dir_fd, c_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => FileType::from_raw_mode(st.st_mode),
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(err) => return Err(io::Error::from(err)),
+            },
+            ft => ft,
+        };
+        if file_type == FileType::Directory {
+            let parsed_uuid = if name_bytes.len() == uuid::fmt::Hyphenated::LENGTH {
+                std::str::from_utf8(name_bytes).ok().and_then(|s| {
+                    let parsed = uuid::Uuid::try_parse(s).ok()?;
+                    let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                    (parsed.hyphenated().encode_lower(&mut buf) == s).then_some(parsed)
+                })
+            } else {
+                None
+            };
+            let Some(parsed) = parsed_uuid else {
+                let dirs = data_dirs
+                    .take()
+                    .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+                return Ok((dirs, true));
+            };
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if dirs.binary_search(&parsed).is_err() {
+                return Ok((std::mem::take(dirs), true));
+            }
+            valid_entries += 1;
+        } else if file_type == FileType::RegularFile {
+            valid_entries += 1;
+        } else {
+            continue;
+        }
+
+        let entry_limit = data_dirs.as_ref().map_or(2, |dirs| dirs.len().saturating_add(2));
+        if valid_entries == entry_limit {
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if valid_entries == dirs.len().saturating_add(2) {
+                return Ok((std::mem::take(dirs), true));
+            }
+        }
+    }
+
+    let dirs = data_dirs
+        .take()
+        .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+    Ok((dirs, true))
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+pub(crate) fn has_non_data_dir_entry_lazy(
+    path: impl AsRef<Path>,
+    load_data_dirs: impl FnOnce() -> Vec<uuid::Uuid>,
+) -> io::Result<(Vec<uuid::Uuid>, bool)> {
+    match has_non_data_dir_entry_lazy_inner(path.as_ref(), load_data_dirs) {
+        Ok(res) => Ok(res),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok((Vec::new(), false)),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn has_non_data_dir_entry_lazy_inner(
+    path: &Path,
+    load_data_dirs: impl FnOnce() -> Vec<uuid::Uuid>,
+) -> io::Result<(Vec<uuid::Uuid>, bool)> {
+    let mut dir = std::fs::read_dir(path)?;
+    let mut data_dirs: Option<Vec<uuid::Uuid>> = None;
+    let mut load = Some(load_data_dirs);
+    let mut valid_entries = 0usize;
+
+    for _ in 0..READ_DIR_PROBE_RAW_LIMIT {
+        let Some(entry) = dir.next() else {
+            return Ok((data_dirs.unwrap_or_default(), false));
         };
         let entry = entry?;
         let file_name = entry.file_name();
@@ -2777,18 +3392,24 @@ fn has_non_data_dir_entry_inner(path: &Path, data_dirs: &[uuid::Uuid]) -> io::Re
 
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            let is_data_dir = file_name.len() == uuid::fmt::Hyphenated::LENGTH
-                && file_name
-                    .to_str()
-                    .and_then(|s| {
-                        let parsed = uuid::Uuid::try_parse(s).ok()?;
-                        let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
-                        (parsed.hyphenated().encode_lower(&mut buf) == s && data_dirs.binary_search(&parsed).is_ok())
-                            .then_some(())
-                    })
-                    .is_some();
-            if !is_data_dir {
-                return Ok(true);
+            let parsed_uuid = if file_name.len() == uuid::fmt::Hyphenated::LENGTH {
+                file_name.to_str().and_then(|s| {
+                    let parsed = uuid::Uuid::try_parse(s).ok()?;
+                    let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                    (parsed.hyphenated().encode_lower(&mut buf) == s).then_some(parsed)
+                })
+            } else {
+                None
+            };
+            let Some(parsed) = parsed_uuid else {
+                let dirs = data_dirs
+                    .take()
+                    .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+                return Ok((dirs, true));
+            };
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if dirs.binary_search(&parsed).is_err() {
+                return Ok((std::mem::take(dirs), true));
             }
             valid_entries += 1;
         } else if file_type.is_file() {
@@ -2797,12 +3418,19 @@ fn has_non_data_dir_entry_inner(path: &Path, data_dirs: &[uuid::Uuid]) -> io::Re
             continue;
         }
 
+        let entry_limit = data_dirs.as_ref().map_or(2, |dirs| dirs.len().saturating_add(2));
         if valid_entries == entry_limit {
-            return Ok(true);
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if valid_entries == dirs.len().saturating_add(2) {
+                return Ok((std::mem::take(dirs), true));
+            }
         }
     }
 
-    Ok(true)
+    let dirs = data_dirs
+        .take()
+        .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+    Ok((dirs, true))
 }
 
 // read_dir  count read limit. when count == 0 unlimit.
@@ -3637,14 +4265,19 @@ impl PreparedRenameSource {
         #[cfg(not(windows))]
         std::io::Write::write_all(&mut self.source, data)?;
         if sync {
-            #[cfg(test)]
-            multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::FileSync, &self.test_destination)?;
-            let _sync = StageTimer::new(true, "disk_prepared_metadata_fdatasync");
-            #[cfg(windows)]
-            self.source.as_file().sync_data()?;
-            #[cfg(not(windows))]
-            self.source.sync_data()?;
+            self.sync_data()?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn sync_data(&self) -> io::Result<()> {
+        #[cfg(test)]
+        multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::FileSync, &self.test_destination)?;
+        let _sync = StageTimer::new(true, "disk_prepared_metadata_fdatasync");
+        #[cfg(windows)]
+        self.source.as_file().sync_data()?;
+        #[cfg(not(windows))]
+        self.source.sync_data()?;
         Ok(())
     }
 }
@@ -4302,12 +4935,18 @@ fn prepare_destination_parent_with_retry(
     base_dir: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<ExistingBaseDirectoryGuard> {
-    let prune_budget = parent_prune_budget(parent, base_dir);
+    let mut prune_budget = None;
     let mut attempt = 0;
     loop {
         match mkdir_all_below_existing_base_std(parent, base_dir, publication_root) {
             Ok(preparation) => return Ok(preparation),
-            Err(err) if should_retry_prepare(&err, attempt, prune_budget) => {
+            Err(err)
+                if should_retry_prepare(
+                    &err,
+                    attempt,
+                    *prune_budget.get_or_insert_with(|| parent_prune_budget(parent, base_dir)),
+                ) =>
+            {
                 attempt += 1;
             }
             Err(err) => return Err(err),
@@ -4799,13 +5438,9 @@ impl PublicationRoot {
         #[cfg(target_os = "linux")]
         {
             use rustix::fs::{Mode, OFlags};
-            let parent = self.open_directory(
-                path.parent()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file parent"))?,
-            )?;
-            let name = path
-                .file_name()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))?;
+            let (parent_path, name) = rustfs_utils::path::unix_split_parent_and_file_name(path)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file parent or name"))?;
+            let parent = self.open_directory(parent_path)?;
             let file = open_linux_relative(
                 &parent,
                 Path::new(name),
@@ -4833,10 +5468,21 @@ impl PublicationRoot {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn open_directory_and_readonly_child(
+        &self,
+        dir_path: &Path,
+        child_name: &str,
+    ) -> io::Result<(std::fs::File, std::fs::File)> {
+        let dir = self.open_directory(dir_path)?;
+        let child = open_linux_relative(&dir, Path::new(child_name), rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty())?;
+        Ok((dir, child))
+    }
+
+    #[cfg(target_os = "linux")]
     fn relative_path<'a>(&self, path: &'a Path) -> io::Result<&'a Path> {
-        path.strip_prefix(self.io_path.as_path())
-            .or_else(|_| path.strip_prefix(self.path.as_path()))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path must remain below its publication root"))
+        rustfs_utils::path::unix_normalized_path_strip_prefix(path, self.io_path.as_path())
+            .or_else(|| rustfs_utils::path::unix_normalized_path_strip_prefix(path, self.path.as_path()))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path must remain below its publication root"))
     }
 
     #[cfg(windows)]
@@ -4846,6 +5492,13 @@ impl PublicationRoot {
             .or_else(|_| path.strip_prefix(self.configured_path.as_path()))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path must remain below its publication root"))
     }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn linux_relative_path_has_invalid_component(relative: &Path) -> bool {
+    let bytes = relative.as_os_str().as_encoded_bytes();
+    bytes.starts_with(b"/") || rustfs_utils::path::unix_path_has_dotdot_segment(bytes)
 }
 
 /// Open the actual IO handle with the same containment policy as path validation.
@@ -4858,10 +5511,7 @@ fn open_linux_relative(
     mode: rustix::fs::Mode,
 ) -> io::Result<std::fs::File> {
     use rustix::fs::{OFlags, ResolveFlags, openat2};
-    if relative
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-    {
+    if linux_relative_path_has_invalid_component(relative) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid relative disk path"));
     }
     let relative = if relative.as_os_str().is_empty() {
@@ -5032,11 +5682,8 @@ impl LinuxCommitDirectories {
 
     fn file_name<'a>(&self, path: &'a Path, source: bool) -> io::Result<&'a std::ffi::OsStr> {
         let parent = if source { &self.source_path } else { &self.destination_path };
-        if path.parent() != Some(parent) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "file parent does not match its commit guard"));
-        }
-        path.file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))
+        rustfs_utils::path::unix_direct_child_file_name(path, parent)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file parent does not match its commit guard"))
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -5048,8 +5695,8 @@ impl LinuxCommitDirectories {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
         }
         let destination = self.prepare_destination()?;
-        if self.source_path != self.destination_path
-            || (self.source.device, self.source.inode) != (destination.device, destination.inode)
+        if (self.source.device, self.source.inode) != (destination.device, destination.inode)
+            || self.source_path.as_os_str() != self.destination_path.as_os_str()
         {
             let current = self.root.open_directory(&self.destination_path)?.metadata()?;
             if (current.dev(), current.ino()) != (destination.device, destination.inode) {
@@ -5068,7 +5715,10 @@ impl LinuxCommitDirectories {
         loop {
             if let Some(prepared) = prepared {
                 let metadata = rustix::fs::statat(&*self.source.file, source_name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
-                if prepared.path != source || metadata.st_dev != prepared.device || metadata.st_ino != prepared.inode {
+                if (prepared.path.as_os_str() != source.as_os_str() && prepared.path != source)
+                    || metadata.st_dev != prepared.device
+                    || metadata.st_ino != prepared.inode
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "rename source identity changed while publication was prepared",
@@ -5297,6 +5947,34 @@ impl RenameCommitGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn multipart_payload_commit_guard_std(
+    metadata_guard: &RenameCommitGuard,
+    source_parent: &Path,
+) -> io::Result<RenameCommitGuard> {
+    let original = &metadata_guard.directories;
+    original.validate()?;
+    let source = LinuxCommitDirectory::new(original.root.open_directory(source_parent)?)?;
+    let destination = original.prepare_destination()?;
+    // Clone the pinned file identity, never recapture the target pathname
+    // between payload and canonical-head publication.
+    let destination = LinuxCommitDirectory {
+        file: Arc::clone(&destination.file),
+        device: destination.device,
+        inode: destination.inode,
+    };
+    Ok(RenameCommitGuard {
+        directories: Arc::new(LinuxCommitDirectories {
+            root: original.root.clone(),
+            source_path: source_parent.to_path_buf(),
+            destination_path: original.destination_path.clone(),
+            source,
+            destination: std::sync::OnceLock::from(destination),
+            destination_base: original.destination_base.clone(),
+        }),
+    })
+}
+
 /// Native MPU metadata and payload have distinct source parents. Reuse the
 /// exact target identity already held by the metadata transaction, while
 /// independently pinning the private payload source under the same root.
@@ -5308,30 +5986,7 @@ pub(crate) async fn multipart_payload_commit_guard(
 ) -> io::Result<RenameCommitGuard> {
     let metadata_guard = metadata_guard.clone();
     let source_parent = source_parent.to_path_buf();
-    run_blocking_namespace_operation(lease, move || {
-        let original = &metadata_guard.directories;
-        original.validate()?;
-        let source = LinuxCommitDirectory::new(original.root.open_directory(&source_parent)?)?;
-        let destination = original.prepare_destination()?;
-        // Clone the pinned file identity, never recapture the target pathname
-        // between payload and canonical-head publication.
-        let destination = LinuxCommitDirectory {
-            file: Arc::clone(&destination.file),
-            device: destination.device,
-            inode: destination.inode,
-        };
-        Ok(RenameCommitGuard {
-            directories: Arc::new(LinuxCommitDirectories {
-                root: original.root.clone(),
-                source_path: source_parent,
-                destination_path: original.destination_path.clone(),
-                source,
-                destination: std::sync::OnceLock::from(destination),
-                destination_base: original.destination_base.clone(),
-            }),
-        })
-    })
-    .await
+    run_blocking_namespace_operation(lease, move || multipart_payload_commit_guard_std(&metadata_guard, &source_parent)).await
 }
 
 pub(crate) fn prepare_rename_commit_guard(
@@ -6201,19 +6856,35 @@ fn windows_rename_source_is_allowed(attributes: u32, reparse_tag: u32) -> bool {
 }
 
 fn existing_base_directory_suffix<'a>(dir_path: &'a Path, base_dir: &Path) -> io::Result<&'a Path> {
-    let relative = dir_path
-        .strip_prefix(base_dir)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must remain below its base directory"))?;
-    for component in relative.components() {
-        if !matches!(component, Component::Normal(_) | Component::CurDir) {
+    #[cfg(target_os = "linux")]
+    {
+        let relative = rustfs_utils::path::unix_normalized_path_strip_prefix(dir_path, base_dir).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "rename destination must remain below its base directory")
+        })?;
+        if linux_relative_path_has_invalid_component(relative) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "rename destination contains an invalid path component",
             ));
         }
+        Ok(relative)
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let relative = dir_path.strip_prefix(base_dir).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "rename destination must remain below its base directory")
+        })?;
+        for component in relative.components() {
+            if !matches!(component, Component::Normal(_) | Component::CurDir) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "rename destination contains an invalid path component",
+                ));
+            }
+        }
 
-    Ok(relative)
+        Ok(relative)
+    }
 }
 
 /// Missing state never downgrades surviving native control records to legacy.
@@ -6514,6 +7185,17 @@ pub(crate) fn sync_multipart_owned_record_parents(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
+    sync_multipart_owned_record_parents_options(source, record_parent, include_leaf, true, base, publication_root)
+}
+
+pub(crate) fn sync_multipart_owned_record_parents_options(
+    source: &Path,
+    record_parent: &Path,
+    include_leaf: bool,
+    sync_source_root: bool,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<()> {
     let relative = record_parent
         .strip_prefix(source)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "native record escaped source"))?;
@@ -6535,6 +7217,9 @@ pub(crate) fn sync_multipart_owned_record_parents(
     for _ in 0..=2 {
         if !directory.starts_with(source) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "native record barrier escaped source"));
+        }
+        if directory == source && !sync_source_root {
+            return Ok(());
         }
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
@@ -10985,6 +11670,54 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
+    #[test]
+    fn has_non_data_dir_entry_lazy_skips_loader_when_only_xl_meta_exists() {
+        let temp_dir = tempdir().expect("create temp dir");
+        std::fs::write(temp_dir.path().join("xl.meta"), b"meta").expect("write xl.meta");
+        let mut called = 0usize;
+        let (dirs, has_child) = has_non_data_dir_entry_lazy(temp_dir.path(), || {
+            called += 1;
+            vec![uuid::Uuid::new_v4()]
+        })
+        .expect("lazy check must succeed");
+        assert_eq!(called, 0, "inline object dir without subdirs must not invoke loader");
+        assert!(dirs.is_empty());
+        assert!(!has_child);
+
+        #[cfg(target_os = "linux")]
+        {
+            let pub_root = PublicationRoot::new(temp_dir.path()).expect("open pub root");
+            let (dir_fd, _meta) = pub_root
+                .open_directory_and_readonly_child(temp_dir.path(), "xl.meta")
+                .expect("open dir and child");
+            let mut fd_called = 0usize;
+            let (fd_dirs, fd_has_child) = has_non_data_dir_entry_lazy_from_fd(&dir_fd, || {
+                fd_called += 1;
+                vec![uuid::Uuid::new_v4()]
+            })
+            .expect("fd lazy check must succeed");
+            assert_eq!(fd_called, 0);
+            assert!(fd_dirs.is_empty());
+            assert!(!fd_has_child);
+        }
+
+        let data_dir = uuid::Uuid::new_v4();
+        std::fs::create_dir(temp_dir.path().join(data_dir.to_string())).expect("create data dir");
+        let (dirs, has_child) = has_non_data_dir_entry_lazy(temp_dir.path(), || {
+            called += 1;
+            vec![data_dir]
+        })
+        .expect("lazy check with data dir must succeed");
+        assert_eq!(called, 1, "data dir presence must invoke loader once");
+        assert_eq!(dirs, vec![data_dir]);
+        assert!(!has_child);
+
+        std::fs::create_dir(temp_dir.path().join("nested-key")).expect("create nested child dir");
+        let (dirs, has_child) = has_non_data_dir_entry_lazy(temp_dir.path(), || vec![data_dir]).expect("lazy check child");
+        assert_eq!(dirs, vec![data_dir], "child presence must still return data_dirs for skip set");
+        assert!(has_child);
+    }
+
     #[tokio::test]
     #[serial_test::serial(file_sync_probe)]
     async fn resource_grouped_fdatasync_retired_limiter_keeps_its_budget_until_worker_cleanup() {
@@ -11228,19 +11961,24 @@ mod tests {
             let queue = register_disk_blocking_queue(root.path(), root.path());
             std::fs::write(root.path().join("intermediate"), b"backup").expect("backup");
             std::fs::write(root.path().join("receipt"), b"committed").expect("receipt");
-            let (started_tx, started_rx) = oneshot::channel();
-            let (release_tx, release_rx) = oneshot::channel();
-            let blocker_queue = Arc::clone(&queue);
-            let blocker = tokio::spawn(async move {
-                blocker_queue
-                    .run_fsync_cancellable(move |_| {
-                        let _ = started_tx.send(());
-                        let _ = release_rx.blocking_recv();
-                        Ok(())
-                    })
-                    .await
-            });
-            started_rx.await.expect("fsync lane blocked");
+            let mut release_txs = Vec::new();
+            let mut blockers = Vec::new();
+            for _ in 0..MAX_FSYNC_WORKERS_PER_DISK {
+                let (started_tx, started_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let blocker_queue = Arc::clone(&queue);
+                blockers.push(tokio::spawn(async move {
+                    blocker_queue
+                        .run_fsync_cancellable(move |_| {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.blocking_recv();
+                            Ok(())
+                        })
+                        .await
+                }));
+                started_rx.await.expect("fsync worker blocked");
+                release_txs.push(release_tx);
+            }
             let mut cleanup = std::pin::pin!(remove_files_and_fsync_with_owner(
                 root.path(),
                 &["intermediate"],
@@ -11251,8 +11989,12 @@ mod tests {
             assert!(futures::FutureExt::now_or_never(&mut cleanup).is_none());
             let foreground = tokio::time::timeout(Duration::from_secs(5), queue.run(|| Ok(()))).await;
             let retained = root.path().join("receipt").exists();
-            release_tx.send(()).expect("release fsync lane");
-            blocker.await.expect("blocker joined").expect("blocker completed");
+            for release_tx in release_txs {
+                release_tx.send(()).expect("release fsync worker");
+            }
+            for blocker in blockers {
+                blocker.await.expect("blocker joined").expect("blocker completed");
+            }
             cleanup.await.expect("cleanup completed");
             foreground.expect("foreground must progress").expect("foreground operation");
             assert_eq!(retained, sync, "only durable cleanup must wait for the fsync lane");
@@ -11474,6 +12216,25 @@ mod tests {
 
         for lane in [DiskBlockingLane::Foreground, DiskBlockingLane::Fsync] {
             let queue = DiskBlockingQueue::new();
+            let max_workers = queue.lane_max_workers(lane);
+            let mut hold_txs = Vec::new();
+            let mut hold_tasks = Vec::new();
+            for _ in 1..max_workers {
+                let (started_tx, started_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let hold_queue = Arc::clone(&queue);
+                hold_tasks.push(tokio::spawn(async move {
+                    hold_queue
+                        .run_on_lane(lane, "hold operation failed", DiskBlockingQueue::test_stages_for_lane(lane), move |_| {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.blocking_recv();
+                            Ok(())
+                        })
+                        .await
+                }));
+                started_rx.await.expect("hold worker started");
+                hold_txs.push(release_tx);
+            }
             let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
             let (first_started_tx, first_started_rx) = oneshot::channel();
             let (first_release_tx, first_release_rx) = oneshot::channel();
@@ -11507,8 +12268,89 @@ mod tests {
             let retained = gate.snapshot().active;
             second_release_tx.send(()).expect("release second producer");
             second.await.expect("second producer completed");
+            for tx in hold_txs {
+                let _ = tx.send(());
+            }
+            for task in hold_tasks {
+                task.await.expect("hold task joined").expect("hold task completed");
+            }
             assert_eq!(retained, 0, "shared worker must not retain a completed producer's unit");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disk_blocking_queue_fsync_lane_scales_workers_and_retires_idle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let queue = DiskBlockingQueue::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let (all_entered_tx, all_entered_rx) = oneshot::channel();
+        let all_entered_tx = Arc::new(Mutex::new(Some(all_entered_tx)));
+        let (release_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
+        let mut handles = Vec::new();
+        for i in 0..(MAX_FSYNC_WORKERS_PER_DISK + 4) {
+            let q = Arc::clone(&queue);
+            let active = Arc::clone(&active);
+            let max_seen = Arc::clone(&max_seen);
+            let entered = Arc::clone(&entered);
+            let all_entered_tx = Arc::clone(&all_entered_tx);
+            let mut release_rx = release_tx.subscribe();
+            handles.push(tokio::spawn(async move {
+                use_current_runtime_for_fsync();
+                q.run_on_lane(
+                    DiskBlockingLane::Fsync,
+                    "fsync scale test failed",
+                    DiskBlockingQueue::test_stages_for_lane(DiskBlockingLane::Fsync),
+                    move |_| {
+                        let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(cur, Ordering::SeqCst);
+                        let ord = entered.fetch_add(1, Ordering::SeqCst) + 1;
+                        if ord == MAX_FSYNC_WORKERS_PER_DISK
+                            && let Some(tx) = all_entered_tx.lock().expect("lock completion sender").take()
+                        {
+                            let _ = tx.send(());
+                        }
+                        if ord <= MAX_FSYNC_WORKERS_PER_DISK {
+                            let _ = release_rx.blocking_recv();
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(i)
+                    },
+                )
+                .await
+            }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), all_entered_rx)
+            .await
+            .expect("all fsync workers should enter within timeout")
+            .expect("all_entered channel");
+        let _ = release_tx.send(());
+        for (i, handle) in handles.into_iter().enumerate() {
+            assert_eq!(handle.await.expect("task join").expect("fsync job"), i);
+        }
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            MAX_FSYNC_WORKERS_PER_DISK,
+            "fsync lane must run MAX_FSYNC_WORKERS_PER_DISK concurrent workers up to its configured bound"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                {
+                    let state = queue.lane(DiskBlockingLane::Fsync).state.lock();
+                    if state.active_workers == 0 && state.idle_workers == 0 {
+                        assert!(state.jobs.is_empty());
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all fsync workers must retire with zero idle count");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11518,6 +12360,7 @@ mod tests {
         let queue = DiskBlockingQueue::new();
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(std::sync::Barrier::new(MAX_NAMESPACE_WORKERS_PER_DISK + 1));
 
         let mut handles = Vec::new();
@@ -11525,12 +12368,13 @@ mod tests {
             let q = Arc::clone(&queue);
             let active = Arc::clone(&active);
             let max_seen = Arc::clone(&max_seen);
+            let entered = Arc::clone(&entered);
             let barrier = Arc::clone(&barrier);
             handles.push(tokio::spawn(async move {
                 q.run(move || {
                     let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
                     max_seen.fetch_max(cur, Ordering::SeqCst);
-                    if i < MAX_NAMESPACE_WORKERS_PER_DISK {
+                    if entered.fetch_add(1, Ordering::SeqCst) < MAX_NAMESPACE_WORKERS_PER_DISK {
                         barrier.wait();
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -11643,6 +12487,174 @@ mod tests {
             "directory in place of file must fail intermediate remove_file"
         );
         assert!(preserved_final.exists(), "final file must remain when intermediate removal fails");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_unix_path_key_preserves_std_path_equality_and_prefix_semantics() {
+        let samples = [
+            "",
+            "/",
+            "///",
+            "/.",
+            "/./.",
+            ".",
+            "./",
+            "./.",
+            "./a",
+            "././a/",
+            ".//a/.",
+            "a",
+            "a/",
+            "a/.",
+            "a/b/c",
+            "a/b/c/",
+            "a//b/./c/.",
+            "/tmp/d0/bucket/obj",
+            "/tmp/d0/bucket/obj/",
+            "/tmp/d0//bucket/./obj/.",
+            "/tmp/d0/.rustfs.sys/multipart/sha/upload",
+            "/proc/self/fd/12/.",
+            "/proc/self/fd/12",
+            "/proc/self/fd/12/./bucket/obj",
+            "/proc/self/fd/12/bucket/obj",
+            "/tmp/d1",
+            "/tmp/d10",
+            "a/../b",
+            "a/../b/",
+            "/utf8/\u{00af}/segment/",
+        ];
+        for s in samples {
+            let p = Path::new(s);
+            let fast = canonical_unix_path_key(p);
+            let slow = canonical_unix_path_key_slow(p);
+            assert_eq!(fast.as_ref(), slow.as_ref(), "fast and slow key mismatch for {s:?}");
+        }
+        for a in samples {
+            for b in samples {
+                let pa = Path::new(a);
+                let pb = Path::new(b);
+                let ka = canonical_unix_path_key(pa);
+                let kb = canonical_unix_path_key(pb);
+                assert_eq!(
+                    pa == pb,
+                    ka.as_ref() == kb.as_ref(),
+                    "Path::eq vs canonical key mismatch for {a:?} and {b:?}"
+                );
+                assert_eq!(
+                    pa.starts_with(pb),
+                    unix_canonical_key_starts_with(ka.as_ref(), kb.as_ref()),
+                    "Path::starts_with vs canonical key prefix mismatch for {a:?} and {b:?}"
+                );
+            }
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let p_clean = dir.path().join("bucket/object");
+        let p_trailing = PathBuf::from(format!("{}/", p_clean.display()));
+        let p_redundant = PathBuf::from(format!("{}//bucket/./object/.", dir.path().display()));
+        let lock1 = disk_namespace_mutation_lock(&p_clean);
+        let lock2 = disk_namespace_mutation_lock(&p_trailing);
+        let lock3 = disk_namespace_mutation_lock(&p_redundant);
+        assert!(Arc::ptr_eq(&lock1, &lock2));
+        assert!(Arc::ptr_eq(&lock1, &lock3));
+
+        let vlock1 = disk_volume_mutation_lock(dir.path(), "bucket");
+        let vlock2 = disk_volume_mutation_lock(&PathBuf::from(format!("{}/.", dir.path().display())), "bucket/");
+        assert!(Arc::ptr_eq(&vlock1, &vlock2));
+
+        let io_root = dir.path().join("io_root/.");
+        let q_reg = register_disk_blocking_queue(dir.path(), &io_root);
+        let q_root = disk_blocking_queue_for_root(dir.path());
+        let q_path = disk_blocking_queue_for_path(&dir.path().join("io_root/bucket/key"));
+        assert!(Arc::ptr_eq(&q_reg, &q_root));
+        assert!(Arc::ptr_eq(&q_reg, &q_path));
+    }
+
+    #[test]
+    fn sharded_path_lock_registry_reuses_slots_and_bounds_dead_weak_entries() {
+        let registry: ShardedPathLockRegistry<AsyncMutex<()>> = ShardedPathLockRegistry::new();
+        let target = Path::new("/tmp/sharded-lock-test/persistent-key");
+        let held = registry.get_or_create(target, || AsyncMutex::new(()));
+        let held_again = registry.get_or_create(target, || AsyncMutex::new(()));
+        assert!(Arc::ptr_eq(&held, &held_again), "live lock must be shared");
+
+        // Re-acquiring a key after drop must reuse the existing slot in-place.
+        let transient = Path::new("/tmp/sharded-lock-test/reused-slot");
+        drop(registry.get_or_create(transient, || AsyncMutex::new(())));
+        let reused = registry.get_or_create(transient, || AsyncMutex::new(()));
+        drop(reused);
+
+        // Flood transient keys across shards and verify `held` is never evicted
+        // and total dead entries remain bounded by the amortized GC threshold.
+        for i in 0..(PATH_LOCK_SHARDS * PATH_LOCK_INITIAL_GC_THRESHOLD * 3) {
+            let p = PathBuf::from(format!("/tmp/sharded-lock-test/ephemeral-{i}"));
+            drop(registry.get_or_create(&p, || AsyncMutex::new(())));
+        }
+        let still_held = registry.get_or_create(target, || AsyncMutex::new(()));
+        assert!(Arc::ptr_eq(&held, &still_held), "GC must never evict a live lock");
+        for shard in &registry.shards {
+            let guard = shard.lock();
+            assert!(
+                guard.entries.len() <= guard.next_gc_threshold,
+                "shard entries ({}) exceeded GC threshold ({})",
+                guard.entries.len(),
+                guard.next_gc_threshold
+            );
+        }
+    }
+
+    #[test]
+    fn sharded_path_cache_normalizes_keys_reuses_slots_and_filters_prefixes() {
+        let cache: ShardedPathCache<usize> = ShardedPathCache::new(2);
+        let clean = Path::new("/tmp/sharded-cache-test/bucket/obj");
+        let non_canonical = Path::new("/tmp/sharded-cache-test//bucket/./obj/.");
+
+        cache.insert(clean, 10);
+        assert_eq!(cache.with_get(non_canonical, |v| *v), Some(10));
+
+        cache.with_get_mut(non_canonical, |v| *v += 5);
+        assert_eq!(cache.with_get(clean, |v| *v), Some(15));
+
+        cache.remove_if_mut(clean, |v| *v == 99);
+        assert_eq!(cache.with_get(clean, |v| *v), Some(15));
+        cache.remove_if_mut(non_canonical, |v| *v == 15);
+        assert_eq!(cache.with_get(clean, |v| *v), None);
+
+        cache.insert(Path::new("/tmp/sharded-cache-test/bucket/a"), 1);
+        cache.insert(Path::new("/tmp/sharded-cache-test/bucket/b"), 2);
+        cache.insert(Path::new("/tmp/sharded-cache-test/bucket-other/c"), 3);
+        cache.retain_outside_prefix(Path::new("/tmp/sharded-cache-test//bucket/."));
+        assert_eq!(cache.with_get(Path::new("/tmp/sharded-cache-test/bucket/a"), |v| *v), None);
+        assert_eq!(cache.with_get(Path::new("/tmp/sharded-cache-test/bucket/b"), |v| *v), None);
+        assert_eq!(cache.with_get(Path::new("/tmp/sharded-cache-test/bucket-other/c"), |v| *v), Some(3));
+
+        for i in 0..512 {
+            cache.insert(&PathBuf::from(format!("/tmp/sharded-cache-test/cap/{i}")), i);
+        }
+        for shard in &cache.shards {
+            assert!(shard.lock().len() <= 2);
+        }
+
+        #[cfg(unix)]
+        {
+            let overwrite_cache: ShardedPathCache<usize> = ShardedPathCache::new(2);
+            let target_shard = ShardedPathCache::<usize>::shard_index(b"/tmp/sharded-cache-test/same-0");
+            let mut same_shard_paths = vec![PathBuf::from("/tmp/sharded-cache-test/same-0")];
+            let mut candidate = 1usize;
+            while same_shard_paths.len() < 2 {
+                let p = PathBuf::from(format!("/tmp/sharded-cache-test/same-{candidate}"));
+                if ShardedPathCache::<usize>::shard_index(canonical_unix_path_key(&p).as_ref()) == target_shard {
+                    same_shard_paths.push(p);
+                }
+                candidate += 1;
+            }
+            overwrite_cache.insert(&same_shard_paths[0], 100);
+            overwrite_cache.insert(&same_shard_paths[1], 200);
+            overwrite_cache.insert(&same_shard_paths[0], 101);
+            assert_eq!(overwrite_cache.with_get(&same_shard_paths[0], |v| *v), Some(101));
+            assert_eq!(overwrite_cache.with_get(&same_shard_paths[1], |v| *v), Some(200));
+        }
     }
 }
 

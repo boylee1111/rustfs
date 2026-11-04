@@ -459,22 +459,62 @@ fn read_listing_metadata_entry_std(
     root: &os::PublicationRoot,
     object_dir: &Path,
 ) -> core::result::Result<ListingMetadataRead, ReadAllError> {
-    let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
-    let (bytes, _) = read_listing_metadata_bytes_std(root.open_readonly(&metadata_path))?;
-    let (file_meta, data_dirs, counts_toward_limit) = parse_listing_metadata_bytes(&bytes);
-    #[cfg(not(test))]
-    let _ = file_meta;
-    let has_namespace_child_candidate =
-        os::has_non_data_dir_entry(object_dir, &data_dirs).map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
-
-    Ok(ListingMetadataRead {
-        bytes,
+    #[cfg(target_os = "linux")]
+    {
+        let (dir_fd, meta_file) = root
+            .open_directory_and_readonly_child(object_dir, STORAGE_FORMAT_FILE)
+            .map_err(ReadAllError::Open)?;
+        let (bytes, _) = read_listing_metadata_bytes_std(Ok(meta_file))?;
+        let mut parsed_counts: Option<bool> = None;
+        let (data_dirs, has_namespace_child_candidate) = os::has_non_data_dir_entry_lazy_from_fd(&dir_fd, || {
+            let (_, data_dirs, counts) = parse_listing_metadata_bytes(&bytes);
+            parsed_counts = Some(counts);
+            data_dirs
+        })
+        .map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
+        let counts_toward_limit = parsed_counts.unwrap_or_else(|| FileMeta::bytes_count_toward_listing_limit(&bytes));
+        Ok(ListingMetadataRead {
+            #[cfg(test)]
+            file_meta: FileMeta::load(&bytes).ok(),
+            bytes,
+            data_dirs,
+            has_namespace_child_candidate,
+            counts_toward_limit,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+        let (bytes, _) = read_listing_metadata_bytes_std(root.open_readonly(&metadata_path))?;
         #[cfg(test)]
-        file_meta,
-        data_dirs,
-        has_namespace_child_candidate,
-        counts_toward_limit,
-    })
+        let (file_meta, data_dirs, counts_toward_limit, has_namespace_child_candidate) = {
+            let (file_meta, data_dirs, counts_toward_limit) = parse_listing_metadata_bytes(&bytes);
+            let has_namespace_child_candidate = os::has_non_data_dir_entry(object_dir, &data_dirs)
+                .map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
+            (file_meta, data_dirs, counts_toward_limit, has_namespace_child_candidate)
+        };
+        #[cfg(not(test))]
+        let (data_dirs, counts_toward_limit, has_namespace_child_candidate) = {
+            let mut parsed_counts: Option<bool> = None;
+            let (data_dirs, has_namespace_child_candidate) = os::has_non_data_dir_entry_lazy(object_dir, || {
+                let (_, data_dirs, counts) = parse_listing_metadata_bytes(&bytes);
+                parsed_counts = Some(counts);
+                data_dirs
+            })
+            .map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
+            let counts_toward_limit = parsed_counts.unwrap_or_else(|| FileMeta::bytes_count_toward_listing_limit(&bytes));
+            (data_dirs, counts_toward_limit, has_namespace_child_candidate)
+        };
+
+        Ok(ListingMetadataRead {
+            bytes,
+            #[cfg(test)]
+            file_meta,
+            data_dirs,
+            has_namespace_child_candidate,
+            counts_toward_limit,
+        })
+    }
 }
 
 pub(crate) fn inline_metadata_rollback_dir(version_id: Uuid, meta: &FileMeta) -> Uuid {
@@ -511,11 +551,11 @@ fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn snapshot_part_transaction_file(src: &Path, backup: &Path, absent: &Path) -> std::io::Result<()> {
+fn snapshot_part_transaction_file(src: &Path, backup: &Path, absent: &Path) -> std::io::Result<bool> {
     match std::fs::symlink_metadata(src) {
-        Ok(metadata) if metadata.is_file() => std::fs::hard_link(src, backup),
+        Ok(metadata) if metadata.is_file() => std::fs::hard_link(src, backup).map(|()| true),
         Ok(_) => Err(std::io::Error::new(ErrorKind::InvalidData, "multipart transaction source is not a file")),
-        Err(err) if err.kind() == ErrorKind::NotFound => std::fs::write(absent, []),
+        Err(err) if err.kind() == ErrorKind::NotFound => std::fs::write(absent, []).map(|()| false),
         Err(err) => Err(err),
     }
 }
@@ -2972,6 +3012,46 @@ fn should_fail_local_inline_rollback_hardlink(dst_path: &Path) -> bool {
         .remove(dst_path)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn remove_dst_base_before_commit_std(
+    dst_path: &str,
+    guard: os::RenameCommitGuard,
+    source_parent: &Path,
+    destination_parent: &Path,
+    destination_base: &Path,
+    publication_root: &os::PublicationRoot,
+) -> Result<os::RenameCommitGuard> {
+    let base = {
+        let mut target = RENAME_DATA_REMOVE_DST_BASE_BEFORE_COMMIT
+            .lock()
+            .expect("test failpoint lock should not be poisoned");
+        if target.as_ref().is_some_and(|(target_path, _)| target_path == dst_path) {
+            target.take().map(|(_, base)| base)
+        } else {
+            None
+        }
+    };
+    let Some(base) = base else {
+        return Ok(guard);
+    };
+
+    #[cfg(windows)]
+    drop(guard);
+    std::fs::remove_dir_all(base).map_err(to_file_error)?;
+    let result =
+        os::prepare_rename_commit_guard(source_parent, destination_parent, destination_base, publication_root).map_err(|err| {
+            match std::fs::symlink_metadata(destination_base) {
+                Err(base_err) if base_err.kind() == ErrorKind::NotFound => base_err,
+                _ => err,
+            }
+        });
+    #[cfg(all(test, windows))]
+    if result.is_ok() {
+        run_destination_commit_directory_preparation(destination_parent);
+    }
+    result.map_err(to_file_error).map_err(DiskError::from)
+}
+
 #[cfg(test)]
 async fn remove_dst_base_before_commit(
     dst_path: &str,
@@ -3208,6 +3288,18 @@ fn should_remove_staged_meta_before_commit(_dst_path: &str) -> bool {
 #[cfg(all(not(test), not(windows)))]
 fn should_fail_local_inline_rollback_hardlink(_dst_path: &Path) -> bool {
     false
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+pub(super) fn remove_dst_base_before_commit_std(
+    _dst_path: &str,
+    guard: os::RenameCommitGuard,
+    _source_parent: &Path,
+    _destination_parent: &Path,
+    _destination_base: &Path,
+    _publication_root: &os::PublicationRoot,
+) -> Result<os::RenameCommitGuard> {
+    Ok(guard)
 }
 
 #[cfg(not(test))]
@@ -3557,15 +3649,48 @@ async fn await_walk_stall_progress<T>(
 }
 
 async fn read_dir_entries_with_walk_stall(path: &Path, count: i32, stall: Option<Duration>) -> Result<Vec<String>> {
+    if stall.is_none() {
+        let path = path.to_path_buf();
+        let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+        return spawn_blocking_with_disk_io_permit(io_permit, move || {
+            let entries = std::fs::read_dir(&path).map_err(|err| DiskError::from(to_file_error(err)))?;
+            let cap = if count > 0 {
+                (count as usize).min(READ_DIR_BATCH_SIZE)
+            } else {
+                16
+            };
+            let mut names = Vec::with_capacity(cap);
+            for entry in entries {
+                if count > 0 && names.len() >= count as usize {
+                    break;
+                }
+                let entry = entry.map_err(to_file_error)?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.is_empty() || name == "." || name == ".." {
+                    continue;
+                }
+                let file_type = entry.file_type().map_err(to_file_error)?;
+                if file_type.is_file() {
+                    names.push(name);
+                } else if file_type.is_dir() {
+                    names.push(format!("{name}{SLASH_SEPARATOR}"));
+                }
+            }
+            Ok(names)
+        })
+        .await
+        .map_err(DiskError::from)?;
+    }
+
     let mut entries = read_dir_with_walk_stall(path.to_path_buf(), stall).await?;
     let mut names = Vec::new();
     let mut remaining = count;
 
     loop {
         let result_limit = if remaining > 0 {
-            (remaining as usize).min(WALK_DIR_BATCH_SIZE)
+            (remaining as usize).min(READ_DIR_BATCH_SIZE)
         } else {
-            WALK_DIR_BATCH_SIZE
+            READ_DIR_BATCH_SIZE
         };
         let (next_entries, next_names, reached_eof) = read_dir_entry_batch_with_walk_stall(entries, result_limit, stall).await?;
         entries = next_entries;
@@ -3579,7 +3704,11 @@ async fn read_dir_entries_with_walk_stall(path: &Path, count: i32, stall: Option
     Ok(names)
 }
 
+#[cfg(test)]
 const WALK_DIR_BATCH_SIZE: usize = 32;
+#[cfg(not(test))]
+const WALK_DIR_BATCH_SIZE: usize = 256;
+const READ_DIR_BATCH_SIZE: usize = 512;
 
 async fn read_dir_with_walk_stall(path: PathBuf, stall: Option<Duration>) -> Result<std::fs::ReadDir> {
     let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
@@ -3598,7 +3727,7 @@ async fn read_dir_entry_batch_with_walk_stall(
     let batch = spawn_blocking_with_disk_io_permit(io_permit, move || {
         let mut names = Vec::with_capacity(result_limit);
         let mut reached_eof = false;
-        for _ in 0..WALK_DIR_BATCH_SIZE {
+        for _ in 0..READ_DIR_BATCH_SIZE {
             if names.len() == result_limit {
                 break;
             }
@@ -3606,8 +3735,8 @@ async fn read_dir_entry_batch_with_walk_stall(
                 reached_eof = true;
                 break;
             };
-            let _ = progress_tx.send(());
             let entry = entry.map_err(to_file_error)?;
+            let _ = progress_tx.send(());
             let name = entry.file_name().to_string_lossy().to_string();
             if name.is_empty() || name == "." || name == ".." {
                 continue;
@@ -4037,6 +4166,9 @@ fn reclaim_std_file_cache(_file: &std::fs::File, _reclaim_len: usize, _reclaim_o
 static PRESYNCED_TMP_DATA_DIRS: std::sync::LazyLock<ParkingLotMutex<HashSet<PathBuf>>> =
     std::sync::LazyLock::new(|| ParkingLotMutex::new(HashSet::new()));
 
+static PRESYNCED_TMP_FILES: std::sync::LazyLock<ParkingLotMutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| ParkingLotMutex::new(HashSet::new()));
+
 fn mark_presynced_tmp_data_dir(dir: PathBuf) {
     let mut set = PRESYNCED_TMP_DATA_DIRS.lock();
     if set.len() >= 4096 {
@@ -4045,13 +4177,34 @@ fn mark_presynced_tmp_data_dir(dir: PathBuf) {
     set.insert(dir);
 }
 
-fn unmark_presynced_tmp_data_dir(dir: &Path) {
-    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir);
+fn unmark_presynced_tmp_data_dir(dir: &Path) -> bool {
+    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir)
+}
+
+#[cfg(target_os = "linux")]
+pub(in crate::disk) fn is_presynced_tmp_data_dir(dir: &Path) -> bool {
+    PRESYNCED_TMP_DATA_DIRS.lock().contains(dir)
 }
 
 #[cfg(target_os = "linux")]
 pub(in crate::disk) fn take_presynced_tmp_data_dir(dir: &Path) -> bool {
     PRESYNCED_TMP_DATA_DIRS.lock().remove(dir)
+}
+
+fn mark_presynced_tmp_file(file: PathBuf) {
+    let mut set = PRESYNCED_TMP_FILES.lock();
+    if set.len() >= 8192 {
+        set.clear();
+    }
+    set.insert(file);
+}
+
+fn unmark_presynced_tmp_file(file: &Path) {
+    PRESYNCED_TMP_FILES.lock().remove(file);
+}
+
+fn take_presynced_tmp_file(file: &Path) -> bool {
+    PRESYNCED_TMP_FILES.lock().remove(file)
 }
 
 fn open_lazy_local_file_std(file_path: &Path, volume_dir: &Path, _reclaim_on_shutdown: bool) -> std::io::Result<std::fs::File> {
@@ -4081,6 +4234,7 @@ struct LazyLocalFileWriter {
     reclaim_len: usize,
     reclaim_on_shutdown: bool,
     sync_on_close: bool,
+    mark_dir_presynced: bool,
     bytes_written: usize,
     state: LazyLocalFileWriterState,
 }
@@ -4094,13 +4248,21 @@ enum LazyLocalFileWriterState {
 }
 
 impl LazyLocalFileWriter {
-    fn new(file_path: PathBuf, volume_dir: PathBuf, reclaim_len: usize, reclaim_on_shutdown: bool, sync_on_close: bool) -> Self {
+    fn new(
+        file_path: PathBuf,
+        volume_dir: PathBuf,
+        reclaim_len: usize,
+        reclaim_on_shutdown: bool,
+        sync_on_close: bool,
+        mark_dir_presynced: bool,
+    ) -> Self {
         Self {
             file_path,
             volume_dir,
             reclaim_len,
             reclaim_on_shutdown,
             sync_on_close,
+            mark_dir_presynced,
             bytes_written: 0,
             state: LazyLocalFileWriterState::Unopened,
         }
@@ -4112,6 +4274,7 @@ impl LazyLocalFileWriter {
         let reclaim_len = self.bytes_written.saturating_add(len).max(self.reclaim_len);
         let reclaim_on_shutdown = self.reclaim_on_shutdown;
         let sync_on_close = self.sync_on_close;
+        let mark_dir_presynced = self.mark_dir_presynced;
         match std::mem::replace(&mut self.state, LazyLocalFileWriterState::Closed) {
             LazyLocalFileWriterState::Unopened => {
                 let file_path = self.file_path.clone();
@@ -4125,8 +4288,11 @@ impl LazyLocalFileWriter {
                         }
                         reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
                         drop(file);
-                        if sync_on_close && let Some(parent) = file_path.parent() {
-                            mark_presynced_tmp_data_dir(parent.to_path_buf());
+                        if sync_on_close {
+                            if mark_dir_presynced && let Some(parent) = file_path.parent() {
+                                mark_presynced_tmp_data_dir(parent.to_path_buf());
+                            }
+                            mark_presynced_tmp_file(file_path);
                         }
                         Ok((None, len))
                     } else {
@@ -4144,8 +4310,11 @@ impl LazyLocalFileWriter {
                         }
                         reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
                         drop(file);
-                        if sync_on_close && let Some(parent) = file_path.parent() {
-                            mark_presynced_tmp_data_dir(parent.to_path_buf());
+                        if sync_on_close {
+                            if mark_dir_presynced && let Some(parent) = file_path.parent() {
+                                mark_presynced_tmp_data_dir(parent.to_path_buf());
+                            }
+                            mark_presynced_tmp_file(file_path);
                         }
                         Ok((None, len))
                     } else {
@@ -4262,14 +4431,18 @@ impl AsyncWrite for LazyLocalFileWriter {
                     let reclaim_len = self.bytes_written.max(self.reclaim_len);
                     let reclaim_on_shutdown = self.reclaim_on_shutdown;
                     let sync_on_close = self.sync_on_close;
+                    let mark_dir_presynced = self.mark_dir_presynced;
                     self.state = LazyLocalFileWriterState::Closing(tokio::task::spawn_blocking(move || {
                         if sync_on_close {
                             file.sync_data().map_err(to_file_error)?;
                         }
                         reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
                         drop(file);
-                        if sync_on_close && let Some(parent) = file_path.parent() {
-                            mark_presynced_tmp_data_dir(parent.to_path_buf());
+                        if sync_on_close {
+                            if mark_dir_presynced && let Some(parent) = file_path.parent() {
+                                mark_presynced_tmp_data_dir(parent.to_path_buf());
+                            }
+                            mark_presynced_tmp_file(file_path);
                         }
                         Ok(())
                     }));
@@ -4994,6 +5167,7 @@ impl LocalIoBackend for StdBackend {
                     Arc::new(FdCacheEntry {
                         file: Arc::new(file),
                         len: metadata_len,
+                        invalidated: AtomicBool::new(false),
                     })
                 });
                 #[cfg(not(target_os = "linux"))]
@@ -5297,10 +5471,18 @@ impl LocalIoBackend for StdBackend {
                 let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
                 let file_path = local_disk_object_path(self.io_root(), volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
+                let mut mark_dir_presynced = false;
                 if let Some(parent) = file_path.parent() {
                     check_path_length(parent.to_string_lossy().as_ref())?;
                     if volume == RUSTFS_META_TMP_BUCKET {
-                        unmark_presynced_tmp_data_dir(parent);
+                        unmark_presynced_tmp_file(&file_path);
+                        let parent_was_presynced = unmark_presynced_tmp_data_dir(parent);
+                        let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                        mark_dir_presynced = sync_on_close
+                            && (file_name == "part.1"
+                                || (parent_was_presynced
+                                    && (file_name.starts_with("part.1.integrity.")
+                                        || (file_name.starts_with(".part.1.") && file_name.contains(".proof.")))));
                     }
                 }
 
@@ -5331,6 +5513,9 @@ impl LocalIoBackend for StdBackend {
                 }
 
                 if let Some(resources) = current_resource_unit() {
+                    if let Some(parent) = file_path.parent() {
+                        os::make_dir_all(parent, &volume_dir).await?;
+                    }
                     return self.open_resource_writer(file_path, mode, resources).await;
                 }
 
@@ -5341,6 +5526,7 @@ impl LocalIoBackend for StdBackend {
                     size_hint.max(0) as usize,
                     reclaim_on_shutdown,
                     sync_on_close,
+                    mark_dir_presynced,
                 )))
             }
             WriteMode::Append => {
@@ -5421,6 +5607,9 @@ const FD_CACHE_CAPACITY: u64 = 512;
 /// blast radius if a future mutation path forgets to call it.
 #[cfg(any(target_os = "linux", all(unix, test)))]
 const FD_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+const FD_CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[cfg(target_os = "linux")]
 fn is_io_uring_fd_cache_enabled() -> bool {
@@ -5517,6 +5706,403 @@ struct FdCacheEntry {
     file: Arc<std::fs::File>,
     /// File length captured together with the descriptor.
     len: u64,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    invalidated: AtomicBool,
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+const FD_CACHE_VOLUME_FILTER_SLOTS: usize = 256;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+const FD_CACHE_EXACT_FILTER_SLOTS: usize = 8192;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+const FD_CACHE_PREFIX_FILTER_SLOTS: usize = 16384;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+const FD_CACHE_PREFIX_SHARDS: usize = 64;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+const FD_CACHE_MAX_INDEXED_PREFIXES: usize = 12;
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+#[inline]
+fn fd_cache_volume_hash_and_slot(volume: &str) -> (u64, u8) {
+    let hash = xxhash_rust::xxh3::xxh3_64(volume.as_bytes());
+    (hash, (hash as usize & (FD_CACHE_VOLUME_FILTER_SLOTS - 1)) as u8)
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+#[inline]
+fn fd_cache_hash_and_quad_slots(volume_hash: u64, text: &str, slots: usize) -> (u64, [u16; 4]) {
+    let h = xxhash_rust::xxh3::xxh3_64_with_seed(text.as_bytes(), volume_hash);
+    let mask = (slots - 1) as u16;
+    (
+        h,
+        [
+            (h as u16) & mask,
+            ((h >> 16) as u16) & mask,
+            ((h >> 32) as u16) & mask,
+            ((h >> 48) as u16) & mask,
+        ],
+    )
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+type FdTrackerEntryList = Vec<(u64, Arc<FdKey>, std::sync::Weak<CachedFdEntry>)>;
+
+/// Tracks active descriptors and their volume/prefix hashes so unmatched
+/// `invalidate_under`, `invalidate_volume`, and `invalidate_exact` calls return
+/// without scanning `moka` or waking the background maintenance task.
+///
+/// Memory-ordering invariant:
+/// - `CachedFdEntry::new` increments all volume/exact/prefix counters and then,
+///   while holding `entry_shards[entry_shard]`, executes
+///   `live_entries.fetch_add(1, Ordering::SeqCst)` before pushing the entry into
+///   `entry_shards`. No thread can discover or retire the entry before it is counted.
+/// - `insert_if_fresh` rechecks `generation.load(Ordering::SeqCst)` after
+///   `CachedFdEntry::new` (`live_entries++`) and before publishing the entry into
+///   `moka`, retiring and aborting on mismatch.
+/// - Every `invalidate_*` bumps `generation.fetch_add(1, Ordering::SeqCst)` and then
+///   calls `may_match_*`, which executes `live_entries.load(Ordering::SeqCst)` as its
+///   first load. This Dekker `SeqCst` pair guarantees that an invalidation and a
+///   concurrent `insert_if_fresh` cannot both miss each other.
+///
+/// Lock acquisition order:
+/// 1. `invalidation_locks[i]` (outermost per-key shard lock, serializes cache insert vs removal)
+/// 2. `CachedFdEntry::state` (per-entry RwLock)
+/// 3. `prefix_shards[i]` and `entry_shards[i]` (leaf locks, acquired inside `CachedFdEntry::new` and `CachedFdLiveState::drop`)
+///
+/// `pending_invalidations` is an independent leaf lock and is never held while
+/// acquiring `invalidation_locks`, `state`, `prefix_shards`, or `entry_shards`.
+#[cfg(any(target_os = "linux", all(unix, test)))]
+struct FdCacheTracker {
+    live_entries: std::sync::atomic::AtomicUsize,
+    next_entry_id: std::sync::atomic::AtomicU64,
+    has_pending_invalidations: AtomicBool,
+    idle: AtomicBool,
+    invalidation_locks: [parking_lot::Mutex<()>; FD_CACHE_PREFIX_SHARDS],
+    pending_invalidations: parking_lot::Mutex<Vec<(Arc<FdKey>, std::sync::Weak<CachedFdEntry>)>>,
+    volume_counts: [std::sync::atomic::AtomicU32; FD_CACHE_VOLUME_FILTER_SLOTS],
+    unindexed_counts: [std::sync::atomic::AtomicU32; FD_CACHE_VOLUME_FILTER_SLOTS],
+    exact_counts: [std::sync::atomic::AtomicU32; FD_CACHE_EXACT_FILTER_SLOTS],
+    prefix_counts: [std::sync::atomic::AtomicU32; FD_CACHE_PREFIX_FILTER_SLOTS],
+    prefix_shards: [parking_lot::Mutex<Vec<(u64, usize)>>; FD_CACHE_PREFIX_SHARDS],
+    entry_shards: [parking_lot::Mutex<FdTrackerEntryList>; FD_CACHE_PREFIX_SHARDS],
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl FdCacheTracker {
+    fn new() -> Self {
+        Self {
+            live_entries: std::sync::atomic::AtomicUsize::new(0),
+            next_entry_id: std::sync::atomic::AtomicU64::new(1),
+            has_pending_invalidations: AtomicBool::new(false),
+            idle: AtomicBool::new(false),
+            invalidation_locks: std::array::from_fn(|_| parking_lot::Mutex::new(())),
+            pending_invalidations: parking_lot::Mutex::new(Vec::new()),
+            volume_counts: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            unindexed_counts: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            exact_counts: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            prefix_counts: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            prefix_shards: std::array::from_fn(|_| parking_lot::Mutex::new(Vec::new())),
+            entry_shards: std::array::from_fn(|_| parking_lot::Mutex::new(Vec::new())),
+        }
+    }
+
+    #[inline]
+    fn lock_key(&self, volume: &str, path: &str) -> parking_lot::MutexGuard<'_, ()> {
+        let vol_hash = xxhash_rust::xxh3::xxh3_64(volume.as_bytes());
+        let h = xxhash_rust::xxh3::xxh3_64_with_seed(path.as_bytes(), vol_hash);
+        self.invalidation_locks[(h as usize) & (FD_CACHE_PREFIX_SHARDS - 1)].lock()
+    }
+
+    #[inline]
+    fn live_entries(&self) -> usize {
+        self.live_entries.load(Ordering::SeqCst)
+    }
+
+    #[inline]
+    fn is_idle_candidate(&self) -> bool {
+        self.live_entries.load(Ordering::SeqCst) == 0 && !self.has_pending_invalidations.load(Ordering::SeqCst)
+    }
+
+    fn insert_prefix_hash(&self, hash: u64) {
+        let mut shard = self.prefix_shards[(hash as usize) & (FD_CACHE_PREFIX_SHARDS - 1)].lock();
+        if let Some((_, count)) = shard.iter_mut().find(|(h, _)| *h == hash) {
+            *count += 1;
+        } else {
+            shard.push((hash, 1));
+        }
+    }
+
+    fn remove_prefix_hash(&self, hash: u64) {
+        let mut shard = self.prefix_shards[(hash as usize) & (FD_CACHE_PREFIX_SHARDS - 1)].lock();
+        if let Some(pos) = shard.iter().position(|(h, _)| *h == hash) {
+            if shard[pos].1 > 1 {
+                shard[pos].1 -= 1;
+            } else {
+                shard.swap_remove(pos);
+            }
+        }
+    }
+
+    #[inline]
+    fn has_prefix_hash(&self, hash: u64) -> bool {
+        let shard = self.prefix_shards[(hash as usize) & (FD_CACHE_PREFIX_SHARDS - 1)].lock();
+        shard.iter().any(|(h, _)| *h == hash)
+    }
+
+    fn matching_entries_in_volume(
+        &self,
+        volume: &str,
+        matches: impl Fn(&FdKey) -> bool,
+    ) -> Vec<(Arc<FdKey>, Arc<CachedFdEntry>)> {
+        let (vol_hash, _) = fd_cache_volume_hash_and_slot(volume);
+        let shard = self.entry_shards[(vol_hash as usize) & (FD_CACHE_PREFIX_SHARDS - 1)].lock();
+        let mut out = Vec::new();
+        for (_, key, weak) in shard.iter() {
+            if matches(key)
+                && let Some(cached) = weak.upgrade()
+            {
+                out.push((Arc::clone(key), cached));
+            }
+        }
+        out
+    }
+
+    fn all_live_entries(&self) -> Vec<Arc<CachedFdEntry>> {
+        let mut out = Vec::new();
+        for shard in &self.entry_shards {
+            let guard = shard.lock();
+            for (_, _, weak) in guard.iter() {
+                if let Some(cached) = weak.upgrade() {
+                    out.push(cached);
+                }
+            }
+        }
+        out
+    }
+
+    #[inline]
+    fn may_match_volume(&self, volume: &str) -> bool {
+        if self.live_entries.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        let (_, vol_slot) = fd_cache_volume_hash_and_slot(volume);
+        self.volume_counts[usize::from(vol_slot)].load(Ordering::Acquire) != 0
+    }
+
+    #[inline]
+    fn may_match_exact(&self, volume: &str, path: &str) -> bool {
+        if self.live_entries.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        let (vol_hash, vol_slot) = fd_cache_volume_hash_and_slot(volume);
+        if self.volume_counts[usize::from(vol_slot)].load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let (hash, [s0, s1, s2, s3]) = fd_cache_hash_and_quad_slots(vol_hash, path, FD_CACHE_EXACT_FILTER_SLOTS);
+        if self.exact_counts[usize::from(s0)].load(Ordering::Acquire) == 0
+            || self.exact_counts[usize::from(s1)].load(Ordering::Acquire) == 0
+            || self.exact_counts[usize::from(s2)].load(Ordering::Acquire) == 0
+            || self.exact_counts[usize::from(s3)].load(Ordering::Acquire) == 0
+        {
+            return false;
+        }
+        self.unindexed_counts[usize::from(vol_slot)].load(Ordering::Acquire) != 0 || self.has_prefix_hash(hash)
+    }
+
+    #[inline]
+    fn may_match_prefix(&self, volume: &str, prefix: &str) -> bool {
+        if self.live_entries.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        let (vol_hash, vol_slot) = fd_cache_volume_hash_and_slot(volume);
+        if self.volume_counts[usize::from(vol_slot)].load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        if self.unindexed_counts[usize::from(vol_slot)].load(Ordering::Acquire) != 0 {
+            return true;
+        }
+        let (hash, [s0, s1, s2, s3]) = fd_cache_hash_and_quad_slots(vol_hash, prefix, FD_CACHE_PREFIX_FILTER_SLOTS);
+        self.prefix_counts[usize::from(s0)].load(Ordering::Acquire) != 0
+            && self.prefix_counts[usize::from(s1)].load(Ordering::Acquire) != 0
+            && self.prefix_counts[usize::from(s2)].load(Ordering::Acquire) != 0
+            && self.prefix_counts[usize::from(s3)].load(Ordering::Acquire) != 0
+            && self.has_prefix_hash(hash)
+    }
+
+    fn enqueue_invalidations(&self, entries: Vec<(Arc<FdKey>, std::sync::Weak<CachedFdEntry>)>) {
+        let mut pending = self.pending_invalidations.lock();
+        if pending.len() >= (FD_CACHE_CAPACITY as usize).saturating_mul(2) {
+            pending.retain(|(_, weak)| weak.strong_count() > 0);
+        }
+        pending.extend(entries);
+        self.has_pending_invalidations.store(true, Ordering::SeqCst);
+    }
+
+    fn take_pending_invalidations(&self) -> Vec<(Arc<FdKey>, std::sync::Weak<CachedFdEntry>)> {
+        let mut pending = self.pending_invalidations.lock();
+        let taken = std::mem::take(&mut *pending);
+        self.has_pending_invalidations.store(false, Ordering::SeqCst);
+        taken
+    }
+
+    fn clear_pending_invalidations(&self) {
+        let mut pending = self.pending_invalidations.lock();
+        pending.clear();
+        self.has_pending_invalidations.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+struct CachedFdLiveState {
+    entry: Arc<FdCacheEntry>,
+    tracker: Arc<FdCacheTracker>,
+    entry_id: u64,
+    entry_shard: u8,
+    volume_slot: u8,
+    prefix_slot_len: u8,
+    exact_slots: [u16; 4],
+    prefix_hashes: [u64; FD_CACHE_MAX_INDEXED_PREFIXES],
+    prefix_slots: [[u16; 4]; FD_CACHE_MAX_INDEXED_PREFIXES],
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl Drop for CachedFdLiveState {
+    fn drop(&mut self) {
+        {
+            let mut shard = self.tracker.entry_shards[usize::from(self.entry_shard)].lock();
+            if let Some(pos) = shard.iter().position(|(id, _, _)| *id == self.entry_id) {
+                shard.swap_remove(pos);
+            }
+        }
+        if self.prefix_slot_len == u8::MAX {
+            self.tracker.unindexed_counts[usize::from(self.volume_slot)].fetch_sub(1, Ordering::AcqRel);
+        } else {
+            for i in 0..usize::from(self.prefix_slot_len) {
+                for &s in &self.prefix_slots[i] {
+                    self.tracker.prefix_counts[usize::from(s)].fetch_sub(1, Ordering::AcqRel);
+                }
+                self.tracker.remove_prefix_hash(self.prefix_hashes[i]);
+            }
+        }
+        for s in self.exact_slots {
+            self.tracker.exact_counts[usize::from(s)].fetch_sub(1, Ordering::AcqRel);
+        }
+        self.tracker.volume_counts[usize::from(self.volume_slot)].fetch_sub(1, Ordering::AcqRel);
+        self.tracker.live_entries.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+struct CachedFdEntry {
+    active: AtomicBool,
+    enqueued_for_removal: AtomicBool,
+    state: std::sync::RwLock<Option<CachedFdLiveState>>,
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl CachedFdEntry {
+    fn new(tracker: Arc<FdCacheTracker>, key: &FdKey, entry: Arc<FdCacheEntry>) -> Arc<Self> {
+        let (vol_hash, volume_slot) = fd_cache_volume_hash_and_slot(&key.volume);
+        let entry_shard = (vol_hash as usize) & (FD_CACHE_PREFIX_SHARDS - 1);
+        let entry_id = tracker.next_entry_id.fetch_add(1, Ordering::Relaxed);
+        let (_, exact_slots) = fd_cache_hash_and_quad_slots(vol_hash, &key.path, FD_CACHE_EXACT_FILTER_SLOTS);
+        let mut prefix_hashes = [0u64; FD_CACHE_MAX_INDEXED_PREFIXES];
+        let mut prefix_slots = [[0u16; 4]; FD_CACHE_MAX_INDEXED_PREFIXES];
+        let mut prefix_slot_len = 0usize;
+        let mut overflowed = false;
+
+        for (idx, byte) in key.path.bytes().enumerate() {
+            if byte == b'/' {
+                if prefix_slot_len == FD_CACHE_MAX_INDEXED_PREFIXES {
+                    overflowed = true;
+                    break;
+                }
+                let (h, slots) = fd_cache_hash_and_quad_slots(vol_hash, &key.path[..idx], FD_CACHE_PREFIX_FILTER_SLOTS);
+                prefix_hashes[prefix_slot_len] = h;
+                prefix_slots[prefix_slot_len] = slots;
+                prefix_slot_len += 1;
+            }
+        }
+        if !overflowed {
+            if prefix_slot_len == FD_CACHE_MAX_INDEXED_PREFIXES {
+                overflowed = true;
+            } else {
+                let (h, slots) = fd_cache_hash_and_quad_slots(vol_hash, &key.path, FD_CACHE_PREFIX_FILTER_SLOTS);
+                prefix_hashes[prefix_slot_len] = h;
+                prefix_slots[prefix_slot_len] = slots;
+                prefix_slot_len += 1;
+            }
+        }
+
+        tracker.volume_counts[usize::from(volume_slot)].fetch_add(1, Ordering::AcqRel);
+        for s in exact_slots {
+            tracker.exact_counts[usize::from(s)].fetch_add(1, Ordering::AcqRel);
+        }
+        let encoded_len = if overflowed {
+            tracker.unindexed_counts[usize::from(volume_slot)].fetch_add(1, Ordering::AcqRel);
+            u8::MAX
+        } else {
+            for i in 0..prefix_slot_len {
+                tracker.insert_prefix_hash(prefix_hashes[i]);
+                for &s in &prefix_slots[i] {
+                    tracker.prefix_counts[usize::from(s)].fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            prefix_slot_len as u8
+        };
+
+        let tracker_for_state = Arc::clone(&tracker);
+        let cached = Arc::new(Self {
+            active: AtomicBool::new(true),
+            enqueued_for_removal: AtomicBool::new(false),
+            state: std::sync::RwLock::new(Some(CachedFdLiveState {
+                entry,
+                tracker: tracker_for_state,
+                entry_id,
+                entry_shard: entry_shard as u8,
+                volume_slot,
+                prefix_slot_len: encoded_len,
+                exact_slots,
+                prefix_hashes,
+                prefix_slots,
+            })),
+        });
+        {
+            let mut shard = tracker.entry_shards[entry_shard].lock();
+            // Count the entry before publishing it to `entry_shards` so no thread
+            // can discover and retire it before `live_entries` is incremented.
+            // Pairs with `live_entries.load(Ordering::SeqCst)` in `may_match_*`.
+            tracker.live_entries.fetch_add(1, Ordering::SeqCst);
+            shard.push((entry_id, Arc::new(key.clone()), Arc::downgrade(&cached)));
+        }
+
+        cached
+    }
+
+    #[inline]
+    fn get_entry(&self) -> Option<Arc<FdCacheEntry>> {
+        if !self.active.load(Ordering::Acquire) {
+            return None;
+        }
+        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
+        let live = guard.as_ref()?;
+        (!live.entry.invalidated.load(Ordering::Acquire)).then(|| Arc::clone(&live.entry))
+    }
+
+    fn mark_invalidated(&self) {
+        self.active.store(false, Ordering::Release);
+        if let Some(live) = self.state.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            live.entry.invalidated.store(true, Ordering::Release);
+        }
+    }
+
+    fn retire(&self) {
+        self.active.store(false, Ordering::Release);
+        let live = self.state.write().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(live) = live {
+            live.entry.invalidated.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// Per-disk cache of open descriptors for io_uring reads (backlog#1145).
@@ -5549,12 +6135,29 @@ struct FdCacheEntry {
 /// the descriptor once no in-flight read still holds it.
 #[cfg(any(target_os = "linux", all(unix, test)))]
 struct FdCache {
-    cache: moka::future::Cache<FdKey, Arc<FdCacheEntry>>,
+    cache: moka::sync::Cache<FdKey, Arc<CachedFdEntry>>,
+    tracker: Arc<FdCacheTracker>,
+    // The only sender belongs to this cache. Dropping it lets the worker finish
+    // maintenance and release its cache clone without retaining the backend.
+    maintenance_tx: tokio::sync::watch::Sender<()>,
+    maintenance_task: std::sync::OnceLock<tokio::task::JoinHandle<()>>,
     /// Bumped by every invalidation. A miss-path open snapshots this before it
     /// opens and refuses to insert if it moved, so an fd opened before a
     /// heal/delete commit can never be resurrected into the cache after the
     /// commit's invalidation ran (open-then-insert race, rustfs/backlog#1176).
     generation: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl Drop for FdCache {
+    fn drop(&mut self) {
+        self.tracker.clear_pending_invalidations();
+        for cached in self.tracker.all_live_entries() {
+            cached.retire();
+        }
+        self.cache.invalidate_all();
+        self.cache.run_pending_tasks();
+    }
 }
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -5567,26 +6170,134 @@ impl FdCache {
     /// `new` (`FD_CACHE_TTL`); tests inject a short TTL to exercise the backstop
     /// eviction (rustfs/backlog#1180) without a multi-second wait.
     fn with_ttl(ttl: std::time::Duration) -> Self {
+        let (maintenance_tx, _) = tokio::sync::watch::channel(());
         Self {
-            cache: moka::future::Cache::builder()
+            cache: moka::sync::Cache::builder()
                 .max_capacity(FD_CACHE_CAPACITY)
                 .time_to_live(ttl)
-                // Required for `invalidate_entries_if`; without it that call
-                // fails at runtime instead of dropping stale descriptors.
-                .support_invalidation_closures()
+                .eviction_listener(|_key, cached: Arc<CachedFdEntry>, cause| {
+                    if !matches!(cause, moka::notification::RemovalCause::Explicit) {
+                        cached.retire();
+                    }
+                })
                 .build(),
+            tracker: Arc::new(FdCacheTracker::new()),
+            maintenance_tx,
+            maintenance_task: std::sync::OnceLock::new(),
             generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
+    fn ensure_maintenance_task(&self) {
+        self.maintenance_task.get_or_init(|| {
+            let cache = self.cache.clone();
+            let tracker = Arc::clone(&self.tracker);
+            let mut notifications = self.maintenance_tx.subscribe();
+            // Invalidation runs on the disk API's Tokio runtime. Starting lazily
+            // keeps construction runtime-independent and idle caches task-free.
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + FD_CACHE_MAINTENANCE_INTERVAL,
+                    FD_CACHE_MAINTENANCE_INTERVAL,
+                );
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    let stopping = if tracker.is_idle_candidate() {
+                        tracker.idle.store(true, Ordering::SeqCst);
+                        if tracker.is_idle_candidate() {
+                            let res = notifications.changed().await.is_err();
+                            tracker.idle.store(false, Ordering::SeqCst);
+                            interval.reset();
+                            res
+                        } else {
+                            tracker.idle.store(false, Ordering::SeqCst);
+                            tokio::select! {
+                                changed = notifications.changed() => changed.is_err(),
+                                _ = interval.tick() => false,
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            changed = notifications.changed() => changed.is_err(),
+                            _ = interval.tick() => false,
+                        }
+                    };
+                    if stopping {
+                        tracker.clear_pending_invalidations();
+                        let live = tracker.all_live_entries();
+                        cache.invalidate_all();
+                        cache.run_pending_tasks();
+                        for cached in live {
+                            cached.retire();
+                        }
+                        break;
+                    }
+                    let pending = tracker.take_pending_invalidations();
+                    let mut retired_entries = Vec::with_capacity(pending.len());
+                    for (key, weak_entry) in pending {
+                        let Some(invalidated_entry) = weak_entry.upgrade() else {
+                            continue;
+                        };
+                        {
+                            let _guard = tracker.lock_key(&key.volume, &key.path);
+                            if cache
+                                .get(key.as_ref())
+                                .is_some_and(|current| Arc::ptr_eq(&current, &invalidated_entry))
+                            {
+                                cache.invalidate(key.as_ref());
+                            }
+                        }
+                        retired_entries.push(invalidated_entry);
+                    }
+                    cache.run_pending_tasks();
+                    for entry in retired_entries {
+                        entry.retire();
+                    }
+                }
+            })
+        });
+    }
+
+    fn schedule_maintenance(&self) {
+        self.ensure_maintenance_task();
+        self.maintenance_tx.send_replace(());
+    }
+
+    fn activate_maintenance(&self) {
+        if self.maintenance_task.get().is_none() {
+            self.ensure_maintenance_task();
+        }
+        if self.tracker.idle.load(Ordering::SeqCst) {
+            self.maintenance_tx.send_replace(());
+        }
+    }
+
+    fn invalidate_matching(&self, volume: &str, matches: impl Fn(&FdKey) -> bool) {
+        for lock in &self.tracker.invalidation_locks {
+            drop(lock.lock());
+        }
+        let matched = self.tracker.matching_entries_in_volume(volume, matches);
+        let mut newly_invalidated = Vec::with_capacity(matched.len());
+        for (key, cached) in matched {
+            cached.mark_invalidated();
+            if !cached.enqueued_for_removal.swap(true, Ordering::AcqRel) {
+                newly_invalidated.push((key, Arc::downgrade(&cached)));
+            }
+        }
+        if !newly_invalidated.is_empty() {
+            self.tracker.enqueue_invalidations(newly_invalidated);
+            self.schedule_maintenance();
+        }
+    }
+
     async fn get(&self, key: &FdKey) -> Option<Arc<FdCacheEntry>> {
-        self.cache.get(key).await
+        self.cache.get(key).and_then(|cached| cached.get_entry())
     }
 
     /// Current invalidation generation, snapshotted by the miss path before it
     /// opens a descriptor (rustfs/backlog#1176).
     fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// Insert a freshly-opened descriptor only if no invalidation happened since
@@ -5595,12 +6306,39 @@ impl FdCache {
     /// cached. The post-insert re-check closes the tiny window where an
     /// invalidate races the insert itself, by removing the entry we just added.
     async fn insert_if_fresh(&self, key: FdKey, entry: Arc<FdCacheEntry>, gen_at_open: u64) {
-        if self.generation.load(Ordering::Acquire) != gen_at_open {
+        if self.generation.load(Ordering::SeqCst) != gen_at_open {
             return;
         }
-        self.cache.insert(key.clone(), entry).await;
-        if self.generation.load(Ordering::Acquire) != gen_at_open {
-            self.cache.invalidate(&key).await;
+        let cached = {
+            let _guard = self.tracker.lock_key(&key.volume, &key.path);
+            if self.generation.load(Ordering::SeqCst) != gen_at_open {
+                return;
+            }
+            let cached = CachedFdEntry::new(Arc::clone(&self.tracker), &key, entry);
+            // Dekker partner: must stay after `CachedFdEntry::new` (`live_entries++`)
+            // and before `previous.retire()` / `self.cache.insert`.
+            if self.generation.load(Ordering::SeqCst) != gen_at_open {
+                cached.retire();
+                return;
+            }
+            if let Some(previous) = self.cache.get(&key) {
+                previous.retire();
+            }
+            self.cache.insert(key.clone(), Arc::clone(&cached));
+            if self.generation.load(Ordering::SeqCst) != gen_at_open {
+                cached.retire();
+                self.cache.invalidate(&key);
+                return;
+            }
+            cached
+        };
+        self.activate_maintenance();
+        if self.generation.load(Ordering::SeqCst) != gen_at_open {
+            cached.retire();
+            let _guard = self.tracker.lock_key(&key.volume, &key.path);
+            if self.cache.get(&key).is_some_and(|current| Arc::ptr_eq(&current, &cached)) {
+                self.cache.invalidate(&key);
+            }
         }
     }
 
@@ -5610,59 +6348,85 @@ impl FdCache {
     async fn invalidate_exact(&self, volume: &str, path: &str) {
         // Bump BEFORE the moka invalidation so a concurrent miss-path insert
         // that snapshotted the old generation is refused (rustfs/backlog#1176).
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if !self.tracker.may_match_exact(volume, path) {
+            return;
+        }
         let mut key = FdKey {
             volume: volume.to_owned(),
             path: path.to_owned(),
             direct: false,
         };
-        self.cache.invalidate(&key).await;
-        key.direct = true;
-        self.cache.invalidate(&key).await;
+        let mut removed_any = false;
+        {
+            let _guard = self.tracker.lock_key(volume, path);
+            if let Some(cached) = self.cache.get(&key) {
+                cached.retire();
+                removed_any = true;
+            }
+            self.cache.invalidate(&key);
+            key.direct = true;
+            if let Some(cached) = self.cache.get(&key) {
+                cached.retire();
+                removed_any = true;
+            }
+            self.cache.invalidate(&key);
+        }
+        if removed_any {
+            self.schedule_maintenance();
+        }
     }
 
     /// Drop every descriptor for `volume` whose path is `prefix` or lies under it.
     /// A component-boundary check keeps `a/b` from invalidating `a/bc`.
     ///
-    /// moka applies the predicate to entries inserted at or before this call and
-    /// guarantees a later `get` never returns one of them, so the invalidation is
-    /// effective immediately even though the removal itself is deferred. Reserved
-    /// for paths whose exact keys are unknown (`delete`); every predicate is
-    /// re-evaluated by subsequent `get`s, so registering one per write would tax
-    /// the read path.
+    /// Mark matching entries immediately so reads reject them while maintenance
+    /// removes them. The scan borrows its paths and retains no invalidation
+    /// closures when the cache is empty or idle.
     fn invalidate_under(&self, volume: &str, prefix: &str) {
-        // Bump before registering the predicate so a concurrent miss-path insert
+        // Bump before scanning the cache so a concurrent miss-path insert
         // that snapshotted the old generation is refused (rustfs/backlog#1176).
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        let volume = volume.to_owned();
-        let prefix = prefix.trim_end_matches('/').to_owned();
-        let matches = move |k: &FdKey, _: &Arc<FdCacheEntry>| {
-            k.volume == volume && (k.path == prefix || k.path.strip_prefix(&prefix).is_some_and(|r| r.starts_with('/')))
-        };
-        if self.cache.invalidate_entries_if(matches).is_err() {
-            // Closure support is enabled at construction, so this is unreachable.
-            // If it ever changes, over-invalidate rather than serve a stale
-            // descriptor: correctness first, the cache refills on the next read.
-            self.cache.invalidate_all();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let prefix = prefix.trim_end_matches('/');
+        if !self.tracker.may_match_prefix(volume, prefix) {
+            return;
         }
+        self.invalidate_matching(volume, |k| {
+            k.volume == volume && (k.path == prefix || k.path.strip_prefix(prefix).is_some_and(|r| r.starts_with('/')))
+        });
     }
 
     /// Drop every descriptor for `volume` — the whole bucket is gone
     /// (rustfs/backlog#1177).
     fn invalidate_volume(&self, volume: &str) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        let volume = volume.to_owned();
-        let matches = move |k: &FdKey, _: &Arc<FdCacheEntry>| k.volume == volume;
-        if self.cache.invalidate_entries_if(matches).is_err() {
-            self.cache.invalidate_all();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if !self.tracker.may_match_volume(volume) {
+            return;
         }
+        self.invalidate_matching(volume, |k| k.volume == volume);
     }
 
     /// Drop ALL descriptors — this disk instance is being retired
     /// (rustfs/backlog#1177).
     fn clear(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        for lock in &self.tracker.invalidation_locks {
+            drop(lock.lock());
+        }
+        let mut had_entries = self.tracker.live_entries() != 0 || self.tracker.has_pending_invalidations.load(Ordering::SeqCst);
+        self.tracker.clear_pending_invalidations();
+        let live = self.tracker.all_live_entries();
+        if !live.is_empty() {
+            had_entries = true;
+        }
         self.cache.invalidate_all();
+        self.cache.run_pending_tasks();
+        for cached in live {
+            cached.retire();
+        }
+        if had_entries || self.maintenance_task.get().is_some() {
+            self.schedule_maintenance();
+        }
     }
 
     /// Unconditional insert. Production reads go through `insert_if_fresh` (the
@@ -5671,12 +6435,25 @@ impl FdCache {
     #[cfg(test)]
     async fn insert(&self, key: FdKey, file: Arc<std::fs::File>) {
         let len = file.metadata().map(|metadata| metadata.len()).unwrap_or_default();
-        self.cache.insert(key, Arc::new(FdCacheEntry { file, len })).await;
+        let entry = Arc::new(FdCacheEntry {
+            file,
+            len,
+            invalidated: AtomicBool::new(false),
+        });
+        {
+            let _guard = self.tracker.lock_key(&key.volume, &key.path);
+            if let Some(previous) = self.cache.get(&key) {
+                previous.retire();
+            }
+            let cached = CachedFdEntry::new(Arc::clone(&self.tracker), &key, entry);
+            self.cache.insert(key, cached);
+        }
+        self.activate_maintenance();
     }
 
     #[cfg(test)]
     async fn entry_count(&self) -> u64 {
-        self.cache.run_pending_tasks().await;
+        self.cache.run_pending_tasks();
         self.cache.entry_count()
     }
 }
@@ -6270,6 +7047,7 @@ impl UringBackend {
                 let file = Arc::new(FdCacheEntry {
                     file: Arc::new(file),
                     len,
+                    invalidated: AtomicBool::new(false),
                 });
                 if let (Some((cache, key)), Some(gen_at_open)) = (cache_entry, gen_at_open) {
                     cache.insert_if_fresh(key, Arc::clone(&file), gen_at_open).await;
@@ -6442,6 +7220,7 @@ impl UringBackend {
                 let entry = Arc::new(FdCacheEntry {
                     file: Arc::new(file),
                     len,
+                    invalidated: AtomicBool::new(false),
                 });
                 if let (Some(cache), Some(gen_at_open)) = (cache, gen_at_open) {
                     cache.insert_if_fresh(key.clone(), Arc::clone(&entry), gen_at_open).await;
@@ -7101,6 +7880,8 @@ impl LocalDisk {
         let io_root = Self::open_mount_lease(&root)?;
 
         Self::check_startup_writable(&publication_root, &root).await?;
+        multipart_source_state::invalidate_active_multipart_sources_under(&io_root);
+        multipart_source_state::invalidate_active_multipart_sources_under(&root);
 
         ensure_data_usage_layout(&io_root)
             .await
@@ -7846,6 +8627,14 @@ impl LocalDisk {
     fn io_get_object_open_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
         #[cfg(target_os = "linux")]
         {
+            if is_clean_relative_segment(bucket) && is_clean_relative_segment(key) {
+                let root = self.io_root();
+                let mut path = PathBuf::with_capacity(root.as_os_str().len() + bucket.len() + key.len() + 2);
+                path.push(root);
+                path.push(bucket);
+                path.push(key);
+                return Ok(path);
+            }
             let (bucket_path, path) = build_local_disk_object_path(self.io_root(), bucket, key);
             check_local_disk_object_path_components(self.io_root(), &bucket_path, &path)?;
             Ok(path)
@@ -7860,6 +8649,11 @@ impl LocalDisk {
     fn io_get_bucket_and_object_open_path(&self, bucket: &str, key: &str) -> Result<(PathBuf, PathBuf)> {
         #[cfg(target_os = "linux")]
         {
+            if is_clean_relative_segment(bucket) && is_clean_relative_segment(key) {
+                let bucket_path = self.io_root().join(bucket);
+                let path = bucket_path.join(key);
+                return Ok((bucket_path, path));
+            }
             let (bucket_path, path) = build_local_disk_object_path(self.io_root(), bucket, key);
             let normalized = check_local_disk_object_path_components(self.io_root(), &bucket_path, &path)?;
             if matches!(normalized, std::borrow::Cow::Owned(_)) {
@@ -8070,7 +8864,7 @@ impl LocalDisk {
         crate::hp_guard!("LocalDisk::write_metadata");
         if volume == super::RUSTFS_META_MULTIPART_BUCKET {
             let recovery = self.io_get_object_path(volume, &format!("{path}/{}", super::MULTIPART_RECOVERY_DIR))?;
-            match fs::symlink_metadata(recovery).await {
+            match std::fs::symlink_metadata(recovery) {
                 Ok(_) => return Err(DiskError::FileNotFound),
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
                 Err(error) => return Err(to_file_error(error).into()),
@@ -8090,6 +8884,11 @@ impl LocalDisk {
             false
         };
         let source_admission = self.multipart_source_admission(volume, path, false, initial_source)?;
+        if volume == super::RUSTFS_META_MULTIPART_BUCKET
+            && let Some(ref admission) = source_admission
+        {
+            multipart_source_state::invalidate_active_multipart_source_head(admission.source());
+        }
         let p = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
 
         let mut meta = FileMeta::new();
@@ -8104,19 +8903,37 @@ impl LocalDisk {
 
         meta.add_version(fi)?;
 
-        let fm_data = meta.marshal_msg()?;
+        let fm_bytes: Bytes = meta.marshal_msg()?.into();
 
         // Atomic temp+rename: this path also rewrites live xl.meta (delete markers,
         // decommission), where an in-place truncate would expose torn metadata.
         self.write_all_meta_with_source_admission(
             volume,
             format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
-            fm_data.into(),
+            fm_bytes.clone(),
             true,
-            namespace_owner,
-            source_admission,
+            namespace_owner.clone(),
+            source_admission.clone(),
         )
         .await?;
+
+        if initial_source
+            && let Some(admission) = source_admission
+            && let Ok(cached_fi) = get_file_info(
+                &fm_bytes,
+                volume,
+                path,
+                "",
+                FileInfoOpts {
+                    data: false,
+                    include_free_versions: false,
+                    include_part_checksums: true,
+                },
+            )
+        {
+            multipart_source_state::put_active_multipart_source_head(admission.source(), fm_bytes, cached_fi);
+        }
+        drop(namespace_owner);
 
         Ok(())
     }
@@ -8821,6 +9638,12 @@ impl LocalDisk {
         immediate_purge: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        if let Some(name) = delete_path.file_name().and_then(|n| n.to_str())
+            && let Some((_, gen_str)) = name.split_once(".integrity.")
+            && let Ok(generation) = Uuid::parse_str(gen_str)
+        {
+            crate::io_support::shard_integrity::invalidate_verified_stripe_records(generation);
+        }
         #[cfg(unix)]
         if !immediate_purge
             && !delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR)
@@ -8839,18 +9662,73 @@ impl LocalDisk {
         // }
 
         let multipart_check = self.multipart_delete_check(delete_path, true)?;
+        if let Some(check) = &multipart_check {
+            multipart_source_state::invalidate_active_multipart_source_head(check.source());
+        }
         let err = if let Some(check) = &multipart_check {
-            os::rename_all_with_precondition_and_parent_sync(
-                delete_path,
-                &trash_path,
-                &self.io_get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?,
-                &self.publication_root,
-                namespace_owner.clone(),
-                Some(check.callback()),
-                true,
-            )
-            .await
-            .err()
+            if !recursive {
+                let delete_path_owned = delete_path.clone();
+                let trash_path_owned = trash_path.clone();
+                let base_dir = self.io_get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?;
+                let root = self.publication_root.clone();
+                let callback = check.callback();
+                let lease = os::acquire_namespace_mutation_lease_with_owner(&trash_path_owned, namespace_owner.clone()).await;
+                os::run_blocking_namespace_operation(lease, move || {
+                    callback()?;
+                    match std::fs::symlink_metadata(&delete_path_owned) {
+                        Ok(meta) if meta.is_file() => {
+                            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                            os::prepared_publication_test_hooks::run(
+                                os::prepared_publication_test_hooks::Stage::Remove,
+                                &delete_path_owned,
+                            );
+                            return match std::fs::remove_file(&delete_path_owned) {
+                                Ok(()) => Ok(()),
+                                Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+                                Err(err) => Err(err),
+                            };
+                        }
+                        Err(err)
+                            if err.kind() == ErrorKind::NotFound && os::rename_source_is_missing(&delete_path_owned, &root) =>
+                        {
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                    os::rename_all_with_precondition_and_parent_sync_std(
+                        &delete_path_owned,
+                        &trash_path_owned,
+                        &base_dir,
+                        &root,
+                        Some(callback.as_ref()),
+                        false,
+                    )
+                })
+                .await
+                .map_err(|error| Error::from(to_file_error(error)))
+                .err()
+            } else {
+                let delete_path_owned = delete_path.clone();
+                let trash_path_owned = trash_path.clone();
+                let base_dir = self.io_get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?;
+                let root = self.publication_root.clone();
+                let callback = check.callback();
+                let lease = os::acquire_namespace_mutation_lease_with_owner(&trash_path_owned, namespace_owner.clone()).await;
+                os::run_blocking_namespace_operation(lease, move || {
+                    os::rename_all_with_precondition_and_parent_sync_std(
+                        &delete_path_owned,
+                        &trash_path_owned,
+                        &base_dir,
+                        &root,
+                        Some(callback.as_ref()),
+                        false,
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| Error::from(to_file_error(error)))
+                .err()
+            }
         } else if recursive {
             os::rename_all_ignore_missing_source_with_owner(
                 delete_path,
@@ -8917,12 +9795,28 @@ impl LocalDisk {
         if volume == RUSTFS_META_BUCKET {
             crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
         }
+        if let Some((_, gen_str)) = path.rsplit_once(".integrity.")
+            && let Ok(generation) = Uuid::parse_str(gen_str)
+        {
+            crate::io_support::shard_integrity::invalidate_verified_stripe_records(generation);
+        }
+        if volume == RUSTFS_META_MULTIPART_BUCKET
+            && let Ok(source_dir) = self.io_get_object_path(volume, multipart_staging::upload_scope_root(path, true))
+        {
+            multipart_source_state::invalidate_active_multipart_source_head(&source_dir);
+        }
         multipart_staging::reject_native_control_write(&self.root, self.io_root(), volume, path)?;
         let mut source_owner = self.acquire_multipart_delete_owner(volume, path, namespace_owner).await?;
         let namespace_owner = source_owner.namespace_owner();
+        let is_version_delete_path = opt.recursive
+            && opt.immediate
+            && path
+                .rsplit_once('/')
+                .and_then(|(_, id)| Uuid::parse_str(id).ok())
+                .is_some_and(|id| !id.is_nil());
         if volume == RUSTFS_META_MULTIPART_BUCKET
             && let Some(check) = self.multipart_delete_check(&self.io_get_object_path(volume, path)?, opt.recursive)?
-            && (opt.orphan_data_dir || (opt.recursive && opt.immediate))
+            && (opt.orphan_data_dir || is_version_delete_path)
         {
             self.validate_multipart_delete_admission(check, namespace_owner.clone())
                 .await?;
@@ -9394,6 +10288,7 @@ impl LocalDisk {
                 // debug!("delete_file remove_dir done {:?}", &delete_path);
             } else if let Err(err) = {
                 if let Some(check) = self.multipart_delete_check(delete_path, false)? {
+                    multipart_source_state::invalidate_active_multipart_source_head(check.source());
                     let path = delete_path.clone();
                     let lease = os::acquire_namespace_mutation_lease_with_owner(delete_path, namespace_owner.clone()).await;
                     os::run_blocking_namespace_operation(lease, move || {
@@ -9433,6 +10328,7 @@ impl LocalDisk {
             if let Some(dir_path) = delete_path
                 .parent()
                 .filter(|parent| *parent != base_path && parent.starts_with(base_path))
+                && (!recursive || dir_path.is_dir())
             {
                 self.delete_file_with_namespace_owner(
                     base_path,
@@ -9571,13 +10467,8 @@ impl LocalDisk {
             .and_then(|v| v.strip_suffix(".meta"))
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_default();
-        let data_path = self.io_get_object_path(
-            bucket,
-            &path_join_buf(&[
-                path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy().as_ref(),
-                &format!("part.{num}"),
-            ]),
-        )?;
+        let parent_str = path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy();
+        let data_path = self.io_get_object_path(bucket, &path_join_buf(&[parent_str.as_ref(), &format!("part.{num}")]))?;
         let metadata_path = self.io_get_object_path(bucket, path.to_string_lossy().as_ref());
         // A part's existence check, metadata read and decode share one dispatch.
         // Keep open errors unmapped for the existing missing-volume fallback.
@@ -9643,12 +10534,29 @@ impl LocalDisk {
             stream_listing_metadata_batch(&object_names, tx, |object_name| {
                 let (bucket_path, object_dir) = build_local_disk_object_path(&io_root, &volume_str, object_name);
                 #[cfg(target_os = "linux")]
-                let path_check = check_local_disk_valid_object_path_at(&io_root, &mount_lease, &bucket_path, &object_dir);
+                {
+                    if let Err(err) = check_local_disk_object_path_components(&io_root, &bucket_path, &object_dir) {
+                        return Err(ReadAllError::Disk(err));
+                    }
+                    match read_listing_metadata_entry_std(&root, &object_dir) {
+                        Ok(read) => Ok(read),
+                        Err(err) => {
+                            if let Err(path_err) =
+                                check_local_disk_valid_object_path_at(&io_root, &mount_lease, &bucket_path, &object_dir)
+                            {
+                                Err(ReadAllError::Disk(path_err))
+                            } else {
+                                Err(err)
+                            }
+                        }
+                    }
+                }
                 #[cfg(not(target_os = "linux"))]
-                let path_check = check_local_disk_valid_object_path(&io_root, &bucket_path, &object_dir);
-                match path_check {
-                    Ok(()) => read_listing_metadata_entry_std(&root, &object_dir),
-                    Err(err) => Err(ReadAllError::Disk(err)),
+                {
+                    match check_local_disk_valid_object_path(&io_root, &bucket_path, &object_dir) {
+                        Ok(()) => read_listing_metadata_entry_std(&root, &object_dir),
+                        Err(err) => Err(ReadAllError::Disk(err)),
+                    }
                 }
             });
         }));
@@ -10452,16 +11360,46 @@ impl LocalDisk {
 
         let durability = effective_durability(volume);
 
+        let do_sync = sync && durability.syncs_commit_metadata();
+        if let Some(ref admission) = admission
+            && !admission.is_initial()
+        {
+            multipart_source_state::invalidate_active_multipart_source_head(admission.source());
+        }
+        if admission.is_some() && !crash_inject::is_armed(CrashPoint::MetaWriteAfterTmpBeforeRename, path) {
+            let precondition = admission.as_ref().map(|a| a.precondition());
+            let root = self.publication_root.clone();
+            let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, namespace_owner).await;
+            os::run_blocking_namespace_operation_with_sync(lease, do_sync, move || {
+                super::fs::create_dir_all_std(&tmp_volume_dir)?;
+                #[cfg(test)]
+                run_owned_file_before_open(&tmp_file_path);
+                let mut file = root.create_truncate(&tmp_file_path)?;
+                std::io::Write::write_all(&mut file, buf.as_ref())?;
+                if do_sync {
+                    file.sync_data()?;
+                }
+                drop(file);
+                os::rename_all_with_precondition_and_parent_sync_std(
+                    &tmp_file_path,
+                    &file_path,
+                    &volume_dir,
+                    &root,
+                    precondition.as_deref(),
+                    do_sync,
+                )
+            })
+            .await
+            .map_err(to_file_error)?;
+            return Ok(());
+        }
+
         // The tmp file is renamed to its final location right below, so only
         // its contents must be durable here (SyncMode::FileOnly): the rename
         // drops the tmp directory entry, and the destination parent directory
         // is fsynced after the rename. Both are metadata commits, so relaxed
         // tiers skip them.
-        let tmp_sync = if sync && durability.syncs_commit_metadata() {
-            SyncMode::FileOnly
-        } else {
-            SyncMode::None
-        };
+        let tmp_sync = if do_sync { SyncMode::FileOnly } else { SyncMode::None };
         self.write_all_internal(&tmp_file_path, buf, tmp_sync, &tmp_volume_dir)
             .await?;
 
@@ -10807,8 +11745,16 @@ impl LocalDisk {
 
                 if entry.ends_with(SLASH_SEPARATOR) {
                     if entry.ends_with(GLOBAL_DIR_SUFFIX_WITH_SLASH) {
-                        let entry =
-                            format!("{}{}", entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR);
+                        let marker_name = entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH);
+                        // An empty marker name would schedule the directory being
+                        // scanned as its own child and recurse until the stack
+                        // overflows. Ignore malformed markers left by older writers
+                        // or corrupt disks instead of decoding them.
+                        if marker_name.is_empty() {
+                            item.clear();
+                            continue;
+                        }
+                        let entry = format!("{marker_name}{SLASH_SEPARATOR}");
                         dir_objes.insert(entry.clone());
                         *item = entry;
                         continue;
@@ -10925,14 +11871,25 @@ impl LocalDisk {
                     }
 
                     let (pop, skip_object, dir_to_skip, scan_required) = dir_stack.pop().expect("operation should succeed");
-                    write_metacache_obj(
-                        out,
-                        &MetaCacheEntry {
+                    let more_ready_in_batch = !(opts.recursive && scan_required)
+                        && prefetched_batch.as_ref().is_some_and(|b| b.remaining > 0 && !b.rx.is_empty());
+                    if more_ready_in_batch {
+                        out.write_obj_buffered(&MetaCacheEntry {
                             name: pop.clone(),
                             ..Default::default()
-                        },
-                    )
-                    .await?;
+                        })
+                        .await
+                        .map_err(metacache_write_error)?;
+                    } else {
+                        write_metacache_obj(
+                            out,
+                            &MetaCacheEntry {
+                                name: pop.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    }
 
                     let scan_path = pop.clone();
                     if opts.recursive && scan_required {
@@ -10989,7 +11946,14 @@ impl LocalDisk {
                         let mut spawned = false;
                         let (volume_dir, raw_res) = loop {
                             if let Some(batch) = prefetched_batch.as_mut() {
-                                if let Some(raw_res) = with_walk_stall_deadline(stall, batch.rx.recv()).await? {
+                                let next_res = match batch.rx.try_recv() {
+                                    Ok(res) => Some(res),
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                        with_walk_stall_deadline(stall, batch.rx.recv()).await?
+                                    }
+                                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
+                                };
+                                if let Some(raw_res) = next_res {
                                     batch.remaining -= 1;
                                     let stop = batch.remaining == 0
                                         || raw_res.as_ref().map_or(true, |r| r.has_namespace_child_candidate);
@@ -11027,7 +11991,13 @@ impl LocalDisk {
                             };
                             prefetched_batch = Some(self.spawn_listing_metadata_batch(&opts.bucket, batch_names, stall).await?);
                         };
-                        with_walk_stall_timeout(stall, self.resolve_read_all_result(&opts.bucket, &volume_dir, raw_res)).await
+                        match raw_res {
+                            Ok(read) => Ok(read),
+                            Err(err) => {
+                                with_walk_stall_timeout(stall, self.resolve_read_all_result(&opts.bucket, &volume_dir, Err(err)))
+                                    .await
+                            }
+                        }
                     }
                     .await
                 } else {
@@ -11060,10 +12030,19 @@ impl LocalDisk {
 
                         meta.metadata = read.bytes;
 
-                        write_metacache_obj(out, &meta).await?;
-
                         if opts.limit <= 0 || read.counts_toward_limit {
                             *objs_returned += 1;
+                        }
+
+                        let reached_limit = opts.limit > 0 && *objs_returned >= opts.limit;
+                        let more_ready_in_batch = !reached_limit
+                            && !read.has_namespace_child_candidate
+                            && dir_stack.is_empty()
+                            && prefetched_batch.as_ref().is_some_and(|b| b.remaining > 0 && !b.rx.is_empty());
+                        if more_ready_in_batch {
+                            out.write_obj_buffered(&meta).await.map_err(metacache_write_error)?;
+                        } else {
+                            write_metacache_obj(out, &meta).await?;
                         }
 
                         let has_namespace_child_candidate = read.has_namespace_child_candidate;
@@ -11547,7 +12526,7 @@ fn is_root_path(path: impl AsRef<Path>) -> bool {
 }
 
 fn metadata_counts_toward_limit(metadata: &[u8]) -> bool {
-    FileMeta::load(metadata).map_or(true, |meta| file_meta_counts_toward_limit(&meta))
+    FileMeta::bytes_count_toward_listing_limit(metadata)
 }
 
 fn file_meta_counts_toward_limit(meta: &FileMeta) -> bool {
@@ -11663,8 +12642,7 @@ fn local_disk_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBu
 #[cfg(not(windows))]
 #[inline]
 fn is_clean_relative_segment(s: &str) -> bool {
-    let b = s.as_bytes();
-    !matches!(b.first(), None | Some(b'/' | b'.')) && !b.ends_with(b"/") && !b.windows(2).any(|w| matches!(w, b"//" | b"/."))
+    !s.starts_with('/') && rustfs_utils::path::unix_is_canonical_ascii_path(s.as_bytes())
 }
 
 fn build_local_disk_object_path(root: &Path, bucket: &str, key: &str) -> (PathBuf, PathBuf) {
@@ -11711,10 +12689,26 @@ fn build_local_disk_bucket_path(root: &Path, bucket: &str) -> PathBuf {
     bucket_path
 }
 
+#[inline]
+fn disk_path_starts_with_normalized(path: &Path, base: &Path) -> bool {
+    #[cfg(not(windows))]
+    return rustfs_utils::path::unix_normalized_path_starts_with(path, base);
+    #[cfg(windows)]
+    path.starts_with(base)
+}
+
+#[inline]
+fn disk_path_strip_prefix_normalized<'a>(path: &'a Path, base: &Path) -> Result<&'a Path> {
+    #[cfg(not(windows))]
+    return rustfs_utils::path::unix_normalized_path_strip_prefix(path, base).ok_or(DiskError::InvalidPath);
+    #[cfg(windows)]
+    path.strip_prefix(base).map_err(|_| DiskError::InvalidPath)
+}
+
 fn check_local_disk_valid_object_path(root: &Path, bucket_path: &Path, path: &Path) -> Result<()> {
     let bucket_path = normalize_path_cow(bucket_path);
     let path = normalize_path_cow(path);
-    if !bucket_path.starts_with(root) || !path.starts_with(&bucket_path) {
+    if !disk_path_starts_with_normalized(&bucket_path, root) || !disk_path_starts_with_normalized(&path, &bucket_path) {
         return Err(DiskError::InvalidPath);
     }
 
@@ -11723,7 +12717,7 @@ fn check_local_disk_valid_object_path(root: &Path, bucket_path: &Path, path: &Pa
 
 fn check_local_disk_valid_path(root: &Path, path: impl AsRef<Path>) -> Result<()> {
     let path = normalize_path_cow(path.as_ref());
-    if !path.starts_with(root) {
+    if !disk_path_starts_with_normalized(&path, root) {
         return Err(DiskError::InvalidPath);
     }
 
@@ -11744,7 +12738,7 @@ fn check_local_disk_object_path_components<'a>(
 ) -> Result<std::borrow::Cow<'a, Path>> {
     let bucket_path = normalize_path_cow(bucket_path);
     let path = normalize_path_cow(path);
-    if !bucket_path.starts_with(root) || !path.starts_with(&bucket_path) {
+    if !disk_path_starts_with_normalized(&bucket_path, root) || !disk_path_starts_with_normalized(&path, &bucket_path) {
         return Err(DiskError::InvalidPath);
     }
 
@@ -11754,7 +12748,7 @@ fn check_local_disk_object_path_components<'a>(
 #[cfg(target_os = "linux")]
 fn check_local_disk_valid_path_at(root: &Path, root_fd: &std::fs::File, path: impl AsRef<Path>) -> Result<()> {
     let path = normalize_path_cow(path.as_ref());
-    if !path.starts_with(root) {
+    if !disk_path_starts_with_normalized(&path, root) {
         return Err(DiskError::InvalidPath);
     }
 
@@ -11763,7 +12757,7 @@ fn check_local_disk_valid_path_at(root: &Path, root_fd: &std::fs::File, path: im
 
 #[cfg(target_os = "linux")]
 fn reject_local_disk_symlink_components_at(root: &Path, root_fd: &std::fs::File, path: &Path) -> Result<()> {
-    let relative = path.strip_prefix(root).map_err(|_| DiskError::InvalidPath)?;
+    let relative = disk_path_strip_prefix_normalized(path, root)?;
     match validate_existing_local_disk_prefix_at(root_fd, relative) {
         Ok(()) => Ok(()),
         Err(LocalDiskPathValidationAtError::Unsupported) => reject_local_disk_symlink_components(root, path),
@@ -11791,11 +12785,11 @@ fn validate_existing_local_disk_prefix_at(
         return Ok(());
     }
 
-    let mut candidate = relative.to_path_buf();
+    let mut candidate = relative;
     loop {
         match openat2(
             root_fd,
-            &candidate,
+            candidate,
             OFlags::PATH | OFlags::CLOEXEC,
             Mode::empty(),
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
@@ -11804,10 +12798,12 @@ fn validate_existing_local_disk_prefix_at(
             Err(Errno::NOSYS) => return Err(LocalDiskPathValidationAtError::Unsupported),
             Err(Errno::LOOP | Errno::XDEV) => return Err(LocalDiskPathValidationAtError::InvalidPath),
             Err(Errno::NOENT) => {
-                let Some(parent) = candidate.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+                let Some(parent) =
+                    rustfs_utils::path::unix_path_parent(candidate).filter(|parent| !parent.as_os_str().is_empty())
+                else {
                     return Ok(());
                 };
-                candidate = parent.to_path_buf();
+                candidate = parent;
             }
             Err(err) => return Err(LocalDiskPathValidationAtError::Io(err.into())),
         }
@@ -11815,7 +12811,7 @@ fn validate_existing_local_disk_prefix_at(
 }
 
 fn reject_local_disk_symlink_components(root: &Path, path: &Path) -> Result<()> {
-    let relative = path.strip_prefix(root).map_err(|_| DiskError::InvalidPath)?;
+    let relative = disk_path_strip_prefix_normalized(path, root)?;
     let mut current = root.to_path_buf();
 
     for component in relative.components() {
@@ -11839,12 +12835,11 @@ fn reject_local_disk_symlink_components(root: &Path, path: &Path) -> Result<()> 
 fn normalize_path_cow(path: &Path) -> std::borrow::Cow<'_, Path> {
     // Windows prefixes retain the existing PathBuf reconstruction semantics.
     #[cfg(not(windows))]
-    if !path.as_os_str().as_encoded_bytes().contains(&b'.')
-        || !path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
     {
-        return std::borrow::Cow::Borrowed(path);
+        let bytes = path.as_os_str().as_encoded_bytes();
+        if bytes != b"." && !bytes.starts_with(b"./") && !rustfs_utils::path::unix_path_has_dotdot_segment(bytes) {
+            return std::borrow::Cow::Borrowed(path);
+        }
     }
     std::borrow::Cow::Owned(normalize_path_components(path))
 }
@@ -13092,6 +14087,34 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
+        if bucket == RUSTFS_META_MULTIPART_BUCKET && !paths.is_empty() {
+            let mut cached_parts = Vec::with_capacity(paths.len());
+            let mut all_cached = true;
+            for path_str in paths {
+                let Some(num) = Path::new(path_str)
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .and_then(|v| v.strip_prefix("part."))
+                    .and_then(|v| v.strip_suffix(".meta"))
+                    .and_then(|v| v.parse::<usize>().ok())
+                else {
+                    all_cached = false;
+                    break;
+                };
+                let Ok(source) = self.io_get_object_path(bucket, multipart_staging::upload_scope_root(path_str, true)) else {
+                    all_cached = false;
+                    break;
+                };
+                let Some(part) = multipart_source_state::get_active_multipart_source_part(&source, num) else {
+                    all_cached = false;
+                    break;
+                };
+                cached_parts.push(part);
+            }
+            if all_cached {
+                return Ok(cached_parts);
+            }
+        }
         let volume_dir = self.io_get_bucket_path(bucket)?;
         stream::iter(0..paths.len())
             .map(|index| self.read_part_metadata(bucket, &volume_dir, &paths[index]))
@@ -13224,7 +14247,7 @@ impl DiskAPI for LocalDisk {
 
         let durability = effective_durability(dst_volume);
         let part = ObjectPartInfo::unmarshal(&meta)?;
-        if let Some(integrity) = part.integrity {
+        let integrity_prep = if let Some(integrity) = part.integrity {
             integrity.validate()?;
             if usize::try_from(integrity.number).map_err(|_| DiskError::FileCorrupt)? != part.number
                 || usize::try_from(integrity.size).map_err(|_| DiskError::FileCorrupt)? != part.size
@@ -13237,63 +14260,96 @@ impl DiskAPI for LocalDisk {
             let destination = dst_file_path.parent().ok_or(DiskError::FileCorrupt)?.join(&proof_name);
             check_path_length(source.to_string_lossy().as_ref())?;
             check_path_length(destination.to_string_lossy().as_ref())?;
-            let stat = fs::symlink_metadata(&source).await.map_err(to_file_error)?;
-            if !stat.is_file() || stat.len() != u64::try_from(integrity.index_size()?).map_err(|_| DiskError::FileCorrupt)? {
-                return Err(DiskError::FileCorrupt);
-            }
-            if durability.syncs_data_shards() {
-                let source = source.clone();
-                let retained_owner = source_owner.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _owner = retained_owner;
-                    os::sync_file(&source)
-                })
-                .await
-                .map_err(DiskError::from)?
-                .map_err(to_file_error)?;
-            }
-            // Publish the immutable generation before preparing the part switch.
-            // Rollback retains the old generation; an unreferenced new index is
-            // reclaimed with the upload directory if preparation is interrupted.
-            os::rename_all_with_precondition_and_parent_sync(
-                &source,
-                &destination,
-                &dst_volume_dir,
-                &self.publication_root,
-                source_owner.clone(),
-                admission.as_ref().map(|check| check.precondition()),
-                durability.syncs_commit_metadata(),
-            )
-            .await?;
+            let expected_len = u64::try_from(integrity.index_size()?).map_err(|_| DiskError::FileCorrupt)?;
+            Some((integrity, source, destination, expected_len))
+        } else {
+            None
+        };
+        let sync = durability.syncs_data_shards() || durability.syncs_commit_metadata();
+        let publication_root = self.publication_root.clone();
+        let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
+        if let Some(ref source) = admission_source {
+            multipart_source_state::begin_active_multipart_part_transaction(source, part.number);
         }
-        let retained_owner = source_owner.clone();
-        tokio::task::spawn_blocking(move || {
-            let _owner = retained_owner;
-            if let Some(admission) = admission {
-                admission.validate().map_err(to_file_error)?;
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&transaction_path, source_owner).await;
+        let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<Result<()>> {
+            if let Some(ref admission) = admission
+                && let Err(err) = admission.validate()
+            {
+                return Ok(Err(to_file_error(err).into()));
             }
-            let source = std::fs::symlink_metadata(&src_file_path).map_err(to_file_error)?;
+            let source = match std::fs::symlink_metadata(&src_file_path) {
+                Ok(source) => source,
+                Err(err) => return Ok(Err(to_file_error(err).into())),
+            };
             if !source.is_file() {
-                return Err(DiskError::FileAccessDenied);
+                return Ok(Err(DiskError::FileAccessDenied));
             }
             if transaction_path.exists() {
-                return Err(DiskError::FileAccessDenied);
+                return Ok(Err(DiskError::FileAccessDenied));
+            }
+            if let Some((integrity, source, destination, expected_len)) = integrity_prep {
+                let stat = match std::fs::symlink_metadata(&source) {
+                    Ok(stat) => stat,
+                    Err(err) => return Ok(Err(to_file_error(err).into())),
+                };
+                if !stat.is_file() || stat.len() != expected_len {
+                    return Ok(Err(DiskError::FileCorrupt));
+                }
+                let verify_and_sync = (|| -> std::io::Result<bool> {
+                    let mut file = std::fs::File::open(&source)?;
+                    let mut header = [0u8; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
+                    std::io::Read::read_exact(&mut file, &mut header)?;
+                    if header != integrity.index_header() {
+                        return Ok(false);
+                    }
+                    if durability.syncs_data_shards() && !take_presynced_tmp_file(&source) {
+                        file.sync_all()?;
+                    }
+                    Ok(true)
+                })();
+                match verify_and_sync {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(Err(DiskError::FileCorrupt)),
+                    Err(err) => return Ok(Err(to_file_error(err).into())),
+                }
+                let precondition = admission.as_ref().map(|check| check.precondition());
+                // Publish the immutable generation before preparing the part switch.
+                // Rollback retains the old generation; an unreferenced new index is
+                // reclaimed with the upload directory if preparation is interrupted.
+                // Defer the parent directory fsync to the transaction_parent fsync
+                // below when both live in the same parent directory.
+                let same_parent = destination.parent() == transaction_path.parent();
+                if let Err(err) = os::rename_all_with_precondition_and_parent_sync_std(
+                    &source,
+                    &destination,
+                    &dst_volume_dir,
+                    &publication_root,
+                    precondition.as_deref(),
+                    durability.syncs_commit_metadata() && !same_parent,
+                ) {
+                    return Ok(Err(to_file_error(err).into()));
+                }
             }
 
             let Some(transaction_parent) = transaction_path.parent() else {
-                return Err(DiskError::InvalidPath);
+                return Ok(Err(DiskError::InvalidPath));
             };
-            std::fs::create_dir_all(transaction_parent).map_err(to_file_error)?;
+            if let Err(err) = std::fs::create_dir_all(transaction_parent) {
+                return Ok(Err(to_file_error(err).into()));
+            }
             let staging_path = transaction_parent.join(format!(".part-txn-{}", Uuid::new_v4()));
-            std::fs::create_dir(&staging_path).map_err(to_file_error)?;
+            if let Err(err) = std::fs::create_dir(&staging_path) {
+                return Ok(Err(to_file_error(err).into()));
+            }
 
             let prepare_result = (|| -> std::io::Result<()> {
-                snapshot_part_transaction_file(
+                let had_old_data = snapshot_part_transaction_file(
                     &dst_file_path,
                     &staging_path.join(PART_TRANSACTION_OLD_DATA),
                     &staging_path.join(PART_TRANSACTION_OLD_DATA_ABSENT),
                 )?;
-                snapshot_part_transaction_file(
+                let had_old_meta = snapshot_part_transaction_file(
                     &dst_meta_path,
                     &staging_path.join(PART_TRANSACTION_OLD_META),
                     &staging_path.join(PART_TRANSACTION_OLD_META_ABSENT),
@@ -13310,11 +14366,12 @@ impl DiskAPI for LocalDisk {
                 // Windows rejects renaming a directory while one of its children is
                 // still open, even when the child handle shares delete access.
                 drop(new_meta);
-                if durability.syncs_commit_metadata() {
+                let sync_overwrite_backup = durability.syncs_commit_metadata() && (had_old_data || had_old_meta);
+                if sync_overwrite_backup {
                     os::fsync_dir_std(&staging_path)?;
                 }
                 std::fs::rename(&staging_path, &transaction_path)?;
-                if durability.syncs_commit_metadata() {
+                if sync_overwrite_backup {
                     os::fsync_dir_std(transaction_parent)?;
                 }
                 Ok(())
@@ -13322,19 +14379,26 @@ impl DiskAPI for LocalDisk {
 
             if let Err(err) = prepare_result {
                 let _ = remove_dir_all_if_exists(&staging_path);
-                return Err(to_file_error(err).into());
+                return Ok(Err(to_file_error(err).into()));
             }
 
-            Ok(())
+            Ok(Ok(()))
         })
         .await
-        .map_err(DiskError::from)?
+        .map_err(to_file_error)?;
+        if res.is_err()
+            && let Some(ref source) = admission_source
+        {
+            multipart_source_state::invalidate_active_multipart_source_head(source);
+        }
+        res
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
         let source_owner = self.multipart_source_owner(volume, path, true, false, None).await?;
         let admission = self.multipart_source_admission(volume, path, true, false)?;
+        let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
         self.io_get_bucket_path(volume)?;
         let current_data_path = self.io_get_object_path(volume, path)?;
         let current_meta_path = self.io_get_object_path(volume, &format!("{path}.meta"))?;
@@ -13343,47 +14407,62 @@ impl DiskAPI for LocalDisk {
             check_path_length(candidate.to_string_lossy().as_ref())?;
         }
         let durability = effective_durability(volume);
+        let sync = durability.syncs_commit_metadata();
+        let part_number = current_data_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("part."))
+            .and_then(|num| num.parse::<usize>().ok());
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&transaction_path, source_owner).await;
 
-        tokio::task::spawn_blocking(move || {
-            let _owner = source_owner;
+        let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<Result<bool>> {
             match std::fs::symlink_metadata(&transaction_path) {
                 Ok(metadata) if metadata.is_dir() => {}
-                Ok(_) => return Err(DiskError::FileCorrupt),
-                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-                Err(err) => return Err(to_file_error(err).into()),
+                Ok(_) => return Ok(Err(DiskError::FileCorrupt)),
+                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Ok(false)),
+                Err(err) => return Ok(Err(to_file_error(err).into())),
             }
 
-            if let Some(admission) = admission {
-                admission.validate().map_err(to_file_error)?;
+            if let Some(admission) = admission
+                && let Err(err) = admission.validate()
+            {
+                return Ok(Err(to_file_error(err).into()));
             }
             if action == PartTransactionAction::Rollback {
-                std::fs::write(transaction_path.join(PART_TRANSACTION_ROLLBACK), []).map_err(to_file_error)?;
-                if durability.syncs_commit_metadata() {
-                    os::fsync_dir_std(&transaction_path).map_err(to_file_error)?;
+                if let Err(err) = std::fs::write(transaction_path.join(PART_TRANSACTION_ROLLBACK), []) {
+                    return Ok(Err(to_file_error(err).into()));
                 }
-                restore_part_transaction_file(
+                if durability.syncs_commit_metadata()
+                    && let Err(err) = os::fsync_dir_std(&transaction_path)
+                {
+                    return Ok(Err(to_file_error(err).into()));
+                }
+                if let Err(err) = restore_part_transaction_file(
                     &current_data_path,
                     &transaction_path.join(PART_TRANSACTION_OLD_DATA),
                     &transaction_path.join(PART_TRANSACTION_OLD_DATA_ABSENT),
                     &transaction_path.join("restore.data"),
-                )
-                .map_err(to_file_error)?;
-                restore_part_transaction_file(
+                ) {
+                    return Ok(Err(to_file_error(err).into()));
+                }
+                if let Err(err) = restore_part_transaction_file(
                     &current_meta_path,
                     &transaction_path.join(PART_TRANSACTION_OLD_META),
                     &transaction_path.join(PART_TRANSACTION_OLD_META_ABSENT),
                     &transaction_path.join("restore.meta"),
-                )
-                .map_err(to_file_error)?;
+                ) {
+                    return Ok(Err(to_file_error(err).into()));
+                }
                 if durability.syncs_commit_metadata()
                     && let Some(parent) = current_data_path.parent()
+                    && let Err(err) = os::fsync_dir_std(parent)
                 {
-                    os::fsync_dir_std(parent).map_err(to_file_error)?;
+                    return Ok(Err(to_file_error(err).into()));
                 }
             }
 
             let Some(parent) = transaction_path.parent() else {
-                return Err(DiskError::InvalidPath);
+                return Ok(Err(DiskError::InvalidPath));
             };
             // Delete only the generation made obsolete by this settled switch.
             // Check the published metadata before removing either proof, so a
@@ -13410,25 +14489,38 @@ impl DiskAPI for LocalDisk {
             {
                 let obsolete_path = parent.join(integrity.file_name());
                 match std::fs::remove_file(&obsolete_path) {
-                    Ok(()) => {
-                        if durability.syncs_commit_metadata() {
-                            os::fsync_dir_std(parent).map_err(to_file_error)?;
-                        }
-                    }
+                    Ok(()) => {}
                     Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => return Err(to_file_error(error).into()),
+                    Err(error) => return Ok(Err(to_file_error(error).into())),
                 }
             }
             let cleanup_path = parent.join(format!(".part-txn-settled-{}", Uuid::new_v4()));
-            std::fs::rename(&transaction_path, &cleanup_path).map_err(to_file_error)?;
-            if durability.syncs_commit_metadata() {
-                os::fsync_dir_std(parent).map_err(to_file_error)?;
+            if let Err(err) = std::fs::rename(&transaction_path, &cleanup_path) {
+                return Ok(Err(to_file_error(err).into()));
             }
-            remove_dir_all_if_exists(&cleanup_path).map_err(to_file_error)?;
-            Ok(())
+            if durability.syncs_commit_metadata()
+                && let Err(err) = os::fsync_dir_std(parent)
+            {
+                return Ok(Err(to_file_error(err).into()));
+            }
+            if let Err(err) = remove_dir_all_if_exists(&cleanup_path) {
+                return Ok(Err(to_file_error(err).into()));
+            }
+            Ok(Ok(true))
         })
         .await
-        .map_err(DiskError::from)??;
+        .map_err(to_file_error)?;
+
+        if let Some(ref source) = admission_source {
+            let retired_existing_txn = matches!(res, Ok(true));
+            multipart_source_state::finish_active_multipart_part_transaction(
+                source,
+                part_number,
+                res.is_ok() && action == PartTransactionAction::Commit,
+                retired_existing_txn,
+            );
+        }
+        res?;
 
         self.io_backend.invalidate_cached_fd(volume, path).await;
         Ok(())
@@ -13442,6 +14534,7 @@ impl DiskAPI for LocalDisk {
         let source_owner = self.multipart_source_owner(dst_volume, dst_path, true, false, None).await?;
         multipart_staging::reject_reserved_anchor(dst_path)?;
         let admission = self.multipart_source_admission(dst_volume, dst_path, true, false)?;
+        let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
         pool_meta_native::reject_raw_path(&self.root, src_volume, src_path)?;
         pool_meta_native::reject_raw_path(&self.root, dst_volume, dst_path)?;
         let src_volume_dir = self.io_get_bucket_path(src_volume)?;
@@ -13580,14 +14673,11 @@ impl DiskAPI for LocalDisk {
                     None
                 };
 
-                if durability.syncs_data_shards() && !src_is_dir {
+                if durability.syncs_data_shards() && !src_is_dir && !take_presynced_tmp_file(&src_file_path) {
                     os::sync_file(&src_file_path).map_err(to_file_error)?;
                 }
 
-                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
                 let precondition = admission.as_ref().map(|check| check.precondition());
-                #[cfg(not(all(any(test, feature = "test-util"), not(windows))))]
-                let precondition: Option<Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>> = None;
 
                 os::rename_all_with_precondition_and_parent_sync_std(
                     &src_file_path,
@@ -13646,17 +14736,38 @@ impl DiskAPI for LocalDisk {
                 }
             })
             .await
-            .map_err(DiskError::from)?;
+            .map_err(DiskError::from);
+        let published_transaction_meta = match published_transaction_meta {
+            Ok(published) => published,
+            Err(err) => {
+                if let Some(ref source) = admission_source {
+                    multipart_source_state::invalidate_active_multipart_source_head(source);
+                }
+                return Err(err);
+            }
+        };
 
-        if !published_transaction_meta {
-            self.write_all_meta_with_namespace_owner(
-                dst_volume,
-                &format!("{dst_path}.meta"),
-                meta_for_legacy,
-                true,
-                source_owner.clone(),
-            )
-            .await?;
+        if !published_transaction_meta
+            && let Err(err) = self
+                .write_all_meta_with_namespace_owner(
+                    dst_volume,
+                    &format!("{dst_path}.meta"),
+                    meta_for_legacy.clone(),
+                    true,
+                    source_owner.clone(),
+                )
+                .await
+        {
+            if let Some(ref source) = admission_source {
+                multipart_source_state::invalidate_active_multipart_source_head(source);
+            }
+            return Err(err);
+        }
+        if !src_is_dir
+            && let Some(ref source) = admission_source
+            && let Ok(part_info) = ObjectPartInfo::unmarshal(&meta_for_legacy)
+        {
+            multipart_source_state::record_active_multipart_part_committed(source, part_info);
         }
 
         if src_is_dir {
@@ -13773,7 +14884,12 @@ impl DiskAPI for LocalDisk {
         }
         pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         crate::hp_guard!("LocalDisk::create_file");
-        if !origvolume.is_empty() {
+        let is_tmp_part_or_proof = volume == RUSTFS_META_TMP_BUCKET
+            && Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("part.") || (name.starts_with(".part.") && name.contains(".proof.")));
+        if !origvolume.is_empty() && !is_tmp_part_or_proof {
             let origvolume_dir = self.io_get_bucket_path(origvolume)?;
             if !skip_access_checks(origvolume) {
                 cached_access(origvolume_dir)
@@ -13787,9 +14903,9 @@ impl DiskAPI for LocalDisk {
         #[cfg(not(test))]
         let probe_active = false;
         let sync_on_close = cfg!(target_os = "linux")
-            && volume == RUSTFS_META_TMP_BUCKET
             && !origvolume.is_empty()
-            && path.ends_with("/part.1")
+            && origvolume != RUSTFS_META_MULTIPART_BUCKET
+            && is_tmp_part_or_proof
             && effective_durability(origvolume).syncs_data_shards()
             && !os::file_fdatasync_group_commit_enabled()
             && !probe_active;
@@ -14508,6 +15624,15 @@ impl DiskAPI for LocalDisk {
         check_path_length(file_path.to_string_lossy().as_ref())?;
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READ_VERSION_PATH_CHECK, path_check_start);
 
+        if volume == RUSTFS_META_MULTIPART_BUCKET
+            && !opts.read_data
+            && version_id.is_empty()
+            && let Some((_, mut cached_fi)) = multipart_source_state::get_active_multipart_source_head(&file_path)
+        {
+            cached_fi.name = path.to_owned();
+            return Ok(cached_fi);
+        }
+
         let read_data = opts.read_data;
 
         let xlmeta_read_start = get_stage_timer_if_enabled(stage_metrics_enabled);
@@ -14610,6 +15735,12 @@ impl DiskAPI for LocalDisk {
         super::lifecycle_test_io::observe(volume, Some(path));
         crate::hp_guard!("LocalDisk::read_xl");
         let file_path = self.io_get_object_path(volume, path)?;
+        if volume == RUSTFS_META_MULTIPART_BUCKET
+            && !read_data
+            && let Some((raw, _)) = multipart_source_state::get_active_multipart_source_head(&file_path)
+        {
+            return Ok(RawFileInfo { buf: raw.to_vec() });
+        }
         let file_dir = self.io_get_bucket_path(volume)?;
 
         let (buf, _) = self.read_raw(volume, file_dir, file_path, read_data).await?;
@@ -14626,6 +15757,11 @@ impl DiskAPI for LocalDisk {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
+        if volume == RUSTFS_META_MULTIPART_BUCKET
+            && let Ok(source) = self.io_get_object_path(volume, multipart_staging::upload_scope_root(path, false))
+        {
+            multipart_source_state::invalidate_active_multipart_source_head(&source);
+        }
         self.delete_version_inner(
             volume,
             path,
@@ -15847,7 +16983,7 @@ mod test {
         std::fs::write(&xl_path, old_metadata).expect("old metadata should be written");
         set_local_inline_rollback_hardlink_failure(&xl_path);
 
-        let rollback_path = create_local_inline_rollback_backup(&xl_path, &staging_path, old_metadata)
+        let rollback_path = create_local_inline_rollback_backup(&xl_path, &staging_path, old_metadata, false)
             .expect("copy fallback should create rollback backup");
         let backup = std::fs::read(&rollback_path).expect("fallback backup should be readable");
 
@@ -26230,6 +27366,49 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_scan_dir_ignores_empty_directory_markers() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create disk directory");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+        for object in ["__XLDIR__", "nested/__XLDIR__", "nested/healthy", "folder__XLDIR__"] {
+            let object_dir = bucket_dir.join(object);
+            fs::create_dir_all(&object_dir).await.expect("create object directory");
+            fs::write(object_dir.join("xl.meta"), b"meta")
+                .await
+                .expect("write object metadata");
+        }
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("valid disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_owned(),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut count = 0;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut count, false, None),
+        )
+        .await
+        .expect("malformed directory marker must not recurse into its parent")
+        .expect("scan succeeds despite malformed markers");
+        out.close().await.expect("close metacache stream");
+        let entries = MetacacheReader::new(reader).read_all().await.expect("read listed objects");
+        let names: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, vec!["folder/", "nested/healthy"]);
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
     async fn test_scan_dir_deduplicates_explicit_dir_marker_recursion() {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
@@ -28243,19 +29422,24 @@ mod test {
         let metadata = dir.path().join("existing-metadata");
         fs::write(&metadata, b"existing").await.expect("metadata fixture");
         for sync in [SyncMode::None, SyncMode::FileOnly, SyncMode::FileAndDir] {
-            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-            let queue = Arc::clone(&disk.blocking_queue);
-            let blocker = tokio::spawn(async move {
-                queue
-                    .run_fsync_cancellable(move |_| {
-                        let _ = started_tx.send(());
-                        let _ = release_rx.blocking_recv();
-                        Ok(())
-                    })
-                    .await
-            });
-            started_rx.await.expect("fsync lane blocked");
+            let mut release_txs = Vec::new();
+            let mut blockers = Vec::new();
+            for _ in 0..os::MAX_FSYNC_WORKERS_PER_DISK {
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let queue = Arc::clone(&disk.blocking_queue);
+                blockers.push(tokio::spawn(async move {
+                    queue
+                        .run_fsync_cancellable(move |_| {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.blocking_recv();
+                            Ok(())
+                        })
+                        .await
+                }));
+                started_rx.await.expect("fsync worker blocked");
+                release_txs.push(release_tx);
+            }
             let path = dir.path().join("new-metadata");
             let mut write = std::pin::pin!(disk.write_all_internal(&path, Bytes::from_static(b"new"), sync, dir.path(),));
             assert!(futures::FutureExt::now_or_never(&mut write).is_none());
@@ -28270,8 +29454,12 @@ mod test {
             )
             .await;
             let published_before_sync = path.exists();
-            release_tx.send(()).expect("release fsync lane");
-            blocker.await.expect("blocker joined").expect("blocker completed");
+            for release_tx in release_txs {
+                release_tx.send(()).expect("release fsync worker");
+            }
+            for blocker in blockers {
+                blocker.await.expect("blocker joined").expect("blocker completed");
+            }
             write.await.expect("write completed");
             assert_eq!(
                 read.expect("metadata read must progress")
@@ -33585,11 +34773,217 @@ mod test {
         });
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_invalidation_releases_descriptors_without_further_operations() {
+        let cache = FdCache::new();
+        for round in 0..4 {
+            let file = Arc::new(tempfile::tempfile().expect("create a descriptor to invalidate"));
+            let released = Arc::downgrade(&file);
+            let parts = if round == 1 || round == 2 { FD_CACHE_CAPACITY } else { 1 };
+            for part in 0..parts {
+                cache
+                    .insert(
+                        FdKey {
+                            volume: "bucket".into(),
+                            path: format!("object-{round}/part.{part}"),
+                            direct: false,
+                        },
+                        file.clone(),
+                    )
+                    .await;
+            }
+            drop(file);
+            if round % 2 == 0 {
+                cache.invalidate_under("bucket", &format!("object-{round}"));
+            } else {
+                cache.invalidate_volume("bucket");
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while released.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("invalidation must release descriptors without another cache operation");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_invalidation_rejects_entries_before_maintenance() {
+        let cache = FdCache::new();
+        let key = FdKey {
+            volume: "bucket".into(),
+            path: "object/part.1".into(),
+            direct: false,
+        };
+        cache
+            .insert(key.clone(), Arc::new(tempfile::tempfile().expect("create a cached descriptor")))
+            .await;
+        assert!(cache.get(&key).await.is_some());
+        cache.invalidate_under("bucket", "object");
+
+        // No yield has allowed the maintenance task to remove the entry yet.
+        assert!(cache.cache.contains_key(&key));
+        assert!(cache.get(&key).await.is_none(), "a marked descriptor must never be served");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_idle_maintenance_releases_expired_descriptors() {
+        let cache = FdCache::with_ttl(std::time::Duration::from_millis(50));
+        let file = Arc::new(tempfile::tempfile().expect("create a descriptor with a short TTL"));
+        let released = Arc::downgrade(&file);
+        let key = FdKey {
+            volume: "retained".into(),
+            path: "part.1".into(),
+            direct: false,
+        };
+        cache.insert(key.clone(), file).await;
+        cache.invalidate_volume("other");
+        assert!(cache.get(&key).await.is_some(), "invalidation must preserve other volumes");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while released.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("periodic maintenance must release expired descriptors while idle");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_maintenance_exits_when_cache_is_dropped() {
+        let mut cache = FdCache::new();
+        let file = Arc::new(tempfile::tempfile().expect("create a descriptor to retire"));
+        let released = Arc::downgrade(&file);
+        cache
+            .insert(
+                FdKey {
+                    volume: "bucket".into(),
+                    path: "part.1".into(),
+                    direct: false,
+                },
+                file,
+            )
+            .await;
+        cache.invalidate_volume("bucket");
+        let maintenance = cache.maintenance_task.take().expect("invalidation starts maintenance");
+        drop(cache);
+        tokio::time::timeout(std::time::Duration::from_secs(10), maintenance)
+            .await
+            .expect("dropping the cache must stop its maintenance task")
+            .expect("maintenance must complete without a panic");
+        assert!(released.upgrade().is_none(), "shutdown must release cached descriptors");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_maintenance_survives_request_cancellation() {
+        let cache = FdCache::new();
+        let file = Arc::new(tempfile::tempfile().expect("create a descriptor to invalidate"));
+        let released = Arc::downgrade(&file);
+        cache
+            .insert(
+                FdKey {
+                    volume: "bucket".into(),
+                    path: "part.1".into(),
+                    direct: false,
+                },
+                file,
+            )
+            .await;
+        let mut request = Box::pin(async {
+            cache.invalidate_volume("bucket");
+            std::future::pending::<()>().await;
+        });
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(request.as_mut(), &mut context).is_pending());
+        drop(request);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while released.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("maintenance must continue after the invalidating request is cancelled");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_cache_construction_does_not_require_a_runtime() {
+        let cache = FdCache::new();
+        assert!(cache.maintenance_task.get().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_invalidation_fences_an_open_before_the_first_insert() {
+        for mode in 0..2 {
+            let cache = FdCache::new();
+            let key = FdKey {
+                volume: "bucket".into(),
+                path: "object/part.1".into(),
+                direct: false,
+            };
+            let opened = Arc::new(FdCacheEntry {
+                file: Arc::new(tempfile::tempfile().expect("open the descriptor before invalidation")),
+                len: 0,
+                invalidated: AtomicBool::new(false),
+            });
+            let generation = cache.generation();
+            match mode {
+                0 => cache.invalidate_under("bucket", "object"),
+                _ => cache.invalidate_volume("bucket"),
+            }
+            cache.insert_if_fresh(key.clone(), opened, generation).await;
+            assert!(cache.get(&key).await.is_none(), "mode {mode} must reject a pre-invalidation open");
+
+            let fresh = Arc::new(FdCacheEntry {
+                file: Arc::new(tempfile::tempfile().expect("open a fresh descriptor after invalidation")),
+                len: 0,
+                invalidated: AtomicBool::new(false),
+            });
+            cache.insert_if_fresh(key.clone(), fresh.clone(), cache.generation()).await;
+            let cached = cache.get(&key).await.expect("a post-invalidation open must remain cacheable");
+            assert!(Arc::ptr_eq(&cached, &fresh));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_clear_releases_descriptors_without_further_reads() {
+        let cache = FdCache::new();
+        let file = Arc::new(tempfile::tempfile().expect("create a descriptor to retire"));
+        let released = Arc::downgrade(&file);
+        cache
+            .insert(
+                FdKey {
+                    volume: "bucket".into(),
+                    path: "part.1".into(),
+                    direct: false,
+                },
+                file,
+            )
+            .await;
+        cache.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while released.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clear must release retired descriptors without another cache operation");
+    }
+
     /// Prefix invalidation must respect component boundaries: dropping the
     /// descriptors for object `a/b` must not also drop those for `a/bc`.
-    /// moka applies the predicate lazily, so this also pins the guarantee we rely
-    /// on — a `get` after `invalidate_under` never returns a matched entry.
-    #[cfg(target_os = "linux")]
+    /// A `get` after `invalidate_under` must reject matched entries while
+    /// background maintenance removes them.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn fd_cache_prefix_invalidation_respects_component_boundary() {
         use std::fs::File;
@@ -33825,8 +35219,32 @@ mod test {
             }
         }
 
-        // Invalidating by the object prefix drops the cached descriptor.
+        let key = FdKey {
+            volume: volume.into(),
+            path: object.into(),
+            direct: false,
+        };
+        let released = {
+            let entry = cache
+                .get(&key)
+                .await
+                .expect("repeated reads must retain the cached descriptor");
+            Arc::downgrade(&entry.file)
+        };
+
+        // Reads reject invalidated entries immediately; maintenance releases the descriptor.
         backend.invalidate_cached_fds_under(volume, "obj/abc");
+        assert!(
+            cache.get(&key).await.is_none(),
+            "prefix invalidation must immediately reject the cached descriptor"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while released.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prefix invalidation must release the descriptor without further cache operations");
         assert_eq!(cache.entry_count().await, 0, "prefix invalidation must drop the cached descriptor");
     }
 

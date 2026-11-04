@@ -19,9 +19,27 @@ use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::multipart::MultipartOperations as _;
 use crate::storage_api_contracts::object::ObjectOperations as _;
 use futures::{StreamExt, stream};
+use rustfs_utils::path::encode_dir_object_ref;
 use std::collections::HashSet;
 
 const MULTIPART_LIST_SET_CONCURRENCY: usize = 4;
+
+#[async_trait::async_trait]
+impl crate::storage_api_contracts::multipart::MultipartUploadInspection for ECStore {
+    type Error = Error;
+
+    async fn ensure_no_multipart_uploads(&self, bucket: &str) -> Result<()> {
+        let (_, lifecycle_guard) = self
+            .guard_multipart_bucket_incarnation(bucket, &ObjectOptions::default())
+            .await?;
+        for pool in &self.pools {
+            for set in &pool.disk_set {
+                set.ensure_no_multipart_uploads(bucket).await?;
+            }
+        }
+        ensure_multipart_bucket_lifecycle_guard_held(lifecycle_guard.as_ref(), bucket, "")
+    }
+}
 
 #[cfg(test)]
 static DATA_MOVEMENT_MULTIPART_DISCOVERY_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>> =
@@ -612,7 +630,7 @@ impl ECStore {
         }
         if opts.http_preconditions.is_some()
             && !opts.data_movement
-            && let Some(err) = self.check_write_precondition(bucket, object, &opts).await
+            && let Some(err) = self.check_write_precondition(bucket, object, &opts, false).await
         {
             return Err(err);
         }
@@ -1154,12 +1172,31 @@ impl ECStore {
         Ok(())
     }
 
-    async fn check_write_precondition(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Option<StorageError> {
+    async fn check_write_precondition(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        require_all_pools: bool,
+    ) -> Option<StorageError> {
         let mut lookup_opts = opts.clone();
         let http_preconditions = lookup_opts.http_preconditions?;
         lookup_opts.http_preconditions = None;
         lookup_opts.no_lock = true;
-        let oi = self.get_object_info_for_delete(bucket, object, &lookup_opts).await;
+        let oi = if require_all_pools {
+            lookup_opts.metadata_cache_safe = false;
+            lookup_opts.suppress_read_repair = true;
+            // Only completion uses this branch, after validating bucket and object.
+            let encoded_object = encode_dir_object_ref(object);
+            self.get_latest_object_info_for_conditional_write(bucket, encoded_object.as_ref(), &lookup_opts)
+                .await
+                .and_then(|(info, _)| {
+                    lookup_opts.precondition_check(&info)?;
+                    Ok(info)
+                })
+        } else {
+            self.get_object_info_for_delete(bucket, object, &lookup_opts).await
+        };
         crate::set_disk::SetDisks::evaluate_write_precondition(oi, &http_preconditions, bucket, object, opts)
     }
 
@@ -1173,7 +1210,34 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         check_complete_multipart_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+            // The set-level commit judges the null version this completion
+            // replaces; give it the same authoritative snapshot a PUT carries.
+            let expected_incarnation_id = opts
+                .expected_bucket_incarnation_id
+                .ok_or_else(|| Error::other("multipart completion is missing its bucket incarnation"))?;
+            let lifecycle_fence = opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .ok_or_else(|| Error::other("multipart completion is missing its bucket lifecycle fence"))?;
+            let snapshot = match opts.object_lock_config_snapshot.as_ref() {
+                Some(snapshot) => Arc::clone(snapshot),
+                None => {
+                    self.object_lock_config_snapshot_under_lifecycle_fence(bucket, lifecycle_fence)
+                        .await?
+                }
+            };
+            if !snapshot.is_valid_for_destructive_put(self.id, bucket, expected_incarnation_id) {
+                return Err(Error::other(
+                    "Object Lock snapshot does not hold valid target bucket generation and configuration fences",
+                ));
+            }
+            snapshot.add_lock_fences(&mut opts);
+            opts.object_lock_config_snapshot = Some(snapshot);
+        }
         if !self.single_pool() {
             opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
         }
@@ -1186,11 +1250,13 @@ impl ECStore {
                 .await;
             return enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, opts).await;
         }
-        if opts.http_preconditions.is_some()
-            && !opts.data_movement
-            && let Some(err) = self.check_write_precondition(bucket, object, opts).await
-        {
-            return Err(err);
+        if opts.http_preconditions.is_some() && !opts.data_movement {
+            // Preserve explicitly scoped internal reads and borrowed-lock callers.
+            let require_all_pools =
+                !opts.replication_request && !opts.no_lock && !opts.skip_decommissioned && !opts.skip_rebalancing;
+            if let Some(err) = self.check_write_precondition(bucket, object, opts, require_all_pools).await {
+                return Err(err);
+            }
         }
 
         let result = match self.multipart_upload_pool_idx(bucket, object, upload_id, opts).await {

@@ -39,6 +39,7 @@ use super::storage_api::multipart_usecase::contract::object::ObjectOperations as
 use super::storage_api::multipart_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::multipart_usecase::data_usage::{
     quota_object_size, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+    record_bucket_object_write_unknown_previous_memory,
 };
 use super::storage_api::multipart_usecase::error::{
     StorageError, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
@@ -68,6 +69,7 @@ use super::storage_api::multipart_usecase::sse::{
 };
 use super::storage_api::multipart_usecase::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
+    validate_object_key,
 };
 use super::trailer_adapter::trailer_source;
 use crate::app::object::{
@@ -549,12 +551,9 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        // Special handling for abort_multipart_upload: Per AWS S3 API specification, this operation
-        // should return NoSuchUpload (404) when the upload_id doesn't exist, even if the format
-        // appears invalid. This differs from other multipart operations (upload_part, list_parts,
-        // complete_multipart_upload) which return InvalidArgument for malformed upload_ids.
-        // The lenient validation matches AWS S3 behavior where format validation is relaxed for
-        // abort operations to avoid leaking information about upload_id format requirements.
+        // Per the AWS S3 API reference, a malformed upload ID is reported as
+        // NoSuchUpload (404), the same as an upload that was aborted or
+        // completed. See multipart_upload_api_error.
         match store
             .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), &opts)
             .await
@@ -567,13 +566,7 @@ impl DefaultMultipartUsecase {
                 );
                 Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
             }
-            Err(err) => {
-                // Convert MalformedUploadID to NoSuchUpload for S3 API compatibility
-                if matches!(err, StorageError::MalformedUploadID(_)) {
-                    return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
-                }
-                Err(ApiError::from(err).into())
-            }
+            Err(err) => Err(multipart_upload_api_error(err)),
         }
     }
 
@@ -583,6 +576,8 @@ impl DefaultMultipartUsecase {
         &self,
         mut req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        // Uploads created before the key was reserved must not publish it.
+        validate_object_key(&req.input.key, "CompleteMultipartUpload")?;
         reject_presigned_multipart_max_total_object_size_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -690,34 +685,13 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let current_opts = internal_object_info_lookup_opts(
-            get_opts(&bucket, &key, None, None, &req.headers)
-                .await
-                .map_err(ApiError::from)?,
-        );
-        let object_lock_config_state = Box::pin(load_bucket_object_lock_config_state(&bucket)).await?;
-        let previous_current_sizes = match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &current_opts)?;
-                let physical_size = existing_obj_info.size.max(0) as u64;
-                let logical_size = quota_object_size(&existing_obj_info);
-                Some((physical_size, logical_size))
-            }
-            Err(err) => {
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
-                }
-                None
-            }
-        };
-
         // A lost Complete response retries the same upload id after staging is
         // gone. `get_multipart_info` is NoSuchUpload in that case; completion
         // below replays the committed object instead of failing the retry.
         let multipart_info = match store.get_multipart_info(&bucket, &key, &upload_id, &opts).await {
             Ok(info) => Some(info),
             Err(err) if is_err_invalid_upload_id(&err) => None,
-            Err(err) => return Err(ApiError::from(err).into()),
+            Err(err) => return Err(multipart_upload_api_error(err)),
         };
         // A ciphertext-passthrough session stores encrypted parts verbatim and
         // completes without the customer key (the replication client has none),
@@ -740,11 +714,6 @@ impl DefaultMultipartUsecase {
             }
             validate_complete_multipart_checksum_type(&req.headers, &info.user_defined)?;
         }
-        let cache_adapter = self.object_data_cache();
-        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
-
-        let upload_user_defined = multipart_info.as_ref().map(|info| info.user_defined.clone());
-        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
 
         let quota_metadata_sys = self.bucket_metadata_sys();
         let quota_tracking = quota_metadata_sys.is_some();
@@ -757,12 +726,41 @@ impl DefaultMultipartUsecase {
             apply_quota_admission(&mut opts, &check_result)?;
         }
 
-        let previous_current_size = match previous_current_sizes {
-            Some((_, Ok(logical_size))) if quota_enabled => Some(logical_size),
-            Some((_, Err(err))) if quota_enabled => return Err(ApiError::from(err).into()),
-            Some((physical_size, _)) => Some(physical_size),
-            None => None,
+        let object_lock_config_state = Box::pin(load_bucket_object_lock_config_state(&bucket)).await?;
+        let prelookup_required = quota_enabled
+            || (!super::object::shared::put_like_write_creates_new_version(&opts)
+                && super::object::shared::object_lock_checks_required_for_state(&object_lock_config_state));
+        let prelookup_previous_current_size: Option<Option<u64>> = if prelookup_required {
+            let current_opts = internal_object_info_lookup_opts(
+                get_opts(&bucket, &key, None, None, &req.headers)
+                    .await
+                    .map_err(ApiError::from)?,
+            );
+            match store.get_object_info(&bucket, &key, &current_opts).await {
+                Ok(existing_obj_info) => {
+                    validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &current_opts)?;
+                    Some(Some(if quota_enabled {
+                        quota_object_size(&existing_obj_info).map_err(ApiError::from)?
+                    } else {
+                        existing_obj_info.size.max(0) as u64
+                    }))
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+                    Some(None)
+                }
+            }
+        } else {
+            None
         };
+
+        let cache_adapter = self.object_data_cache();
+        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+
+        let upload_user_defined = multipart_info.as_ref().map(|info| info.user_defined.clone());
+        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
 
         // Replication admission is decided at the object-creation commit, not
         // at multipart-session creation. Configuration and matching targets
@@ -831,11 +829,20 @@ impl DefaultMultipartUsecase {
                 if !obj_info.multipart_completion_replayed {
                     if quota_tracking {
                         let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
-
-                        if versioned {
-                            record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
-                        } else {
-                            record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                        match prelookup_previous_current_size
+                            .or_else(|| super::object::previous_current_size_from_backfill(obj_info.backfilled_old_current_size))
+                        {
+                            Some(previous_current_size) => {
+                                if versioned {
+                                    record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size)
+                                        .await;
+                                } else {
+                                    record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                                }
+                            }
+                            None => {
+                                record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, versioned).await;
+                            }
                         }
                     }
 
@@ -977,6 +984,7 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        validate_object_key(&req.input.key, "CreateMultipartUpload")?;
         let multipart_max_total_object_size = parse_presigned_multipart_max_total_object_size(
             &req.headers,
             req.uri.query(),
@@ -1159,18 +1167,22 @@ impl DefaultMultipartUsecase {
             );
         }
 
-        let current_opts: ObjectOptions = internal_object_info_lookup_opts(
-            get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)
-                .await
-                .map_err(ApiError::from)?,
-        );
-        match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &opts)?
-            }
-            Err(err) => {
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
+        if !super::object::shared::put_like_write_creates_new_version(&opts)
+            && super::object::shared::object_lock_checks_required_for_state(&object_lock_config_state)
+        {
+            let current_opts: ObjectOptions = internal_object_info_lookup_opts(
+                get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)
+                    .await
+                    .map_err(ApiError::from)?,
+            );
+            match store.get_object_info(&bucket, &key, &current_opts).await {
+                Ok(existing_obj_info) => {
+                    validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &opts)?
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
                 }
             }
         }
@@ -1262,7 +1274,7 @@ impl DefaultMultipartUsecase {
         let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(multipart_upload_api_error)?;
         let max_total_object_size = multipart_max_total_object_size(&fi.user_defined)?;
         let mut size = require_upload_part_size(size, max_total_object_size.is_some())?;
         if let Some(limit) = max_total_object_size
@@ -1657,7 +1669,7 @@ impl DefaultMultipartUsecase {
         let res = store
             .list_object_parts(&bucket, &key, &upload_id, params.part_number_marker, params.max_parts, &opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(multipart_upload_api_error)?;
 
         Ok(S3Response::new(build_list_parts_output(res)))
     }
@@ -1774,7 +1786,7 @@ impl DefaultMultipartUsecase {
         let mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(multipart_upload_api_error)?;
         let destination_size_limit = multipart_max_total_object_size(&mp_info.user_defined)?;
         EncryptionRequest {
             bucket: &bucket,
@@ -2101,6 +2113,21 @@ fn normalize_presigned_part_checksums(req: &mut S3Request<UploadPartInput>) -> S
         }
     }
     Ok(())
+}
+
+/// Maps a storage error from an operation that addresses an existing multipart
+/// upload (UploadPart, UploadPartCopy, ListParts, CompleteMultipartUpload and
+/// AbortMultipartUpload) to an S3 error.
+///
+/// A malformed upload ID cannot name an existing upload, so it is reported as
+/// `NoSuchUpload` (404), which the AWS S3 error reference describes as "The
+/// upload ID might be invalid, or the multipart upload might have been aborted
+/// or completed".
+fn multipart_upload_api_error(err: StorageError) -> S3Error {
+    if matches!(err, StorageError::MalformedUploadID(_)) {
+        return S3Error::new(S3ErrorCode::NoSuchUpload);
+    }
+    ApiError::from(err).into()
 }
 
 #[cfg(test)]
@@ -2690,6 +2717,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multipart_upload_rejects_reserved_directory_markers() {
+        for key in ["__XLDIR__", "prefix__XLDIR__/object", "object__XLDIR__"] {
+            let create = CreateMultipartUploadInput::builder()
+                .bucket("bucket".to_owned())
+                .key(key.to_owned())
+                .build()
+                .expect("valid create request DTO");
+            let error = make_usecase()
+                .execute_create_multipart_upload(build_request(create, Method::POST))
+                .await
+                .expect_err("reserved key must be rejected before accessing storage");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+
+            let complete = CompleteMultipartUploadInput::builder()
+                .bucket("bucket".to_owned())
+                .key(key.to_owned())
+                .upload_id("upload".to_owned())
+                .build()
+                .expect("valid complete request DTO");
+            let error = Box::pin(make_usecase().execute_complete_multipart_upload(build_request(complete, Method::POST)))
+                .await
+                .expect_err("uploads created before the fix must not publish reserved keys");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
     async fn execute_create_multipart_upload_rejects_invalid_storage_class() {
         let input = CreateMultipartUploadInput::builder()
             .bucket("bucket".to_string())
@@ -2747,6 +2801,22 @@ mod tests {
 
         metadata.insert("x-minio-internal-max-total-object-size".to_string(), "1".to_string());
         assert!(multipart_max_total_object_size(&metadata).is_err());
+    }
+
+    #[test]
+    fn multipart_upload_api_error_reports_malformed_upload_id_as_no_such_upload() {
+        let malformed = multipart_upload_api_error(StorageError::MalformedUploadID("bucket/object-not-an-id".to_string()));
+        assert_eq!(malformed.code(), &S3ErrorCode::NoSuchUpload);
+
+        let unknown = multipart_upload_api_error(StorageError::InvalidUploadID(
+            "bucket".to_string(),
+            "object".to_string(),
+            "dXBsb2FkLWlk".to_string(),
+        ));
+        assert_eq!(unknown.code(), &S3ErrorCode::NoSuchUpload);
+
+        let other = multipart_upload_api_error(StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()));
+        assert_eq!(other.code(), &S3ErrorCode::NoSuchKey);
     }
 
     #[tokio::test]

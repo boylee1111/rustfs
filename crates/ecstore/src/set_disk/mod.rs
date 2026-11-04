@@ -80,7 +80,7 @@ use crate::erasure::codec::bridge::{
 use crate::erasure::coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::io_support::bitrot::{create_bitrot_reader_from_bytes, create_bitrot_writer};
+use crate::io_support::bitrot::{create_bitrot_reader_from_bytes, create_bitrot_writer, create_bitrot_writer_with_orig_volume};
 use crate::object_api::ObjectOptions;
 use crate::object_api::get_object_body_cache_hook;
 use crate::object_api::object_api_utils::get_raw_etag;
@@ -120,7 +120,6 @@ use bytesize::ByteSize;
 use futures::future::join_all;
 use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
-use regex::Regex;
 use rustfs_config::MI_B;
 use rustfs_filemeta::metadata_keys;
 use rustfs_filemeta::{
@@ -4697,6 +4696,17 @@ pub(crate) fn same_distributed_lock_domain(left: &[Arc<dyn LockClient>], right: 
             .all(|right_client| left.iter().any(|left_client| Arc::ptr_eq(left_client, right_client)))
 }
 
+// Reusing a held writer additionally requires the same quorum, so repeated
+// clients must not give different weight to an otherwise identical domain.
+fn same_distributed_lock_quorum(left: &[Arc<dyn LockClient>], right: &[Arc<dyn LockClient>]) -> bool {
+    !left.is_empty()
+        && left.len() == right.len()
+        && left.iter().all(|client| {
+            left.iter().filter(|other| Arc::ptr_eq(client, other)).count() == 1
+                && right.iter().filter(|other| Arc::ptr_eq(client, other)).count() == 1
+        })
+}
+
 const ERASURE_CACHE_MAX_ENTRIES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -5646,9 +5656,9 @@ impl SetDisks {
     pub(crate) async fn shares_namespace_lock_domain(&self, other: &Self) -> bool {
         match (self.ctx.is_dist_erasure().await, other.ctx.is_dist_erasure().await) {
             (false, false) => Arc::ptr_eq(&self.local_lock_manager, &other.local_lock_manager),
-            (true, true) => {
-                self.set_lock_namespace == other.set_lock_namespace && same_distributed_lock_domain(&self.lockers, &other.lockers)
-            }
+            // Distributed lock clients receive the raw ObjectKey; the pool
+            // namespace is not part of the key stored by their backends.
+            (true, true) => same_distributed_lock_quorum(&self.lockers, &other.lockers),
             _ => false,
         }
     }
@@ -8036,16 +8046,29 @@ fn parts_after_marker(part_numbers: &[usize], part_number_marker: usize) -> Opti
     Some(&part_numbers[index..])
 }
 
-pub fn canonicalize_etag(etag: &str) -> String {
-    let re = Regex::new("\"*?([^\"]*?)\"*?$").unwrap();
-    re.replace_all(etag, "$1").to_string()
+fn canonicalized_etag(etag: &str) -> Cow<'_, str> {
+    // Preserve the legacy suffix-matching behavior for embedded quotes.
+    let trimmed = etag.trim_end_matches('"');
+    let Some(last_quote) = trimmed.rfind('"') else {
+        return Cow::Borrowed(trimmed);
+    };
+    let prefix = trimmed[..last_quote].trim_end_matches('"');
+    let suffix = &trimmed[last_quote + 1..];
+    if prefix.is_empty() {
+        Cow::Borrowed(suffix)
+    } else {
+        let mut result = String::with_capacity(prefix.len() + suffix.len());
+        result.push_str(prefix);
+        result.push_str(suffix);
+        Cow::Owned(result)
+    }
 }
 
 pub fn e_tag_matches(etag: &str, condition: &str) -> bool {
     if condition.trim() == "*" {
         return true;
     }
-    canonicalize_etag(etag) == canonicalize_etag(condition)
+    canonicalized_etag(etag) == canonicalized_etag(condition)
 }
 
 fn weak_etag_matches(etag: &str, condition: &str) -> bool {
@@ -8060,15 +8083,12 @@ fn weak_etag_matches(etag: &str, condition: &str) -> bool {
             .or_else(|| trimmed.strip_prefix("w/"))
             .unwrap_or(trimmed)
     }
-    canonicalize_etag(strip_weak(etag)) == canonicalize_etag(strip_weak(condition))
+    canonicalized_etag(strip_weak(etag)) == canonicalized_etag(strip_weak(condition))
 }
 
-pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
-    let if_none_match = if_none_match
-        .as_deref()
-        .map(str::trim)
-        .filter(|condition| !condition.is_empty());
-    let if_match = if_match.as_deref().map(str::trim).filter(|condition| !condition.is_empty());
+pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<&str>, if_match: Option<&str>) -> bool {
+    let if_none_match = if_none_match.map(str::trim).filter(|condition| !condition.is_empty());
+    let if_match = if_match.map(str::trim).filter(|condition| !condition.is_empty());
 
     match &oi.etag {
         Some(etag) => {
@@ -9029,6 +9049,13 @@ mod tests {
             "constructing an object lock must not clone each client Arc"
         );
 
+        // Check shared ownership before acquisition can spawn pending cleanup.
+        let read_lock = set
+            .new_ns_lock("bucket", "read-object")
+            .await
+            .expect("second namespace lock should be created");
+        assert_eq!(Arc::strong_count(&set.shared_lockers), clients_before + 2);
+
         let write_error = write_lock
             .get_write_lock(Duration::from_millis(500))
             .await
@@ -9043,11 +9070,6 @@ mod tests {
             ),
             "the shared client representation must preserve the exact write quorum result: {write_error}"
         );
-        let read_lock = set
-            .new_ns_lock("bucket", "read-object")
-            .await
-            .expect("second namespace lock should be created");
-        assert_eq!(Arc::strong_count(&set.shared_lockers), clients_before + 2);
         let read_guard = read_lock
             .get_read_lock(Duration::from_millis(500))
             .await
@@ -9871,7 +9893,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    async fn namespace_lock_domain_includes_pool_namespace() {
+    async fn distributed_namespace_lock_domain_follows_backend_not_pool_name() {
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
 
         let first: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
@@ -9910,9 +9932,23 @@ mod tests {
             "sets in the same pool share the object namespace lock domain"
         );
         assert!(
-            !same_pool_first_set.shares_namespace_lock_domain(&other_pool_set).await,
-            "different pool namespaces must not be deduplicated solely by identical clients"
+            same_pool_first_set.shares_namespace_lock_domain(&other_pool_set).await,
+            "different pools using identical backends lock the same raw object key"
         );
+    }
+
+    #[test]
+    fn distributed_lock_domain_rejects_partial_or_duplicate_backends() {
+        let a: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let b: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let c: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        assert!(same_distributed_lock_quorum(&[a.clone(), b.clone()], &[b.clone(), a.clone()]));
+        assert!(!same_distributed_lock_quorum(&[a.clone(), b.clone()], &[a.clone(), c]));
+        assert!(!same_distributed_lock_quorum(
+            &[a.clone(), a.clone(), b.clone()],
+            &[a.clone(), b.clone(), b]
+        ));
+        assert!(!same_distributed_lock_quorum(&[], &[]));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -13773,6 +13809,22 @@ mod tests {
     }
 
     #[test]
+    fn canonicalized_etag_preserves_legacy_regex_semantics() {
+        let regex = regex::Regex::new("\"*?([^\"]*?)\"*?$").expect("valid legacy ETag pattern");
+        let alphabet = ['a', '"', '\n', 'é', '\0'];
+        for length in 0..=6_u32 {
+            for mut number in 0..alphabet.len().pow(length) {
+                let mut input = String::new();
+                for _ in 0..length {
+                    input.push(alphabet[number % alphabet.len()]);
+                    number /= alphabet.len();
+                }
+                assert_eq!(canonicalized_etag(&input), regex.replace_all(&input, "$1"), "input: {input:?}");
+            }
+        }
+    }
+
+    #[test]
     fn test_etag_matches() {
         assert!(e_tag_matches("abc", "abc"));
         assert!(e_tag_matches("\"abc\"", "abc"));
@@ -14347,61 +14399,61 @@ mod tests {
             etag: Some("abc".to_string()),
             ..Default::default()
         };
-        let if_none_match = Some("abc".to_string());
+        let if_none_match = Some("abc");
         let if_match = None;
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some("*".to_string());
+        let if_none_match = Some("*");
         let if_match = None;
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = None;
-        let if_match = Some("def".to_string());
+        let if_match = Some("def");
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = None;
-        let if_match = Some("*".to_string());
+        let if_match = Some("*");
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some("def".to_string());
+        let if_none_match = Some("def");
         let if_match = None;
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some("def".to_string());
-        let if_match = Some("*".to_string());
+        let if_none_match = Some("def");
+        let if_match = Some("*");
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some("def".to_string());
-        let if_match = Some("\"abc\"".to_string());
+        let if_none_match = Some("def");
+        let if_match = Some("\"abc\"");
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some("*".to_string());
-        let if_match = Some("\"abc\"".to_string());
+        let if_none_match = Some("*");
+        let if_match = Some("\"abc\"");
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
         let oi = ObjectInfo {
             etag: None,
             ..Default::default()
         };
-        let if_none_match = Some("*".to_string());
-        let if_match = Some("\"abc\"".to_string());
+        let if_none_match = Some("*");
+        let if_match = Some("\"abc\"");
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = None;
         let if_match = None;
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some(String::new());
-        let if_match = Some(" ".to_string());
+        let if_none_match = Some("");
+        let if_match = Some(" ");
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
         let oi = ObjectInfo {
             etag: Some("abc".to_string()),
             ..Default::default()
         };
-        assert!(should_prevent_write(&oi, Some("W/\"abc\"".to_string()), None));
-        assert!(!should_prevent_write(&oi, Some("W/\"def\"".to_string()), None));
-        assert!(should_prevent_write(&oi, None, Some("W/\"abc\"".to_string())));
+        assert!(should_prevent_write(&oi, Some("W/\"abc\""), None));
+        assert!(!should_prevent_write(&oi, Some("W/\"def\""), None));
+        assert!(should_prevent_write(&oi, None, Some("W/\"abc\"")));
     }
 
     #[test]

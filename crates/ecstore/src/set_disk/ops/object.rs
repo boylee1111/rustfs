@@ -46,9 +46,9 @@ use super::super::{
     build_get_object_info, build_inline_bitrot_readers, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
     check_object_lock_delete, check_object_lock_for_deletion_with_state, check_object_lock_retention_update,
     classify_get_codec_streaming_object_class, classify_put_write_path, classify_storage_error,
-    collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer, debug, delete_file_info_version_id,
-    disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker, finish_set_disk_read_lock,
-    get_codec_streaming_reader_gate_with_plan, get_object_body_cache_hook, get_raw_etag,
+    collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer_with_orig_volume, debug,
+    delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker,
+    finish_set_disk_read_lock, get_codec_streaming_reader_gate_with_plan, get_object_body_cache_hook, get_raw_etag,
     get_small_object_direct_memory_decision_with_threshold_and_plan, get_small_object_direct_memory_threshold,
     get_stage_timer_if_enabled, get_str, get_transitioned_object_reader_with_tier_manager, inline_admission_shard_size,
     inline_erasure_shard_file_offset, inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled,
@@ -4459,9 +4459,10 @@ impl SetDisks {
                             if let Some(disk) = disk_op
                                 && disk.is_online().await
                             {
-                                match create_bitrot_writer(
+                                match create_bitrot_writer_with_orig_volume(
                                     is_inline_buffer,
                                     Some(disk),
+                                    bucket,
                                     RUSTFS_META_TMP_BUCKET,
                                     &tmp_obj,
                                     shard_file_size,
@@ -4533,7 +4534,7 @@ impl SetDisks {
 
             let stream = mem::replace(
                 &mut data.stream,
-                HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
+                HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, true)?,
             );
 
             let small_size_hint = if matches!(write_path, SmallWritePath::Inline | SmallWritePath::SingleBlockNonInline) {
@@ -4957,7 +4958,20 @@ impl SetDisks {
                 );
             }
 
-            if let Some(version_id) = opts.version_id.as_deref()
+            // A write without a version id to a key that is not versioning-Enabled
+            // replaces the key's null version in place, so the WORM gate must judge
+            // that version too. The request-layer pre-check reads the latest
+            // version, which is not the one replaced when a UUID version or a
+            // delete marker sits above a retained null version.
+            let worm_gate_version_id = opts.version_id.clone().or_else(|| {
+                (!opts.versioned
+                    && opts
+                        .object_lock_config_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| !matches!(snapshot.state(), ObjectLockConfigState::ConfirmedAbsent)))
+                .then(|| Uuid::nil().to_string())
+            });
+            if let Some(version_id) = worm_gate_version_id.as_deref()
                 && !is_meta_bucketname(bucket)
             {
                 let explicit_version_lookup_started = rustfs_io_metrics::put_stage_timer();
@@ -4977,9 +4991,10 @@ impl SetDisks {
                     .await;
                 match current {
                     Ok(existing) => {
-                        let object_lock_config = opts.object_lock_config_snapshot.as_deref().ok_or_else(|| {
-                            Error::other("explicit-version PUT is missing its Object Lock configuration snapshot")
-                        })?;
+                        let object_lock_config = opts
+                            .object_lock_config_snapshot
+                            .as_deref()
+                            .ok_or_else(|| Error::other("destructive PUT is missing its Object Lock configuration snapshot"))?;
                         // The WORM gate protects the locked version from local
                         // overwrites; an authorized replication write passes it
                         // only when the LWW merge below will judge every
@@ -5010,6 +5025,8 @@ impl SetDisks {
                             }
                         }
                     }
+                    // A null delete marker has no protected payload to replace.
+                    Err(StorageError::MethodNotAllowed) if version_id == Uuid::nil().to_string() => {}
                     Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
                     Err(err) => return Err(err),
                 }
@@ -6128,7 +6145,11 @@ impl SetDisks {
                     );
                 }
 
-                if !tail_owns_tmp_cleanup {
+                let all_local_disks_cleaned_tmp = all_commit_disks_local
+                    && online_disks.len() == commit_set.set_drive_count
+                    && online_disks.iter().all(Option::is_some)
+                    && !issue3031_diag_enabled();
+                if !tail_owns_tmp_cleanup && !all_local_disks_cleaned_tmp {
                     let cleanup_set = commit_set.clone();
                     let cleanup_tmp_dir = commit_tmp_dir.clone();
                     cleanup_runtime::spawn(commit_cleanup_reservation.clone(), async move {
@@ -9299,6 +9320,60 @@ impl SetDisks {
 }
 
 impl SetDisks {
+    /// Judge the version a versionless destructive delete removes.
+    ///
+    /// For a key that is not versioning-`Enabled`, a delete without a version
+    /// id removes the `null` version, while the preceding Object Lock check
+    /// judged the key's latest entry. When a UUID version or delete marker
+    /// sits above a retained `null` version, the two differ and the retained
+    /// version must be judged on its own. The caller holds the object's write
+    /// lock. Plain unversioned keys and versioning-`Enabled` keys keep a single
+    /// lookup: their latest entry is the version removed.
+    ///
+    /// The lookup future is boxed from a synchronous wrapper so it leaves the
+    /// delete futures' frames: `delete_object` already nests the boxed batch
+    /// path, and inlining a second `get_object_info` overflowed the 4 MiB test
+    /// stack on Linux.
+    fn check_null_version_object_lock_delete<'a>(
+        &'a self,
+        bucket: &'a str,
+        object: &'a str,
+        latest: &'a ObjectInfo,
+        opts: &'a ObjectOptions,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        Box::pin(self.check_null_version_object_lock_delete_inner(bucket, object, latest, opts))
+    }
+
+    async fn check_null_version_object_lock_delete_inner(
+        &self,
+        bucket: &str,
+        object: &str,
+        latest: &ObjectInfo,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        if is_meta_bucketname(bucket)
+            || opts.version_id.is_some()
+            || set_disk_delete_creates_delete_marker(opts)
+            || opts.transition.expire_restored
+            || latest.version_id.is_none_or(|version| version.is_nil())
+        {
+            return Ok(());
+        }
+        let null_opts = ObjectOptions {
+            version_id: Some(Uuid::nil().to_string()),
+            no_lock: true,
+            metadata_cache_safe: false,
+            ..opts.clone()
+        };
+        match self.get_object_info(bucket, object, &null_opts).await {
+            Ok(existing) => check_object_lock_delete(&self.ctx, bucket, object, &existing, &null_opts).await,
+            // A null delete marker has no protected payload to remove.
+            Err(StorageError::MethodNotAllowed) => Ok(()),
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Read current metadata without cache admission or read-side repair. The
     /// outer batch owner already holds the sorted namespace write-lock set.
     pub(crate) async fn conditional_delete_current_snapshot(
@@ -9331,6 +9406,76 @@ where
     // Capability probes are read-only, so a failure can cancel the remaining
     // probes. Admission still requires every probe to complete successfully.
     futures::future::try_join_all(probes).await.map(|_| ()).map_err(Error::from)
+}
+
+/// Per-key source-read inputs for the bulk-delete admission loop. The bounded
+/// metadata pre-fetch and the loop itself must resolve these identically, so
+/// both sides derive them here.
+struct BatchDeleteSourceInputs {
+    replication_object_name: String,
+    explicit_null_version: bool,
+    version_id: Option<Uuid>,
+    versioned: bool,
+    version_suspended: bool,
+    check_opts: ObjectOptions,
+    object_lock_check_required: bool,
+    replicate_delete: bool,
+    needs_source_read: bool,
+}
+
+fn batch_delete_source_inputs(
+    bucket: &str,
+    dobj: &ObjectToDelete,
+    opts: &ObjectOptions,
+    delete_config_snapshot: &DeleteReplicationConfigSnapshot,
+    object_lock_config: &Arc<ObjectLockConfigSnapshot>,
+    guarded: bool,
+) -> BatchDeleteSourceInputs {
+    let replication_object_name = decode_dir_object(&dobj.object_name);
+    let explicit_null_version = is_explicit_null_version(dobj.version_id);
+    let version_id = delete_file_info_version_id(dobj.version_id);
+    let (versioned, version_suspended) = delete_config_snapshot
+        .versioning_config()
+        .delete_state(replication_object_name.as_str());
+    let check_opts = ObjectOptions {
+        version_id: dobj.version_id.map(|version_id| version_id.to_string()),
+        versioned,
+        version_suspended,
+        object_lock_delete: opts.object_lock_delete.clone(),
+        object_lock_config_snapshot: Some(Arc::clone(object_lock_config)),
+        no_lock: true,
+        suppress_read_repair: guarded,
+        ..Default::default()
+    };
+    // A missing bucket Object Lock configuration does not prove that
+    // persisted object metadata is clean: migrated or corrupt data may
+    // still carry an explicit retention or legal hold. Only a real
+    // delete-marker creation can skip the object-level WORM check.
+    let object_lock_check_required = !is_meta_bucketname(bucket) && !set_disk_delete_creates_delete_marker(&check_opts);
+    let replicate_delete = delete_config_snapshot.has_active_rule(&replication_object_name);
+    let marker_delete = dobj.version_id.is_none() || dobj.synthetic_version_id;
+    let replication_needs_source = replicate_delete
+        && (!marker_delete || delete_config_snapshot.active_delete_marker_rules_require_tags(&replication_object_name));
+    // Guarded explicit-version deletes are rejected before any read and must
+    // not join the pre-fetch wave.
+    let admission_error = guarded && dobj.version_id.is_some();
+    let needs_source_read = !admission_error
+        && (object_lock_check_required
+            || replication_needs_source
+            || opts.tier_delete_journal_api.is_some()
+            || dobj.expected_identity.is_some()
+            || dobj.version_id.is_some());
+    BatchDeleteSourceInputs {
+        replication_object_name,
+        explicit_null_version,
+        version_id,
+        versioned,
+        version_suspended,
+        check_opts,
+        object_lock_check_required,
+        replicate_delete,
+        needs_source_read,
+    }
 }
 
 #[async_trait::async_trait]
@@ -9731,7 +9876,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let unique_lock_count = batch.requests.len();
 
         let mut failed_map = HashMap::new();
-        let mut _local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
+        let mut local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
         let mut locked_objects = HashSet::new();
 
         // Instance-scoped, not the ambient facade (backlog#1052) — see
@@ -9748,7 +9893,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             (failed_map, locked_objects, dist_batch_lock_ids) = self.acquire_dist_delete_object_locks_batch(&batch).await;
         } else {
             let batch_result = self.local_lock_manager.acquire_locks_batch(batch).await;
-            _local_batch_guards = batch_result.guards;
+            local_batch_guards = batch_result.guards;
 
             for key in batch_result.successful_locks {
                 locked_objects.insert(key.object.as_ref().to_string());
@@ -9790,8 +9935,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // Every raw batch lock is acquired first. Canonical sorting also
             // gives aliases of one disk key exactly one transaction owner.
             let keys: std::collections::BTreeSet<_> = locked_objects.iter().cloned().collect();
-            for key in keys {
-                match self.acquire_delete_transaction_lock(bucket, &key).await {
+            // Bulk delete is the only multi-key transaction-lock holder; one
+            // batched lock round replaces one quorum round-trip per key and is
+            // deadlock-free by construction (a single `lock_batch` RPC per lock
+            // client, global (shard, key) order at each server). Per-key
+            // failures keep the set layer's per-key error reporting.
+            let key_names: Vec<&str> = keys.iter().map(|key| key.as_str()).collect();
+            let acquired = self
+                .acquire_delete_transaction_locks_batch(bucket, &key_names, super::super::get_lock_acquire_timeout())
+                .await;
+            for (key, result) in keys.into_iter().zip(acquired) {
+                match result {
                     Ok(guard) => {
                         opts.add_namespace_lock_guard(&guard);
                         transaction_guards.insert(key, guard);
@@ -9827,6 +9981,54 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 },
             }
         };
+        // Per-key read inputs are resolved exactly once; the pre-fetch and the
+        // admission loop below consume this table so the two cannot disagree
+        // on eligibility or read options.
+        let mut source_inputs: Vec<Option<BatchDeleteSourceInputs>> = Vec::with_capacity(objects.len());
+        for dobj in &objects {
+            let guarded = current_generations.is_some_and(|generations| generations.contains_key(&dobj.object_name));
+            source_inputs.push(Some(batch_delete_source_inputs(
+                bucket,
+                dobj,
+                &opts,
+                &delete_config_snapshot,
+                &object_lock_config,
+                guarded,
+            )));
+        }
+        // Bounded-parallel pre-fetch of the source metadata each admitted key
+        // needs below. These reads are pure quorum lookups under the locks
+        // already held; sequencing one metadata fan-out per key made a
+        // 1000-key batch pay a full round of drive reads at a time.
+        const DELETE_OBJECTS_SOURCE_READ_CONCURRENCY: usize = 16;
+        let mut source_reads: HashMap<usize, (ObjectInfo, FileInfo, Option<Error>)> = HashMap::with_capacity(objects.len());
+        {
+            let mut pending = Vec::new();
+            for (i, source) in source_inputs.iter().enumerate() {
+                if del_errs[i].is_some() {
+                    continue;
+                }
+                let Some(source) = source else {
+                    continue;
+                };
+                if !source.needs_source_read {
+                    continue;
+                }
+                let object_name = objects[i].object_name.clone();
+                let check_opts = &source.check_opts;
+                pending.push(async move {
+                    let (goi, file_info, _write_quorum, gerr) = self
+                        .get_object_info_fileinfo_and_quorum(bucket, &object_name, check_opts)
+                        .await;
+                    (i, (goi, file_info, gerr))
+                });
+            }
+            let reads = futures::stream::iter(pending)
+                .buffer_unordered(DELETE_OBJECTS_SOURCE_READ_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            source_reads.extend(reads);
+        }
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
         let mut tier_reference_leases: Vec<(usize, String, Option<TierDestinationId>)> = Vec::new();
         let mut tier_free_version_receipt_candidates: HashMap<usize, TierFreeVersionReceiptCandidate> = HashMap::new();
@@ -9848,41 +10050,30 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 ));
                 continue;
             }
-            let replication_object_name = decode_dir_object(&dobj.object_name);
-            let explicit_null_version = is_explicit_null_version(dobj.version_id);
-            let version_id = delete_file_info_version_id(dobj.version_id);
-            let (versioned, version_suspended) = delete_config_snapshot
-                .versioning_config()
-                .delete_state(replication_object_name.as_str());
-            let check_opts = ObjectOptions {
-                version_id: dobj.version_id.map(|version_id| version_id.to_string()),
+            let Some(source) = source_inputs[i].take() else {
+                continue;
+            };
+            let BatchDeleteSourceInputs {
+                replication_object_name,
+                explicit_null_version,
+                version_id,
                 versioned,
                 version_suspended,
-                object_lock_delete: opts.object_lock_delete.clone(),
-                object_lock_config_snapshot: Some(Arc::clone(&object_lock_config)),
-                no_lock: true,
-                suppress_read_repair: guarded,
-                ..Default::default()
-            };
-            // A missing bucket Object Lock configuration does not prove that
-            // persisted object metadata is clean: migrated or corrupt data may
-            // still carry an explicit retention or legal hold. Only a real
-            // delete-marker creation can skip the object-level WORM check.
-            let object_lock_check_required = !is_meta_bucketname(bucket) && !set_disk_delete_creates_delete_marker(&check_opts);
-            let replicate_delete = delete_config_snapshot.has_active_rule(&replication_object_name);
-            let marker_delete = dobj.version_id.is_none() || dobj.synthetic_version_id;
-            let replication_needs_source = replicate_delete
-                && (!marker_delete || delete_config_snapshot.active_delete_marker_rules_require_tags(&replication_object_name));
-            let (mut goi, mut authoritative_file_info, mut gerr) = if object_lock_check_required
-                || replication_needs_source
-                || opts.tier_delete_journal_api.is_some()
-                || dobj.expected_identity.is_some()
-                || dobj.version_id.is_some()
-            {
-                let (goi, file_info, _write_quorum, gerr) = self
-                    .get_object_info_fileinfo_and_quorum(bucket, &dobj.object_name, &check_opts)
-                    .await;
-                (goi, file_info, gerr)
+                check_opts,
+                object_lock_check_required,
+                replicate_delete,
+                needs_source_read,
+            } = source;
+            let (mut goi, mut authoritative_file_info, mut gerr) = if needs_source_read {
+                match source_reads.remove(&i) {
+                    Some(read) => read,
+                    None => {
+                        let (goi, file_info, _write_quorum, gerr) = self
+                            .get_object_info_fileinfo_and_quorum(bucket, &dobj.object_name, &check_opts)
+                            .await;
+                        (goi, file_info, gerr)
+                    }
+                }
             } else {
                 (ObjectInfo::default(), FileInfo::default(), None)
             };
@@ -9899,6 +10090,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 && !guarded
                 && goi.name.is_empty()
             {
+                // Recovery can restore or retire versions of this key
+                // (rolling back an interrupted prepared delete brings a
+                // retained version back). A pre-fetched read for a later
+                // duplicate of the same name would still report the stale
+                // miss and skip its object-lock check — bypassing retention —
+                // so evict those entries and let the loop re-read them live.
+                for (other_index, other) in objects.iter().enumerate() {
+                    if other_index != i && other.object_name == dobj.object_name {
+                        source_reads.remove(&other_index);
+                    }
+                }
                 let recovery = self
                     .recover_delete_key(
                         bucket,
@@ -10013,6 +10215,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if object_lock_check_required
                 && !source_missing
                 && let Err(err) = check_object_lock_delete(&self.ctx, bucket, &dobj.object_name, &goi, &check_opts).await
+            {
+                del_errs[i] = Some(err);
+                continue;
+            }
+            // Not gated on `source_missing`: with a delete marker on top the
+            // latest-version lookup reports the key as missing while the null
+            // version below it may still be retained.
+            if object_lock_check_required
+                && let Err(err) = self
+                    .check_null_version_object_lock_delete(bucket, &dobj.object_name, &goi, &check_opts)
+                    .await
             {
                 del_errs[i] = Some(err);
                 continue;
@@ -10472,6 +10685,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // response can hide a persisted decision and must never roll back.
             let groups = groups.collect::<Vec<_>>();
             published_groups.extend(groups.iter().map(|index| vers[*index].name.clone()));
+            // Journal publish fans out per object per drive; keep enough
+            // publications in flight to feed the drives' durable-mutation
+            // lanes (8 workers each) across a 16-drive set.
+            const DELETE_JOURNAL_PUBLISH_CONCURRENCY: usize = 32;
             let publications = futures::stream::iter(groups.into_iter().map(|index: usize| {
                 let group = &vers[index];
                 let recovery_ticket = recovery_tickets[index].clone();
@@ -10507,7 +10724,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     (index, result)
                 }
             }))
-            .buffer_unordered(16)
+            .buffer_unordered(DELETE_JOURNAL_PUBLISH_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
             for (index, result) in publications {
@@ -10647,9 +10864,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // Deferred recovery takes fresh raw and transaction locks. Discard the
         // completed leases' deadlines while retaining every caller-owned fence.
         opts.namespace_lock_fence = outer_namespace_lock_fence;
-        // Release inner owners before reacquiring any raw key lock.
+        // Release inner owners before reacquiring any raw key lock. The raw
+        // batch guards must go too: deferred recovery takes a fresh write lock
+        // on the same keys below, and a still-held local batch guard would
+        // deadlock it against itself (the distributed path releases its batch
+        // ids in the same region).
         drop(namespace_owner);
         drop(transaction_guards);
+        drop(local_batch_guards);
 
         // TODO(backlog): support partial object deletion for multi-part objects
 
@@ -11064,7 +11286,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if let Some(err) = &gerr
             && goi.name.is_empty()
         {
-            if should_force_delete_marker_for_missing_version(&opts) {
+            if (is_err_object_not_found(err) || is_err_version_not_found(err))
+                && should_force_delete_marker_for_missing_version(&opts)
+            {
                 version_found = false;
             } else {
                 if is_err_object_not_found(err) {
@@ -11087,6 +11311,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             opts.precondition_check(&goi)?;
             check_object_lock_delete(&self.ctx, bucket, object, &goi, &opts).await?;
         }
+        self.check_null_version_object_lock_delete(bucket, object, &goi, &opts)
+            .await?;
         let delete_marker_purge_candidate = opts
             .version_id
             .as_deref()
@@ -24983,6 +25209,131 @@ mod delete_objects_lock_gating_tests {
             .put_object(bucket, object, &mut reader, &ObjectOptions::default())
             .await
             .expect("plain object should be written");
+    }
+
+    /// Regression for the PR9155 review finding: a pre-fetched source-missing
+    /// read of a later duplicate must not skip the object-lock check after an
+    /// earlier entry's recovery rolls back an interrupted prepared delete and
+    /// restores a GOVERNANCE-retained version. Without the eviction the later
+    /// duplicate deletes the restored version, bypassing retention.
+    #[tokio::test]
+    async fn duplicate_entries_recheck_object_lock_after_recovery_restores_retained_version() {
+        let (_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "recovery-retention-dup";
+        let object = "retained.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+
+        // A versioned put, so the batch can address the version explicitly.
+        let mut reader = PutObjReader::from_vec(vec![7u8; 256]);
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned object should be written");
+        let version = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read back the version identity")
+            .version_id
+            .expect("versioned put assigns a version id");
+
+        // GOVERNANCE retention on that version, persisted the way
+        // PutObjectRetention persists it.
+        let retain_until = OffsetDateTime::now_utc() + time::Duration::days(60);
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    version_id: Some(version.to_string()),
+                    eval_metadata: Some(HashMap::from([
+                        (metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_string()),
+                        (
+                            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                            retain_until
+                                .format(&time::format_description::well_known::Rfc3339)
+                                .expect("retention date formats"),
+                        ),
+                    ])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("governance retention should persist");
+
+        // Interrupted authorized delete: the recoverable per-disk delete
+        // applies the version removal and leaves the prepared journal
+        // undecided — exactly a crash between apply and publish.
+        let transaction = Uuid::new_v4();
+        for disk in &disk_stores {
+            let fi = disk
+                .read_version("", bucket, object, &version.to_string(), &crate::disk::ReadOptions::default())
+                .await
+                .expect("version exists before the interrupted delete");
+            let errors = disk
+                .delete_versions_recoverable(
+                    bucket,
+                    vec![FileInfoVersions {
+                        name: object.to_string(),
+                        versions: vec![fi],
+                        ..Default::default()
+                    }],
+                    DeleteOptions {
+                        recoverable_delete: true,
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(errors.iter().all(Option::is_none), "the plant must apply: {errors:?}");
+        }
+
+        // A no-bypass batch naming the retained version twice: the first
+        // entry rolls the prepared delete back (restoring the retained
+        // version) and must be denied; the second must re-read and stay
+        // denied too instead of reusing the stale pre-fetched miss.
+        let victim = ObjectToDelete {
+            object_name: object.to_string(),
+            version_id: Some(version),
+            ..Default::default()
+        };
+        let (_deleted, errors) = set_disks
+            .delete_objects(
+                bucket,
+                vec![victim.clone(), victim],
+                ObjectOptions {
+                    versioned: true,
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            errors.iter().all(|error| error
+                .as_ref()
+                .is_some_and(|error| matches!(error, StorageError::PrefixAccessDenied(_, _)))),
+            "both duplicates must be denied by the restored retention: {errors:?}"
+        );
+
+        // The retained version survives the batch.
+        for disk in &disk_stores {
+            disk.read_version("", bucket, object, &version.to_string(), &crate::disk::ReadOptions::default())
+                .await
+                .expect("the retained version must survive the batch");
+        }
     }
 
     #[tokio::test]
