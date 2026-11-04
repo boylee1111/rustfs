@@ -368,6 +368,7 @@ async fn check_unknown_source_deleted_bucket_replay() {
         );
     }
     assert_eq!(manager.get_queue_length().await, 0, "identity probes must not enqueue object healing");
+    tokio::fs::remove_dir_all(&env.temp_root).await.ok();
 }
 
 fn restored_v2_runtime(next_probe_at_ms: u64, probe_attempts: u32) -> (MrfRuntime, PartialWriteKey) {
@@ -418,6 +419,7 @@ async fn lifecycle_v2_reader_restores_bounded_probe_schedule_and_attempt_count()
 }
 
 #[tokio::test(start_paused = true)]
+#[serial]
 async fn lifecycle_v2_reader_persists_failed_probe_pacing_without_object_dispatch() {
     let storage = Arc::new(ProbeStorage {
         lookup: Mutex::new(Lookup::Identity(None)),
@@ -566,6 +568,10 @@ where
                             "mrf-writer-test-topology".to_owned(),
                         );
                         test().await;
+                        crate::heal::storage_api::ecstore_start_remote_version_state_fleet_probe(
+                            "changed-test-topology".to_owned(),
+                        );
+                        tokio::fs::remove_dir_all(&env.temp_root).await.ok();
                     });
             })
             .expect("writer fixture thread")
@@ -676,6 +682,7 @@ async fn unknown_source_deleted_bucket_writer_does_not_promote_errors_or_disable
 }
 
 #[tokio::test(start_paused = true)]
+#[serial]
 async fn unknown_source_deleted_bucket_writer_without_fleet_proof_keeps_v1_visible_and_backed_off() {
     let storage = Arc::new(ProbeStorage {
         lookup: Mutex::new(Lookup::Identity(None)),

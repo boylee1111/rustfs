@@ -1491,6 +1491,16 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
             for slot in all_fleet_capability_proof_slots() {
                 mark_fleet_capability_topology_conflict(slot);
             }
+        } else {
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                for slot in all_fleet_capability_proof_slots() {
+                    slot.write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .topology_conflict = false;
+                }
+                NOTIFICATION_SYS_PUBLISHED.notify_waiters();
+            }
         }
         return;
     }

@@ -2001,6 +2001,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
     async fn delayed_reader_error_keeps_source_and_drops_every_encode_path() {
         #[derive(Debug, thiserror::Error)]
         #[error("injected request body inactivity")]
@@ -2194,6 +2195,7 @@ mod tests {
     // default, and honor `0` as "disabled". This guards against the fix silently
     // regressing to wait-forever behavior on the default PUT path.
     #[test]
+    #[serial_test::serial]
     fn default_write_progress_policy_is_armed_and_configurable() {
         temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_WRITE_STALL_TIMEOUT, || {
             temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_WRITE_ABSOLUTE_CAP, || {
@@ -2553,6 +2555,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn encode_shutdowns_writers_after_small_shards() {
         let committed = Arc::new(Mutex::new(Vec::new()));
         let writer = DeferredCommitWriter::new(committed.clone());
@@ -2567,6 +2570,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn encode_bytesmut_ingest_streaming_path_writes_and_shutdowns_writers() {
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 2;
@@ -2652,6 +2656,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn encode_streaming_write_quorum_failure_aborts_and_reports_error() {
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 2;
@@ -2784,6 +2789,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn encode_returns_unexpected_eof_for_truncated_limited_reader() {
         let committed = Arc::new(Mutex::new(Vec::new()));
         let writer = DeferredCommitWriter::new(committed);
@@ -2826,6 +2832,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn encode_works_on_current_thread_runtime() {
         let committed = Arc::new(Mutex::new(Vec::new()));
         let writer = DeferredCommitWriter::new(committed);
@@ -2843,6 +2850,7 @@ mod tests {
     // block_in_place (rustfs/backlog#932). The other tests default to the
     // current-thread runtime and only exercise the spawn_blocking arm.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
     async fn encode_works_on_multi_thread_runtime() {
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 2;
@@ -2914,6 +2922,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn encode_batched_writes_full_and_tail_batches() {
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 2;
@@ -2944,6 +2953,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn encode_batched_write_quorum_failure_aborts_and_reports_error() {
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 2;
@@ -3283,6 +3293,7 @@ mod tests {
     /// bytes as the public block encoder for both shard-size formulas and all block
     /// boundary shapes.
     #[tokio::test]
+    #[serial_test::serial]
     async fn bytesmut_ingest_matches_vec_ingest_byte_for_byte() {
         const BLOCK_SIZE: usize = 64;
         let payloads: Vec<Vec<u8>> = vec![

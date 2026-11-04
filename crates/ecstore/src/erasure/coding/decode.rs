@@ -3644,6 +3644,7 @@ mod tests {
     /// missing resize between stripes (including the short final stripe). Run
     /// with bitrot verification both on and off.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_erasure_decode_with_missing_shards_reuses_buffers() {
         const DATA_SHARDS: usize = 4;
         const PARITY_SHARDS: usize = 2;
@@ -6067,6 +6068,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_zero_read_timeout_disables_scheduled_hedging() {
         assert_eq!(shard_read_hedge_delay(Duration::ZERO), None);
         assert_eq!(shard_read_hedge_delay(Duration::from_millis(50)), Some(Duration::from_millis(50)));
