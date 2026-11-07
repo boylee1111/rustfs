@@ -518,7 +518,10 @@ impl ReedSolomonEncoder {
     }
 }
 
-fn cached_modern_reed_solomon(data_shards: usize, parity_shards: usize) -> Result<Arc<ReedSolomon>, rustfs_erasure_codec::Error> {
+pub(crate) fn cached_modern_reed_solomon(
+    data_shards: usize,
+    parity_shards: usize,
+) -> Result<Arc<ReedSolomon>, rustfs_erasure_codec::Error> {
     let key = (data_shards, parity_shards);
     let cache = MODERN_REED_SOLOMON_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
 
