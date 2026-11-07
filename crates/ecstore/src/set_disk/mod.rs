@@ -357,8 +357,7 @@ use crate::io_support::rio::HashReader;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
-pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
-pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
+pub(crate) use crate::disk::multipart_index::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
 pub(crate) const DATA_MOVEMENT_MULTIPART_PREFIX: &str = "data-movement";
 const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
 
@@ -5019,6 +5018,11 @@ impl DiskHealthEntry {
 #[error("committed system metadata write requires repair by its owning writer")]
 pub(crate) struct SystemMetadataRepairRequired;
 
+/// An inline metadata write was rejected before staging or commit began.
+#[derive(Debug, thiserror::Error)]
+#[error("system metadata write rejected before staging: {0}")]
+pub(crate) struct SystemMetadataWriteNotStarted(#[source] pub(crate) Error);
+
 impl SetDisks {
     pub(in crate::set_disk) async fn persist_delete_marker_purge(
         &self,
@@ -7976,20 +7980,22 @@ fn is_min_allowed_part_size(size: i64) -> bool {
 }
 
 fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
-    let mut buf = Vec::new();
-
-    for part in parts.iter() {
-        if let Some(etag) = &part.etag {
-            if let Ok(etag_bytes) = hex_simd::decode_to_vec(etag.as_bytes()) {
-                buf.extend(etag_bytes);
-            } else {
-                buf.extend(etag.bytes());
+    let mut hasher = Md5::new();
+    for etag in parts.iter().filter_map(|part| part.etag.as_deref()) {
+        // Native part ETags decode to one fixed-size digest. Preserve the
+        // historical hex-or-raw interpretation for imported part ETags.
+        let mut digest = [0u8; 16];
+        if etag.len() == digest.len() * 2 {
+            match hex_simd::decode(etag.as_bytes(), hex_simd::Out::from_slice(&mut digest)) {
+                Ok(decoded) => hasher.update(decoded),
+                Err(_) => hasher.update(etag.as_bytes()),
             }
+        } else if let Ok(decoded) = hex_simd::decode_to_vec(etag.as_bytes()) {
+            hasher.update(decoded);
+        } else {
+            hasher.update(etag.as_bytes());
         }
     }
-
-    let mut hasher = Md5::new();
-    hasher.update(&buf);
 
     let digest = hasher.finalize();
     let etag_hex = faster_hex::hex_string(digest.as_slice());
@@ -9678,50 +9684,59 @@ mod tests {
     }
 
     #[test]
-    fn test_get_complete_multipart_md5() {
-        // Test MD5 calculation for multipart upload
-        let parts = vec![
+    fn complete_multipart_md5_preserves_legacy_etag_encodings() {
+        fn part(etag: Option<&str>, part_num: usize) -> CompletePart {
             CompletePart {
-                part_num: 1,
-                etag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
-                checksum_crc32: None,
-                checksum_crc32c: None,
-                checksum_sha1: None,
-                checksum_sha256: None,
-                checksum_crc64nvme: None,
-            },
-            CompletePart {
-                part_num: 2,
-                etag: Some("098f6bcd4621d373cade4e832627b4f6".to_string()),
-                checksum_crc32: None,
-                checksum_crc32c: None,
-                checksum_sha1: None,
-                checksum_sha256: None,
-                checksum_crc64nvme: None,
-            },
+                part_num,
+                etag: etag.map(str::to_owned),
+                ..Default::default()
+            }
+        }
+
+        fn buffered_digest(parts: &[CompletePart]) -> String {
+            let mut bytes = Vec::new();
+            for etag in parts.iter().filter_map(|part| part.etag.as_deref()) {
+                match hex_simd::decode_to_vec(etag.as_bytes()) {
+                    Ok(decoded) => bytes.extend(decoded),
+                    Err(_) => bytes.extend_from_slice(etag.as_bytes()),
+                }
+            }
+            format!("{}-{}", faster_hex::hex_string(&Md5::digest(bytes)), parts.len())
+        }
+
+        assert_eq!(get_complete_multipart_md5(&[]), "d41d8cd98f00b204e9800998ecf8427e-0");
+        assert_eq!(get_complete_multipart_md5(&[part(None, 1)]), "d41d8cd98f00b204e9800998ecf8427e-1");
+        assert_eq!(get_complete_multipart_md5(&[part(Some("00"), 1)]), "93b885adfe0da089cdf634904fd59f71-1");
+        assert_eq!(
+            get_complete_multipart_md5(&[
+                part(Some("d41d8cd98f00b204e9800998ecf8427e"), 1),
+                part(Some("098f6bcd4621d373cade4e832627b4f6"), 2),
+            ]),
+            "f666c301a43456b66b9f3a47f696d391-2"
+        );
+
+        let encodings = [
+            None,
+            Some(""),
+            Some("00"),
+            Some("0aBcFf"),
+            Some("0123456789abcdef0123456789abcdef"),
+            Some("0123456789ABCDEF0123456789ABCDEF"),
+            Some("0123456789abcdef0123456789abcdef00"),
+            Some("0123456789abcdef0123456789abcdeg"),
+            Some("0123456789abcdef0123456789abcdeg00"),
+            Some("f"),
+            Some("not-hex"),
+            Some("\"0123456789abcdef0123456789abcdef\""),
+            Some("0123456789abcdef0123456789abcdef-2"),
+            Some("café"),
         ];
-
-        let md5 = get_complete_multipart_md5(&parts);
-        assert!(md5.ends_with("-2")); // Should end with part count
-        assert!(md5.len() > 10); // Should have reasonable length
-
-        // Test with empty parts
-        let empty_parts = vec![];
-        let empty_result = get_complete_multipart_md5(&empty_parts);
-        assert!(empty_result.ends_with("-0"));
-
-        // Test with single part
-        let single_part = vec![CompletePart {
-            part_num: 1,
-            etag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
-            checksum_crc32: None,
-            checksum_crc32c: None,
-            checksum_sha1: None,
-            checksum_sha256: None,
-            checksum_crc64nvme: None,
-        }];
-        let single_result = get_complete_multipart_md5(&single_part);
-        assert!(single_result.ends_with("-1"));
+        for first in encodings {
+            for second in encodings {
+                let parts = [part(first, 1), part(second, 2)];
+                assert_eq!(get_complete_multipart_md5(&parts), buffered_digest(&parts), "{first:?}, {second:?}");
+            }
+        }
     }
 
     #[test]

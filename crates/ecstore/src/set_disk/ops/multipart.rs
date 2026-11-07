@@ -46,8 +46,8 @@ use super::super::{
     log_multipart_write_quorum_failure, multipart_part_logical_size, parts_after_marker, path_join_buf,
     prepare_complete_multipart_parts, record_compression_total_memory, record_multipart_write_quorum_failure,
     reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map, resolve_write_layout,
-    restore_commit_operation_id_from_metadata, should_persist_encryption_original_size, strip_internal_multipart_metadata,
-    to_object_err, warn,
+    restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, should_persist_encryption_original_size,
+    strip_internal_multipart_metadata, to_object_err, warn,
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 #[cfg(test)]
@@ -99,6 +99,7 @@ use rustfs_utils::http::SSEC_ALGORITHM_HEADER;
 #[cfg(test)]
 use rustfs_utils::http::SUFFIX_COMPRESSION;
 use rustfs_utils::http::{SUFFIX_INLINE_DATA, SUFFIX_MAX_TOTAL_OBJECT_SIZE, get_consistent_str};
+use rustfs_utils::path::{decode_dir_object, encode_dir_object};
 use std::future::Future;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -110,6 +111,10 @@ use std::time::Duration;
 #[cfg(test)]
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
+
+#[cfg(test)]
+#[path = "multipart_quorum_tests.rs"]
+mod multipart_writer_test_hook;
 
 // The erasure-set width bounds fan-out. Await every opener so errors retain
 // their disk slots and every successful writer remains owned until quorum is checked.
@@ -123,6 +128,13 @@ async fn create_part_writers(
         let Some(disk) = disk else {
             return (None, Some(DiskError::DiskNotFound));
         };
+        #[cfg(test)]
+        if let Some(result) = multipart_writer_test_hook::create_writer(disk, path, length, shard_size).await {
+            return match result {
+                Ok(writer) => (Some(writer), None),
+                Err(error) => (None, Some(error)),
+            };
+        }
         match create_bitrot_writer_with_orig_volume(
             false,
             Some(disk),
@@ -972,12 +984,48 @@ fn multipart_upload_leaf_is_safe(leaf: &str) -> bool {
     !leaf.is_empty() && leaf != "." && leaf != ".." && !leaf.contains(['/', '\\', '\0'])
 }
 
+#[cfg(test)]
+static MULTIPART_DISCOVERY_DIRECTORIES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<String>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn observe_multipart_discovery_directory(bucket: &str, directory: &str) {
+    if let Some(directories) = MULTIPART_DISCOVERY_DIRECTORIES
+        .lock()
+        .expect("multipart discovery observer lock")
+        .get_mut(bucket)
+    {
+        directories.push(directory.to_owned());
+    }
+}
+
+async fn multipart_index_roots_on_disk(disk: DiskStore, bucket: &str) -> disk::error::Result<(Uuid, Vec<String>)> {
+    if !disk.is_online().await {
+        return Err(DiskError::DiskNotFound);
+    }
+    let identity = disk
+        .get_disk_id()
+        .await?
+        .filter(|id| !id.is_nil())
+        .ok_or(DiskError::DiskNotFound)?;
+    let query_bucket = bucket.to_owned();
+    let roots = crate::disk::multipart_index::collect_pages(bucket, identity, move |marker| {
+        let disk = disk.clone();
+        let bucket = query_bucket.clone();
+        async move { disk.list_multipart_index_roots(&bucket, marker.as_deref()).await }
+    })
+    .await?;
+    Ok((identity, roots))
+}
+
 async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_prefix: &str) -> disk::error::Result<Vec<String>> {
     if !disk.is_online().await {
         return Err(DiskError::DiskNotFound);
     }
 
     if !root_prefix.is_empty() && root_prefix != DATA_MOVEMENT_MULTIPART_PREFIX {
+        #[cfg(test)]
+        observe_multipart_discovery_directory(bucket, root_prefix);
         let upload_dirs = match disk.list_dir(bucket, RUSTFS_META_MULTIPART_BUCKET, root_prefix, -1).await {
             Ok(entries) => entries,
             Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => return Ok(Vec::new()),
@@ -992,6 +1040,8 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_pref
             .collect());
     }
 
+    #[cfg(test)]
+    observe_multipart_discovery_directory(bucket, root_prefix);
     let sha_dirs = match disk.list_dir(bucket, RUSTFS_META_MULTIPART_BUCKET, root_prefix, -1).await {
         Ok(entries) => entries,
         Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => return Ok(Vec::new()),
@@ -1014,6 +1064,8 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_pref
         .map(|sha_dir| {
             let disk = disk.clone();
             async move {
+                #[cfg(test)]
+                observe_multipart_discovery_directory(bucket, &sha_dir);
                 match disk.list_dir(bucket, RUSTFS_META_MULTIPART_BUCKET, &sha_dir, -1).await {
                     Ok(entries) => Ok((sha_dir, entries)),
                     Err(DiskError::FileNotFound) => Ok((sha_dir, Vec::new())),
@@ -1036,6 +1088,12 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_pref
     }
 
     Ok(upload_paths)
+}
+
+struct MultipartUploadListScope<'a> {
+    bucket: &'a str,
+    prefix: &'a str,
+    exact_key: bool,
 }
 
 impl SetDisks {
@@ -1134,13 +1192,25 @@ impl SetDisks {
         require_all_disks: bool,
     ) -> Result<(Vec<Option<DiskStore>>, Vec<String>, usize, bool)> {
         let disks = self.disks.read().await.clone();
-        if disks.is_empty() {
+        self.discover_multipart_upload_paths_on_disks(disks, orig_bucket, error_path, root_prefix, require_all_disks)
+            .await
+    }
+
+    async fn discover_multipart_upload_paths_on_disks(
+        &self,
+        disks: Vec<Option<DiskStore>>,
+        orig_bucket: &str,
+        error_path: &str,
+        root_prefix: &str,
+        require_all_disks: bool,
+    ) -> Result<(Vec<Option<DiskStore>>, Vec<String>, usize, bool)> {
+        if disks.len() != self.set_drive_count || self.set_drive_count == 0 {
             return Err(Error::ErasureReadQuorum);
         }
         let discovery_quorum = if self.default_parity_count == 0 {
-            disks.len()
+            self.set_drive_count
         } else {
-            (disks.len() / 2).max(1)
+            (self.set_drive_count / 2).max(1)
         };
         let mut discovery_errors = (0..disks.len()).map(|_| Some(DiskError::DiskNotFound)).collect::<Vec<_>>();
         let mut candidate_counts = HashMap::<String, usize>::new();
@@ -1819,8 +1889,134 @@ impl SetDisks {
         max_uploads: usize,
         expected_incarnation_id: Option<Uuid>,
     ) -> Result<ListMultipartsInfo> {
-        let (disks, candidate_paths, discovery_quorum, _) =
-            self.discover_multipart_upload_paths(bucket, prefix, "", false).await?;
+        self.list_multipart_uploads_in_scope(
+            MultipartUploadListScope {
+                bucket,
+                prefix,
+                exact_key: false,
+            },
+            key_marker,
+            upload_id_marker,
+            delimiter,
+            max_uploads,
+            expected_incarnation_id,
+        )
+        .await
+    }
+
+    /// Probe only the legacy staging directory belonging to this encoded key.
+    pub(crate) async fn has_multipart_upload_for_key(
+        &self,
+        bucket: &str,
+        object: &str,
+        expected_incarnation_id: Option<Uuid>,
+    ) -> Result<bool> {
+        let key = decode_dir_object(object);
+        let result = self
+            .list_multipart_uploads_in_scope(
+                MultipartUploadListScope {
+                    bucket,
+                    prefix: &key,
+                    exact_key: true,
+                },
+                None,
+                None,
+                None,
+                1,
+                expected_incarnation_id,
+            )
+            .await?;
+        Ok(!result.uploads.is_empty())
+    }
+
+    /// Index coverage only locates candidates. Every candidate still traverses
+    /// the original directory and metadata quorum checks on this disk snapshot.
+    async fn multipart_index_roots(
+        &self,
+        bucket: &str,
+    ) -> Option<(Vec<Option<DiskStore>>, std::collections::BTreeSet<String>, usize)> {
+        let disks = self.disks.read().await.clone();
+        // Coverage describes configured physical slots, not the size of a
+        // transient inventory. Missing slots must remain explicit None entries.
+        if disks.len() != self.set_drive_count || self.set_drive_count == 0 {
+            return None;
+        }
+        let quorum = if self.default_parity_count == 0 {
+            self.set_drive_count
+        } else {
+            (self.set_drive_count / 2).max(1)
+        };
+        let required = self.set_drive_count.checked_sub(quorum)?.checked_add(1)?.max(quorum);
+        let mut tasks = JoinSet::new();
+        for disk in disks.iter().flatten().cloned() {
+            let bucket = bucket.to_owned();
+            tasks.spawn(async move { multipart_index_roots_on_disk(disk, &bucket).await });
+        }
+        let mut covered_ids = HashSet::new();
+        let mut roots = std::collections::BTreeSet::new();
+        while let Some(result) = tasks.join_next().await {
+            if let Ok(Ok((disk_id, candidates))) = result {
+                // Duplicate physical identities cannot count as independent slots.
+                if !covered_ids.insert(disk_id) {
+                    return None;
+                }
+                roots.extend(candidates);
+            }
+        }
+        // Every returnable metadata read quorum has at least `quorum` slots.
+        // N-D+1 independently indexed slots intersect every such quorum, even
+        // when an old coordinator wrote the upload without knowing this index.
+        (covered_ids.len() >= required).then_some((disks, roots, quorum))
+    }
+
+    async fn list_multipart_uploads_in_scope(
+        &self,
+        scope: MultipartUploadListScope<'_>,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
+        max_uploads: usize,
+        expected_incarnation_id: Option<Uuid>,
+    ) -> Result<ListMultipartsInfo> {
+        let MultipartUploadListScope {
+            bucket,
+            prefix,
+            exact_key,
+        } = scope;
+        let root = if exact_key {
+            Self::get_multipart_sha_dir(bucket, &encode_dir_object(prefix))
+        } else {
+            String::new()
+        };
+        let covered = if exact_key {
+            None
+        } else {
+            self.multipart_index_roots(bucket).await
+        };
+        let (disks, candidate_paths, discovery_quorum, _) = if let Some((disks, mut roots, quorum)) = covered {
+            // Legacy no-incarnation callers can list an exact-prefix orphan after
+            // completion moved xl.meta. Its SHA is known without foreign scanning.
+            if expected_incarnation_id.is_none() && !prefix.is_empty() {
+                roots.insert(Self::get_multipart_sha_dir(bucket, &encode_dir_object(prefix)));
+            }
+            let mut candidates = Vec::new();
+            let mut discoveries = futures::stream::iter(roots.into_iter().map(|root| {
+                let disks = disks.clone();
+                async move {
+                    self.discover_multipart_upload_paths_on_disks(disks, bucket, prefix, &root, false)
+                        .await
+                }
+            }))
+            .buffer_unordered(MULTIPART_LIST_IO_CONCURRENCY);
+            while let Some(discovered) = discoveries.next().await {
+                let (_, paths, _, _) = discovered?;
+                candidates.extend(paths);
+            }
+            drop(discoveries);
+            (disks, candidates, quorum, false)
+        } else {
+            self.discover_multipart_upload_paths(bucket, prefix, &root, false).await?
+        };
         let listed_uploads = stream::iter(candidate_paths)
             .map(|upload_path| {
                 let disks = &disks;
@@ -1844,7 +2040,11 @@ impl SetDisks {
                         .iter()
                         .filter(|err| matches!(err, Some(DiskError::FileNotFound | DiskError::VolumeNotFound)))
                         .count();
-                    if missing_metadata >= discovery_quorum {
+                    // At half-set parity, both successful heads and missing or corrupt
+                    // replies can reach discovery quorum. Resolve the surviving heads
+                    // through the authoritative layout and identity checks in that tie.
+                    let below_discovery_quorum = errs.iter().filter(|err| err.is_none()).count() < discovery_quorum;
+                    if below_discovery_quorum && missing_metadata >= discovery_quorum {
                         if expected_incarnation_id.is_some() {
                             return Ok(None);
                         }
@@ -1853,7 +2053,7 @@ impl SetDisks {
                         // crash in that window intentionally leaves a reclaimable
                         // upload directory whose object name can still be proven for
                         // an exact-key listing by matching the namespace hash.
-                        if !prefix.is_empty() && sha_dir == Self::get_multipart_sha_dir(bucket, prefix) {
+                        if !prefix.is_empty() && sha_dir == Self::get_multipart_sha_dir(bucket, &encode_dir_object(prefix)) {
                             let initiated = raw_upload_id
                                 .rsplit_once('x')
                                 .and_then(|(_, timestamp)| timestamp.parse::<i128>().ok())
@@ -1882,7 +2082,7 @@ impl SetDisks {
                         .iter()
                         .filter(|err| err.as_ref().is_some_and(is_corrupt_upload_metadata_error))
                         .count();
-                    if corrupt_metadata > 0 && missing_metadata + corrupt_metadata >= discovery_quorum {
+                    if below_discovery_quorum && corrupt_metadata > 0 && missing_metadata + corrupt_metadata >= discovery_quorum {
                         debug!(
                             bucket,
                             upload_path = %upload_path,
@@ -1947,7 +2147,8 @@ impl SetDisks {
                         // retry instead of silently losing entries.
                         Err(err) => return Err(err),
                     };
-                    if !object.starts_with(prefix) {
+                    let object = decode_dir_object(&object);
+                    if (exact_key && object != prefix) || !object.starts_with(prefix) {
                         return Ok(None);
                     }
 
@@ -2051,14 +2252,9 @@ impl SetDisks {
             .zip(errors)
             .map(|(fi, error)| error.is_none().then_some(fi))
             .collect();
-        let (completed, mut matching_minority) = self.completed_multipart_write_quorum_candidate(
-            (bucket, object),
-            upload_id,
-            uploaded_parts,
-            source,
-            candidates,
-            opts,
-        )?;
+        let (completed, mut matching_minority) = self
+            .completed_multipart_write_quorum_candidate((bucket, object), upload_id, uploaded_parts, source, candidates, opts)
+            .await?;
         if let Some(completed) = completed {
             return self
                 .acknowledge_completed_multipart(&disks, bucket, object, upload_id, completed, opts)
@@ -2108,14 +2304,9 @@ impl SetDisks {
                 }
                 candidates.push(candidate);
             }
-            let (completed, historical_minority) = self.completed_multipart_write_quorum_candidate(
-                (bucket, object),
-                upload_id,
-                uploaded_parts,
-                source,
-                candidates,
-                opts,
-            )?;
+            let (completed, historical_minority) = self
+                .completed_multipart_write_quorum_candidate((bucket, object), upload_id, uploaded_parts, source, candidates, opts)
+                .await?;
             matching_minority |= historical_minority;
             if let Some(completed) = completed {
                 return self
@@ -2170,7 +2361,7 @@ impl SetDisks {
     /// Count exact completion identities once per physical slot. Each call
     /// evaluates one complete fanout; observations from different reads never
     /// combine to manufacture a write quorum.
-    fn completed_multipart_write_quorum_candidate(
+    async fn completed_multipart_write_quorum_candidate(
         &self,
         target: (&str, &str),
         upload_id: &str,
@@ -2215,6 +2406,16 @@ impl SetDisks {
             matching_minority |= count < required
                 && rustfs_utils::http::get_consistent_str(&fi.metadata, rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID)
                     == Some(upload_id);
+            // Select a write-quorum candidate belonging to this upload before
+            // authorizing it; never compare requested parts or confirm/reclaim a
+            // completed object using a different upload's authorization evidence.
+            if count >= required
+                && rustfs_utils::http::get_consistent_str(&fi.metadata, rustfs_utils::http::SUFFIX_MULTIPART_UPLOAD_ID)
+                    == Some(upload_id)
+                && let Some(authorization) = &opts.multipart_completion_authorization
+            {
+                authorization.authorize(&fi.metadata).await?;
+            }
             if count >= required
                 && completed_multipart_upload_matches(
                     &fi.metadata,
@@ -2454,8 +2655,19 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 SmallWritePath::PipelineBatchedLarge => IntegrityEncodeMode::Batched,
                 SmallWritePath::Inline | SmallWritePath::Pipeline => IntegrityEncodeMode::Streaming,
             };
+            let shard_write_policy = crate::erasure::coding::encode::ShardWritePolicy::multipart(write_quorum);
+            #[cfg(test)]
+            let shard_write_policy = multipart_writer_test_hook::write_policy(&shuffle_disks, write_quorum)
+                .unwrap_or(shard_write_policy);
             let (reader, w_size, _, integrity) = Arc::clone(&erasure)
-                .encode_with_shard_integrity(stream, &mut writers, write_quorum, part_id, mode, protected_upload)
+                .encode_with_shard_integrity(
+                    stream,
+                    &mut writers,
+                    shard_write_policy,
+                    part_id,
+                    mode,
+                    protected_upload,
+                )
                 .await?;
 
             if let Some(stage_start) = encode_stage_start {
@@ -2516,6 +2728,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 .map(crate::io_support::rio::compression_index_storage_bytes);
 
             let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
+            let encrypted_etag = data.stream.encrypted_etag
+                && !etag.is_empty()
+                && opts.preserve_etag.as_ref().is_none_or(|preserved| preserved == &etag);
 
             if let Some(ref tag) = opts.preserve_etag {
                 etag = tag.clone();
@@ -2536,6 +2751,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             let part_info = ObjectPartInfo {
                 etag: etag.clone(),
+                encrypted_etag,
                 number: part_id,
                 size: w_size,
                 mod_time: Some(OffsetDateTime::now_utc()),
@@ -2809,7 +3025,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let mut ret = ListPartsInfo {
             bucket: bucket.to_owned(),
-            object: object.to_owned(),
+            object: decode_dir_object(object),
             upload_id: upload_id.to_owned(),
             storage_class,
             max_parts,
@@ -3188,7 +3404,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         Ok(MultipartInfo {
             bucket: bucket.to_owned(),
-            object: object.to_owned(),
+            object: decode_dir_object(object),
             upload_id: upload_id.to_owned(),
             user_defined: {
                 strip_internal_multipart_metadata(&mut fi.metadata);
@@ -3402,6 +3618,12 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
+        // Recovery can restore a source after the request's metadata preflight
+        // missed it. Reauthorize that exact source before checksum comparison or
+        // publication while retaining the original object/upload locks.
+        if let Some(authorization) = &opts.multipart_completion_authorization {
+            authorization.authorize(&fi.metadata).await?;
+        }
         if !initial_multipart_source_observations(&fi, &files_metas)
             && let Some(completed) = self
                 .replay_completed_multipart_upload(bucket, object, upload_id, &uploaded_parts, Some(&fi), opts)
@@ -3429,6 +3651,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
         }
         let source_condition = capture_source_condition(bucket, object, &upload_id_path, &fi, Uuid::new_v4())?;
+        let preserved_encrypted_etag = preserves_staged_encrypted_etag_proof(&fi, opts, expected_restore_operation_id);
         let upload_data_dir = source_condition.lineage.original_data_dir.to_string();
         // The source generation remains in the captured precondition. Its
         // ACTIVE/recovery controls are not final user-object metadata.
@@ -3899,11 +4122,17 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
 
         // etag
-        let etag = resolve_complete_etag(opts, &uploaded_parts);
+        let (etag, encrypted_etag) = resolve_complete_etag(opts, &uploaded_parts, &fi.parts);
+        let encrypted_etag = encrypted_etag
+            || preserved_encrypted_etag
+                && fi.version_id.filter(|version| !version.is_nil()) == source_condition.lineage.original_version_id;
 
-        // An upload can contain parts from an older writer or a peer. Until
-        // every part's format is attested, keep its ETag out of keyless lists.
+        // New writes attest their selected parts. Same-version internal moves
+        // and restores can retain the proof from quorum-validated source metadata.
         rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG);
+        if encrypted_etag {
+            insert_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+        }
 
         fi.metadata.insert("etag".to_owned(), etag);
 
@@ -4730,19 +4959,57 @@ fn completed_multipart_upload_matches(
     Ok(true)
 }
 
+// Capture only the original staged proof, before completion applies metadata
+// updates. Publication must also retain the source lineage's version.
+fn preserves_staged_encrypted_etag_proof(fi: &FileInfo, opts: &ObjectOptions, restore_operation_id: Option<Uuid>) -> bool {
+    if opts.replication_request {
+        return false;
+    }
+    let movement = opts.data_movement
+        && opts.version_id.is_some()
+        && get_consistent_str(&fi.metadata, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD)
+            .is_some_and(|identity| !identity.is_empty());
+    // Commit rechecks this operation against the live object under its lock.
+    let restore = restore_operation_id
+        .is_some_and(|expected| restore_operation_id_from_metadata(&fi.metadata).is_ok_and(|id| id == Some(expected)));
+    if !movement && !restore {
+        return false;
+    }
+    let Ok(version) = opts.version_id.as_deref().map(Uuid::parse_str).transpose() else {
+        return false;
+    };
+    let Some(etag) = opts.preserve_etag.as_deref().filter(|etag| !etag.is_empty()) else {
+        return false;
+    };
+    version.filter(|version| !version.is_nil()) == fi.version_id.filter(|version| !version.is_nil())
+        && fi.metadata.get("etag").map(String::as_str) == Some(etag)
+        && get_consistent_str(&fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG) == Some("v1")
+}
+
 /// Final ETag for a completed multipart object. An authorized replication
 /// request preserves the source ETag so the replication HEAD comparison
 /// converges even when the source ETag is not derivable from the uploaded
 /// parts (foreign-origin objects, ciphertext-derived ETags); the internal
 /// metadata override comes next; otherwise the ETag is computed from parts.
-fn resolve_complete_etag(opts: &ObjectOptions, uploaded_parts: &[CompletePart]) -> String {
-    if let Some(etag) = opts.preserve_etag.as_ref().filter(|etag| !etag.is_empty()) {
-        return etag.clone();
+fn resolve_complete_etag(
+    opts: &ObjectOptions,
+    uploaded_parts: &[CompletePart],
+    stored_parts: &[ObjectPartInfo],
+) -> (String, bool) {
+    let preserved = opts
+        .preserve_etag
+        .as_ref()
+        .filter(|etag| !etag.is_empty())
+        .or_else(|| opts.user_defined.get("etag"));
+    let protected_parts = !stored_parts.is_empty() && stored_parts.iter().all(|part| part.encrypted_etag);
+    if let Some(etag) = preserved
+        && !protected_parts
+    {
+        return (etag.clone(), false);
     }
-    if let Some(etag) = opts.user_defined.get("etag") {
-        return etag.clone();
-    }
-    get_complete_multipart_md5(uploaded_parts)
+    let computed = get_complete_multipart_md5(uploaded_parts);
+    let encrypted_etag = protected_parts && preserved.is_none_or(|etag| etag == &computed);
+    (preserved.cloned().unwrap_or(computed), encrypted_etag)
 }
 
 /// Serialize the object-level checksum record that `complete_multipart_upload`
@@ -5250,6 +5517,45 @@ mod tests {
     async fn make_bucket_on_all(disks: &[DiskStore], bucket: &str) {
         for disk in disks {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+    }
+
+    #[test]
+    fn multipart_upload_paths_reject_aliases_before_disk_or_lock_use() {
+        let bucket = "multipart-path-owner";
+        let key = "allowed-key";
+        let leaf = format!("{}x1000000000", Uuid::new_v4());
+        let encode = |deployment: &str, suffix: &str| {
+            base64_simd::URL_SAFE_NO_PAD.encode_to_string(format!("{deployment}.{suffix}").as_bytes())
+        };
+        for data_movement in [false, true] {
+            let canonical = SetDisks::validated_multipart_upload_path(bucket, key, &encode("deployment", &leaf), data_movement)
+                .expect("issued upload leaf is accepted");
+            assert_eq!(
+                canonical,
+                SetDisks::validated_multipart_upload_path(bucket, key, &encode("another-deployment", &leaf), data_movement)
+                    .expect("deployment aliases resolve to the identical disk and lock path")
+            );
+            for suffix in [
+                format!("{leaf}/"),
+                format!("{leaf}//"),
+                format!("./{leaf}"),
+                format!("../{}/{leaf}", SetDisks::get_multipart_sha_dir(bucket, "denied-key")),
+                format!("{leaf}\\"),
+                format!("{leaf}\0"),
+            ] {
+                assert!(
+                    matches!(
+                        SetDisks::validated_multipart_upload_path(bucket, key, &encode("deployment", &suffix), data_movement),
+                        Err(Error::InvalidUploadID(..))
+                    ),
+                    "unsafe upload suffix must not reach path normalization: {suffix:?}"
+                );
+            }
+            assert!(matches!(
+                SetDisks::validated_multipart_upload_path(bucket, key, "not-base64!", data_movement),
+                Err(Error::InvalidUploadID(..))
+            ));
         }
     }
 
@@ -8799,6 +9105,326 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_part_retry_persists_new_etag_and_rejects_the_previous_receipt() {
+        use crate::io_support::rio::{WriteEncryption, WritePlan};
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "encrypted-etag-retry";
+        make_bucket_on_all(&disks, bucket).await;
+        let opts = ObjectOptions {
+            user_defined: HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())]),
+            ..Default::default()
+        };
+        let upload = set
+            .new_multipart_upload(bucket, "object", &opts)
+            .await
+            .expect("create encrypted upload");
+        let mut receipts = Vec::new();
+        for part_number in [1, 2, 1, 3] {
+            let bytes = b"same confidential part";
+            let size = i64::try_from(bytes.len()).expect("test length");
+            let source = HashReader::from_stream(Cursor::new(bytes.to_vec()), size, size, None, None, false).expect("source");
+            let encrypted = WritePlan::new()
+                .with_encryption(WriteEncryption::multipart([7; 32], [9; 12], part_number))
+                .apply(source, size)
+                .expect("encrypt part");
+            let mut reader = PutObjReader::new(encrypted);
+            let mut part_opts = opts.clone();
+            if part_number == 3 {
+                part_opts.preserve_etag = Some("0123456789abcdef0123456789abcdef".to_string());
+            }
+            let part = set
+                .put_object_part(bucket, "object", &upload.upload_id, part_number, &mut reader, &part_opts)
+                .await
+                .expect("persist encrypted part");
+            if part_number == 3 {
+                assert_eq!(part.etag, part_opts.preserve_etag);
+            } else {
+                receipts.push(part.etag);
+            }
+        }
+        let (staged, _) = set
+            .check_upload_id_exists(bucket, "object", &upload.upload_id, false)
+            .await
+            .expect("read upload generation");
+        let upload_path = SetDisks::get_upload_id_dir(bucket, "object", &upload.upload_id);
+        let data_dir = staged.data_dir.expect("staging data directory");
+        for disk in &disks {
+            let metadata = disk
+                .read_parts(
+                    RUSTFS_META_MULTIPART_BUCKET,
+                    &[
+                        format!("{upload_path}/{data_dir}/part.1.meta"),
+                        format!("{upload_path}/{data_dir}/part.3.meta"),
+                    ],
+                )
+                .await
+                .expect("read persisted part proofs");
+            assert!(metadata[0].encrypted_etag, "rewritten protected part is attested");
+            assert!(!metadata[1].encrypted_etag, "an overridden part ETag has no producer proof");
+        }
+        assert_ne!(receipts[0], receipts[1], "spare parts must not identify another part's plaintext");
+        assert_ne!(receipts[0], receipts[2], "same-number retries get a new receipt");
+        for _ in 0..2 {
+            let listed = set
+                .list_object_parts(bucket, "object", &upload.upload_id, None, 10, &opts)
+                .await
+                .expect("list parts");
+            assert_eq!(listed.parts[0].etag, receipts[2], "stored ETags do not change on reads");
+        }
+        let stale = CompletePart {
+            part_num: 1,
+            etag: receipts[0].clone(),
+            ..Default::default()
+        };
+        let error = set
+            .clone()
+            .complete_multipart_upload(bucket, "object", &upload.upload_id, vec![stale], &opts)
+            .await
+            .expect_err("the old part receipt must not complete a rewritten part");
+        assert!(matches!(error, Error::InvalidPart(..)), "{error:?}");
+        let current = CompletePart {
+            part_num: 1,
+            etag: receipts[2].clone(),
+            ..Default::default()
+        };
+        let committed = set
+            .clone()
+            .complete_multipart_upload(bucket, "object", &upload.upload_id, vec![current.clone()], &opts)
+            .await
+            .expect("complete with the stored receipt");
+        let replay = set
+            .clone()
+            .complete_multipart_upload(bucket, "object", &upload.upload_id, vec![current], &opts)
+            .await
+            .expect("committed completion replay is stable");
+        assert_eq!(replay.etag, committed.etag);
+        for completed in [committed, replay] {
+            assert!(
+                rustfs_utils::http::etag_can_be_listed(&completed.user_defined),
+                "the selected protected part retains its ETag after completion and replay"
+            );
+            assert_eq!(
+                rustfs_utils::http::get_consistent_str(&completed.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,),
+                Some("v1")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_encrypted_multipart_clears_unproven_upload_etag_marker() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "legacy-encrypted-etag";
+        make_bucket_on_all(&disks, bucket).await;
+        let mut opts = ObjectOptions {
+            user_defined: HashMap::from([(SSEC_ALGORITHM_HEADER.to_owned(), "AES256".to_owned())]),
+            ..Default::default()
+        };
+        insert_str(&mut opts.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+        // Model an older writer whose part metadata has no protected-format proof.
+        let (upload_id, parts) = stage_upload_with_create_opts(&set, bucket, "object", b"legacy part", &opts).await;
+        let completed = set
+            .clone()
+            .complete_multipart_upload(bucket, "object", &upload_id, parts, &ObjectOptions::default())
+            .await
+            .expect("legacy part can still complete");
+        let reread = set
+            .get_object_info(bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("read completed metadata");
+        assert_eq!(completed.etag, reread.etag);
+        for info in [completed, reread] {
+            assert!(!rustfs_utils::http::etag_can_be_listed(&info.user_defined));
+            assert!(!contains_key_str(&info.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG));
+        }
+    }
+
+    #[test]
+    fn data_movement_etag_proof_requires_verified_source_identity() {
+        let version = Uuid::new_v4();
+        let mut source = FileInfo {
+            version_id: Some(version),
+            metadata: HashMap::from([("etag".to_owned(), "protected-source-etag".to_owned())]),
+            ..Default::default()
+        };
+        insert_str(
+            &mut source.metadata,
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            "source-generation".to_owned(),
+        );
+        insert_str(&mut source.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+        let opts = ObjectOptions {
+            data_movement: true,
+            version_id: Some(version.to_string()),
+            preserve_etag: source.metadata.get("etag").cloned(),
+            ..Default::default()
+        };
+        assert!(preserves_staged_encrypted_etag_proof(&source, &opts, None));
+        for version_id in [None, Some(Uuid::nil())] {
+            let null_source = FileInfo {
+                version_id,
+                ..source.clone()
+            };
+            let null_opts = ObjectOptions {
+                version_id: Some(Uuid::nil().to_string()),
+                ..opts.clone()
+            };
+            assert!(preserves_staged_encrypted_etag_proof(&null_source, &null_opts, None));
+        }
+        for rejected in [
+            ObjectOptions {
+                data_movement: false,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                replication_request: true,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                version_id: None,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                version_id: Some("invalid".to_owned()),
+                ..opts.clone()
+            },
+            ObjectOptions {
+                version_id: Some(Uuid::new_v4().to_string()),
+                ..opts.clone()
+            },
+            ObjectOptions {
+                preserve_etag: None,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                preserve_etag: Some(String::new()),
+                ..opts.clone()
+            },
+            ObjectOptions {
+                preserve_etag: Some("replacement-etag".to_owned()),
+                ..opts.clone()
+            },
+        ] {
+            assert!(!preserves_staged_encrypted_etag_proof(&source, &rejected, None));
+        }
+        for suffix in [
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,
+        ] {
+            let mut missing = source.clone();
+            rustfs_utils::http::remove_str(&mut missing.metadata, suffix);
+            assert!(!preserves_staged_encrypted_etag_proof(&missing, &opts, None));
+            insert_str(&mut missing.metadata, suffix, String::new());
+            assert!(!preserves_staged_encrypted_etag_proof(&missing, &opts, None));
+            let mut conflicting = source.clone();
+            conflicting
+                .metadata
+                .insert(format!("x-minio-internal-{suffix}"), "conflict".to_owned());
+            assert!(!preserves_staged_encrypted_etag_proof(&conflicting, &opts, None));
+        }
+        for value in [None, Some("unknown")] {
+            let mut unproven = source.clone();
+            rustfs_utils::http::remove_str(&mut unproven.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG);
+            if let Some(value) = value {
+                insert_str(&mut unproven.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, value.to_owned());
+            }
+            let request_claim = ObjectOptions {
+                user_defined: source.metadata.clone(),
+                ..opts.clone()
+            };
+            assert!(!preserves_staged_encrypted_etag_proof(&unproven, &request_claim, None));
+        }
+    }
+
+    #[test]
+    fn restore_etag_proof_requires_matching_staged_operation() {
+        let operation_id = Uuid::new_v4();
+        for version_id in [None, Some(Uuid::new_v4())] {
+            let mut staged = FileInfo {
+                version_id,
+                metadata: HashMap::from([("etag".to_owned(), "source-etag".to_owned())]),
+                ..Default::default()
+            };
+            let opts = ObjectOptions {
+                version_id: version_id.map(|id| id.to_string()),
+                preserve_etag: Some("source-etag".to_owned()),
+                ..Default::default()
+            };
+            insert_str(&mut staged.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+            assert!(!preserves_staged_encrypted_etag_proof(&staged, &opts, Some(operation_id)));
+            insert_str(&mut staged.metadata, SUFFIX_RESTORE_OPERATION_ID, operation_id.to_string());
+            assert!(preserves_staged_encrypted_etag_proof(&staged, &opts, Some(operation_id)));
+            assert!(!preserves_staged_encrypted_etag_proof(&staged, &opts, Some(Uuid::new_v4())));
+            rustfs_utils::http::remove_str(&mut staged.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG);
+            assert!(!preserves_staged_encrypted_etag_proof(&staged, &opts, Some(operation_id)));
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_data_movement_etag_proof_rejects_version_rewrites_and_late_claims() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "movement-etag-proof";
+        make_bucket_on_all(&disks, bucket).await;
+        for (object, staged_proof, publish_versioned, late_claim, expected_proof) in [
+            ("same-version", true, true, false, true),
+            ("rewritten-version", true, false, false, false),
+            ("late-claim", false, true, true, false),
+        ] {
+            let version = Uuid::new_v4();
+            let mut opts = ObjectOptions {
+                data_movement: true,
+                versioned: true,
+                version_id: Some(version.to_string()),
+                preserve_etag: Some("protected-source-etag".to_owned()),
+                user_defined: HashMap::from([(SSEC_ALGORITHM_HEADER.to_owned(), "AES256".to_owned())]),
+                ..Default::default()
+            };
+            insert_str(
+                &mut opts.user_defined,
+                rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+                "source-generation".to_owned(),
+            );
+            if staged_proof {
+                insert_str(&mut opts.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+            }
+            let (upload_id, parts) = stage_upload_with_create_opts(&set, bucket, object, b"raw source bytes", &opts).await;
+            opts.versioned = publish_versioned;
+            if late_claim {
+                let mut metadata = HashMap::new();
+                insert_str(&mut metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+                opts.eval_metadata = Some(metadata);
+            }
+            let completed = set
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &opts)
+                .await
+                .expect("complete raw internal movement");
+            assert_eq!(completed.version_id, publish_versioned.then_some(version), "{object}");
+            assert_eq!(completed.etag, opts.preserve_etag, "{object}");
+            let persisted = set
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: Some(crate::data_movement::data_movement_exact_version_id(completed.version_id)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read completed proof from disk");
+            assert_eq!(
+                rustfs_utils::http::etag_can_be_listed(&persisted.user_defined),
+                expected_proof,
+                "{object}"
+            );
+            assert_eq!(
+                get_consistent_str(&persisted.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG),
+                expected_proof.then_some("v1"),
+                "{object}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn complete_encrypted_multipart_marks_quorum_validated_layout() {
         temp_env::async_with_vars([(crate::object_api::ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
             assert_eq!(
@@ -11177,6 +11803,237 @@ mod tests {
             .unwrap_or(decoded)
     }
 
+    #[tokio::test]
+    async fn multipart_index_shortened_inventory_cannot_lower_configured_quorum() {
+        let (_roots, disks, set) = hermetic_set_disks(4).await;
+        for disk in &disks {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::disk::disk_store::wait_for_multipart_index_bootstrap(disk),
+            )
+            .await
+            .expect("bootstrap completes")
+            .expect("local bootstrap worker");
+        }
+        let bucket = "multipart-index-short-inventory";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("fixture bucket");
+        }
+        let full = set.disks.read().await.clone();
+        assert_eq!(set.set_drive_count, 4);
+        for available in 0..4 {
+            *set.disks.write().await = full[..available].to_vec();
+            assert!(
+                set.multipart_index_roots(bucket).await.is_none(),
+                "{available} inventory slots cannot redefine configured N"
+            );
+            assert!(matches!(
+                set.list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
+                    .await,
+                Err(Error::ErasureReadQuorum)
+            ));
+        }
+        *set.disks.write().await = full.clone();
+        set.disks.write().await[3] = None;
+        assert!(
+            set.multipart_index_roots(bucket).await.is_some(),
+            "three covered slots still satisfy configured 4-slot coverage"
+        );
+        set.disks.write().await[2] = None;
+        assert!(set.multipart_index_roots(bucket).await.is_none());
+        let listed = set
+            .list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
+            .await
+            .expect("two explicit available slots still satisfy legacy D=2");
+        assert!(listed.uploads.is_empty());
+        *set.disks.write().await = full;
+        assert!(set.multipart_index_roots(bucket).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn multipart_index_covering_set_finds_old_write_on_minimum_metadata_quorum() {
+        let (_roots, disks, set) = hermetic_set_disks(4).await;
+        for disk in &disks {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::disk::disk_store::wait_for_multipart_index_bootstrap(disk),
+            )
+            .await
+            .expect("bootstrap completes")
+            .expect("local bootstrap worker");
+        }
+        let bucket = "multipart-index-minimum-quorum";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("fixture bucket");
+        }
+        let key = "old-writer";
+        let upload = format!("{}x1", Uuid::new_v4());
+        let path = format!("{}/{upload}", SetDisks::get_multipart_sha_dir(bucket, key));
+        let mut metadata = FileInfo::new(&path, 2, 2);
+        metadata.data_dir = Some(Uuid::new_v4());
+        metadata.mod_time = Some(OffsetDateTime::now_utc());
+        metadata.fresh = true;
+        metadata.metadata.insert(RUSTFS_MULTIPART_BUCKET_KEY.into(), bucket.into());
+        metadata.metadata.insert(RUSTFS_MULTIPART_OBJECT_KEY.into(), key.into());
+        // Exactly one of the two surviving source copies intersects the three
+        // covered disks. No coordinator-side index update is involved.
+        for (index, disk) in disks.iter().take(2).enumerate() {
+            let mut info = metadata.clone();
+            info.erasure.index = metadata.erasure.distribution[index];
+            disk.write_metadata(bucket, RUSTFS_META_MULTIPART_BUCKET, &path, info)
+                .await
+                .expect("legacy metadata publication");
+        }
+        // Raw head replacement requires an existing source. Initialize a separate
+        // upload before damaging it so the two readable target copies stay intact.
+        let damaged_key = "damaged-source";
+        let damaged_path = format!("{}/{}x1", SetDisks::get_multipart_sha_dir(bucket, damaged_key), Uuid::new_v4());
+        let mut damaged = metadata.clone();
+        damaged.name.clone_from(&damaged_path);
+        damaged.data_dir = Some(Uuid::new_v4());
+        damaged.erasure.index = damaged.erasure.distribution[0];
+        damaged
+            .metadata
+            .insert(RUSTFS_MULTIPART_OBJECT_KEY.into(), damaged_key.into());
+        disks[0]
+            .write_metadata(bucket, RUSTFS_META_MULTIPART_BUCKET, &damaged_path, damaged)
+            .await
+            .expect("initialize the source that will lose index coverage");
+        disks[0]
+            .write_all(
+                RUSTFS_META_MULTIPART_BUCKET,
+                &format!("{damaged_path}/xl.meta"),
+                Bytes::from_static(b"old damaged head"),
+            )
+            .await
+            .expect("one uncovered disk");
+        assert!(matches!(
+            multipart_index_roots_on_disk(disks[0].clone(), bucket).await,
+            Err(disk::error::DiskError::MethodNotAllowed)
+        ));
+        let target_root = SetDisks::get_multipart_sha_dir(bucket, key);
+        for (index, disk) in disks.iter().enumerate().skip(1) {
+            let (_, roots) = multipart_index_roots_on_disk(disk.clone(), bucket)
+                .await
+                .expect("the other three physical disks attest coverage");
+            assert_eq!(roots.contains(&target_root), index == 1, "only covered disk 1 contains the target source");
+        }
+        let (_, roots, quorum) = set
+            .multipart_index_roots(bucket)
+            .await
+            .expect("three covered disks intersect D=2");
+        assert_eq!(quorum, 2);
+        assert_eq!(roots, std::collections::BTreeSet::from([target_root]));
+        let (head, _) = set
+            .check_upload_id_exists(bucket, key, &runtime_sources::deployment_upload_id(&upload), false)
+            .await
+            .expect("the two surviving legacy source heads satisfy an ordinary metadata read");
+        assert_eq!(head.metadata.get(RUSTFS_MULTIPART_OBJECT_KEY).map(String::as_str), Some(key));
+        let listed = set
+            .list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
+            .await
+            .expect("minimum readable source quorum remains discoverable");
+        assert_eq!(listed.uploads.len(), 1);
+        assert_eq!(listed.uploads[0].object, key);
+        assert_eq!(upload_uuid_suffix(&listed.uploads[0].upload_id), upload);
+    }
+
+    #[tokio::test]
+    async fn multipart_index_covering_set_avoids_foreign_scans_and_falls_back_without_coverage() {
+        let (_roots, disks, set) = hermetic_set_disks(4).await;
+        for disk in &disks {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::disk::disk_store::wait_for_multipart_index_bootstrap(disk),
+            )
+            .await
+            .expect("bootstrap completes")
+            .expect("local bootstrap worker");
+        }
+        let bucket = "multipart-index-covered-bucket";
+        let foreign = "multipart-index-foreign-bucket";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("target bucket");
+            disk.make_volume(foreign).await.expect("foreign bucket");
+        }
+        let mine = set
+            .new_multipart_upload(bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("target upload");
+        let other = set
+            .new_multipart_upload(foreign, "other", &ObjectOptions::default())
+            .await
+            .expect("foreign upload");
+        let foreign_path = SetDisks::get_upload_id_dir(foreign, "other", &other.upload_id);
+        let target_root = SetDisks::get_multipart_sha_dir(bucket, "object");
+        // Model one disk that cannot attest coverage. The real raw legacy write
+        // revokes only that physical disk's index, without changing the target.
+        disks[0]
+            .write_all(
+                RUSTFS_META_MULTIPART_BUCKET,
+                &format!("{foreign_path}/xl.meta"),
+                Bytes::from_static(b"legacy damaged head"),
+            )
+            .await
+            .expect("unindexable legacy publication");
+        assert!(
+            set.multipart_index_roots(bucket).await.is_some(),
+            "3 of 4 intersects every 2-copy metadata quorum"
+        );
+        MULTIPART_DISCOVERY_DIRECTORIES
+            .lock()
+            .expect("observer")
+            .insert(bucket.into(), Vec::new());
+        let listed = set
+            .list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
+            .await
+            .expect("covered listing");
+        assert_eq!(listed.uploads.len(), 1);
+        assert_eq!(upload_uuid_suffix(&listed.uploads[0].upload_id), upload_uuid_suffix(&mine.upload_id));
+        let directories = MULTIPART_DISCOVERY_DIRECTORIES
+            .lock()
+            .expect("observer")
+            .remove(bucket)
+            .expect("observed discovery");
+        assert!(!directories.is_empty());
+        assert!(
+            directories.iter().all(|directory| directory == &target_root),
+            "covered requests cannot enumerate the staging root or foreign uploads"
+        );
+
+        disks[1]
+            .write_all(
+                RUSTFS_META_MULTIPART_BUCKET,
+                &format!("{foreign_path}/xl.meta"),
+                Bytes::from_static(b"another legacy damaged head"),
+            )
+            .await
+            .expect("second unavailable index");
+        assert!(
+            set.multipart_index_roots(bucket).await.is_none(),
+            "2 of 4 does not cover the disjoint 2-copy quorum"
+        );
+        MULTIPART_DISCOVERY_DIRECTORIES
+            .lock()
+            .expect("observer")
+            .insert(bucket.into(), Vec::new());
+        let listed = set
+            .list_multipart_uploads_for_incarnation(bucket, "", None, None, None, 1000, None)
+            .await
+            .expect("complete legacy fallback");
+        assert_eq!(listed.uploads.len(), 1);
+        assert_eq!(upload_uuid_suffix(&listed.uploads[0].upload_id), upload_uuid_suffix(&mine.upload_id));
+        let directories = MULTIPART_DISCOVERY_DIRECTORIES
+            .lock()
+            .expect("observer")
+            .remove(bucket)
+            .expect("observed fallback");
+        assert!(
+            directories.iter().any(String::is_empty),
+            "fallback uses the complete old discovery algorithm"
+        );
+    }
+
     /// Regression (issue #5716): the multipart staging namespace is flat —
     /// `sha256(bucket/object)` directories from every bucket share one volume —
     /// so a bucket-scoped listing reads metadata belonging to other buckets'
@@ -11342,6 +12199,66 @@ mod tests {
             .expect("create upload in target bucket");
         assert!(
             matches!(set_disks.ensure_no_multipart_uploads(bucket).await, Err(Error::BucketNotEmpty(name)) if name == bucket)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_multipart_pool_probe_is_scoped_to_bucket_and_encoded_key() {
+        let (dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "multipart-exact-probe";
+        let other_bucket = "multipart-other-probe";
+        for disk in &disks {
+            for bucket in [bucket, other_bucket] {
+                disk.make_volume(bucket).await.expect("create bucket");
+            }
+        }
+        for (upload_bucket, key) in [(bucket, "object-long"), (bucket, "object/"), (other_bucket, "object")] {
+            set.new_multipart_upload(upload_bucket, &encode_dir_object(key), &ObjectOptions::default())
+                .await
+                .expect("create unrelated upload");
+        }
+        // An unrelated broken SHA directory makes a full staging-root walk fail.
+        // It must not be touched by an exact-key pool probe.
+        let unrelated = SetDisks::get_multipart_sha_dir(other_bucket, "broken");
+        for dir in &dirs {
+            tokio::fs::write(dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&unrelated), b"not a directory")
+                .await
+                .expect("seed unrelated discovery failure");
+        }
+        MULTIPART_DISCOVERY_DIRECTORIES
+            .lock()
+            .expect("observer lock")
+            .insert(bucket.to_owned(), Vec::new());
+        assert!(
+            !set.has_multipart_upload_for_key(bucket, "object", None)
+                .await
+                .expect("unrelated keys cannot match")
+        );
+        set.new_multipart_upload(bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("create exact legacy-layout upload");
+        assert!(
+            set.has_multipart_upload_for_key(bucket, "object", None)
+                .await
+                .expect("exact upload remains discoverable")
+        );
+        let probes = MULTIPART_DISCOVERY_DIRECTORIES
+            .lock()
+            .expect("observer lock")
+            .remove(bucket)
+            .expect("recorded probes");
+        assert_eq!(probes.len(), 2 * disks.len(), "one directory per disk and probe");
+        let expected = SetDisks::get_multipart_sha_dir(bucket, "object");
+        assert!(probes.iter().all(|directory| directory == &expected));
+        assert!(
+            set.has_multipart_upload_for_key(bucket, &encode_dir_object("object/"), None)
+                .await
+                .expect("directory key keeps its encoded staging layout")
+        );
+        set.disks.write().await.fill(None);
+        assert!(
+            set.has_multipart_upload_for_key(bucket, "object", None).await.is_err(),
+            "a failed discovery quorum must not become a negative pool match"
         );
     }
 
@@ -11534,7 +12451,7 @@ mod tests {
     /// surviving disks still identify it, so it stays listed.
     #[tokio::test]
     async fn list_multipart_uploads_survives_sub_quorum_corruption() {
-        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "multipart-partial-corrupt-bucket";
         for disk in &disk_stores {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
@@ -11545,32 +12462,29 @@ mod tests {
             .await
             .expect("multipart upload should be created");
 
-        // Corrupt the upload's metadata on exactly one disk (discovery quorum
-        // on this 4-disk set is 2): the other replicas keep it identifiable.
-        let sha = SetDisks::get_multipart_sha_dir(bucket, "partial/object.bin");
-        let mut corrupted = 0usize;
-        for temp_dir in &temp_dirs {
-            let sha_dir = temp_dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&sha);
-            for meta in multipart_meta_files_on_disk(temp_dir, "xl.meta").await {
-                if meta.starts_with(sha_dir.to_string_lossy().as_ref()) {
-                    tokio::fs::write(&meta, b"not an xl.meta")
-                        .await
-                        .expect("corrupting xl.meta should succeed");
-                    corrupted += 1;
-                }
-            }
-            if corrupted > 0 {
-                break;
-            }
-        }
-        assert_eq!(corrupted, 1, "exactly one disk's metadata should be corrupted");
-
-        let listed = set_disks
-            .list_multipart_uploads_for_incarnation(bucket, "partial/", None, None, None, 1000, None)
+        // Exercise both a minority of corrupt replies and a tie between corruption
+        // and the remaining readable metadata. Each list must resolve the real ID.
+        let path = SetDisks::get_upload_id_dir(bucket, "partial/object.bin", &upload.upload_id);
+        for disk in disk_stores.iter().take(2) {
+            disk.write_all(
+                RUSTFS_META_MULTIPART_BUCKET,
+                &format!("{path}/xl.meta"),
+                Bytes::from_static(b"not an xl.meta"),
+            )
             .await
-            .expect("sub-quorum corruption must not fail the listing");
-        assert_eq!(listed.uploads.len(), 1);
-        assert_eq!(upload_uuid_suffix(&listed.uploads[0].upload_id), upload_uuid_suffix(&upload.upload_id));
+            .expect("replace one existing head and invalidate its cached metadata");
+            let error = disk
+                .read_version(bucket, RUSTFS_META_MULTIPART_BUCKET, &path, "", &ReadOptions::default())
+                .await
+                .expect_err("the damaged head must no longer return cached metadata");
+            assert!(is_corrupt_upload_metadata_error(&error), "unexpected damage classification: {error:?}");
+            let listed = set_disks
+                .list_multipart_uploads_for_incarnation(bucket, "partial/", None, None, None, 1000, None)
+                .await
+                .expect("a readable upload survives corrupt replies");
+            assert_eq!(listed.uploads.len(), 1);
+            assert_eq!(upload_uuid_suffix(&listed.uploads[0].upload_id), upload_uuid_suffix(&upload.upload_id));
+        }
     }
 
     /// Pins the degrade-vs-propagate classification (issue #5716 review): only
@@ -12000,6 +12914,108 @@ mod tests {
                 .await
                 .expect("clean proven orphan")
         );
+    }
+
+    struct TestCompletionAuthorization {
+        allowed: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+        expected_marker: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::multipart::MultipartCompletionAuthorization for TestCompletionAuthorization {
+        type Error = Error;
+
+        async fn authorize(&self, metadata: &HashMap<String, String>) -> Result<()> {
+            if let Some(expected) = self.expected_marker {
+                assert_eq!(metadata.get("authorization-source").map(String::as_str), Some(expected));
+            }
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.allowed.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(Error::PrefixAccessDenied("bucket".to_string(), "object".to_string()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_authorizes_selected_source_and_historical_replay_before_part_comparison() {
+        use std::sync::atomic::Ordering;
+        for versioned in [false, true] {
+            let (_dirs, disks, set) = hermetic_set_disks(4).await;
+            let bucket = "completion-authorization";
+            let object = "object";
+            make_bucket_on_all(&disks, bucket).await;
+            let create_opts = ObjectOptions {
+                versioned,
+                user_defined: HashMap::from([("authorization-source".to_string(), "original".to_string())]),
+                ..Default::default()
+            };
+            let (upload, parts) = stage_upload_with_create_opts(&set, bucket, object, &[0x61; 4096], &create_opts).await;
+            let gate = Arc::new(TestCompletionAuthorization {
+                allowed: std::sync::atomic::AtomicBool::new(false),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                expected_marker: Some("original"),
+            });
+            let opts = ObjectOptions {
+                multipart_completion_authorization: Some(gate.clone()),
+                ..create_opts.clone()
+            };
+            let denied = set
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload, parts.clone(), &opts)
+                .await;
+            assert!(matches!(denied, Err(Error::PrefixAccessDenied(..))));
+            assert!(set.get_multipart_info(bucket, object, &upload, &create_opts).await.is_ok());
+            gate.allowed.store(true, Ordering::SeqCst);
+            let committed = set
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload, parts.clone(), &opts)
+                .await
+                .expect("authorized commit");
+            if versioned {
+                let other_opts = ObjectOptions {
+                    user_defined: HashMap::from([("authorization-source".to_string(), "other".to_string())]),
+                    ..create_opts.clone()
+                };
+                let (other_upload, other_parts) =
+                    stage_upload_with_create_opts(&set, bucket, object, &[0x62; 4096], &other_opts).await;
+                set.clone()
+                    .complete_multipart_upload(bucket, object, &other_upload, other_parts, &other_opts)
+                    .await
+                    .expect("new current version");
+            }
+            gate.allowed.store(false, Ordering::SeqCst);
+            let mut guessed_parts = parts.clone();
+            guessed_parts[0].etag = Some("guessed-part-etag".to_string());
+            let denied = set
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload, guessed_parts, &opts)
+                .await;
+            assert!(
+                matches!(denied, Err(Error::PrefixAccessDenied(..))),
+                "authorization must precede InvalidPart disclosure"
+            );
+            gate.allowed.store(true, Ordering::SeqCst);
+            let replay_opts = ObjectOptions {
+                want_checksum: Some(rustfs_rio::Checksum {
+                    checksum_type: rustfs_rio::ChecksumType::SHA256,
+                    encoded: "a-guess-is-not-compared-on-replay".to_string(),
+                    ..Default::default()
+                }),
+                ..opts
+            };
+            let replay = set
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload, parts, &replay_opts)
+                .await
+                .expect("authorized replay");
+            assert!(replay.multipart_completion_replayed);
+            assert_eq!(replay.version_id, committed.version_id);
+            assert_eq!(replay.etag, committed.etag);
+            assert!(gate.calls.load(Ordering::SeqCst) >= 4);
+        }
     }
 
     #[tokio::test]
@@ -14112,9 +15128,30 @@ mod tests {
             }
             assert_eq!(seals, 2, "two local seals do not establish a terminal quorum");
             assert_completion_files_preserved(&disks, RUSTFS_META_MULTIPART_BUCKET, &source_files).await;
-            let retried = complete(&set, bucket, object, &upload, parts)
+            let gate = Arc::new(TestCompletionAuthorization {
+                allowed: std::sync::atomic::AtomicBool::new(false),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                expected_marker: None,
+            });
+            let guarded_opts = ObjectOptions {
+                multipart_completion_authorization: Some(gate.clone()),
+                ..Default::default()
+            };
+            let denied = set
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload, parts.clone(), &guarded_opts)
+                .await;
+            assert!(
+                matches!(denied, Err(Error::PrefixAccessDenied(..))),
+                "restored source must be authorized before publication"
+            );
+            gate.allowed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let retried = set
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload, parts, &guarded_opts)
                 .await
-                .expect("H remaining present heads authorize all-N blocked restore and activation");
+                .expect("authorized recovery retains all-N blocked restore and activation");
+            assert!(gate.calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
             assert!(
                 !retried.multipart_completion_replayed,
                 "a partial seal cannot acknowledge the old minority"
@@ -15461,7 +16498,7 @@ mod tests {
             preserve_etag: Some(foreign_etag.clone()),
             ..Default::default()
         };
-        assert_eq!(resolve_complete_etag(&opts, &[]), foreign_etag);
+        assert_eq!(resolve_complete_etag(&opts, &[], &[]), (foreign_etag, false));
 
         // Empty preserve value degrades to the next source.
         let opts_empty = ObjectOptions {
@@ -15469,11 +16506,67 @@ mod tests {
             user_defined: std::collections::HashMap::from([("etag".to_string(), "override-etag".to_string())]),
             ..Default::default()
         };
-        assert_eq!(resolve_complete_etag(&opts_empty, &[]), "override-etag");
+        assert_eq!(resolve_complete_etag(&opts_empty, &[], &[]), ("override-etag".to_string(), false));
 
         // Without either source the ETag is computed from the parts.
-        let computed = resolve_complete_etag(&ObjectOptions::default(), &[]);
-        assert_eq!(computed, get_complete_multipart_md5(&[]));
+        let computed = resolve_complete_etag(&ObjectOptions::default(), &[], &[]);
+        assert_eq!(computed, (get_complete_multipart_md5(&[]), false));
+    }
+
+    #[test]
+    fn complete_etag_proof_requires_all_selected_parts_and_matching_overrides() {
+        for proofs in [&[][..], &[true], &[true, true], &[true, false], &[false]] {
+            let stored: Vec<_> = proofs
+                .iter()
+                .enumerate()
+                .map(|(index, &encrypted_etag)| ObjectPartInfo {
+                    number: index + 1,
+                    etag: "0123456789abcdef0123456789abcdef".to_owned(),
+                    encrypted_etag,
+                    ..Default::default()
+                })
+                .collect();
+            let uploaded: Vec<_> = stored
+                .iter()
+                .map(|part| CompletePart {
+                    part_num: part.number,
+                    etag: Some(part.etag.clone()),
+                    ..Default::default()
+                })
+                .collect();
+            let computed = get_complete_multipart_md5(&uploaded);
+            let protected = !proofs.is_empty() && proofs.iter().all(|&proof| proof);
+            assert_eq!(
+                resolve_complete_etag(&ObjectOptions::default(), &uploaded, &stored),
+                (computed.clone(), protected)
+            );
+
+            for preserved in ["foreign-etag", computed.as_str(), ""] {
+                for opts in [
+                    ObjectOptions {
+                        preserve_etag: Some(preserved.to_owned()),
+                        ..Default::default()
+                    },
+                    ObjectOptions {
+                        user_defined: HashMap::from([("etag".to_owned(), preserved.to_owned())]),
+                        ..Default::default()
+                    },
+                    ObjectOptions {
+                        preserve_etag: Some(preserved.to_owned()),
+                        user_defined: HashMap::from([("etag".to_owned(), "metadata-etag".to_owned())]),
+                        ..Default::default()
+                    },
+                ] {
+                    let expected_etag = if !preserved.is_empty() || opts.preserve_etag.is_none() {
+                        preserved
+                    } else {
+                        opts.user_defined.get("etag").map_or(computed.as_str(), String::as_str)
+                    };
+                    let result = resolve_complete_etag(&opts, &uploaded, &stored);
+                    assert_eq!(result, (expected_etag.to_owned(), protected && expected_etag == computed));
+                }
+            }
+        }
     }
 
     /// Accumulate the per-part digests and the running full-object checksum the
