@@ -105,7 +105,8 @@ impl Opt {
             | Some(Commands::Tls(_))
             | Some(Commands::Diagnose(_))
             | Some(Commands::Inspect(_))
-            | Some(Commands::Connect(_)) => Self::from_server_opts(default_server_opts()),
+            | Some(Commands::Connect(_))
+            | Some(Commands::Health(_)) => Self::from_server_opts(default_server_opts()),
             None => {
                 // Default to server with empty volumes (will be filled from env)
                 Self::from_server_opts(default_server_opts())
@@ -140,6 +141,7 @@ impl Opt {
             Some(Commands::Tls(opts)) => Ok(CommandResult::Tls(opts)),
             Some(Commands::Diagnose(opts)) => Ok(CommandResult::Diagnose(opts)),
             Some(Commands::Inspect(opts)) => Ok(CommandResult::Inspect(opts)),
+            Some(Commands::Health(opts)) => Ok(CommandResult::Health(opts)),
             Some(Commands::Connect(opts)) => match opts.command {
                 ConnectCommands::Register(opts) => Ok(CommandResult::ConnectRegister(opts)),
                 ConnectCommands::License(opts) => Ok(CommandResult::ConnectLicense(opts.command)),
@@ -200,7 +202,8 @@ impl Opt {
             | Some(Commands::Tls(_))
             | Some(Commands::Diagnose(_))
             | Some(Commands::Inspect(_))
-            | Some(Commands::Connect(_)) => Err(clap::Error::new(clap::error::ErrorKind::DisplayHelp)),
+            | Some(Commands::Connect(_))
+            | Some(Commands::Health(_)) => Err(clap::Error::new(clap::error::ErrorKind::DisplayHelp)),
             None => {
                 // Default to server with empty volumes
                 Ok(Self::from_server_opts(default_server_opts()))

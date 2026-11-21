@@ -91,6 +91,7 @@ pub mod error;
 pub mod foreground_observation;
 #[cfg(test)]
 pub(crate) mod guard_sources;
+pub mod health_probe;
 pub mod init;
 pub mod inspect;
 pub(crate) mod kms_deletion_gate;

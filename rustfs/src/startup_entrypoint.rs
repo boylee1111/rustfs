@@ -84,11 +84,41 @@ where
 }
 
 pub fn run_process() -> ExitCode {
+    if let Some(exit_code) = try_run_lightweight_health_subcommand() {
+        return exit_code;
+    }
     #[cfg(not(feature = "internode-transport"))]
     let run = run_process_on_current_thread;
     #[cfg(feature = "internode-transport")]
     let run = || run_process_on_current_thread(None);
     run_on_startup_thread(run)
+}
+
+/// Short-circuit `rustfs health` before allocating the 8 MiB startup stack or
+/// multi-threaded server Tokio runtime so periodic container `exec` probes stay fast.
+fn try_run_lightweight_health_subcommand() -> Option<ExitCode> {
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(String::as_str) != Some("health") {
+        return None;
+    }
+    if let Err(err) = bootstrap_external_prefix_compat() {
+        emit_fatal_stderr("Environment prefix bootstrap failed", err);
+        return Some(ExitCode::FAILURE);
+    }
+    match Opt::parse_command(raw_args) {
+        Ok(CommandResult::Health(opts)) => match crate::health_probe::run_health_probe_cli(&opts) {
+            Ok(()) => Some(ExitCode::SUCCESS),
+            Err(err) => {
+                emit_fatal_stderr("Health probe failed", err);
+                Some(ExitCode::FAILURE)
+            }
+        },
+        Ok(_) => None,
+        Err(err) => {
+            emit_fatal_stderr("Command parse failed", err);
+            Some(ExitCode::FAILURE)
+        }
+    }
 }
 
 /// Run `f` on a thread whose stack is [`STARTUP_THREAD_STACK_SIZE`] on every
@@ -229,6 +259,7 @@ async fn async_main(#[cfg(feature = "internode-transport")] build: Option<BuildP
         CommandResult::ConnectTelemetry(command) => return execute_connect_telemetry(command).await,
         CommandResult::ConnectTop(command) => return execute_connect_top(command).await,
         CommandResult::ConnectInspect(options) => return execute_connect_inspect(options).await,
+        CommandResult::Health(options) => return crate::health_probe::execute_health_probe(&options).await,
         CommandResult::Server(config) => config,
     };
 

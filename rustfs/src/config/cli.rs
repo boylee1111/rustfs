@@ -48,7 +48,7 @@ pub(super) const LONG_VERSION: &str = concat!(
 );
 
 /// Known subcommands. When the first arg matches one of these, it is treated as a subcommand.
-pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls", "diagnose", "inspect", "connect"];
+pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls", "diagnose", "inspect", "connect", "health"];
 
 /// Preprocess argv for legacy compatibility: `rustfs <volume>` and `rustfs --address ...` are
 /// treated as `rustfs server <volume>` and `rustfs server --address ...` respectively.
@@ -112,6 +112,44 @@ pub enum Commands {
     Inspect(InspectOpts),
     /// Configure outbound RustFS Connect integration
     Connect(Box<ConnectOpts>),
+    /// Probe the HTTP/HTTPS/mTLS liveness or readiness endpoint
+    Health(HealthProbeOpts),
+}
+
+/// Built-in HTTP/HTTPS/mTLS health and readiness probe options
+#[derive(Args, Clone, Debug)]
+pub struct HealthProbeOpts {
+    /// Probe readiness (/health/ready) instead of liveness (/health)
+    #[arg(long)]
+    pub ready: bool,
+
+    /// Server listen address used to derive the local probe host and port
+    #[arg(
+        long,
+        default_value_t = rustfs_config::DEFAULT_ADDRESS.to_string(),
+        env = "RUSTFS_ADDRESS"
+    )]
+    pub address: String,
+
+    /// TLS certificate directory (loads ca.crt, rustfs_cert.pem, and client_cert.pem/client_key.pem)
+    #[arg(long = "tls-path", env = "RUSTFS_TLS_PATH")]
+    pub tls_path: Option<String>,
+
+    /// Client certificate PEM path for mTLS authentication
+    #[arg(long = "cert", env = "RUSTFS_MTLS_CLIENT_CERT")]
+    pub client_cert: Option<PathBuf>,
+
+    /// Client private key PEM path for mTLS authentication
+    #[arg(long = "key", env = "RUSTFS_MTLS_CLIENT_KEY")]
+    pub client_key: Option<PathBuf>,
+
+    /// Skip server certificate verification (still presents mTLS client identity)
+    #[arg(long, short = 'k')]
+    pub insecure: bool,
+
+    /// Maximum probe duration in seconds
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..=300))]
+    pub timeout: u64,
 }
 
 /// RustFS Connect subcommand options
@@ -1694,6 +1732,8 @@ pub enum CommandResult {
     ConnectTop(ConnectTopCommands),
     /// Consent-bound local object integrity export
     ConnectInspect(ConnectInspectObjectOpts),
+    /// HTTP/HTTPS/mTLS health or readiness probe command
+    Health(HealthProbeOpts),
 }
 
 /// Create default ServerOpts from environment variables
@@ -2169,5 +2209,24 @@ mod tests {
         ] {
             assert!(help.contains(env), "server help should mention {env}");
         }
+    }
+
+    #[test]
+    fn health_subcommand_parses_readiness_and_mtls_flags() {
+        let args = preprocess_args_for_legacy(vec![
+            "rustfs".to_string(),
+            "health".to_string(),
+            "--ready".to_string(),
+            "--insecure".to_string(),
+            "--timeout".to_string(),
+            "2".to_string(),
+        ]);
+        let cli = Cli::try_parse_from(args).expect("rustfs health --ready must parse");
+        let Some(Commands::Health(opts)) = cli.command else {
+            panic!("expected Commands::Health");
+        };
+        assert!(opts.ready);
+        assert!(opts.insecure);
+        assert_eq!(opts.timeout, 2);
     }
 }
